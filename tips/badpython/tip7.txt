@@ -1,0 +1,672 @@
+## Python no-excuses bad-behavior denylist
+
+I’m treating “not excusable” as: **do not merge, deploy, ship, commit, auto-run, or let an agent produce this without immediate correction**. A throwaway local experiment with no secrets, no network, no persistence, and no commit history is the only place some of these patterns can exist briefly.
+
+The strongest source-backed red zones are Python’s own security warnings, CodeQL’s Python security queries, GitLab/GitHub security guidance, OWASP cheat sheets, Bandit/Semgrep rules, and agent-security guidance from OWASP/OpenAI. Python’s docs explicitly call out risky modules such as `pickle`, `shelve`, `random`, `ssl`, `subprocess`, `tempfile`, `xml`, `zipfile`, `http.server`, and logging configuration; CodeQL’s built-in Python queries similarly flag code injection, sensitive logging/storage, CSRF weakening, debug mode, SSRF, insecure temp files, SQL/NoSQL/LDAP injection, path-like issues, insecure TLS, and unsafe deserialization. ([Python documentation][1])
+
+---
+
+# 1. Absolute security red lines
+
+### Code execution and dynamic evaluation
+
+Never:
+
+* Use `eval()`, `exec()`, `compile()`, `execfile`-style behavior, dynamic imports, or `ast` tricks on untrusted or semi-trusted input.
+* “Sandbox” `eval()` with `{"__builtins__": None}` and pretend it is safe.
+* Let users, files, environment variables, prompts, model outputs, database rows, URLs, queue messages, YAML, JSON, CSV, Markdown, notebooks, or config files become Python code.
+* Generate Python code with an LLM and run it automatically.
+* Store business rules as Python snippets in a database and execute them.
+* Pass model/tool output into `exec`, `eval`, Jinja templates, shell commands, SQL strings, or Python import paths.
+* Use `logging.config.listen()` or config formats that can evaluate attacker-controlled logging config.
+* Hide dynamic execution behind helper names like `safe_eval`, `run_formula`, `execute_rule`, `load_plugin`, or `dynamic_transform`.
+
+Semgrep’s Python code-injection guidance calls out `exec()` and `eval()` on dynamic content as dangerous, and Python’s logging config docs warn that parts of logging configuration are passed through `eval()`. ([Semgrep][2])
+
+### Deserialization
+
+Never:
+
+* `pickle.load()` or `pickle.loads()` anything that could have come from a user, network, queue, file upload, model artifact, cache, database, Git repo, CI artifact, object store, email, notebook, or vendor.
+* Use `shelve`, `dill`, `cloudpickle`, `joblib`, `jsonpickle`, or ML model files as if they were safe data formats.
+* Use PyYAML unsafe loaders, `yaml.load()` with unsafe/default loaders, or object constructors from untrusted YAML.
+* Accept “it’s signed” as a reason to deserialize if the signing key can be reused, leaked, shared broadly, or bypassed.
+* Treat internal queues as trusted if any external service, webhook, test environment, or agent can write to them.
+* Deserialize before authentication, authorization, schema validation, tenant isolation, and size limits.
+* Load pickled ML models from random GitHub repos, Kaggle notebooks, Hugging Face uploads, build artifacts, or agent-suggested URLs without a hardened trust process.
+
+Python’s `pickle` docs are explicit: pickle is not secure, malicious pickle data can execute arbitrary code, and only trusted data should be unpickled; CodeQL gives unsafe deserialization severity 9.8 and recommends avoiding untrusted object deserialization or using formats such as JSON. ([Python documentation][3])
+
+### Shell and OS commands
+
+Never:
+
+* Use `os.system`, `os.popen`, `subprocess.*(..., shell=True)`, `pty`, `pexpect`, `bash -c`, PowerShell, `sh -c`, or command strings with user/model-controlled content.
+* Build command strings with f-strings, `%`, `.format()`, concatenation, templates, or joined argument lists.
+* Assume `shlex.quote()` makes arbitrary shell execution safe enough for privileged paths.
+* Pass user input as a command name, executable path, environment variable, working directory, glob, redirect, pipe, or shell fragment.
+* Let agents run arbitrary terminal commands.
+* Let a Python app invoke package managers, interpreters, migration tools, cloud CLIs, Docker, Kubernetes, Git, SSH, or deployment commands from untrusted input.
+* Run subprocesses without timeouts, resource limits, bounded output capture, explicit environment, and error checking.
+* Ignore return codes from security-sensitive subprocesses.
+
+Prefer native Python APIs; when a subprocess is truly required, pass an argument list, not a shell string, and constrain every argument. Semgrep’s command-injection guidance specifically flags user input passed to subprocess command strings and recommends internal APIs, no user-controlled input, and argument arrays. ([Semgrep][4])
+
+### SQL, NoSQL, LDAP, template, and query injection
+
+Never:
+
+* Build SQL with f-strings, concatenation, `.format()`, `%`, or templating.
+* Put user input into `WHERE`, `ORDER BY`, `LIMIT`, table names, column names, JSON paths, raw ORM clauses, or stored-procedure calls without strict allowlisting/parameterization.
+* Use “escaping” as the primary defense.
+* Let an LLM write raw SQL that runs against production or privileged data.
+* Trust ORM filters constructed directly from request dictionaries.
+* Build Mongo/NoSQL queries from unvalidated dictionaries that can contain operators like `$where`, `$ne`, `$regex`, `$gt`.
+* Build LDAP filters, XPath, GraphQL, Elasticsearch, Redis, or PromQL queries with string concatenation.
+* Treat “admin-only” input as safe.
+
+OWASP’s SQL injection guidance says parameterized queries separate code from data and prevent attacker input from changing query intent; its secure code review checklist explicitly calls out unsafe query construction, command injection, path traversal, deserialization, and access-control issues. ([OWASP Cheat Sheet Series][5])
+
+### Secrets and credentials
+
+Never:
+
+* Hardcode API keys, passwords, private keys, JWT secrets, OAuth secrets, database URLs, signing keys, SSH keys, cloud credentials, service-account tokens, or webhook secrets.
+* Commit `.env`, `.pypirc`, `.netrc`, kubeconfig, Terraform state, AWS/GCP/Azure credential files, `.pem`, `.key`, `.p12`, or local config with secrets.
+* Put secrets in prompts, model context, issue comments, PR descriptions, code snippets, screenshots, notebooks, fixtures, test data, or logs.
+* Print secrets during debugging.
+* Store secrets in Docker images, baked config files, frontend bundles, mobile apps, or public package metadata.
+* Use one shared secret across dev/staging/prod.
+* Use long-lived production credentials for local development or agents.
+* Give CI/CD jobs broad secrets by default.
+* Ignore secret-scanning alerts.
+* Remove leaked secrets from Git history but fail to rotate/revoke them.
+* Let an agent read `.env`, key files, browser cookies, SSH config, cloud profiles, password-manager exports, or clipboard contents unless that is explicitly scoped and audited.
+
+GitHub secret scanning exists because hardcoded credentials become targets for unauthorized access, and GitHub push protection is specifically designed to block secrets before they reach a repository; OWASP recommends centralized, standardized, access-controlled secrets management and least privilege. ([GitHub Docs][6])
+
+### Cryptography and randomness
+
+Never:
+
+* Use `random` for passwords, tokens, reset links, API keys, nonces, salts, session IDs, verification codes, invite links, CSRF tokens, or anything security-related.
+* Use MD5, SHA-1, bare SHA-256, or fast hashes for password storage.
+* Store passwords in plaintext, reversible encryption, unsalted hashes, or homegrown password schemes.
+* Roll your own crypto protocol, token format, password reset flow, key exchange, signature format, or encryption mode.
+* Reuse IVs/nonces with encryption modes that require uniqueness.
+* Use ECB mode.
+* Disable certificate validation to “fix” TLS errors.
+* Use hardcoded JWT signing keys or accept `alg=none`.
+* Accept unsigned, unverified, expired, wrong-audience, wrong-issuer, or wrong-tenant tokens.
+* Use comparison operators for secrets where timing leaks matter; use constant-time comparison.
+
+Python says `random` is deterministic and unsuitable for cryptographic purposes, while `secrets` is intended for cryptographically strong random numbers; OWASP recommends modern adaptive password hashing such as Argon2id, with scrypt or bcrypt as alternatives in specified circumstances. ([Python documentation][7])
+
+### TLS, HTTPS, SSH, and transport security
+
+Never:
+
+* Use `verify=False` in `requests`/HTTP clients outside a one-off local diagnostic.
+* Set `ssl.CERT_NONE` or disable hostname verification for real traffic.
+* Suppress TLS warnings instead of fixing trust configuration.
+* Accept unknown SSH host keys automatically in production automation.
+* Use HTTP for login, tokens, cookies, internal admin panels, webhooks carrying secrets, package downloads, or service-to-service auth.
+* Send API keys in URLs.
+* Log full URLs if they may contain tokens.
+* Trust self-signed certs without pinning/managed CA strategy.
+* Use deprecated TLS versions/ciphers because “it works.”
+* Fail open when TLS verification fails.
+
+Python’s security page flags `ssl` as security-sensitive, Python’s SSL docs describe certificate validation via CA certificates, and OWASP REST guidance says secure REST services must provide HTTPS endpoints to protect credentials in transit and authenticate the service. ([Python documentation][1])
+
+---
+
+# 2. File, path, archive, and upload red lines
+
+### File path handling
+
+Never:
+
+* Join user input directly into paths for reading, writing, deleting, serving, importing, or archiving.
+* Trust filenames from uploads, ZIP/TAR entries, HTTP headers, emails, S3 keys, Git repos, or model output.
+* Allow `../`, absolute paths, Windows drive paths, UNC paths, symlinks, null bytes, Unicode confusables, or hidden dotfiles to escape intended directories.
+* Use user-controlled filenames for templates, config, imports, logs, cache keys, or output files.
+* Delete paths derived from user input without canonicalization, base-directory enforcement, and authorization.
+* Serve files by direct path instead of stable IDs mapped server-side.
+* Put sensitive config inside web roots or static directories.
+* Treat “we sanitized the string” as sufficient for path safety.
+
+OWASP describes path traversal as manipulating `../` or absolute paths to access files outside intended directories and recommends avoiding user input in filesystem calls where possible, using indexes, allowlists, and normalization. ([OWASP Foundation][8])
+
+### Temporary files
+
+Never:
+
+* Use `tempfile.mktemp()`.
+* Generate predictable temp names.
+* Create temp files in world-writable directories without atomic creation.
+* Close/delete a secure temp file and then reopen the same path.
+* Pass temp filenames to external programs in a way that creates race windows.
+* Use temp files for secrets unless permissions, lifecycle, cleanup, and crash behavior are controlled.
+* Leave temp directories/files behind with sensitive contents.
+
+Python marks `tempfile.mktemp()` deprecated and warns it may introduce a security hole because another process can create the returned filename before you use it; `mkstemp()` and `mkdtemp()` are described as secure against race conditions when the platform supports the required flags. ([Python documentation][9])
+
+### Archives and decompression
+
+Never:
+
+* Extract ZIP/TAR files from users or external systems without path traversal checks, file count limits, total uncompressed size limits, compression-ratio limits, symlink/hardlink checks, and destination isolation.
+* Trust archive member names.
+* Let archives overwrite existing files.
+* Extract archives as root or into application code directories.
+* Process compressed XML/ZIP/GZIP/LZMA streams without decompression-bomb protections.
+* Load Python packages, plugins, notebooks, model artifacts, or config directly from uploaded archives.
+* Assume `zipfile.extractall()` alone is your security boundary.
+
+Python’s `zipfile` docs call out decompression pitfalls including disk exhaustion from ZIP bombs and overwriting files on repeated extraction; Python’s XML docs warn attacker-controlled XML can cause denial of service, local-file access, network connections, and firewall bypasses. ([Python documentation][10])
+
+### File uploads
+
+Never:
+
+* Trust `Content-Type`.
+* Trust the file extension.
+* Use the original filename as the stored filename.
+* Store uploads inside the webroot.
+* Let uploaded files be executable or importable.
+* Accept unlimited size, dimensions, pages, rows, sheets, nested archives, or compression ratios.
+* Allow uploads from unauthenticated users unless the whole design is abuse-hardened.
+* Skip malware/sandbox/CDR checks where file risk matters.
+* Serve uploaded content under your primary app domain without isolation.
+* Parse uploaded Office/PDF/image/XML/CSV/archive files in privileged workers without resource limits.
+* Return uploaded files inline when they should be attachment-only.
+
+OWASP’s file-upload guidance recommends allowlisted extensions, validating file type rather than trusting `Content-Type`, generated filenames, filename length/character limits, file size limits, authorization, storage outside the webroot, and malware/sandbox/CDR checks where applicable. ([OWASP Cheat Sheet Series][11])
+
+---
+
+# 3. Web/API red lines
+
+Never:
+
+* Run Flask/Django/FastAPI/debug servers in production with debug mode, auto-reload, interactive debugger, or traceback exposure.
+* Use `python -m http.server` or `http.server` as a production server.
+* Bind admin/debug/dev tools to `0.0.0.0`.
+* Use default `SECRET_KEY`, weak Flask/Django secrets, default admin credentials, or tutorial config.
+* Disable CSRF protection for browser-authenticated state-changing endpoints.
+* Use GET for destructive actions.
+* Trust hidden fields, disabled fields, client-side validation, frontend route guards, or UI visibility for authorization.
+* Fail to check authorization on every object access.
+* Implement access control only in templates or React/Vue routes.
+* Use wildcard CORS with credentials.
+* Set cookies without appropriate `Secure`, `HttpOnly`, and `SameSite` flags.
+* Put JWTs or session IDs in query strings.
+* Return raw exceptions, stack traces, SQL errors, environment values, or dependency versions to users.
+* Disable rate limiting on login, password reset, invite, OTP, expensive search, file upload, webhook, or agent endpoints.
+* Accept arbitrary redirect URLs.
+* Fetch arbitrary user-provided URLs server-side without SSRF controls.
+* Allow SSRF to `localhost`, cloud metadata IPs, private ranges, link-local addresses, file schemes, gopher/data/dict schemes, redirects to internal addresses, or DNS rebinding targets.
+* Treat internal services as trusted just because they are internal.
+* Use template `|safe`, `Markup`, disabled autoescaping, or raw HTML rendering on user/model content.
+* Render Markdown/HTML from untrusted sources without a sanitizer and strict allowlist.
+* Return sensitive data in autocomplete, search, error messages, analytics, or logs.
+
+Python’s `http.server` docs warn it is not recommended for production and only implements basic security checks; OWASP’s SSRF guidance describes user-controlled URLs as a common enabler and warns not to accept complete URLs from users when validation is required because URL parsers can be abused. ([Python documentation][12])
+
+---
+
+# 4. Logging, errors, observability, and privacy red lines
+
+Never:
+
+* Log passwords, tokens, cookies, Authorization headers, API keys, private keys, reset links, magic links, OTPs, database URLs, `.env` values, session IDs, raw JWTs, or cloud credentials.
+* Log full request/response bodies by default.
+* Log PII, health data, government IDs, payment data, or confidential business data unless legally justified, minimized, masked, access-controlled, and retention-bound.
+* Use `print()` debugging for production services.
+* Let libraries configure root logging globally.
+* Swallow exceptions silently.
+* Use `except Exception: pass`.
+* Log an error and continue after data corruption, failed auth checks, failed payment checks, failed signature checks, failed migration, or partial write.
+* Emit stack traces to clients.
+* Emit logs without request IDs/correlation IDs for sensitive operations.
+* Let logs be writable/deletable by the application user without tamper controls.
+* Put logs in public buckets or user-visible build artifacts.
+* Disable audit logs for admin, auth, permission, export, delete, billing, deployment, and secret-access events.
+* Let agent actions happen without audit trails.
+
+OWASP says sensitive data such as session IDs, access tokens, passwords, database connection strings, encryption keys, payment data, and high-classification data should usually be removed, masked, sanitized, hashed, or encrypted before logging; it also recommends sanitizing event data to prevent log injection and protecting logs from tampering. ([OWASP Cheat Sheet Series][13])
+
+---
+
+# 5. Dependency and supply-chain red lines
+
+Never:
+
+* `pip install` a package suggested by an LLM without verifying it exists, is the intended project, has acceptable maintainership, provenance, version history, license, and security posture.
+* Install typo-squatted, hallucinated, abandoned, or lookalike packages because “the import worked.”
+* Use unpinned dependencies in deployable applications.
+* Use broad version ranges in production deploys without a lockfile or repeatable build process.
+* Deploy without vulnerability scanning.
+* Ignore known-critical dependency vulnerabilities.
+* Pull from `main`, random Git SHAs, unreviewed forks, pastebins, gists, or arbitrary archives in production builds.
+* Use `curl | python`, `curl | bash`, or agent-generated installer commands.
+* Allow dependency installation at runtime.
+* Let application startup mutate dependencies.
+* Install packages globally on shared hosts.
+* Mix system Python packages with app packages.
+* Use `--extra-index-url` carelessly in a way that enables dependency confusion.
+* Publish packages with compromised PyPI tokens, no MFA, shared credentials, or broad maintainers.
+* Ship vendored code without provenance and update process.
+* Skip hash verification for high-integrity deployment paths.
+* Let CI install dev dependencies with production secrets available.
+
+pip’s repeatable-install docs recommend pinning versions to protect from bugs/incompatibilities and hash-checking to protect against package/index or certificate-chain compromise; pip’s secure-install docs require hashes for all requirements/dependencies and pinned requirements in hash-checking mode. ([Pip][14])
+
+---
+
+# 6. GitHub/GitLab/CI/CD red lines
+
+Never:
+
+* Merge Python code that fails tests, lint, type checks, SAST, dependency scan, or secret scan.
+* Disable branch protection to “just get it in.”
+* Let AI-generated code bypass human review.
+* Approve your own security-sensitive PR.
+* Use broad CI tokens by default.
+* Expose secrets to forked PRs.
+* Use `pull_request_target`-style workflows unsafely.
+* Run untrusted PR code with write tokens or secrets.
+* Let CI jobs deploy from unreviewed branches.
+* Allow arbitrary workflow dispatch inputs to become shell commands.
+* Cache virtualenvs/build artifacts without key isolation.
+* Upload build artifacts containing `.env`, logs, test DBs, coverage with source secrets, or generated config.
+* Put production deploy credentials in repo variables available to all jobs.
+* Skip CODEOWNERS/security review for auth, crypto, payments, permissions, migrations, data export/delete, agent tools, or deployment changes.
+* Use CI as a remote shell for agents.
+* Let agents auto-commit, auto-push, auto-merge, auto-release, or auto-deploy without review gates.
+* Ignore GitHub/GitLab secret or code scanning alerts.
+* Treat “private repo” as a secrets manager.
+
+GitLab describes SAST as finding vulnerabilities before production and running scans automatically in CI/CD; Bandit is designed to find common security issues in Python code by parsing ASTs; GitHub documents CodeQL’s Python query suite and secret scanning/push protection for preventing and detecting credential leaks. ([GitLab Docs][15])
+
+---
+
+# 7. Agent-friendly / vibe-coding red lines
+
+### Agent permissions
+
+Never:
+
+* Give an agent unrestricted shell access.
+* Give an agent unrestricted filesystem read/write.
+* Give an agent production credentials.
+* Give an agent access to `.env`, SSH keys, cloud profiles, browser cookies, password vault exports, private repos, customer data, prod DBs, or billing systems by default.
+* Give an agent write/delete/deploy/email/payment/admin tools without explicit per-action approval.
+* Let an agent install packages, run migrations, delete files, push commits, open PRs, close incidents, rotate secrets, or change IAM without guardrails.
+* Give one agent both sensitive read access and external-send capabilities without a source/sink control.
+* Let agent tools accept arbitrary paths, URLs, shell commands, SQL, Python code, or JSON blobs.
+* Use denylist-only controls for dangerous tools.
+* Let agent loops run without budget, time, token, network, retry, and cost limits.
+* Let agents run on developer laptops with broad ambient credentials.
+
+OWASP’s AI Agent Security Cheat Sheet recommends least privilege, per-tool permission scoping, separate tool sets for different trust levels, and explicit authorization for sensitive operations; it gives unrestricted shell access as a bad MCP/tool configuration example. ([OWASP Cheat Sheet Series][16])
+
+### Prompt injection and untrusted context
+
+Never:
+
+* Treat retrieved documents, web pages, emails, issue comments, README files, code comments, PDFs, images, filenames, API responses, tool output, logs, or database content as instructions.
+* Put untrusted variables into system/developer messages.
+* Let tool output override policy.
+* Let web content tell the agent which tools to call.
+* Let a dependency README or repo file instruct the agent to exfiltrate secrets.
+* Store raw untrusted user/model content in long-term agent memory without validation, tenant isolation, expiry, and auditing.
+* Reuse memory across users or tenants.
+* Let model output flow into shell, SQL, file paths, HTTP requests, emails, or commits without structured validation.
+* Use free-form text where a strict schema, enum, allowlist, or typed object is possible.
+* Let an agent silently transmit sensitive data to third parties.
+* Treat guardrails as perfect.
+
+OpenAI’s agent-safety guidance describes prompt injection as untrusted text/data attempting to override instructions, warns that private data leakage can happen through tool calls, advises not putting untrusted variables into developer messages, recommends structured outputs, and says tool approvals should remain enabled for MCP tools. ([OpenAI Developers][17])
+
+### Agent-generated code quality
+
+Never:
+
+* Accept code because “the AI said it works.”
+* Accept imports that were not verified.
+* Accept code with no tests.
+* Accept code that cannot be explained by the committer.
+* Accept code that changes behavior outside the requested scope.
+* Accept huge agent PRs with unrelated rewrites.
+* Accept generated regex, crypto, auth, SQL, concurrency, parser, or permission code without expert review.
+* Accept generated migrations without checking data loss and rollback.
+* Accept generated code that hides side effects at import time.
+* Accept generated code that silently catches errors.
+* Accept generated code that weakens validation “to make tests pass.”
+* Accept generated code that removes security checks, logging, or monitoring.
+* Accept generated dependencies without provenance review.
+* Accept generated tests that only assert mocks were called and not behavior.
+* Accept generated docs that do not match code.
+* Let an agent mark its own task complete without running the project’s actual checks.
+
+OpenAI’s prompt-injection architecture discussion frames agent risk as dangerous combinations of untrusted sources and sensitive sinks such as transmitting information, following links, or using tools; the practical control is to constrain capabilities and require safeguards for dangerous actions. ([OpenAI][18])
+
+---
+
+# 8. Python correctness and maintainability red lines
+
+### Exceptions and error handling
+
+Never:
+
+* Use bare `except:`.
+* Use `except Exception: pass`.
+* Catch everything and continue as if the operation succeeded.
+* Hide partial failure in data writes, payments, auth, security checks, migrations, file operations, or external API calls.
+* Convert all exceptions to `None`/`False` without preserving context.
+* Retry non-idempotent operations blindly.
+* Retry forever.
+* Retry without backoff/jitter.
+* Log the same exception repeatedly in tight loops.
+* Raise generic `Exception` for domain errors when callers need to respond differently.
+* Use exceptions for normal loop control in hot paths where simple branching is clearer.
+* Suppress `CancelledError` or task cancellation in async code.
+* Ignore cleanup after failed transactions.
+
+### Input validation and data contracts
+
+Never:
+
+* Validate only on the client.
+* Trust type hints as runtime validation.
+* Trust Pydantic/dataclasses/TypedDict without checking boundaries and constraints.
+* Accept arbitrary dictionaries as config, request, message, or tool parameters.
+* Accept unknown fields silently in security-sensitive inputs.
+* Validate with a denylist when a strict allowlist is possible.
+* Fail open when validation fails.
+* Treat `None`, empty string, `0`, missing field, and false as interchangeable in business logic.
+* Use regex for complex parsers when a real parser exists.
+* Parse dates, currencies, URLs, IPs, emails, and hostnames with ad hoc string splitting.
+* Ignore Unicode normalization, case folding, confusables, and locale issues for usernames, filenames, domains, identifiers, and allowlists.
+
+OWASP’s input validation guidance calls denylist validation a common and massively flawed approach because attackers can bypass filters. ([OWASP Cheat Sheet Series][19])
+
+### Types, interfaces, and readability
+
+Never:
+
+* Leave public functions in shared code with ambiguous argument/return types when types are knowable.
+* Use `Any` to silence type problems.
+* Use `# type: ignore` without a precise reason.
+* Ignore type-checker errors in changed code.
+* Use misleading names like `data`, `obj`, `thing`, `tmp`, `res`, `handle`, or `manager` for important concepts.
+* Use one-letter variables outside tiny local scopes.
+* Hide domain concepts in nested dicts instead of named types/classes.
+* Return multiple unrelated shapes from the same function.
+* Return `None` for failure without documenting it.
+* Make functions depend on ambient globals instead of explicit parameters.
+* Use mutable global state for request/user/session/tenant data.
+* Write giant functions, giant classes, or “god modules.”
+* Mix I/O, parsing, validation, authorization, business logic, and persistence in one function.
+* Make agent-unfriendly code where behavior is impossible to inspect locally.
+
+PEP 8 emphasizes readability and consistency; PEP 484 introduced standard type annotation syntax to support static analysis, IDE completion, and refactoring. ([Python Enhancement Proposals (PEPs)][20])
+
+### Python-specific footguns
+
+Never:
+
+* Use mutable default arguments like `def f(x=[]):`.
+* Use `assert` for runtime validation, user input validation, authorization, authentication, or security checks.
+* Use `is` for equality with strings, numbers, booleans other than literal `None` checks, or containers.
+* Shadow built-ins like `id`, `type`, `list`, `dict`, `set`, `file`, `input`, `sum`.
+* Name files after standard-library modules, such as `json.py`, `typing.py`, `logging.py`, `email.py`, `asyncio.py`, `random.py`, `ssl.py`.
+* Use wildcard imports in production modules.
+* Mutate `sys.path` to make imports work.
+* Depend on the current working directory.
+* Perform network calls, DB connections, file writes, migrations, subprocesses, logging configuration, or secret loading at import time.
+* Monkeypatch built-ins or third-party library internals in application code.
+* Rely on dictionary ordering, timezone defaults, locale defaults, or environment defaults without stating assumptions.
+* Mix bytes and strings casually.
+* Use implicit file encodings.
+* Use naive datetimes for cross-system timestamps.
+* Use local time for persisted timestamps when UTC-aware timestamps are required.
+* Use floats for money.
+* Use `deepcopy`/serialization as a substitute for understanding object ownership.
+* Depend on private attributes of libraries.
+* Ignore deprecation warnings forever.
+
+### Resource management
+
+Never:
+
+* Open files, sockets, DB connections, HTTP sessions, temp dirs, locks, or subprocess pipes without deterministic cleanup.
+* Skip context managers for resources that need closing.
+* Make HTTP requests without timeouts.
+* Read unbounded files into memory.
+* Accept unbounded request bodies.
+* Accept unbounded CSV rows, JSON depth, XML entities, archive entries, image dimensions, or regex input.
+* Use regexes vulnerable to catastrophic backtracking on uncontrolled input.
+* Spawn unbounded threads, processes, tasks, greenlets, or subprocesses.
+* Use queues without max sizes.
+* Use caches without size/TTL/tenant isolation.
+* Use recursion on attacker-controlled depth.
+* Build infinite agent/retry/poll loops.
+* Ignore OS signals and graceful shutdown for services.
+* Leave zombie subprocesses.
+
+### Async and concurrency
+
+Never:
+
+* Call blocking network/file/database/subprocess code directly inside an event loop.
+* Forget `await`.
+* Create fire-and-forget tasks without tracking, cancellation, and exception handling.
+* Share mutable state across threads/tasks without locks or immutability.
+* Use global request state in async services.
+* Use thread-local assumptions in async code.
+* Mix sync and async DB sessions incorrectly.
+* Ignore cancellation.
+* Hold locks across awaits unless intentionally designed.
+* Use `time.sleep()` in async code.
+* Assume the GIL makes compound operations safe.
+* Write non-idempotent background jobs without dedupe, locking, or transaction boundaries.
+
+---
+
+# 9. Data, database, and migration red lines
+
+Never:
+
+* Run app code as database superuser/root.
+* Use one DB user for all services and migrations.
+* Give read/write/delete/schema privileges to code that only needs read.
+* Make destructive migrations without backups, dry runs, rollback plans, and explicit review.
+* Auto-run destructive migrations at application startup.
+* Drop/recreate tables in production because “the model changed.”
+* Store PII without data classification and retention rules.
+* Copy production data to dev laptops, notebooks, demos, or agent contexts without anonymization and approval.
+* Put production DB dumps in object storage, CI artifacts, Slack, Git, notebooks, or issue attachments.
+* Log query results containing sensitive data.
+* Cache tenant/user-specific data without tenant/user keys.
+* Trust database data as safe just because it is “internal.”
+* Build second-order injection by storing untrusted input and later using it in SQL/shell/templates.
+* Skip transactions for multi-step writes that must be atomic.
+* Ignore isolation, locking, idempotency, and retry behavior.
+* Use timestamps or incremental IDs as authorization boundaries.
+* Expose raw internal IDs where authorization is missing.
+* Implement soft delete without access rules and retention cleanup.
+
+---
+
+# 10. Testing red lines
+
+Never:
+
+* Merge behavior changes without tests.
+* Merge security fixes without regression tests.
+* Let generated tests replace human review.
+* Skip tests to make CI green.
+* Use `pytest.mark.skip`, `xfail`, or broad mocks without a reason and owner.
+* Write tests that only verify implementation details.
+* Write tests that pass even if the feature is broken.
+* Depend on test order.
+* Depend on real time, local timezone, random order, network availability, external APIs, or production credentials in unit tests.
+* Use `sleep()` to “fix” flaky tests.
+* Use shared mutable fixtures without cleanup.
+* Leave test data in production systems.
+* Run destructive tests against production-like credentials.
+* Let tests hit paid APIs by default.
+* Use real secrets in tests.
+* Generate golden files from current broken output and call it done.
+* Ignore coverage gaps in auth, permissions, parsing, validation, error handling, migrations, and billing.
+* Mock security checks away.
+* Test only happy paths.
+* Avoid property/fuzz tests for parsers, serializers, validators, and boundary-heavy code.
+
+Python’s standard `unittest` supports automated tests and independence from the reporting framework, and pytest emphasizes small readable tests that scale to complex testing. ([Python documentation][21])
+
+---
+
+# 11. Configuration and environment red lines
+
+Never:
+
+* Have behavior depend silently on undeclared environment variables.
+* Fail open when config is missing.
+* Use production defaults in development templates.
+* Use development defaults in production.
+* Use `DEBUG=True` by default.
+* Put secrets in config files committed to Git.
+* Mix dev/staging/prod credentials.
+* Let local config override security controls silently.
+* Use broad `ALLOWED_HOSTS = ["*"]`, wildcard CORS with credentials, or permissive origins by default.
+* Rely on current working directory, relative paths, or developer-specific absolute paths.
+* Hide config in code instead of typed, validated settings.
+* Start services successfully with invalid or partial config.
+* Let an agent rewrite config without showing a diff.
+* Keep feature flags undocumented, permanent, or unsafe by default.
+* Use environment variables as an unvalidated control plane for dangerous behavior.
+
+---
+
+# 12. Packaging, project structure, and repo hygiene red lines
+
+Never:
+
+* Ship a Python app without a clear dependency file/lock strategy.
+* Leave the supported Python version ambiguous.
+* Leave no `README`, run command, test command, lint command, or setup instructions.
+* Require undocumented manual steps.
+* Depend on developer machine state.
+* Commit virtualenvs, `__pycache__`, `.pytest_cache`, `.mypy_cache`, build outputs, local databases, notebook checkpoints, or generated secrets.
+* Put large binaries/model files in Git without a storage/provenance strategy.
+* Use notebooks as the only production source of truth.
+* Have import cycles that require side-effect imports to work.
+* Hide CLI behavior in module import side effects.
+* Publish packages with missing license/provenance.
+* Publish internal packages accidentally to public registries.
+* Name internal packages in ways that collide with public packages.
+* Trust package names hallucinated by AI tools.
+* Leave dead code, unused dependencies, stale scripts, and obsolete config in place.
+
+---
+
+# 13. Operations and deployment red lines
+
+Never:
+
+* Run Python services as root unless there is a tightly justified and isolated reason.
+* Run containers privileged by default.
+* Mount host Docker socket into app containers.
+* Give app containers broad cloud IAM.
+* Put production secrets in images.
+* Expose metrics/admin/debug endpoints publicly.
+* Expose Jupyter, Streamlit, Gradio, Flower, Celery dashboards, Redis, RabbitMQ, Postgres, or admin UIs without auth/network isolation.
+* Deploy without health checks.
+* Deploy without rollback.
+* Deploy without logs/metrics/traces for critical paths.
+* Deploy without rate limits and resource limits.
+* Deploy without backups for stateful systems.
+* Deploy without monitoring failed auth, permission failures, data exports, deletes, billing changes, and admin actions.
+* Let one failed dependency hang all workers indefinitely.
+* Let background jobs retry forever and duplicate side effects.
+* Let queues grow without bounds.
+* Store user data in local container disk without persistence strategy.
+* Use local SQLite for multi-worker production writes unless explicitly designed.
+* Ignore OS/package/security updates.
+* Leave old endpoints, old secrets, old tokens, and old service accounts alive.
+
+---
+
+# 14. Review and governance red lines
+
+Never:
+
+* Merge security-sensitive code without a second reviewer.
+* Merge auth/crypto/payment/data-deletion/permission/migration code based only on AI output.
+* Skip threat modeling for new external input, file parsing, webhooks, agent tools, uploads, auth flows, or data exports.
+* Let the author decide alone that a finding is a false positive.
+* Suppress SAST/lint/type/security warnings without an inline reason and owner.
+* Accept “temporary” bypasses without expiry.
+* Accept TODOs in security-critical code without a tracking issue.
+* Make huge PRs that mix refactor, behavior, formatting, dependency, and security changes.
+* Review only the diff when the change affects trust boundaries.
+* Ignore abuse cases.
+* Ignore privacy/legal constraints.
+* Ignore backwards compatibility in libraries.
+* Ignore migration/rollback plans.
+* Ignore operational runbooks.
+* Let undocumented tribal knowledge be required to run or secure the system.
+
+OWASP’s secure code review guidance recommends architecture review, entry-point analysis, auth/authz verification, data-flow tracing, crypto review, error handling review, configuration/deployment review, and checking trust boundaries and regressions in diffs. ([OWASP Cheat Sheet Series][22])
+
+---
+
+# 15. The “vibe coding” Python rejection checklist
+
+Reject the code immediately if any answer is “yes”:
+
+1. Does it execute strings as code?
+2. Does it deserialize untrusted objects?
+3. Does it shell out with user/model-controlled input?
+4. Does it build SQL/queries/templates/paths from strings?
+5. Does it commit, print, log, or prompt with secrets?
+6. Does it disable TLS, auth, CSRF, validation, or security checks?
+7. Does it load packages suggested by AI without verification?
+8. Does it add dependencies without pinning/review?
+9. Does it let an agent use broad tools or ambient credentials?
+10. Does it place untrusted content into privileged prompts/messages?
+11. Does it lack tests for changed behavior?
+12. Does it catch and suppress errors?
+13. Does it lack timeouts/resource limits on I/O?
+14. Does it trust filenames, URLs, headers, content types, cookies, JWTs, or client-side checks?
+15. Does it change migrations, permissions, billing, auth, crypto, data export/delete, deployment, or CI without expert review?
+
+A good Python codebase should make the safe path boring: typed boundaries, explicit validation, parameterized queries, structured outputs, scoped agent tools, pinned dependencies, tests, SAST/secret scanning, minimal privileges, safe defaults, and readable code.
+
+[1]: https://docs.python.org/3/library/security_warnings.html "Security Considerations — Python 3.14.5rc1 documentation"
+[2]: https://semgrep.dev/docs/cheat-sheets/python-code-injection "Code Injection in Python | Semgrep"
+[3]: https://docs.python.org/3/library/pickle.html "pickle — Python object serialization — Python 3.14.5rc1 documentation"
+[4]: https://semgrep.dev/docs/cheat-sheets/python-command-injection "Command Injection in Python | Semgrep"
+[5]: https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html "SQL Injection Prevention - OWASP Cheat Sheet Series"
+[6]: https://docs.github.com/code-security/secret-scanning/about-secret-scanning "About secret scanning - GitHub Docs"
+[7]: https://docs.python.org/3/library/random.html "random — Generate pseudo-random numbers — Python 3.14.5rc1 documentation"
+[8]: https://owasp.org/www-community/attacks/Path_Traversal "Path Traversal | OWASP Foundation"
+[9]: https://docs.python.org/3/library/tempfile.html "tempfile — Generate temporary files and directories — Python 3.14.5rc1 documentation"
+[10]: https://docs.python.org/3/library/zipfile.html "zipfile — Work with ZIP archives — Python 3.14.5rc1 documentation"
+[11]: https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html "File Upload - OWASP Cheat Sheet Series"
+[12]: https://docs.python.org/3/library/http.server.html "http.server — HTTP servers — Python 3.14.5rc1 documentation"
+[13]: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html "Logging - OWASP Cheat Sheet Series"
+[14]: https://pip.pypa.io/en/stable/topics/repeatable-installs/ "Repeatable Installs - pip documentation v26.1.1"
+[15]: https://docs.gitlab.com/user/application_security/sast/ "Static application security testing (SAST) | GitLab Docs"
+[16]: https://cheatsheetseries.owasp.org/cheatsheets/AI_Agent_Security_Cheat_Sheet.html "AI Agent Security - OWASP Cheat Sheet Series"
+[17]: https://developers.openai.com/api/docs/guides/agent-builder-safety "Safety in building agents | OpenAI API"
+[18]: https://openai.com/index/designing-agents-to-resist-prompt-injection/ "Designing AI agents to resist prompt injection | OpenAI"
+[19]: https://cheatsheetseries.owasp.org/cheatsheets/Input_Validation_Cheat_Sheet.html "Input Validation - OWASP Cheat Sheet Series"
+[20]: https://peps.python.org/pep-0008/?utm_source=chatgpt.com "PEP 8 – Style Guide for Python Code"
+[21]: https://docs.python.org/3/library/unittest.html?utm_source=chatgpt.com "unittest — Unit testing framework"
+[22]: https://cheatsheetseries.owasp.org/cheatsheets/Secure_Code_Review_Cheat_Sheet.html "Secure Code Review - OWASP Cheat Sheet Series"
+

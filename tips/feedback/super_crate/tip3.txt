@@ -1,0 +1,2534 @@
+<!--
+SINGLE-FILE COPY/PASTE ARTIFACT
+Everything needed to implement the proposed crate is embedded in this Markdown file as path-labeled code blocks.
+No companion files are required to read the implementation plan.
+-->
+
+# `jankurai-proofmark`: Changed-Behavior Proof Receipts for Rust
+
+**Decision:** Invent and add one new Rust crate: **`jankurai-proofmark`**.
+
+**One-line idea:** make “tests pass” insufficient by emitting a Jankurai-compatible receipt proving that the changed Rust behavior was executed, asserted, mutation-constrained, and security-negative-tested where relevant.
+
+**Target repository:** `jeppsontaylor/Jankurai`  
+**Prepared:** 2026-05-05  
+**Implementation status:** design + paste-ready MVP file contents. This document does not claim the code has already been committed or run in the repository.
+
+---
+
+## 1. The #1 best idea
+
+Add a workspace crate named:
+
+```text
+crates/jankurai-proofmark/
+```
+
+It builds a Cargo subcommand:
+
+```bash
+cargo proofmark jankurai ...
+```
+
+The crate sits inside Jankurai’s proof lane system and converts an ordinary Rust proof command into a **changed-behavior proof receipt**.
+
+Today, a Jankurai proof lane can say:
+
+> “For this changed path, run this proof command, capture the command receipt, and bind it into evidence.”
+
+That is already valuable. The remaining high-value gap is:
+
+> “Did that passing command actually exercise and constrain the changed behavior, or did a green test suite pass nearby?”
+
+The paper names this exact issue as `HLT-008-FALSE-GREEN-RISK`: tests must prove changed behavior, not merely pass nearby. `jankurai-proofmark` is the missing tool that makes this measurable, local, and agent-readable.
+
+It produces this verdict for each change:
+
+```text
+pass   = changed Rust units were reached, tests passed, in-diff mutants were killed or waived
+review = evidence is incomplete but explicitly visible
+block  = tests passed but changed behavior was not proved
+```
+
+The crate automatically emits:
+
+```text
+target/jankurai/proofmark/diff.patch
+target/jankurai/proofmark/coverage.json
+target/jankurai/proofmark/mutants.out/outcomes.json
+target/jankurai/proofmark/proofmark-receipt.json
+target/jankurai/proofmark/proof-receipt.json
+target/jankurai/proofmark/proofmark.md
+```
+
+The important part is `proof-receipt.json`: it conforms to Jankurai’s existing proof receipt shape and stores the rich proofmark report under:
+
+```json
+{
+  "extensions": {
+    "proofmark": { "...": "..." }
+  }
+}
+```
+
+That works with the current design because Jankurai proof receipts already allow `extensions`.
+
+---
+
+## 2. Why this is the highest-leverage crate
+
+Jankurai already has the right control plane: owner maps, test maps, proof lanes, proof receipts, audit, witness, repair, security, UX, and agent adapters. The highest-value new crate is therefore not another generic scanner. It is a proof-quality amplifier for the most common merge claim in Rust projects:
+
+> “I ran the tests.”
+
+That statement is too weak for agent-assisted merge. It can hide:
+
+- dead tests,
+- tests that exercise old paths but not changed paths,
+- tests that hit changed lines without asserting behavior,
+- security-sensitive branches with no negative proof,
+- mutation survivors that reveal unasserted behavior,
+- agent-generated “vibe tests” that check implementation trivia rather than the requirement.
+
+`jankurai-proofmark` upgrades a standard Rust toolchain habit, `cargo test`, into a repository-governed proof object:
+
+```text
+changed paths
+→ changed Rust units
+→ relevant tests and coverage
+→ in-diff mutation evidence
+→ security/invariant tags
+→ Jankurai proof receipt
+→ merge witness
+```
+
+This directly improves:
+
+| Goal | How `jankurai-proofmark` helps |
+|---|---|
+| Reduce vibe coding | Blocks “green but unproved” changes and gives agents a precise missing-proof repair task. |
+| Improve testing | Requires changed units to be exercised and behavior-constrained, not just surrounded by tests. |
+| Improve agent-first design | Emits machine-readable missing proof instructions: exact file, line range, symbol, rule, and tests/mutants to add. |
+| Improve security | Requires negative proof for `HLT-022` authz isolation and `HLT-023` input-boundary surfaces. |
+| Improve popular standard code | Turns Rust’s ordinary test lane into a proof-carrying lane without replacing Cargo, nextest, llvm-cov, or cargo-mutants. |
+| Fit Jankurai | Uses existing proof lanes, receipts, evidence index, `extensions`, and deterministic local artifacts. |
+
+---
+
+## 3. Current repo fit
+
+The repository already states its public rule as:
+
+```text
+no proof, no merge; no receipt, no trust
+```
+
+The daily loop already runs `jankurai prove`, `jankurai audit`, and `jankurai witness`. The paper’s rules include:
+
+```text
+HLT-004-UNMAPPED-PROOF
+HLT-008-FALSE-GREEN-RISK
+HLT-022-AUTHZ-ISOLATION-GAP
+HLT-023-INPUT-BOUNDARY-GAP
+HLT-027-HUMAN-REVIEW-EVIDENCE-GAP
+```
+
+The current Rust CLI already has proof planning/execution, Rust maps, Rust witness graphs, Rust witness diffs, and compile diagnostic packets. It also stores extensible proof receipt data. The proposed crate should therefore **not** replace the existing system. It should plug into it.
+
+### Where it lives
+
+```text
+Cargo.toml                              # add workspace member
+crates/jankurai-proofmark/              # new crate
+schemas/proofmark-receipt.schema.json   # new schema
+agent/proofmark.toml                    # generated policy file
+agent/proof-lanes.toml                  # add proofmark lane
+agent/test-map.json                     # route Rust code changes to proofmark
+crates/jankurai/src/commands/proofmark.rs  # optional child-receipt merge helper
+crates/jankurai/src/commands.rs            # expose helper module
+crates/jankurai/src/commands/proof.rs      # optional merge call after each proof run
+```
+
+### How it should be used
+
+For a Rust change:
+
+```bash
+cargo proofmark jankurai \
+  --changed-from origin/main \
+  --test-command "cargo nextest run --workspace --profile ci --junit target/jankurai/proofmark/nextest.xml" \
+  --coverage-command "cargo llvm-cov nextest --workspace --json --output-path target/jankurai/proofmark/coverage.json" \
+  --run-mutants \
+  --min-changed-line-coverage 0.85 \
+  --min-mutant-kill-pct 0.70 \
+  --out target/jankurai/proofmark/proofmark-receipt.json \
+  --jankurai-receipt target/jankurai/proofmark/proof-receipt.json \
+  --md target/jankurai/proofmark/proofmark.md
+```
+
+Then Jankurai runs the normal proof/audit/witness chain:
+
+```bash
+jankurai prove . --changed-from origin/main
+jankurai audit . --changed-fast --changed-from origin/main \
+  --json target/jankurai/audit-fast.json \
+  --md target/jankurai/audit-fast.md
+jankurai witness . --changed-from origin/main \
+  --baseline agent/repo-score.json \
+  --out target/jankurai/merge-witness.json \
+  --md target/jankurai/merge-witness.md
+```
+
+---
+
+## 4. What the crate proves
+
+`jankurai-proofmark` answers four questions.
+
+### 4.1 Did the changed Rust code get exercised?
+
+It parses the git diff and identifies changed Rust units:
+
+```text
+path + hunk line range
+→ surrounding function/module/type
+→ source/test/generated classification
+→ rule and risk tags
+```
+
+It then imports `llvm-cov export` / `cargo llvm-cov` JSON and checks whether changed executable lines or regions were hit.
+
+### 4.2 Did tests pass?
+
+It can run the configured test command or consume artifacts from nextest/JUnit. The MVP records the command, exit code, log digest, and optional JUnit path.
+
+### 4.3 Did tests constrain behavior?
+
+It runs `cargo-mutants --in-diff` against the exact patch. A mutant in changed code that survives means the test suite may have reached the code without asserting its behavior.
+
+Coverage says:
+
+> “This code ran.”
+
+Mutation says:
+
+> “A bad change here would be caught.”
+
+That is the difference between “nearby green” and “behavior proof.”
+
+### 4.4 Did security-sensitive changes have negative proof?
+
+Security-sensitive paths can be declared in `agent/proofmark.toml`. Example:
+
+```toml
+[[surface]]
+id = "tenant-authz"
+path = "crates/api/src/auth"
+rule_id = "HLT-022-AUTHZ-ISOLATION-GAP"
+required_tests = [
+  "authz::rejects_cross_tenant_access",
+  "authz::rejects_missing_tenant_claim"
+]
+require_mutants = "kill-all"
+```
+
+If a change touches that surface and the required negative tests are absent, skipped, or not associated with proof evidence, the verdict becomes `block` or `review` depending on mode.
+
+---
+
+## 5. Why not a different crate?
+
+I considered several alternatives.
+
+### Alternative A: `jankurai-security-kit`
+
+A Rust crate wrapping `cargo-audit`, `cargo-deny`, `cargo-vet`, SBOMs, secret scanning, SLSA/Sigstore attestations, and CI hardening.
+
+This would be useful, but Jankurai already has security lanes and security evidence surfaces. It would improve coverage, not define a new core primitive.
+
+### Alternative B: `jankurai-agent-manifest`
+
+A crate to generate richer `AGENTS.md`, `.cursor/rules`, Claude/Copilot adapters, and context packs.
+
+This would improve agent UX, but Jankurai already has bounded agent context and adapters. The bigger hole is not telling agents what to read; it is proving that their changes are actually tested.
+
+### Alternative C: `jankurai-supplychain`
+
+A crate to sign proof receipts, emit provenance, and verify tool identities.
+
+This is important for later hardening. It should be phase two of `proofmark`: sign the proofmark receipt once the proof object is worth signing.
+
+### Winner: `jankurai-proofmark`
+
+It attacks the center of the paper: false-green tests, proof coverage ratio, proof-selection accuracy, witness completeness, and review claims. It is also practical: Rust already has nextest, llvm-cov/cargo-llvm-cov, and cargo-mutants. The crate becomes the adapter that makes those tools Jankurai-native.
+
+---
+
+## 6. Artifact model
+
+### 6.1 Proofmark receipt
+
+A rich internal receipt:
+
+```json
+{
+  "schema_version": "0.1.0",
+  "generated_at": "2026-05-05T12:00:00Z",
+  "repo_root": ".",
+  "git_head": "abc123",
+  "base_ref": "origin/main",
+  "changed_paths": ["crates/api/src/auth.rs"],
+  "changed_units": [
+    {
+      "path": "crates/api/src/auth.rs",
+      "kind": "fn",
+      "symbol": "authorize_request",
+      "start_line": 44,
+      "end_line": 92,
+      "changed_lines": [51, 52, 53],
+      "is_test": false,
+      "rules": ["HLT-022-AUTHZ-ISOLATION-GAP"]
+    }
+  ],
+  "coverage": {
+    "verdict": "pass",
+    "changed_lines_total": 3,
+    "changed_lines_covered": 3,
+    "ratio": 1.0,
+    "uncovered": []
+  },
+  "mutation": {
+    "verdict": "pass",
+    "attempted": 8,
+    "killed": 8,
+    "survived": 0,
+    "kill_pct": 1.0
+  },
+  "security_surfaces": [
+    {
+      "id": "tenant-authz",
+      "rule_id": "HLT-022-AUTHZ-ISOLATION-GAP",
+      "verdict": "pass",
+      "required_tests_present": true
+    }
+  ],
+  "verdict": "pass"
+}
+```
+
+### 6.2 Jankurai-compatible child proof receipt
+
+A schema-compatible receipt:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "standard_version": "0.7.0",
+  "auditor_version": "0.7.0",
+  "lane": "proofmark",
+  "command": "cargo proofmark jankurai --changed-from origin/main ...",
+  "exit_code": 0,
+  "elapsed_ms": 123456,
+  "artifacts": [
+    "target/jankurai/proofmark/proofmark-receipt.json",
+    "target/jankurai/proofmark/proofmark.md",
+    "target/jankurai/proofmark/coverage.json",
+    "target/jankurai/proofmark/mutants.out/outcomes.json"
+  ],
+  "changed_paths": ["crates/api/src/auth.rs"],
+  "rules_covered": [
+    {"rule_id": "HLT-008-FALSE-GREEN-RISK", "status": "pass"},
+    {"rule_id": "HLT-022-AUTHZ-ISOLATION-GAP", "status": "pass"}
+  ],
+  "extensions": {
+    "proofmark": {
+      "verdict": "pass",
+      "changed_units_total": 1,
+      "coverage_ratio": 1.0,
+      "mutant_kill_pct": 1.0
+    }
+  }
+}
+```
+
+This makes the tool immediately useful even before Jankurai core understands the full proofmark schema.
+
+---
+
+## 7. Agent-facing behavior
+
+When `jankurai-proofmark` blocks, it should not say “coverage failed” generically. It should produce repairable tasks.
+
+Example `proofmark.md` output:
+
+```text
+# Proofmark verdict: block
+
+Changed behavior was not proved.
+
+## Missing proof
+
+1. `crates/api/src/auth.rs:51-53`
+   - symbol: `authorize_request`
+   - risk: `HLT-022-AUTHZ-ISOLATION-GAP`
+   - problem: changed lines were executed, but 2 in-diff mutants survived
+   - agent fix:
+     Add or update a negative authz test that proves cross-tenant access is rejected.
+     Run:
+       cargo proofmark jankurai --changed-from origin/main ...
+
+2. `crates/api/src/parser.rs:88`
+   - symbol: `parse_redirect`
+   - risk: `HLT-023-INPUT-BOUNDARY-GAP`
+   - problem: changed executable line was not covered
+   - agent fix:
+     Add a test for malformed redirect input and verify no network sink is reached.
+```
+
+This is the anti-vibe loop:
+
+```text
+agent changes code
+→ proofmark says exactly which changed behavior is unproved
+→ agent adds targeted proof
+→ proofmark receipt passes
+→ Jankurai witness binds it
+```
+
+---
+
+## 8. Implementation plan
+
+### Phase 0 — MVP, no Jankurai core change required
+
+Add the crate and proof lane. The lane exits non-zero when proof is weak. Jankurai already treats failing proof commands as failing receipts.
+
+### Phase 1 — Receipt merge
+
+Teach `jankurai prove` to detect `target/jankurai/proofmark/proof-receipt.json` and merge its extension into the parent proof receipt.
+
+### Phase 2 — Audit scoring
+
+Teach `jankurai audit` to create a high-confidence `HLT-008-FALSE-GREEN-RISK` finding if Rust changes lack a valid proofmark receipt.
+
+### Phase 3 — Supply-chain proof
+
+Optionally sign proofmark receipts with Sigstore/cosign or emit an in-toto/SLSA predicate once the proof object is stable.
+
+---
+
+# 9. Paste-ready implementation files
+
+The following MVP is intentionally conservative:
+
+- no network calls,
+- all artifacts local,
+- optional external commands only when explicitly configured,
+- review/block modes instead of hidden assumptions,
+- simple Rust symbol scanning first, swappable for richer `rustdoc-json` or rustc data later.
+
+## 9.1 `Cargo.toml` workspace patch
+
+```toml
+[workspace]
+members = [
+    "crates/jankurai",
+    "crates/jankurai-proofmark",
+]
+resolver = "2"
+```
+
+## 9.2 `crates/jankurai-proofmark/Cargo.toml`
+
+```toml
+[package]
+name = "jankurai-proofmark"
+version = "0.1.0"
+edition = "2021"
+description = "Changed-behavior proof receipts for Jankurai Rust proof lanes."
+license = "MIT"
+repository = "https://github.com/jeppsontaylor/Jankurai"
+keywords = ["jankurai", "testing", "coverage", "mutation", "agent"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "cargo-proofmark"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+toml = "0.9"
+walkdir = "2.5"
+```
+
+## 9.3 `crates/jankurai-proofmark/src/main.rs`
+
+```rust
+fn main() -> anyhow::Result<()> {
+    jankurai_proofmark::cli::main()
+}
+```
+
+## 9.4 `crates/jankurai-proofmark/src/lib.rs`
+
+```rust
+pub mod cli;
+pub mod config;
+pub mod coverage;
+pub mod git;
+pub mod impact;
+pub mod mutants;
+pub mod receipt;
+pub mod render;
+pub mod runner;
+
+use anyhow::{Context, Result};
+use std::fs;
+use std::path::PathBuf;
+use std::time::Instant;
+
+pub fn run_jankurai(args: cli::JankuraiArgs) -> Result<receipt::ProofmarkReceipt> {
+    let started = Instant::now();
+    let repo = args.repo.canonicalize().unwrap_or(args.repo.clone());
+    let out_dir = args
+        .out
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.join("target/jankurai/proofmark"));
+    fs::create_dir_all(&out_dir).context("create proofmark output directory")?;
+
+    let config = config::Config::load(&repo, args.config.as_ref())?;
+    let changed_paths = git::changed_paths(&repo, args.changed_from.as_deref(), &args.changed)?;
+    let git_head = git::git_head(&repo).unwrap_or_else(|_| "unknown".to_string());
+    let diff_text = git::diff_text(&repo, args.changed_from.as_deref(), &changed_paths)?;
+    let diff_path = out_dir.join("diff.patch");
+    fs::write(&diff_path, &diff_text).context("write proofmark diff patch")?;
+
+    let ranges = git::parse_unified_diff_ranges(&diff_text);
+    let changed_units = impact::changed_units(&repo, &changed_paths, &ranges)?;
+
+    let test_run = if let Some(command) = args.test_command.as_deref() {
+        let log_path = out_dir.join("test-command.log");
+        Some(runner::run_shell(&repo, command, &log_path)?)
+    } else {
+        None
+    };
+
+    if let Some(command) = args.coverage_command.as_deref() {
+        let log_path = out_dir.join("coverage-command.log");
+        let result = runner::run_shell(&repo, command, &log_path)?;
+        if result.exit_code != 0 {
+            anyhow::bail!(
+                "coverage command failed with exit {}. See {}",
+                result.exit_code,
+                log_path.display()
+            );
+        }
+    }
+
+    let coverage_path = args.coverage_json.clone().or_else(|| {
+        let p = out_dir.join("coverage.json");
+        p.exists().then_some(p)
+    });
+    let coverage = coverage::summarize(
+        &repo,
+        coverage_path.as_ref(),
+        &changed_units,
+        args.min_changed_line_coverage
+            .or(config.thresholds.changed_line_coverage)
+            .unwrap_or(0.85),
+        &args.mode,
+    )?;
+
+    let mutation = if args.run_mutants {
+        mutants::run_or_read(
+            &repo,
+            &diff_path,
+            args.mutants_out
+                .clone()
+                .unwrap_or_else(|| out_dir.join("mutants.out")),
+            args.mutants_command.as_deref(),
+            args.min_mutant_kill_pct
+                .or(config.thresholds.mutant_kill_pct)
+                .unwrap_or(0.70),
+            &args.mode,
+        )?
+    } else {
+        mutants::MutationSummary::disabled("not requested")
+    };
+
+    let surfaces = config.evaluate_surfaces(&changed_units, test_run.as_ref());
+
+    let verdict = receipt::overall_verdict(&coverage.verdict, &mutation.verdict, &surfaces);
+    let elapsed_ms = started.elapsed().as_millis();
+
+    let proofmark = receipt::ProofmarkReceipt {
+        schema_version: "0.1.0".to_string(),
+        generated_at: receipt::now_rfc3339(),
+        repo_root: repo.display().to_string(),
+        git_head,
+        base_ref: args.changed_from.clone(),
+        changed_paths,
+        changed_units,
+        test_run,
+        coverage,
+        mutation,
+        security_surfaces: surfaces,
+        verdict,
+        elapsed_ms,
+    };
+
+    receipt::write_all(
+        &repo,
+        &proofmark,
+        &args.out,
+        args.jankurai_receipt.as_ref(),
+        args.md.as_ref(),
+        &args.full_command(),
+    )?;
+
+    if proofmark.verdict == "block" {
+        anyhow::bail!("proofmark verdict is block; see {}", args.out.display());
+    }
+
+    Ok(proofmark)
+}
+```
+
+## 9.5 `crates/jankurai-proofmark/src/cli.rs`
+
+```rust
+use crate::run_jankurai;
+use anyhow::Result;
+use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "cargo-proofmark", version)]
+pub struct CargoCli {
+    #[command(subcommand)]
+    command: CargoCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CargoCommand {
+    /// Cargo subcommand entry point: `cargo proofmark jankurai ...`
+    Proofmark(ProofmarkCli),
+    /// Direct entry point: `cargo-proofmark jankurai ...`
+    Jankurai(JankuraiArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ProofmarkCli {
+    #[command(subcommand)]
+    command: ProofmarkCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ProofmarkCommand {
+    Jankurai(JankuraiArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct JankuraiArgs {
+    #[arg(default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long, value_name = "REF")]
+    pub changed_from: Option<String>,
+
+    #[arg(long, value_name = "PATH")]
+    pub changed: Vec<PathBuf>,
+
+    #[arg(long, value_name = "PATH", default_value = "agent/proofmark.toml")]
+    pub config: Option<PathBuf>,
+
+    #[arg(long, value_name = "COMMAND")]
+    pub test_command: Option<String>,
+
+    #[arg(long, value_name = "COMMAND")]
+    pub coverage_command: Option<String>,
+
+    #[arg(long, value_name = "PATH")]
+    pub coverage_json: Option<PathBuf>,
+
+    #[arg(long)]
+    pub run_mutants: bool,
+
+    #[arg(long, value_name = "COMMAND")]
+    pub mutants_command: Option<String>,
+
+    #[arg(long, value_name = "DIR")]
+    pub mutants_out: Option<PathBuf>,
+
+    #[arg(long)]
+    pub min_changed_line_coverage: Option<f64>,
+
+    #[arg(long)]
+    pub min_mutant_kill_pct: Option<f64>,
+
+    #[arg(long, default_value = "advisory", value_parser = ["observe", "advisory", "ratchet"])]
+    pub mode: String,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofmark/proofmark-receipt.json"
+    )]
+    pub out: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofmark/proof-receipt.json"
+    )]
+    pub jankurai_receipt: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofmark/proofmark.md"
+    )]
+    pub md: Option<PathBuf>,
+}
+
+impl JankuraiArgs {
+    pub fn full_command(&self) -> String {
+        std::env::args().collect::<Vec<_>>().join(" ")
+    }
+}
+
+pub fn main() -> Result<()> {
+    let cli = CargoCli::parse();
+    match cli.command {
+        CargoCommand::Proofmark(wrapper) => match wrapper.command {
+            ProofmarkCommand::Jankurai(args) => {
+                run_jankurai(args)?;
+            }
+        },
+        CargoCommand::Jankurai(args) => {
+            run_jankurai(args)?;
+        }
+    }
+    Ok(())
+}
+```
+
+## 9.6 `crates/jankurai-proofmark/src/git.rs`
+
+```rust
+use anyhow::{Context, Result};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedRange {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+pub fn git_head(repo: &Path) -> Result<String> {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo)
+        .output()
+        .context("run git rev-parse HEAD")?;
+    if !out.status.success() {
+        anyhow::bail!("git rev-parse HEAD failed");
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+pub fn changed_paths(
+    repo: &Path,
+    changed_from: Option<&str>,
+    explicit: &[PathBuf],
+) -> Result<Vec<String>> {
+    if !explicit.is_empty() {
+        let mut out = explicit
+            .iter()
+            .map(|p| normalize_path(p))
+            .collect::<Vec<_>>();
+        out.sort();
+        out.dedup();
+        return Ok(out);
+    }
+
+    let base = changed_from.unwrap_or("HEAD");
+    let range = if changed_from.is_some() {
+        format!("{base}...HEAD")
+    } else {
+        "HEAD".to_string()
+    };
+
+    let output = Command::new("git")
+        .args(["diff", "--name-only", &range])
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("run git diff --name-only {range}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "git diff --name-only failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let mut paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+pub fn diff_text(repo: &Path, changed_from: Option<&str>, changed_paths: &[String]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo);
+    cmd.arg("diff").arg("--unified=0");
+
+    if let Some(base) = changed_from {
+        cmd.arg(format!("{base}...HEAD"));
+    }
+
+    if !changed_paths.is_empty() {
+        cmd.arg("--");
+        for path in changed_paths {
+            cmd.arg(path);
+        }
+    }
+
+    let output = cmd.output().context("run git diff --unified=0")?;
+    if !output.status.success() {
+        anyhow::bail!("git diff failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+pub fn parse_unified_diff_ranges(diff: &str) -> Vec<ChangedRange> {
+    let file_re = Regex::new(r"^\+\+\+ b/(.+)$").unwrap();
+    let hunk_re = Regex::new(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@").unwrap();
+
+    let mut current_file: Option<String> = None;
+    let mut ranges = Vec::new();
+
+    for line in diff.lines() {
+        if let Some(caps) = file_re.captures(line) {
+            current_file = Some(caps[1].to_string());
+            continue;
+        }
+
+        if let (Some(file), Some(caps)) = (&current_file, hunk_re.captures(line)) {
+            let start: u32 = caps[1].parse().unwrap_or(1);
+            let count: u32 = caps
+                .get(2)
+                .and_then(|m| m.as_str().parse().ok())
+                .unwrap_or(1);
+            let end = if count == 0 { start } else { start + count - 1 };
+            ranges.push(ChangedRange {
+                path: file.clone(),
+                start_line: start,
+                end_line: end,
+            });
+        }
+    }
+
+    merge_ranges(ranges)
+}
+
+fn merge_ranges(ranges: Vec<ChangedRange>) -> Vec<ChangedRange> {
+    let mut by_path: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
+    for r in ranges {
+        by_path.entry(r.path).or_default().push((r.start_line, r.end_line));
+    }
+
+    let mut out = Vec::new();
+    for (path, mut items) in by_path {
+        items.sort();
+        let mut current: Option<(u32, u32)> = None;
+        for (start, end) in items {
+            match current {
+                Some((cs, ce)) if start <= ce + 1 => current = Some((cs, ce.max(end))),
+                Some((cs, ce)) => {
+                    out.push(ChangedRange {
+                        path: path.clone(),
+                        start_line: cs,
+                        end_line: ce,
+                    });
+                    current = Some((start, end));
+                }
+                None => current = Some((start, end)),
+            }
+        }
+        if let Some((start, end)) = current {
+            out.push(ChangedRange {
+                path,
+                start_line: start,
+                end_line: end,
+            });
+        }
+    }
+    out
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+```
+
+## 9.7 `crates/jankurai-proofmark/src/impact.rs`
+
+```rust
+use crate::git::ChangedRange;
+use anyhow::{Context, Result};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedUnit {
+    pub path: String,
+    pub kind: String,
+    pub symbol: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub changed_lines: Vec<u32>,
+    pub is_test: bool,
+    pub is_generated: bool,
+    pub rules: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SymbolSpan {
+    kind: String,
+    symbol: String,
+    start_line: u32,
+    end_line: u32,
+}
+
+pub fn changed_units(
+    repo: &Path,
+    changed_paths: &[String],
+    ranges: &[ChangedRange],
+) -> Result<Vec<ChangedUnit>> {
+    let mut ranges_by_path: BTreeMap<String, Vec<&ChangedRange>> = BTreeMap::new();
+    for range in ranges {
+        ranges_by_path.entry(range.path.clone()).or_default().push(range);
+    }
+
+    let mut units = Vec::new();
+    for path in changed_paths {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+
+        let abs = repo.join(path);
+        if !abs.exists() {
+            continue;
+        }
+
+        let text = fs::read_to_string(&abs)
+            .with_context(|| format!("read changed Rust file {}", abs.display()))?;
+        let spans = scan_symbols(&text);
+        let file_ranges = ranges_by_path.get(path).cloned().unwrap_or_default();
+        if file_ranges.is_empty() {
+            units.push(file_level_unit(path, &text));
+            continue;
+        }
+
+        for range in file_ranges {
+            let changed_lines = (range.start_line..=range.end_line).collect::<Vec<_>>();
+            let span = spans
+                .iter()
+                .find(|span| span.start_line <= range.start_line && span.end_line >= range.end_line)
+                .or_else(|| spans.iter().find(|span| overlaps(span, range)));
+
+            if let Some(span) = span {
+                units.push(ChangedUnit {
+                    path: path.clone(),
+                    kind: span.kind.clone(),
+                    symbol: span.symbol.clone(),
+                    start_line: span.start_line,
+                    end_line: span.end_line,
+                    changed_lines,
+                    is_test: is_test_path(path),
+                    is_generated: is_generated_text(&text),
+                    rules: infer_rules(path, &text),
+                });
+            } else {
+                units.push(ChangedUnit {
+                    path: path.clone(),
+                    kind: "file-hunk".to_string(),
+                    symbol: format!("{path}:{}-{}", range.start_line, range.end_line),
+                    start_line: range.start_line,
+                    end_line: range.end_line,
+                    changed_lines,
+                    is_test: is_test_path(path),
+                    is_generated: is_generated_text(&text),
+                    rules: infer_rules(path, &text),
+                });
+            }
+        }
+    }
+
+    units.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.symbol.cmp(&b.symbol))
+    });
+    units.dedup_by(|a, b| {
+        a.path == b.path && a.start_line == b.start_line && a.end_line == b.end_line
+    });
+    Ok(units)
+}
+
+fn scan_symbols(text: &str) -> Vec<SymbolSpan> {
+    let re = Regex::new(
+        r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?(?P<kind>fn|struct|enum|trait|impl)\s+(?P<name>[A-Za-z0-9_<>:]+)?",
+    )
+    .unwrap();
+
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut spans = Vec::new();
+
+    for (idx, line) in lines.iter().enumerate() {
+        let Some(caps) = re.captures(line) else {
+            continue;
+        };
+
+        let kind = caps.name("kind").unwrap().as_str().to_string();
+        let symbol = caps
+            .name("name")
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| format!("impl@{}", idx + 1));
+
+        let start_line = (idx + 1) as u32;
+        let end_line = find_end_line(&lines, idx).unwrap_or(start_line);
+
+        spans.push(SymbolSpan {
+            kind,
+            symbol,
+            start_line,
+            end_line,
+        });
+    }
+
+    spans
+}
+
+fn find_end_line(lines: &[&str], start: usize) -> Option<u32> {
+    let mut depth: i32 = 0;
+    let mut seen_open = false;
+
+    for (idx, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen_open = true;
+                }
+                '}' => {
+                    depth -= 1;
+                    if seen_open && depth <= 0 {
+                        return Some((idx + 1) as u32);
+                    }
+                }
+                ';' if !seen_open => return Some((idx + 1) as u32),
+                _ => {}
+            }
+        }
+    }
+
+    Some(lines.len() as u32)
+}
+
+fn overlaps(span: &SymbolSpan, range: &ChangedRange) -> bool {
+    span.start_line <= range.end_line && range.start_line <= span.end_line
+}
+
+fn file_level_unit(path: &str, text: &str) -> ChangedUnit {
+    let line_count = text.lines().count().max(1) as u32;
+    ChangedUnit {
+        path: path.to_string(),
+        kind: "file".to_string(),
+        symbol: path.to_string(),
+        start_line: 1,
+        end_line: line_count,
+        changed_lines: Vec::new(),
+        is_test: is_test_path(path),
+        is_generated: is_generated_text(text),
+        rules: infer_rules(path, text),
+    }
+}
+
+fn is_test_path(path: &str) -> bool {
+    path.contains("/tests/")
+        || path.ends_with("_test.rs")
+        || path.contains("/benches/")
+        || path.contains("/examples/")
+}
+
+fn is_generated_text(text: &str) -> bool {
+    let head = text.lines().take(12).collect::<Vec<_>>().join("\n").to_lowercase();
+    head.contains("@generated")
+        || head.contains("generated by")
+        || head.contains("do not edit")
+        || head.contains("auto-generated")
+}
+
+fn infer_rules(path: &str, text: &str) -> Vec<String> {
+    let lower = format!("{}\n{}", path.to_lowercase(), text.to_lowercase());
+    let mut rules = vec!["HLT-008-FALSE-GREEN-RISK".to_string()];
+
+    if lower.contains("auth")
+        || lower.contains("tenant")
+        || lower.contains("permission")
+        || lower.contains("policy")
+    {
+        rules.push("HLT-022-AUTHZ-ISOLATION-GAP".to_string());
+    }
+
+    if lower.contains("parse")
+        || lower.contains("deserialize")
+        || lower.contains("sql")
+        || lower.contains("command")
+        || lower.contains("path")
+        || lower.contains("url")
+        || lower.contains("input")
+    {
+        rules.push("HLT-023-INPUT-BOUNDARY-GAP".to_string());
+    }
+
+    if lower.contains("unsafe") {
+        rules.push("HLT-018-PERF-CONCURRENCY-DRIFT".to_string());
+    }
+
+    rules.sort();
+    rules.dedup();
+    rules
+}
+```
+
+## 9.8 `crates/jankurai-proofmark/src/coverage.rs`
+
+```rust
+use crate::impact::ChangedUnit;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageSummary {
+    pub verdict: String,
+    pub source: Option<String>,
+    pub changed_lines_total: usize,
+    pub changed_lines_covered: usize,
+    pub ratio: f64,
+    pub min_required: f64,
+    pub uncovered: Vec<UncoveredLine>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UncoveredLine {
+    pub path: String,
+    pub line: u32,
+    pub symbol: String,
+}
+
+pub fn summarize(
+    repo: &Path,
+    coverage_json: Option<&PathBuf>,
+    units: &[ChangedUnit],
+    min_required: f64,
+    mode: &str,
+) -> Result<CoverageSummary> {
+    let Some(path) = coverage_json else {
+        let verdict = if mode == "observe" { "review" } else { "block" };
+        return Ok(CoverageSummary {
+            verdict: verdict.to_string(),
+            source: None,
+            changed_lines_total: changed_source_lines(units).len(),
+            changed_lines_covered: 0,
+            ratio: 0.0,
+            min_required,
+            uncovered: Vec::new(),
+            notes: vec!["no coverage JSON was provided".to_string()],
+        });
+    };
+
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read coverage JSON {}", path.display()))?;
+    let json: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse coverage JSON {}", path.display()))?;
+    let hits = extract_line_hits(repo, &json);
+
+    let mut total = 0usize;
+    let mut covered = 0usize;
+    let mut uncovered = Vec::new();
+
+    for unit in units.iter().filter(|u| !u.is_test && !u.is_generated) {
+        for line in &unit.changed_lines {
+            total += 1;
+            if line_is_hit(&hits, &unit.path, *line) {
+                covered += 1;
+            } else {
+                uncovered.push(UncoveredLine {
+                    path: unit.path.clone(),
+                    line: *line,
+                    symbol: unit.symbol.clone(),
+                });
+            }
+        }
+    }
+
+    let ratio = if total == 0 {
+        1.0
+    } else {
+        covered as f64 / total as f64
+    };
+    let verdict = if ratio >= min_required {
+        "pass"
+    } else if mode == "observe" {
+        "review"
+    } else {
+        "block"
+    };
+
+    Ok(CoverageSummary {
+        verdict: verdict.to_string(),
+        source: Some(path.display().to_string()),
+        changed_lines_total: total,
+        changed_lines_covered: covered,
+        ratio: round2(ratio),
+        min_required,
+        uncovered,
+        notes: Vec::new(),
+    })
+}
+
+fn changed_source_lines(units: &[ChangedUnit]) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for unit in units.iter().filter(|u| !u.is_test && !u.is_generated) {
+        for line in &unit.changed_lines {
+            out.push((unit.path.clone(), *line));
+        }
+    }
+    out
+}
+
+fn extract_line_hits(repo: &Path, json: &Value) -> BTreeMap<String, BTreeSet<u32>> {
+    let mut hits: BTreeMap<String, BTreeSet<u32>> = BTreeMap::new();
+    walk_llvm_value(repo, json, None, &mut hits);
+    hits
+}
+
+fn walk_llvm_value(
+    repo: &Path,
+    value: &Value,
+    current_file: Option<String>,
+    hits: &mut BTreeMap<String, BTreeSet<u32>>,
+) {
+    match value {
+        Value::Object(map) => {
+            let file = map
+                .get("filename")
+                .and_then(Value::as_str)
+                .map(|f| normalize_coverage_path(repo, f))
+                .or(current_file);
+
+            for child in map.values() {
+                walk_llvm_value(repo, child, file.clone(), hits);
+            }
+        }
+        Value::Array(items) => {
+            if let Some(file) = &current_file {
+                maybe_record_region(items, file, hits);
+            }
+            for child in items {
+                walk_llvm_value(repo, child, current_file.clone(), hits);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn maybe_record_region(items: &[Value], file: &str, hits: &mut BTreeMap<String, BTreeSet<u32>>) {
+    // LLVM regions commonly look like:
+    // [line_start, col_start, line_end, col_end, execution_count, ...]
+    if items.len() < 5 {
+        return;
+    }
+
+    let Some(start) = items[0].as_u64() else { return; };
+    let Some(end) = items[2].as_u64() else { return; };
+    let Some(count) = items[4].as_u64() else { return; };
+
+    if count == 0 || start == 0 || end == 0 || end < start {
+        return;
+    }
+
+    // Cap wide regions to avoid bad JSON shapes marking an entire file.
+    if end - start > 500 {
+        return;
+    }
+
+    let entry = hits.entry(file.to_string()).or_default();
+    for line in start..=end {
+        entry.insert(line as u32);
+    }
+}
+
+fn line_is_hit(hits: &BTreeMap<String, BTreeSet<u32>>, path: &str, line: u32) -> bool {
+    hits.get(path).map(|set| set.contains(&line)).unwrap_or(false)
+}
+
+fn normalize_coverage_path(repo: &Path, file: &str) -> String {
+    let path = Path::new(file);
+    if let Ok(rel) = path.strip_prefix(repo) {
+        return rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    file.replace('\\', "/")
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+```
+
+## 9.9 `crates/jankurai-proofmark/src/mutants.rs`
+
+```rust
+use crate::runner;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationSummary {
+    pub enabled: bool,
+    pub verdict: String,
+    pub command: Option<String>,
+    pub outcomes_path: Option<String>,
+    pub attempted: usize,
+    pub killed: usize,
+    pub survived: usize,
+    pub timeout: usize,
+    pub unviable: usize,
+    pub skipped: usize,
+    pub kill_pct: f64,
+    pub min_required: f64,
+    pub notes: Vec<String>,
+}
+
+impl MutationSummary {
+    pub fn disabled(reason: &str) -> Self {
+        Self {
+            enabled: false,
+            verdict: "review".to_string(),
+            command: None,
+            outcomes_path: None,
+            attempted: 0,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            unviable: 0,
+            skipped: 0,
+            kill_pct: 0.0,
+            min_required: 0.0,
+            notes: vec![reason.to_string()],
+        }
+    }
+}
+
+pub fn run_or_read(
+    repo: &Path,
+    diff_path: &Path,
+    out_dir: PathBuf,
+    command_override: Option<&str>,
+    min_required: f64,
+    mode: &str,
+) -> Result<MutationSummary> {
+    fs::create_dir_all(&out_dir).context("create cargo-mutants output directory")?;
+
+    let command = command_override
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "cargo mutants --in-diff {} --output {} --test-tool nextest",
+                shell_quote(&diff_path.display().to_string()),
+                shell_quote(&out_dir.display().to_string())
+            )
+        });
+
+    let log_path = out_dir.join("proofmark-cargo-mutants.log");
+    let run = runner::run_shell(repo, &command, &log_path)?;
+
+    let outcomes_path = out_dir.join("outcomes.json");
+    if !outcomes_path.exists() {
+        let verdict = if mode == "observe" { "review" } else { "block" };
+        return Ok(MutationSummary {
+            enabled: true,
+            verdict: verdict.to_string(),
+            command: Some(command),
+            outcomes_path: None,
+            attempted: 0,
+            killed: 0,
+            survived: 0,
+            timeout: 0,
+            unviable: 0,
+            skipped: 0,
+            kill_pct: 0.0,
+            min_required,
+            notes: vec![
+                format!("cargo-mutants exit code: {}", run.exit_code),
+                format!("no outcomes.json found at {}", outcomes_path.display()),
+                format!("see {}", log_path.display()),
+            ],
+        });
+    }
+
+    let mut summary = parse_outcomes(&outcomes_path, min_required, mode)?;
+    summary.enabled = true;
+    summary.command = Some(command);
+    summary.outcomes_path = Some(outcomes_path.display().to_string());
+    summary.notes.push(format!("cargo-mutants exit code: {}", run.exit_code));
+    Ok(summary)
+}
+
+fn parse_outcomes(path: &Path, min_required: f64, mode: &str) -> Result<MutationSummary> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read cargo-mutants outcomes {}", path.display()))?;
+    let json: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse cargo-mutants outcomes {}", path.display()))?;
+
+    let mut killed = 0usize;
+    let mut survived = 0usize;
+    let mut timeout = 0usize;
+    let mut unviable = 0usize;
+    let mut skipped = 0usize;
+
+    collect_outcomes(&json, &mut |outcome| match outcome {
+        "caught" | "killed" => killed += 1,
+        "missed" | "survived" => survived += 1,
+        "timeout" => timeout += 1,
+        "unviable" | "unviable_build" | "unviable_test" => unviable += 1,
+        "skipped" => skipped += 1,
+        _ => {}
+    });
+
+    let attempted = killed + survived + timeout;
+    let kill_pct = if attempted == 0 {
+        1.0
+    } else {
+        killed as f64 / attempted as f64
+    };
+
+    let verdict = if survived == 0 && timeout == 0 && kill_pct >= min_required {
+        "pass"
+    } else if mode == "observe" {
+        "review"
+    } else {
+        "block"
+    };
+
+    Ok(MutationSummary {
+        enabled: true,
+        verdict: verdict.to_string(),
+        command: None,
+        outcomes_path: Some(path.display().to_string()),
+        attempted,
+        killed,
+        survived,
+        timeout,
+        unviable,
+        skipped,
+        kill_pct: round2(kill_pct),
+        min_required,
+        notes: Vec::new(),
+    })
+}
+
+fn collect_outcomes(value: &Value, f: &mut impl FnMut(&str)) {
+    match value {
+        Value::Object(map) => {
+            if let Some(outcome) = map
+                .get("outcome")
+                .or_else(|| map.get("result"))
+                .or_else(|| map.get("status"))
+                .and_then(Value::as_str)
+            {
+                f(outcome);
+            }
+            for child in map.values() {
+                collect_outcomes(child, f);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_outcomes(child, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+```
+
+## 9.10 `crates/jankurai-proofmark/src/runner.rs`
+
+```rust
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::time::Instant;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRun {
+    pub command: String,
+    pub exit_code: i32,
+    pub elapsed_ms: u128,
+    pub log_path: String,
+    pub log_sha256: String,
+    pub stdout_stderr_bytes: u64,
+}
+
+pub fn run_shell(repo: &Path, command: &str, log_path: &Path) -> Result<CommandRun> {
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).context("create command log parent")?;
+    }
+
+    let started = Instant::now();
+    let output = if cfg!(windows) {
+        Command::new("cmd")
+            .args(["/C", command])
+            .current_dir(repo)
+            .output()
+            .with_context(|| format!("run command `{command}`"))?
+    } else {
+        Command::new("sh")
+            .args(["-c", command])
+            .current_dir(repo)
+            .output()
+            .with_context(|| format!("run command `{command}`"))?
+    };
+
+    let mut log = Vec::new();
+    log.extend_from_slice(b"$ ");
+    log.extend_from_slice(command.as_bytes());
+    log.extend_from_slice(b"\n\n--- stdout ---\n");
+    log.extend_from_slice(&output.stdout);
+    log.extend_from_slice(b"\n--- stderr ---\n");
+    log.extend_from_slice(&output.stderr);
+    fs::write(log_path, &log).context("write command log")?;
+
+    Ok(CommandRun {
+        command: command.to_string(),
+        exit_code: output.status.code().unwrap_or(1),
+        elapsed_ms: started.elapsed().as_millis(),
+        log_path: log_path.display().to_string(),
+        log_sha256: sha256_bytes(&log),
+        stdout_stderr_bytes: log.len() as u64,
+    })
+}
+
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+```
+
+## 9.11 `crates/jankurai-proofmark/src/config.rs`
+
+```rust
+use crate::impact::ChangedUnit;
+use crate::receipt::SecuritySurfaceVerdict;
+use crate::runner::CommandRun;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub thresholds: Thresholds,
+    #[serde(default)]
+    pub surface: Vec<Surface>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Thresholds {
+    pub changed_line_coverage: Option<f64>,
+    pub mutant_kill_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Surface {
+    pub id: String,
+    pub path: String,
+    pub rule_id: String,
+    #[serde(default)]
+    pub required_tests: Vec<String>,
+    #[serde(default)]
+    pub require_mutants: Option<String>,
+}
+
+impl Config {
+    pub fn load(repo: &Path, path: Option<&PathBuf>) -> Result<Self> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let abs = if path.is_absolute() {
+            path.clone()
+        } else {
+            repo.join(path)
+        };
+        if !abs.exists() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(&abs)
+            .with_context(|| format!("read proofmark config {}", abs.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse proofmark config {}", abs.display()))
+    }
+
+    pub fn evaluate_surfaces(
+        &self,
+        units: &[ChangedUnit],
+        test_run: Option<&CommandRun>,
+    ) -> Vec<SecuritySurfaceVerdict> {
+        let mut out = Vec::new();
+
+        for surface in &self.surface {
+            let touched = units.iter().any(|unit| unit.path.starts_with(&surface.path));
+            if !touched {
+                continue;
+            }
+
+            let log_text = test_run
+                .and_then(|run| fs::read_to_string(&run.log_path).ok())
+                .unwrap_or_default();
+
+            let missing_tests = surface
+                .required_tests
+                .iter()
+                .filter(|test| !log_text.contains(test.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let verdict = if missing_tests.is_empty() {
+                "pass"
+            } else {
+                "block"
+            };
+
+            out.push(SecuritySurfaceVerdict {
+                id: surface.id.clone(),
+                path: surface.path.clone(),
+                rule_id: surface.rule_id.clone(),
+                verdict: verdict.to_string(),
+                required_tests: surface.required_tests.clone(),
+                missing_tests,
+                notes: Vec::new(),
+            });
+        }
+
+        out
+    }
+}
+```
+
+## 9.12 `crates/jankurai-proofmark/src/receipt.rs`
+
+```rust
+use crate::coverage::CoverageSummary;
+use crate::impact::ChangedUnit;
+use crate::mutants::MutationSummary;
+use crate::render;
+use crate::runner::{sha256_file, CommandRun};
+use anyhow::{Context, Result};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofmarkReceipt {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub repo_root: String,
+    pub git_head: String,
+    pub base_ref: Option<String>,
+    pub changed_paths: Vec<String>,
+    pub changed_units: Vec<ChangedUnit>,
+    pub test_run: Option<CommandRun>,
+    pub coverage: CoverageSummary,
+    pub mutation: MutationSummary,
+    pub security_surfaces: Vec<SecuritySurfaceVerdict>,
+    pub verdict: String,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecuritySurfaceVerdict {
+    pub id: String,
+    pub path: String,
+    pub rule_id: String,
+    pub verdict: String,
+    pub required_tests: Vec<String>,
+    pub missing_tests: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactDigest {
+    pub path: String,
+    pub sha256: String,
+}
+
+pub fn overall_verdict(
+    coverage: &str,
+    mutation: &str,
+    surfaces: &[SecuritySurfaceVerdict],
+) -> String {
+    if coverage == "block"
+        || mutation == "block"
+        || surfaces.iter().any(|s| s.verdict == "block")
+    {
+        "block".to_string()
+    } else if coverage == "review"
+        || mutation == "review"
+        || surfaces.iter().any(|s| s.verdict == "review")
+    {
+        "review".to_string()
+    } else {
+        "pass".to_string()
+    }
+}
+
+pub fn write_all(
+    repo: &Path,
+    proofmark: &ProofmarkReceipt,
+    out: &Path,
+    jankurai_receipt: Option<&std::path::PathBuf>,
+    md: Option<&std::path::PathBuf>,
+    command: &str,
+) -> Result<()> {
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let text = serde_json::to_string_pretty(proofmark)?;
+    fs::write(out, text).with_context(|| format!("write {}", out.display()))?;
+
+    if let Some(md_path) = md {
+        if let Some(parent) = md_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(md_path, render::render_markdown(proofmark))
+            .with_context(|| format!("write {}", md_path.display()))?;
+    }
+
+    if let Some(path) = jankurai_receipt {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let child = jankurai_receipt_value(repo, proofmark, out, md.map(|p| p.as_path()), command)?;
+        fs::write(path, serde_json::to_string_pretty(&child)?)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn jankurai_receipt_value(
+    repo: &Path,
+    proofmark: &ProofmarkReceipt,
+    proofmark_path: &Path,
+    md_path: Option<&Path>,
+    command: &str,
+) -> Result<Value> {
+    let mut artifacts = vec![repo_relative(repo, proofmark_path)];
+    if let Some(md_path) = md_path {
+        artifacts.push(repo_relative(repo, md_path));
+    }
+    if let Some(source) = &proofmark.coverage.source {
+        artifacts.push(repo_relative(repo, Path::new(source)));
+    }
+    if let Some(outcomes) = &proofmark.mutation.outcomes_path {
+        artifacts.push(repo_relative(repo, Path::new(outcomes)));
+    }
+    if let Some(run) = &proofmark.test_run {
+        artifacts.push(repo_relative(repo, Path::new(&run.log_path)));
+    }
+    artifacts.sort();
+    artifacts.dedup();
+
+    let mut artifact_digests = Vec::new();
+    for artifact in &artifacts {
+        let path = repo.join(artifact);
+        if path.exists() {
+            artifact_digests.push(ArtifactDigest {
+                path: artifact.clone(),
+                sha256: sha256_file(&path)?,
+            });
+        }
+    }
+
+    let exit_code = if proofmark.verdict == "block" { 1 } else { 0 };
+    let mut rules = vec![json!({
+        "rule_id": "HLT-008-FALSE-GREEN-RISK",
+        "status": proofmark.coverage.verdict
+    })];
+
+    for surface in &proofmark.security_surfaces {
+        rules.push(json!({
+            "rule_id": surface.rule_id,
+            "status": surface.verdict
+        }));
+    }
+
+    Ok(json!({
+        "schema_version": "1.0.0",
+        "standard_version": "0.7.0",
+        "auditor_version": "0.7.0",
+        "receipt_id": format!("proofmark-{}", proofmark.git_head.chars().take(12).collect::<String>()),
+        "lane": "proofmark",
+        "command": command,
+        "exit_code": exit_code,
+        "elapsed_ms": proofmark.elapsed_ms,
+        "artifacts": artifacts,
+        "changed_paths": proofmark.changed_paths,
+        "residual_risk": residual_risk(proofmark),
+        "generated_at": proofmark.generated_at,
+        "repo_root": proofmark.repo_root,
+        "git_head": proofmark.git_head,
+        "artifact_digests": artifact_digests,
+        "rules_covered": rules,
+        "extensions": {
+            "proofmark": {
+                "schema_version": proofmark.schema_version,
+                "verdict": proofmark.verdict,
+                "changed_units_total": proofmark.changed_units.len(),
+                "coverage_verdict": proofmark.coverage.verdict,
+                "coverage_ratio": proofmark.coverage.ratio,
+                "mutation_verdict": proofmark.mutation.verdict,
+                "mutant_kill_pct": proofmark.mutation.kill_pct,
+                "security_surface_count": proofmark.security_surfaces.len()
+            }
+        }
+    }))
+}
+
+fn residual_risk(proofmark: &ProofmarkReceipt) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if proofmark.coverage.verdict != "pass" {
+        out.push(format!(
+            "changed-line coverage {} below required {}",
+            proofmark.coverage.ratio, proofmark.coverage.min_required
+        ));
+    }
+    if proofmark.mutation.verdict != "pass" {
+        out.push(format!(
+            "mutation proof {} with {} survived and {} timeout",
+            proofmark.mutation.verdict, proofmark.mutation.survived, proofmark.mutation.timeout
+        ));
+    }
+    for surface in &proofmark.security_surfaces {
+        if surface.verdict != "pass" {
+            out.push(format!(
+                "security surface {} missing tests: {}",
+                surface.id,
+                surface.missing_tests.join(", ")
+            ));
+        }
+    }
+
+    out
+}
+
+pub fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn repo_relative(repo: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(repo) {
+        return rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+```
+
+## 9.13 `crates/jankurai-proofmark/src/render.rs`
+
+```rust
+use crate::receipt::ProofmarkReceipt;
+
+pub fn render_markdown(receipt: &ProofmarkReceipt) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!("# Proofmark verdict: {}\n\n", receipt.verdict));
+    out.push_str(&format!("- Git head: `{}`\n", receipt.git_head));
+    if let Some(base) = &receipt.base_ref {
+        out.push_str(&format!("- Base ref: `{base}`\n"));
+    }
+    out.push_str(&format!("- Changed paths: `{}`\n", receipt.changed_paths.len()));
+    out.push_str(&format!("- Changed units: `{}`\n", receipt.changed_units.len()));
+    out.push('\n');
+
+    out.push_str("## Coverage\n\n");
+    out.push_str(&format!("- Verdict: `{}`\n", receipt.coverage.verdict));
+    out.push_str(&format!(
+        "- Changed-line coverage: `{}/{}` = `{}`; minimum `{}`\n",
+        receipt.coverage.changed_lines_covered,
+        receipt.coverage.changed_lines_total,
+        receipt.coverage.ratio,
+        receipt.coverage.min_required
+    ));
+    if !receipt.coverage.uncovered.is_empty() {
+        out.push_str("\n### Uncovered changed lines\n\n");
+        for item in &receipt.coverage.uncovered {
+            out.push_str(&format!(
+                "- `{}` line `{}` in `{}`\n",
+                item.path, item.line, item.symbol
+            ));
+        }
+    }
+
+    out.push_str("\n## Mutation\n\n");
+    out.push_str(&format!("- Verdict: `{}`\n", receipt.mutation.verdict));
+    out.push_str(&format!(
+        "- Attempted `{}`, killed `{}`, survived `{}`, timeout `{}`, kill pct `{}`\n",
+        receipt.mutation.attempted,
+        receipt.mutation.killed,
+        receipt.mutation.survived,
+        receipt.mutation.timeout,
+        receipt.mutation.kill_pct
+    ));
+    for note in &receipt.mutation.notes {
+        out.push_str(&format!("- Note: {note}\n"));
+    }
+
+    if !receipt.security_surfaces.is_empty() {
+        out.push_str("\n## Security surfaces\n\n");
+        for surface in &receipt.security_surfaces {
+            out.push_str(&format!(
+                "- `{}` `{}`: `{}`\n",
+                surface.id, surface.rule_id, surface.verdict
+            ));
+            if !surface.missing_tests.is_empty() {
+                out.push_str(&format!(
+                    "  - Missing tests: `{}`\n",
+                    surface.missing_tests.join("`, `")
+                ));
+            }
+        }
+    }
+
+    out.push_str("\n## Changed units\n\n");
+    for unit in &receipt.changed_units {
+        out.push_str(&format!(
+            "- `{}` `{}` lines `{}-{}` changed `{:?}` rules `{:?}`\n",
+            unit.path, unit.symbol, unit.start_line, unit.end_line, unit.changed_lines, unit.rules
+        ));
+    }
+
+    out.push_str("\n## Agent repair instruction\n\n");
+    if receipt.verdict == "pass" {
+        out.push_str("Changed Rust behavior has proofmark evidence. Do not add waiver text.\n");
+    } else {
+        out.push_str(
+            "Repair the proof, not the receipt. Add focused tests or negative tests for the listed changed units, rerun `cargo proofmark jankurai`, and only request a waiver when the missing proof is intentionally accepted by a human owner.\n",
+        );
+    }
+
+    out
+}
+```
+
+## 9.14 `schemas/proofmark-receipt.schema.json`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/proofmark-receipt.schema.json",
+  "title": "jankurai proofmark receipt",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "repo_root",
+    "git_head",
+    "changed_paths",
+    "changed_units",
+    "coverage",
+    "mutation",
+    "security_surfaces",
+    "verdict",
+    "elapsed_ms"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "repo_root": { "type": "string" },
+    "git_head": { "type": "string" },
+    "base_ref": { "type": "string" },
+    "changed_paths": { "type": "array", "items": { "type": "string" } },
+    "changed_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "symbol",
+          "start_line",
+          "end_line",
+          "changed_lines",
+          "is_test",
+          "is_generated",
+          "rules"
+        ],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" },
+          "symbol": { "type": "string" },
+          "start_line": { "type": "integer", "minimum": 1 },
+          "end_line": { "type": "integer", "minimum": 1 },
+          "changed_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+          "is_test": { "type": "boolean" },
+          "is_generated": { "type": "boolean" },
+          "rules": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "test_run": { "type": "object", "additionalProperties": true },
+    "coverage": { "type": "object", "additionalProperties": true },
+    "mutation": { "type": "object", "additionalProperties": true },
+    "security_surfaces": { "type": "array", "items": { "type": "object", "additionalProperties": true } },
+    "verdict": { "enum": ["pass", "review", "block"] },
+    "elapsed_ms": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}
+```
+
+## 9.15 `agent/proofmark.toml`
+
+```toml
+# Jankurai Proofmark policy.
+# Generated by `jankurai init` for Rust profiles.
+
+[thresholds]
+changed_line_coverage = 0.85
+mutant_kill_pct = 0.70
+
+# Security-sensitive surfaces. Each touched surface requires named negative proof.
+# Tests are matched in proofmark command logs for MVP; phase 2 should ingest nextest JSON/JUnit.
+
+[[surface]]
+id = "jankurai-proof-router"
+path = "crates/jankurai/src/commands/proof.rs"
+rule_id = "HLT-008-FALSE-GREEN-RISK"
+required_tests = [
+  "proof_plan_routes_changed_path",
+  "proof_command_not_allowlisted_blocks"
+]
+require_mutants = "changed-lines"
+
+[[surface]]
+id = "jankurai-validation"
+path = "crates/jankurai/src/validation.rs"
+rule_id = "HLT-023-INPUT-BOUNDARY-GAP"
+required_tests = [
+  "schema_keyword_coverage_rejects_unsupported_keywords",
+  "schema_keyword_coverage_allows_supported_keywords"
+]
+require_mutants = "changed-lines"
+```
+
+## 9.16 `agent/proof-lanes.toml` addition
+
+```toml
+[[lane]]
+name = "proofmark-rust"
+command = "cargo proofmark jankurai --changed-from origin/main --test-command 'cargo nextest run --workspace --profile ci --junit target/jankurai/proofmark/nextest.xml' --coverage-command 'cargo llvm-cov nextest --workspace --json --output-path target/jankurai/proofmark/coverage.json' --run-mutants --mode ratchet --out target/jankurai/proofmark/proofmark-receipt.json --jankurai-receipt target/jankurai/proofmark/proof-receipt.json --md target/jankurai/proofmark/proofmark.md"
+purpose = "prove changed Rust behavior, not just passing tests"
+command_id = "lane.proofmark-rust"
+kind = "validation"
+cost = 35
+rules_covered = [
+  "HLT-004-UNMAPPED-PROOF",
+  "HLT-008-FALSE-GREEN-RISK",
+  "HLT-022-AUTHZ-ISOLATION-GAP",
+  "HLT-023-INPUT-BOUNDARY-GAP",
+  "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"
+]
+required_artifacts = [
+  "target/jankurai/proofmark/proofmark-receipt.json",
+  "target/jankurai/proofmark/proof-receipt.json",
+  "target/jankurai/proofmark/proofmark.md"
+]
+timeout_seconds = 3600
+requires_network = false
+destructive = false
+```
+
+## 9.17 `agent/test-map.json` routing example
+
+Add or update Rust source routes so ordinary Rust changes route to the proofmark lane:
+
+```json
+{
+  "tests": {
+    "crates/jankurai/src/": {
+      "command": "cargo proofmark jankurai --changed-from origin/main --test-command 'cargo nextest run --workspace --profile ci --junit target/jankurai/proofmark/nextest.xml' --coverage-command 'cargo llvm-cov nextest --workspace --json --output-path target/jankurai/proofmark/coverage.json' --run-mutants --mode ratchet --out target/jankurai/proofmark/proofmark-receipt.json --jankurai-receipt target/jankurai/proofmark/proof-receipt.json --md target/jankurai/proofmark/proofmark.md",
+      "purpose": "prove changed Rust behavior with coverage, mutation, and Jankurai receipt evidence"
+    }
+  }
+}
+```
+
+In the real repository file, preserve existing entries and add the `crates/jankurai/src/` key.
+
+---
+
+# 10. Optional Jankurai core integration
+
+The MVP works without this because the proofmark command exits non-zero when it blocks. The better version lets the parent `jankurai prove` receipt include the child proofmark extension.
+
+## 10.1 `crates/jankurai/src/commands/proofmark.rs`
+
+```rust
+use crate::model::{ArtifactDigest, ProofReceipt, RuleCoverage};
+use anyhow::{Context, Result};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+
+const DEFAULT_CHILD_RECEIPT: &str = "target/jankurai/proofmark/proof-receipt.json";
+
+pub fn merge_child_receipt_if_present(repo: &Path, receipt: &mut ProofReceipt) -> Result<()> {
+    let path = repo.join(DEFAULT_CHILD_RECEIPT);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("read proofmark child receipt {}", path.display()))?;
+    let value: Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse proofmark child receipt {}", path.display()))?;
+
+    let rel = repo_relative(repo, &path);
+    receipt.artifacts.push(rel.clone());
+    receipt.artifacts.sort();
+    receipt.artifacts.dedup();
+
+    receipt.artifact_digests.push(ArtifactDigest {
+        path: rel,
+        sha256: sha256_bytes(text.as_bytes()),
+    });
+
+    if let Some(rules) = value.get("rules_covered").and_then(Value::as_array) {
+        for rule in rules {
+            if let Ok(rich) = serde_json::from_value::<RuleCoverage>(rule.clone()) {
+                receipt.rules_covered.push(rich);
+            }
+        }
+    }
+
+    if let Some(extension) = value.get("extensions").and_then(|v| v.get("proofmark")) {
+        receipt
+            .extensions
+            .insert("proofmark".to_string(), extension.clone());
+    }
+
+    if let Some(residual) = value.get("residual_risk").and_then(Value::as_array) {
+        for item in residual.iter().filter_map(Value::as_str) {
+            if !receipt.residual_risk.iter().any(|existing| existing == item) {
+                receipt.residual_risk.push(item.to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn repo_relative(repo: &Path, path: &Path) -> String {
+    if let Ok(rel) = path.strip_prefix(repo) {
+        return rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+    }
+    path.display().to_string()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+```
+
+## 10.2 `crates/jankurai/src/commands.rs` patch
+
+```rust
+pub mod proofmark;
+```
+
+## 10.3 `crates/jankurai/src/commands/proof.rs` patch
+
+In `execute_proof_plan`, immediately after `execute_run(...)` returns and before the receipt is written:
+
+```rust
+let mut receipt = execute_run(
+    &args.repo,
+    &receipt_dir,
+    &log_dir,
+    index,
+    run,
+    plan_path_str.as_str(),
+    plan_digest.as_str(),
+)?;
+
+crate::commands::proofmark::merge_child_receipt_if_present(&args.repo, &mut receipt)?;
+```
+
+This preserves the current parent proof receipt but enriches it with proofmark evidence when the child file exists.
+
+## 10.4 `crates/jankurai/src/validation.rs` patch
+
+Add a schema variant if Jankurai core will validate the rich proofmark receipt directly:
+
+```rust
+pub enum ArtifactSchema {
+    // ...
+    ProofmarkReceipt,
+}
+```
+
+Then map it:
+
+```rust
+Self::ProofmarkReceipt => "proofmark-receipt.schema.json",
+```
+
+---
+
+# 11. CI workflow example
+
+```yaml
+name: jankurai-proofmark
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  proofmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install proof tools
+        run: |
+          cargo install cargo-nextest --locked
+          cargo install cargo-llvm-cov --locked
+          cargo install cargo-mutants --locked
+
+      - name: Build proofmark
+        run: cargo build -p jankurai-proofmark --locked
+
+      - name: Changed-behavior proof
+        run: |
+          cargo proofmark jankurai \
+            --changed-from origin/main \
+            --test-command "cargo nextest run --workspace --profile ci --junit target/jankurai/proofmark/nextest.xml" \
+            --coverage-command "cargo llvm-cov nextest --workspace --json --output-path target/jankurai/proofmark/coverage.json" \
+            --run-mutants \
+            --mode ratchet \
+            --out target/jankurai/proofmark/proofmark-receipt.json \
+            --jankurai-receipt target/jankurai/proofmark/proof-receipt.json \
+            --md target/jankurai/proofmark/proofmark.md
+
+      - name: Jankurai audit
+        run: |
+          cargo run -p jankurai -- audit . \
+            --changed-fast \
+            --changed-from origin/main \
+            --proof-receipts target/jankurai/proofmark \
+            --json target/jankurai/audit-fast.json \
+            --md target/jankurai/audit-fast.md
+```
+
+---
+
+# 12. Init/adoption behavior
+
+`jankurai init --profile rust-ts-postgres --level full` should eventually do three things:
+
+1. Add `agent/proofmark.toml`.
+2. Add or recommend `proofmark-rust` to `agent/proof-lanes.toml`.
+3. Route Rust source paths in `agent/test-map.json` to proofmark for ratchet mode.
+
+Advisory mode should not force cargo-mutants on day one. Recommended adoption ladder:
+
+```text
+observe  → generate proofmark report, never block
+advisory → block only impossible/missing evidence; mutation survivors are review
+ratchet  → changed-line coverage + mutation thresholds block merge
+```
+
+---
+
+# 13. Security model
+
+`jankurai-proofmark` should be boring and local:
+
+- It does not upload source code.
+- It does not call a hosted service.
+- It does not auto-edit code.
+- It does not auto-accept snapshots.
+- It writes only under configured `target/jankurai/proofmark/` paths.
+- It treats missing evidence as visible risk, not silent success.
+- It uses existing tools only through explicit commands in proof lanes.
+- It emits hashes for logs and artifacts so receipts are replayable.
+
+Security-specific value:
+
+- `HLT-022`: authz/data-isolation changes require named negative tests.
+- `HLT-023`: parser/input/dynamic-sink changes require exploit-focused proof.
+- `HLT-010`: proof logs can be scanned by existing secret lanes.
+- `HLT-016`/`HLT-024`: later phase can sign receipts and tool versions.
+
+---
+
+# 14. Known limitations of the MVP
+
+The MVP intentionally avoids unstable Rust internals. That creates limitations:
+
+1. Symbol scanning is simple regex/bracing. It is enough to produce useful agent tasks but should later use rustdoc JSON, rust-analyzer, or compiler metadata.
+2. Coverage mapping from LLVM JSON is region-based and conservative. It should later be tested against real cargo-llvm-cov output fixtures.
+3. Per-test coverage is not first-class. It proves the test run reached changed code, not which exact test did. A later version can run selected tests one at a time under nextest or integrate with coverage contexts.
+4. Mutation parsing is defensive because cargo-mutants JSON can evolve. The crate should include fixture tests for supported versions.
+5. Negative proof test matching is log-based in the MVP. Later versions should parse JUnit/nextest machine output and support explicit `#[proofmark]` tags.
+
+These limitations do not weaken the core idea. Even the MVP catches the most damaging false-green case: changed Rust source with passing tests but no changed-line coverage, no mutant kill evidence, or missing security negative proof.
+
+---
+
+# 15. Test plan for the crate
+
+Add these tests under `crates/jankurai-proofmark/tests/`:
+
+```text
+diff_parser_merges_hunks
+changed_units_detects_fn_hunk
+coverage_blocks_uncovered_changed_line
+coverage_passes_hit_changed_line
+mutants_blocks_surviving_changed_mutant
+proofmark_writes_jankurai_compatible_receipt
+security_surface_requires_named_negative_test
+observe_mode_reviews_missing_coverage
+ratchet_mode_blocks_missing_coverage
+```
+
+Fixture layout:
+
+```text
+crates/jankurai-proofmark/tests/fixtures/
+  covered-change/
+    before/src/lib.rs
+    after/src/lib.rs
+    coverage.json
+    mutants.out/outcomes.json
+  false-green/
+    before/src/lib.rs
+    after/src/lib.rs
+    coverage.json
+    mutants.out/outcomes.json
+  authz-gap/
+    before/src/auth.rs
+    after/src/auth.rs
+    proofmark.toml
+```
+
+Conformance fixture to add to Jankurai:
+
+```text
+conformance/hl3-false-green-proofmark/
+  agent/owner-map.json
+  agent/test-map.json
+  agent/proofmark.toml
+  target/jankurai/proofmark/proofmark-receipt.json
+  expected/repo-score.json
+```
+
+Expected decision:
+
+```json
+{
+  "decision": "block",
+  "rule": "HLT-008-FALSE-GREEN-RISK",
+  "reason": "changed Rust behavior lacks proofmark pass receipt"
+}
+```
+
+---
+
+# 16. Scoring and value model
+
+Add a proofmark-derived dimension to repo score:
+
+```text
+Proofmark changed-behavior proof
+  + changed Rust source has proofmark receipt
+  + proofmark receipt binds current git head
+  + changed executable lines are covered
+  + in-diff mutants are killed or explicitly waived
+  + security surfaces have required negative tests
+  + receipt is attached to proof evidence index
+```
+
+Suggested score effect:
+
+| Situation | Finding |
+|---|---|
+| Rust source changed and no proofmark receipt | hard `HLT-008`, cap score at 79 in ratchet |
+| Proofmark receipt stale git head | hard `HLT-027`, cap score at 84 |
+| Changed source uncovered | hard `HLT-008`, cap score at 80 |
+| Mutation survivors | high `HLT-008`, cap score at 85 or block for security surfaces |
+| Missing authz/input negative test | hard `HLT-022` / `HLT-023`, cap score at 75 |
+| Proofmark pass | positive proof evidence, improves proof coverage ratio |
+
+---
+
+# 17. Why this will matter for users
+
+For human reviewers:
+
+```text
+Before: "CI is green."
+After:  "The changed function was hit, two authz negative tests ran, eight in-diff mutants were killed, and the receipt is bound to this commit."
+```
+
+For agents:
+
+```text
+Before: "Add tests."
+After:  "Add a negative test for `authorize_request` line 52; two mutants survived; rerun this exact lane."
+```
+
+For maintainers:
+
+```text
+Before: "We hope the proof lane was relevant."
+After:  "The proof lane either proves the changed behavior or explains the exact residual risk."
+```
+
+For Jankurai itself:
+
+```text
+Before: HLT-008 is a known risk category.
+After:  HLT-008 has a concrete Rust implementation path and receipt schema.
+```
+
+---
+
+# 18. Source notes
+
+These sources shaped the proposal:
+
+1. Jankurai README: describes the repository as a local audit CLI and standard for auditable AI-assisted merge, with owner maps, proof lanes, security boundaries, rolling scores, merge witnesses, repair queues, and local receipts.
+2. Jankurai paper companion: names `HLT-008-FALSE-GREEN-RISK`, `HLT-022-AUTHZ-ISOLATION-GAP`, `HLT-023-INPUT-BOUNDARY-GAP`, proof coverage ratio, witness completeness, and proof-selection accuracy.
+3. Jankurai architecture doc: identifies the Rust/TypeScript/PostgreSQL reference profile and tells agents to prefer `agent/owner-map.json` and `agent/test-map.json`, then route to the smallest proof lane.
+4. Jankurai code: current workspace has one Rust crate, existing proof planning/execution, Rust maps/witness graph, proof receipt `extensions`, schema validation, and proof lanes/test-map files.
+5. cargo-nextest docs: machine-readable test lists and JUnit output exist; first-class full-fidelity NDJSON test runs are still future work.
+6. LLVM `llvm-cov` docs: coverage export/show data can represent source regions, line counts, branch information, and summaries.
+7. cargo-mutants docs: mutation testing distinguishes code reached by tests from behavior actually checked; `--in-diff` targets mutants overlapping changed regions.
+8. OpenAI SWE-bench Verified: robust software-engineering evaluation uses tests that should fail before and pass after a fix, plus tests that must keep passing; it also documents how weak or unfair tests can distort correctness claims.
+9. Claude Code security docs: modern coding agents rely on read-only defaults, explicit command approval, command blocklists, and prompt-injection mitigations, reinforcing the need for repository-local proof receipts rather than chat trust.
+10. Recent empirical security work on AI-generated code: current LLMs have improved at vulnerability detection/repair, but generated code and model explanations still require static checks, manual review, and structured verification.
+
+---
+
+# 19. Final recommendation
+
+Implement `jankurai-proofmark` first.
+
+It is the highest-value crate because it turns Jankurai’s strongest slogan into an enforceable Rust proof primitive:
+
+```text
+No proof, no merge.
+No changed-behavior proof, no green test claim.
+No receipt, no trust.
+```
+
+The crate should ship initially as a dev-tool lane, not a runtime dependency. It should become part of the default Rust profile in `jankurai init` once the fixtures are stable.

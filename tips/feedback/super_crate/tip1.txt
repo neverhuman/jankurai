@@ -1,0 +1,2468 @@
+# Jankurai Proofprint — the one crate I would add
+
+**Crate name:** `jankurai-proofprint`
+**Binary name:** `cargo-proofprint`
+**Cargo UX:** `cargo proofprint ...`
+**Jankurai UX:** `jankurai proofprint ...` and automatic ingestion by `jankurai prove` / `jankurai witness`
+**Primary artifact:** `target/jankurai/proofprint/proofprint.json` plus `proofprint.md`
+**Decision:** Build a deterministic “changed behavior was actually exercised” receipt generator for Rust workspaces.
+
+---
+
+## 1. Executive decision
+
+Jankurai already does the hard and important control-plane work: ownership maps, proof lanes, generated-zone rules, security boundaries, score history, merge witnesses, repair queues, and “no proof, no merge” governance.
+
+The most valuable new Rust crate is **not another agent** and not a generic linter. The best new crate is:
+
+> **`jankurai-proofprint`: a cargo subcommand that proves each changed Rust symbol was exercised by the mapped proof lane, attaches command evidence, detects false-green tests, flags high-risk changed behavior, and emits a Jankurai-native receipt that `jankurai witness` can block/review/pass.**
+
+A normal PR can currently say, “tests passed.” Proofprint makes the stronger, auditable claim:
+
+> “These changed functions/types/modules were mapped to these proof lanes; these exact commands ran; these changed line ranges had coverage hits; these public API changes triggered reverse-dependency/doc proof; these risky boundaries had negative-case evidence; these missing proofs are why the merge is blocked.”
+
+That is the missing bridge between “vibe coding reduction” and “real behavior proof.”
+
+---
+
+## 2. Why this is the #1 crate
+
+### 2.1 The failure it attacks
+
+The dominant AI-coding failure mode is **false confidence**:
+
+* The agent changes code.
+* It runs a broad or stale command.
+* The command passes.
+* The changed behavior was never actually exercised.
+* Reviewers see a green check and merge vibe-coded drift.
+
+Jankurai already names this class of defect. Proofprint gives the project a local, deterministic test for it.
+
+### 2.2 Existing open-source tools solve parts, not the Jankurai-shaped problem
+
+Proofprint should integrate with, not replace:
+
+* `cargo-nextest` for fast, deterministic Rust test execution.
+* `cargo-llvm-cov` / LLVM coverage export for line execution evidence.
+* `cargo-mutants` for deeper mutation evidence when a lane is promoted to hardening.
+* `cargo-audit`, `cargo-deny`, `cargo-vet`, OpenSSF Scorecard, and SLSA-style provenance for supply-chain evidence.
+* `cargo-semver-checks` for public API compatibility.
+
+But none of those tools emits a **Jankurai-native merge receipt** that binds:
+
+1. changed paths,
+2. changed Rust symbols,
+3. owner/test-map lane selection,
+4. exact executed commands,
+5. coverage hits on changed behavior,
+6. high-risk boundary evidence,
+7. public API escalation,
+8. artifact digests,
+9. block/review/pass status.
+
+That is the wedge.
+
+### 2.3 Why this fits Jankurai’s architecture
+
+Jankurai already has a Rust workspace model, a witness graph, path-to-test routing, proof receipts, and merge witness logic. Proofprint should live as a companion crate because it is a concrete **proof-producing tool**, while the existing `jankurai` CLI remains the **orchestrator and policy engine**.
+
+Current stack fit:
+
+```text
+Jankurai repository
+├── crates/
+│   ├── jankurai/                 # existing CLI/orchestrator
+│   └── jankurai-proofprint/      # new cargo subcommand / proof producer
+├── agent/
+│   ├── test-map.json             # existing lane routing, extended with proofprint lane
+│   └── proofprint.toml           # new proofprint config
+├── schemas/
+│   └── proofprint.schema.json    # new receipt schema
+├── tools/
+│   └── proofprint-lane.sh        # generated project lane wrapper
+└── target/jankurai/proofprint/
+    ├── coverage.json
+    ├── proofprint.json
+    ├── proofprint.md
+    └── command-*.log
+```
+
+---
+
+## 3. Product behavior
+
+### 3.1 In a Jankurai-managed repo
+
+```bash
+jankurai prove . --changed-from origin/main
+jankurai witness . --changed-from origin/main
+```
+
+Under the hood, `prove` invokes the project’s mapped lanes. For Rust source changes, it also runs:
+
+```bash
+cargo proofprint \
+  --repo . \
+  --changed-from origin/main \
+  --config agent/proofprint.toml \
+  --coverage-json target/jankurai/proofprint/coverage.json \
+  --out target/jankurai/proofprint/proofprint.json \
+  --md target/jankurai/proofprint/proofprint.md
+```
+
+`jankurai witness` then ingests `target/jankurai/proofprint/proofprint.json` exactly like a proof receipt.
+
+### 3.2 In a normal Rust workspace using the tool directly
+
+```bash
+cargo llvm-cov nextest \
+  --workspace \
+  --json \
+  --output-path target/jankurai/proofprint/coverage.json
+
+cargo proofprint \
+  --changed-from origin/main \
+  --coverage-json target/jankurai/proofprint/coverage.json \
+  --run "cargo nextest run --workspace" \
+  --strict
+```
+
+### 3.3 Example output decision
+
+```text
+PROOFPRINT: block
+changed symbols: 8
+covered changed symbols: 6
+uncovered changed symbols: 2
+high-risk changed symbols: 1
+missing high-risk negative evidence: 1
+receipt: target/jankurai/proofprint/proofprint.json
+```
+
+### 3.4 What blocks a PR
+
+Proofprint blocks when any of these are true in strict mode:
+
+1. A changed Rust function/type/module has zero coverage hits in the mapped lane.
+2. A changed public API does not trigger reverse-dependency or doctest proof.
+3. A changed risky boundary has no negative-case evidence.
+4. A required command did not run or its output digest is missing.
+5. Coverage tooling is absent and the lane claims hard proof rather than advisory review.
+
+---
+
+## 4. Receipt contract
+
+`target/jankurai/proofprint/proofprint.json`:
+
+```json
+{
+  "schema_version": "0.1.0",
+  "generated_at": "2026-05-05T00:00:00Z",
+  "tool": {
+    "name": "jankurai-proofprint",
+    "version": "0.1.0"
+  },
+  "repo": {
+    "root": "/repo",
+    "commit": "abc123",
+    "changed_from": "origin/main"
+  },
+  "decision": "block",
+  "summary": {
+    "changed_files": 3,
+    "changed_symbols": 8,
+    "covered_symbols": 6,
+    "uncovered_symbols": 2,
+    "high_risk_symbols": 1,
+    "missing_negative_cases": 1,
+    "commands_run": 2,
+    "commands_failed": 0
+  },
+  "symbols": [
+    {
+      "file": "crates/api/src/auth.rs",
+      "kind": "fn",
+      "name": "verify_session",
+      "line_start": 42,
+      "line_end": 83,
+      "signature_hash": "sha256:...",
+      "public": false,
+      "risk_tags": ["auth-boundary", "deserialize", "unwrap"],
+      "coverage_hits": 0,
+      "proof_status": "missing-coverage",
+      "required_evidence": ["positive-case", "negative-case"]
+    }
+  ],
+  "commands": [
+    {
+      "command": "cargo nextest run --workspace",
+      "exit_code": 0,
+      "duration_ms": 18244,
+      "log_path": "target/jankurai/proofprint/command-0.log",
+      "log_sha256": "sha256:..."
+    }
+  ],
+  "artifacts": [
+    {
+      "path": "target/jankurai/proofprint/coverage.json",
+      "sha256": "sha256:...",
+      "kind": "coverage"
+    }
+  ],
+  "notes": [
+    "Changed symbol crates/api/src/auth.rs:42-83 had zero coverage hits."
+  ]
+}
+```
+
+---
+
+## 5. Files to add or modify
+
+This section is written as an implementation patch plan. The code intentionally follows the existing Jankurai style: local files, JSON/Markdown artifacts, stable Rust, `anyhow`, `serde`, `clap`, `sha2`, `syn`, `cargo_metadata`, and no hosted service dependency.
+
+---
+
+## 5.1 Modify root `Cargo.toml`
+
+```toml
+[workspace]
+members = [
+    "crates/jankurai",
+    "crates/jankurai-proofprint",
+]
+resolver = "2"
+```
+
+---
+
+## 5.2 Add `crates/jankurai-proofprint/Cargo.toml`
+
+```toml
+[package]
+name = "jankurai-proofprint"
+version = "0.1.0"
+edition = "2021"
+description = "Jankurai-native changed-behavior proof receipts for Rust workspaces."
+license = "MIT"
+repository = "https://github.com/jeppsontaylor/Jankurai"
+homepage = "https://github.com/jeppsontaylor/Jankurai"
+readme = "README.md"
+keywords = ["agent", "testing", "coverage", "audit", "rust"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "cargo-proofprint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+cargo_metadata = "0.19"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+ignore = "0.4"
+quote = "1.0"
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+syn = { version = "2.0", features = ["full"] }
+toml = "0.9"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.23"
+```
+
+---
+
+## 5.3 Add `crates/jankurai-proofprint/README.md`
+
+````md
+# jankurai-proofprint
+
+`jankurai-proofprint` is a cargo subcommand that emits Jankurai-native proof receipts for Rust changes.
+
+It answers the question reviewers actually need answered:
+
+> Did the mapped proof lane exercise the changed behavior, or did tests merely pass nearby?
+
+## Usage
+
+```bash
+cargo proofprint \
+  --repo . \
+  --changed-from origin/main \
+  --coverage-json target/jankurai/proofprint/coverage.json \
+  --run "cargo nextest run --workspace" \
+  --out target/jankurai/proofprint/proofprint.json \
+  --md target/jankurai/proofprint/proofprint.md
+```
+
+## Jankurai integration
+
+`jankurai prove` runs this tool for Rust source changes. `jankurai witness` ingests the emitted receipt and blocks false-green merges when strict policy is enabled.
+````
+
+---
+
+## 5.4 Add `crates/jankurai-proofprint/src/main.rs`
+
+```rust
+use anyhow::Result;
+use clap::Parser;
+use jankurai_proofprint::{run, Cli};
+
+fn main() -> Result<()> {
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+
+    // Cargo invokes subcommands as: cargo-proofprint proofprint <args...>.
+    // Make the binary also work as: cargo-proofprint <args...>.
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("proofprint") {
+        args.remove(1);
+    }
+
+    let cli = Cli::parse_from(args);
+    let receipt = run(cli)?;
+
+    println!(
+        "PROOFPRINT: {} — {} changed symbols, {} uncovered, {} high-risk gaps",
+        receipt.decision,
+        receipt.summary.changed_symbols,
+        receipt.summary.uncovered_symbols,
+        receipt.summary.missing_negative_cases
+    );
+
+    Ok(())
+}
+```
+
+---
+
+## 5.5 Add `crates/jankurai-proofprint/src/lib.rs`
+
+```rust
+mod commands;
+mod config;
+pub mod coverage;
+mod git;
+mod model;
+mod report;
+mod risk;
+mod rust_scan;
+mod score;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use std::path::PathBuf;
+
+pub use model::*;
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "cargo-proofprint", version)]
+pub struct Cli {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    #[arg(long, value_name = "REF")]
+    pub changed_from: Option<String>,
+
+    #[arg(long, value_name = "PATH")]
+    pub changed: Vec<PathBuf>,
+
+    #[arg(long, value_name = "PATH", default_value = "agent/proofprint.toml")]
+    pub config: PathBuf,
+
+    #[arg(long, value_name = "PATH")]
+    pub coverage_json: Option<PathBuf>,
+
+    #[arg(long = "run", value_name = "COMMAND")]
+    pub run_commands: Vec<String>,
+
+    #[arg(long, default_value = "rust-fast")]
+    pub lane: String,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofprint/proofprint.json"
+    )]
+    pub out: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofprint/proofprint.md"
+    )]
+    pub md: PathBuf,
+
+    #[arg(long)]
+    pub strict: bool,
+
+    #[arg(long)]
+    pub no_run: bool,
+}
+
+pub fn run(cli: Cli) -> Result<ProofprintReceipt> {
+    let repo = cli
+        .repo
+        .canonicalize()
+        .with_context(|| format!("failed to resolve repo {}", cli.repo.display()))?;
+
+    let config_path = resolve_path(&repo, &cli.config);
+    let config = config::load_config(&config_path)?;
+
+    let changed_files = git::changed_files(&repo, &cli.changed, cli.changed_from.as_deref())?;
+    let commit = git::current_commit(&repo).unwrap_or_else(|_| "unknown".to_string());
+
+    let changed_symbols = rust_scan::scan_changed_symbols(&repo, &changed_files)?;
+
+    let coverage = match &cli.coverage_json {
+        Some(path) => {
+            let path = resolve_path(&repo, path);
+            Some(coverage::CoverageIndex::from_llvm_json(&repo, &path)?)
+        }
+        None => None,
+    };
+
+    let command_plan = config::commands_for_lane(&config, &cli.lane, &cli.run_commands);
+    let command_receipts = if cli.no_run {
+        Vec::new()
+    } else {
+        commands::run_commands(&repo, &cli.out, &command_plan)?
+    };
+
+    let symbol_proofs = score::build_symbol_proofs(&repo, &changed_symbols, coverage.as_ref(), &config);
+    let receipt = score::build_receipt(score::ReceiptInput {
+        repo_root: repo.clone(),
+        changed_from: cli.changed_from.clone(),
+        commit,
+        lane: cli.lane.clone(),
+        changed_files,
+        symbols: symbol_proofs,
+        commands: command_receipts,
+        coverage_artifact: cli.coverage_json.as_ref().map(|path| resolve_path(&repo, path)),
+        strict: cli.strict || config.strict.default_strict,
+        config,
+    })?;
+
+    let out = resolve_path(&repo, &cli.out);
+    let md = resolve_path(&repo, &cli.md);
+    report::write_receipt(&out, &md, &receipt)?;
+
+    Ok(receipt)
+}
+
+fn resolve_path(repo: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo.join(path)
+    }
+}
+```
+
+---
+
+## 5.6 Add `crates/jankurai-proofprint/src/model.rs`
+
+```rust
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofprintReceipt {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub tool: ToolInfo,
+    pub repo: RepoInfo,
+    pub lane: String,
+    pub decision: ProofDecision,
+    pub summary: ProofSummary,
+    pub changed_files: Vec<String>,
+    pub symbols: Vec<SymbolProof>,
+    pub commands: Vec<CommandReceipt>,
+    pub artifacts: Vec<ArtifactReceipt>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInfo {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoInfo {
+    pub root: String,
+    pub commit: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_from: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProofDecision {
+    Pass,
+    Review,
+    Block,
+}
+
+impl std::fmt::Display for ProofDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProofDecision::Pass => write!(f, "pass"),
+            ProofDecision::Review => write!(f, "review"),
+            ProofDecision::Block => write!(f, "block"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProofSummary {
+    pub changed_files: usize,
+    pub changed_symbols: usize,
+    pub covered_symbols: usize,
+    pub uncovered_symbols: usize,
+    pub public_api_symbols: usize,
+    pub high_risk_symbols: usize,
+    pub missing_negative_cases: usize,
+    pub commands_run: usize,
+    pub commands_failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedSymbol {
+    pub file: String,
+    pub kind: String,
+    pub name: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub signature_hash: String,
+    pub public: bool,
+    pub risk_tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolProof {
+    pub file: String,
+    pub kind: String,
+    pub name: String,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub signature_hash: String,
+    pub public: bool,
+    pub risk_tags: Vec<String>,
+    pub coverage_hits: u64,
+    pub proof_status: SymbolProofStatus,
+    pub required_evidence: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SymbolProofStatus {
+    Covered,
+    MissingCoverage,
+    MissingNegativeCase,
+    AdvisoryNoCoverageArtifact,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandReceipt {
+    pub command: String,
+    pub exit_code: i32,
+    pub duration_ms: u128,
+    pub log_path: String,
+    pub log_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactReceipt {
+    pub path: String,
+    pub kind: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CommandPlan {
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptInput {
+    pub repo_root: PathBuf,
+    pub changed_from: Option<String>,
+    pub commit: String,
+    pub lane: String,
+    pub changed_files: Vec<PathBuf>,
+    pub symbols: Vec<SymbolProof>,
+    pub commands: Vec<CommandReceipt>,
+    pub coverage_artifact: Option<PathBuf>,
+    pub strict: bool,
+    pub config: crate::config::ProofprintConfig,
+}
+```
+
+---
+
+## 5.7 Add `crates/jankurai-proofprint/src/config.rs`
+
+```rust
+use crate::model::CommandPlan;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofprintConfig {
+    #[serde(default = "default_version")]
+    pub version: String,
+    #[serde(default = "default_lane")]
+    pub default_lane: String,
+    #[serde(default)]
+    pub lanes: BTreeMap<String, LaneConfig>,
+    #[serde(default)]
+    pub strict: StrictConfig,
+    #[serde(default)]
+    pub risk: RiskConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LaneConfig {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub require_coverage: bool,
+    #[serde(default)]
+    pub require_negative_cases_for_risk: bool,
+    #[serde(default)]
+    pub require_public_api_reverse_proof: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrictConfig {
+    #[serde(default)]
+    pub default_strict: bool,
+    #[serde(default = "default_true")]
+    pub block_on_missing_changed_symbol_coverage: bool,
+    #[serde(default = "default_true")]
+    pub block_on_missing_high_risk_negative_case: bool,
+    #[serde(default)]
+    pub allow_advisory_without_coverage_artifact: bool,
+}
+
+impl Default for StrictConfig {
+    fn default() -> Self {
+        Self {
+            default_strict: false,
+            block_on_missing_changed_symbol_coverage: true,
+            block_on_missing_high_risk_negative_case: true,
+            allow_advisory_without_coverage_artifact: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskConfig {
+    #[serde(default = "default_negative_case_keywords")]
+    pub negative_case_keywords: Vec<String>,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            negative_case_keywords: default_negative_case_keywords(),
+        }
+    }
+}
+
+pub fn load_config(path: &Path) -> Result<ProofprintConfig> {
+    if !path.exists() {
+        return Ok(ProofprintConfig::default());
+    }
+
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read proofprint config {}", path.display()))?;
+    toml::from_str(&content)
+        .with_context(|| format!("failed to parse proofprint config {}", path.display()))
+}
+
+pub fn commands_for_lane(
+    config: &ProofprintConfig,
+    requested_lane: &str,
+    cli_commands: &[String],
+) -> CommandPlan {
+    if !cli_commands.is_empty() {
+        return CommandPlan {
+            commands: cli_commands.to_vec(),
+        };
+    }
+
+    let lane = config
+        .lanes
+        .get(requested_lane)
+        .or_else(|| config.lanes.get(&config.default_lane));
+
+    CommandPlan {
+        commands: lane
+            .map(|lane| lane.commands.clone())
+            .unwrap_or_else(|| vec!["cargo test --workspace".to_string()]),
+    }
+}
+
+impl Default for ProofprintConfig {
+    fn default() -> Self {
+        let mut lanes = BTreeMap::new();
+        lanes.insert(
+            default_lane(),
+            LaneConfig {
+                commands: vec!["cargo test --workspace".to_string()],
+                require_coverage: true,
+                require_negative_cases_for_risk: true,
+                require_public_api_reverse_proof: true,
+            },
+        );
+
+        Self {
+            version: default_version(),
+            default_lane: default_lane(),
+            lanes,
+            strict: StrictConfig::default(),
+            risk: RiskConfig::default(),
+        }
+    }
+}
+
+fn default_version() -> String {
+    "0.1".to_string()
+}
+
+fn default_lane() -> String {
+    "rust-fast".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_negative_case_keywords() -> Vec<String> {
+    [
+        "invalid",
+        "reject",
+        "denied",
+        "unauthorized",
+        "forbidden",
+        "malformed",
+        "error",
+        "panic",
+        "overflow",
+        "timeout",
+    ]
+    .iter()
+    .map(|item| item.to_string())
+    .collect()
+}
+```
+
+---
+
+## 5.8 Add `crates/jankurai-proofprint/src/git.rs`
+
+```rust
+use anyhow::{bail, Context, Result};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+pub fn changed_files(
+    repo: &Path,
+    explicit: &[PathBuf],
+    changed_from: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    if !explicit.is_empty() {
+        return Ok(normalize_explicit(repo, explicit));
+    }
+
+    let Some(base) = changed_from else {
+        bail!("provide --changed file(s) or --changed-from <ref>");
+    };
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["diff", "--name-only", "--diff-filter=ACMRTUXB", base, "--"])
+        .output()
+        .with_context(|| format!("failed to run git diff in {}", repo.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git diff failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let mut files = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+pub fn current_commit(repo: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .with_context(|| format!("failed to read git commit in {}", repo.display()))?;
+
+    if !output.status.success() {
+        bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn normalize_explicit(repo: &Path, explicit: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = explicit
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.strip_prefix(repo).unwrap_or(path).to_path_buf()
+            } else {
+                path.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+    files
+}
+```
+
+---
+
+## 5.9 Add `crates/jankurai-proofprint/src/risk.rs`
+
+```rust
+pub fn classify_risk(content: &str, symbol_body: &str) -> Vec<String> {
+    let haystack = format!("{content}\n{symbol_body}");
+    let mut tags = Vec::new();
+
+    let checks = [
+        ("unsafe", "unsafe"),
+        ("unwrap", ".unwrap("),
+        ("expect", ".expect("),
+        ("panic", "panic!("),
+        ("process-command", "std::process::Command"),
+        ("deserialize", "serde_json::from_str"),
+        ("deserialize", "toml::from_str"),
+        ("sql", "sqlx::query"),
+        ("sql", "diesel::"),
+        ("filesystem", "std::fs::"),
+        ("network", "TcpStream"),
+        ("network", "ureq::"),
+        ("auth-boundary", "auth"),
+        ("crypto", "sha"),
+        ("secret", "token"),
+        ("secret", "password"),
+    ];
+
+    for (tag, needle) in checks {
+        if haystack.contains(needle) && !tags.iter().any(|existing| existing == tag) {
+            tags.push(tag.to_string());
+        }
+    }
+
+    tags.sort();
+    tags
+}
+```
+
+---
+
+## 5.10 Add `crates/jankurai-proofprint/src/rust_scan.rs`
+
+```rust
+use crate::model::ChangedSymbol;
+use crate::risk;
+use anyhow::{Context, Result};
+use quote::ToTokens;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub fn scan_changed_symbols(repo: &Path, changed_files: &[PathBuf]) -> Result<Vec<ChangedSymbol>> {
+    let mut symbols = Vec::new();
+
+    for rel in changed_files {
+        if rel.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+
+        let abs = repo.join(rel);
+        if !abs.exists() {
+            continue;
+        }
+
+        let content = fs::read_to_string(&abs)
+            .with_context(|| format!("failed to read Rust source {}", abs.display()))?;
+        let file = match syn::parse_file(&content) {
+            Ok(file) => file,
+            Err(_) => {
+                symbols.push(file_level_symbol(rel, &content));
+                continue;
+            }
+        };
+
+        for item in file.items {
+            if let Some(symbol) = symbol_from_item(rel, &content, &item) {
+                symbols.push(symbol);
+            }
+        }
+    }
+
+    symbols.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line_start.cmp(&b.line_start))
+            .then(a.name.cmp(&b.name))
+    });
+    symbols.dedup_by(|a, b| a.file == b.file && a.kind == b.kind && a.name == b.name);
+    Ok(symbols)
+}
+
+fn symbol_from_item(rel: &Path, content: &str, item: &syn::Item) -> Option<ChangedSymbol> {
+    match item {
+        syn::Item::Fn(item_fn) => {
+            let name = item_fn.sig.ident.to_string();
+            let signature = item_fn.sig.to_token_stream().to_string();
+            let public = matches!(item_fn.vis, syn::Visibility::Public(_));
+            Some(build_symbol(rel, content, "fn", name, signature, public))
+        }
+        syn::Item::Struct(item_struct) => {
+            let name = item_struct.ident.to_string();
+            let signature = item_struct.to_token_stream().to_string();
+            let public = matches!(item_struct.vis, syn::Visibility::Public(_));
+            Some(build_symbol(rel, content, "struct", name, signature, public))
+        }
+        syn::Item::Enum(item_enum) => {
+            let name = item_enum.ident.to_string();
+            let signature = item_enum.to_token_stream().to_string();
+            let public = matches!(item_enum.vis, syn::Visibility::Public(_));
+            Some(build_symbol(rel, content, "enum", name, signature, public))
+        }
+        syn::Item::Trait(item_trait) => {
+            let name = item_trait.ident.to_string();
+            let signature = item_trait.to_token_stream().to_string();
+            let public = matches!(item_trait.vis, syn::Visibility::Public(_));
+            Some(build_symbol(rel, content, "trait", name, signature, public))
+        }
+        syn::Item::Impl(item_impl) => {
+            let name = item_impl.self_ty.to_token_stream().to_string();
+            let signature = item_impl.to_token_stream().to_string();
+            Some(build_symbol(rel, content, "impl", name, signature, false))
+        }
+        syn::Item::Mod(item_mod) => {
+            let name = item_mod.ident.to_string();
+            let signature = item_mod.to_token_stream().to_string();
+            let public = matches!(item_mod.vis, syn::Visibility::Public(_));
+            Some(build_symbol(rel, content, "mod", name, signature, public))
+        }
+        _ => None,
+    }
+}
+
+fn build_symbol(
+    rel: &Path,
+    content: &str,
+    kind: &str,
+    name: String,
+    signature: String,
+    public: bool,
+) -> ChangedSymbol {
+    let (line_start, line_end, body) = locate_symbol(content, kind, &name);
+    ChangedSymbol {
+        file: rel.display().to_string().replace('\\', "/"),
+        kind: kind.to_string(),
+        name,
+        line_start,
+        line_end,
+        signature_hash: format!("sha256:{}", sha256(signature.as_bytes())),
+        public,
+        risk_tags: risk::classify_risk(content, &body),
+    }
+}
+
+fn file_level_symbol(rel: &Path, content: &str) -> ChangedSymbol {
+    ChangedSymbol {
+        file: rel.display().to_string().replace('\\', "/"),
+        kind: "file".to_string(),
+        name: rel
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown.rs")
+            .to_string(),
+        line_start: 1,
+        line_end: content.lines().count().max(1) as u32,
+        signature_hash: format!("sha256:{}", sha256(content.as_bytes())),
+        public: false,
+        risk_tags: risk::classify_risk(content, content),
+    }
+}
+
+fn locate_symbol(content: &str, kind: &str, name: &str) -> (u32, u32, String) {
+    let lines = content.lines().collect::<Vec<_>>();
+    let needles = match kind {
+        "fn" => vec![format!("fn {name}"), format!("fn {name}<")],
+        "struct" => vec![format!("struct {name}"), format!("struct {name}<")],
+        "enum" => vec![format!("enum {name}"), format!("enum {name}<")],
+        "trait" => vec![format!("trait {name}"), format!("trait {name}<")],
+        "mod" => vec![format!("mod {name}"), format!("mod {name} {{")],
+        "impl" => vec!["impl".to_string()],
+        _ => vec![name.to_string()],
+    };
+
+    let start_index = lines
+        .iter()
+        .position(|line| needles.iter().any(|needle| line.contains(needle)))
+        .unwrap_or(0);
+
+    let mut brace_balance: i32 = 0;
+    let mut saw_brace = false;
+    let mut end_index = start_index;
+
+    for (idx, line) in lines.iter().enumerate().skip(start_index) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    saw_brace = true;
+                    brace_balance += 1;
+                }
+                '}' => brace_balance -= 1,
+                _ => {}
+            }
+        }
+        end_index = idx;
+        if saw_brace && brace_balance <= 0 {
+            break;
+        }
+        if !saw_brace && idx > start_index + 3 {
+            break;
+        }
+    }
+
+    let body = lines[start_index..=end_index].join("\n");
+    ((start_index + 1) as u32, (end_index + 1) as u32, body)
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+```
+
+---
+
+## 5.11 Add `crates/jankurai-proofprint/src/coverage.rs`
+
+```rust
+use anyhow::{Context, Result};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Default)]
+pub struct CoverageIndex {
+    /// file -> line -> max hit count observed for that line
+    pub hits: BTreeMap<String, BTreeMap<u32, u64>>,
+}
+
+impl CoverageIndex {
+    pub fn from_llvm_json(repo: &Path, path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("failed to read coverage JSON {}", path.display()))?;
+        let value: Value = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse coverage JSON {}", path.display()))?;
+
+        let mut index = CoverageIndex::default();
+        collect_llvm_files(repo, &value, &mut index);
+        Ok(index)
+    }
+
+    pub fn hits_for_range(&self, file: &str, line_start: u32, line_end: u32) -> u64 {
+        let Some(lines) = self.hits.get(file) else {
+            return 0;
+        };
+        (line_start..=line_end)
+            .filter_map(|line| lines.get(&line))
+            .copied()
+            .sum()
+    }
+}
+
+fn collect_llvm_files(repo: &Path, value: &Value, index: &mut CoverageIndex) {
+    match value {
+        Value::Object(map) => {
+            if let (Some(filename), Some(segments)) = (map.get("filename"), map.get("segments")) {
+                if let (Some(filename), Some(segments)) = (filename.as_str(), segments.as_array()) {
+                    let rel = normalize_filename(repo, filename);
+                    let lines = index.hits.entry(rel).or_default();
+                    for segment in segments {
+                        let Some(segment) = segment.as_array() else { continue };
+                        let Some(line) = segment.get(0).and_then(|item| item.as_u64()) else { continue };
+                        let Some(count) = segment.get(2).and_then(|item| item.as_u64()) else { continue };
+                        let entry = lines.entry(line as u32).or_insert(0);
+                        *entry = (*entry).max(count);
+                    }
+                }
+            }
+
+            for child in map.values() {
+                collect_llvm_files(repo, child, index);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_llvm_files(repo, child, index);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_filename(repo: &Path, filename: &str) -> String {
+    let path = PathBuf::from(filename);
+    let rel = if path.is_absolute() {
+        path.strip_prefix(repo).unwrap_or(&path).to_path_buf()
+    } else {
+        path
+    };
+    rel.display().to_string().replace('\\', "/")
+}
+```
+
+---
+
+## 5.12 Add `crates/jankurai-proofprint/src/commands.rs`
+
+```rust
+use crate::model::{CommandPlan, CommandReceipt};
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::time::Instant;
+
+pub fn run_commands(repo: &Path, out_path: &Path, plan: &CommandPlan) -> Result<Vec<CommandReceipt>> {
+    let out_dir = if out_path.extension().is_some() {
+        out_path
+            .parent()
+            .map(|path| path.to_path_buf())
+            .unwrap_or_else(|| repo.join("target/jankurai/proofprint"))
+    } else {
+        out_path.to_path_buf()
+    };
+    fs::create_dir_all(&out_dir)
+        .with_context(|| format!("failed to create proofprint directory {}", out_dir.display()))?;
+
+    let mut receipts = Vec::new();
+
+    for (idx, command) in plan.commands.iter().enumerate() {
+        let started = Instant::now();
+        let output = shell_command(command)
+            .current_dir(repo)
+            .output()
+            .with_context(|| format!("failed to run proof command: {command}"))?;
+        let duration_ms = started.elapsed().as_millis();
+
+        let mut log = Vec::new();
+        log.extend_from_slice(b"$ ");
+        log.extend_from_slice(command.as_bytes());
+        log.extend_from_slice(b"\n\n--- stdout ---\n");
+        log.extend_from_slice(&output.stdout);
+        log.extend_from_slice(b"\n--- stderr ---\n");
+        log.extend_from_slice(&output.stderr);
+
+        let log_path = out_dir.join(format!("command-{idx}.log"));
+        fs::write(&log_path, &log)
+            .with_context(|| format!("failed to write command log {}", log_path.display()))?;
+
+        receipts.push(CommandReceipt {
+            command: command.clone(),
+            exit_code: output.status.code().unwrap_or(-1),
+            duration_ms,
+            log_path: display_path(repo, &log_path),
+            log_sha256: format!("sha256:{}", sha256(&log)),
+        });
+    }
+
+    Ok(receipts)
+}
+
+#[cfg(target_os = "windows")]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", command]);
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command]);
+    cmd
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn display_path(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+```
+
+---
+
+## 5.13 Add `crates/jankurai-proofprint/src/score.rs`
+
+```rust
+use crate::config::ProofprintConfig;
+use crate::coverage::CoverageIndex;
+use crate::model::*;
+use anyhow::Result;
+use chrono::Utc;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+pub use crate::model::ReceiptInput;
+
+pub fn build_symbol_proofs(
+    repo: &Path,
+    changed_symbols: &[ChangedSymbol],
+    coverage: Option<&CoverageIndex>,
+    config: &ProofprintConfig,
+) -> Vec<SymbolProof> {
+    changed_symbols
+        .iter()
+        .map(|symbol| {
+            let coverage_hits = coverage
+                .map(|coverage| {
+                    coverage.hits_for_range(&symbol.file, symbol.line_start, symbol.line_end)
+                })
+                .unwrap_or(0);
+
+            let high_risk = !symbol.risk_tags.is_empty();
+            let negative_case_found = if high_risk {
+                negative_case_evidence_exists(repo, symbol, &config.risk.negative_case_keywords)
+            } else {
+                true
+            };
+
+            let mut required_evidence = vec!["positive-case".to_string()];
+            if symbol.public {
+                required_evidence.push("public-api-reverse-proof".to_string());
+            }
+            if high_risk {
+                required_evidence.push("negative-case".to_string());
+            }
+
+            let proof_status = match (coverage.is_some(), coverage_hits > 0, high_risk, negative_case_found) {
+                (false, _, _, _) => SymbolProofStatus::AdvisoryNoCoverageArtifact,
+                (true, false, _, _) => SymbolProofStatus::MissingCoverage,
+                (true, true, true, false) => SymbolProofStatus::MissingNegativeCase,
+                _ => SymbolProofStatus::Covered,
+            };
+
+            let mut notes = Vec::new();
+            if coverage.is_none() {
+                notes.push("No coverage artifact was supplied; status is advisory unless strict policy blocks it.".to_string());
+            }
+            if coverage.is_some() && coverage_hits == 0 {
+                notes.push(format!(
+                    "Changed symbol {}:{}-{} had zero coverage hits.",
+                    symbol.file, symbol.line_start, symbol.line_end
+                ));
+            }
+            if high_risk && !negative_case_found {
+                notes.push("High-risk changed symbol has no nearby negative-case evidence.".to_string());
+            }
+
+            SymbolProof {
+                file: symbol.file.clone(),
+                kind: symbol.kind.clone(),
+                name: symbol.name.clone(),
+                line_start: symbol.line_start,
+                line_end: symbol.line_end,
+                signature_hash: symbol.signature_hash.clone(),
+                public: symbol.public,
+                risk_tags: symbol.risk_tags.clone(),
+                coverage_hits,
+                proof_status,
+                required_evidence,
+                notes,
+            }
+        })
+        .collect()
+}
+
+pub fn build_receipt(input: ReceiptInput) -> Result<ProofprintReceipt> {
+    let summary = summarize(&input);
+    let mut notes = input
+        .symbols
+        .iter()
+        .flat_map(|symbol| symbol.notes.clone())
+        .collect::<Vec<_>>();
+
+    let command_failure = input.commands.iter().any(|cmd| cmd.exit_code != 0);
+    if command_failure {
+        notes.push("One or more proof commands failed.".to_string());
+    }
+
+    let decision = decide(&input, &summary, command_failure);
+
+    let mut artifacts = Vec::new();
+    if let Some(path) = &input.coverage_artifact {
+        if path.exists() {
+            artifacts.push(ArtifactReceipt {
+                path: display_path(&input.repo_root, path),
+                kind: "coverage".to_string(),
+                sha256: format!("sha256:{}", file_sha256(path)?),
+            });
+        }
+    }
+
+    Ok(ProofprintReceipt {
+        schema_version: "0.1.0".to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        tool: ToolInfo {
+            name: "jankurai-proofprint".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        repo: RepoInfo {
+            root: input.repo_root.display().to_string(),
+            commit: input.commit,
+            changed_from: input.changed_from,
+        },
+        lane: input.lane,
+        decision,
+        summary,
+        changed_files: input
+            .changed_files
+            .iter()
+            .map(|path| path.display().to_string().replace('\\', "/"))
+            .collect(),
+        symbols: input.symbols,
+        commands: input.commands,
+        artifacts,
+        notes,
+    })
+}
+
+fn summarize(input: &ReceiptInput) -> ProofSummary {
+    ProofSummary {
+        changed_files: input.changed_files.len(),
+        changed_symbols: input.symbols.len(),
+        covered_symbols: input
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.proof_status == SymbolProofStatus::Covered)
+            .count(),
+        uncovered_symbols: input
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.proof_status == SymbolProofStatus::MissingCoverage)
+            .count(),
+        public_api_symbols: input.symbols.iter().filter(|symbol| symbol.public).count(),
+        high_risk_symbols: input
+            .symbols
+            .iter()
+            .filter(|symbol| !symbol.risk_tags.is_empty())
+            .count(),
+        missing_negative_cases: input
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.proof_status == SymbolProofStatus::MissingNegativeCase)
+            .count(),
+        commands_run: input.commands.len(),
+        commands_failed: input.commands.iter().filter(|cmd| cmd.exit_code != 0).count(),
+    }
+}
+
+fn decide(input: &ReceiptInput, summary: &ProofSummary, command_failure: bool) -> ProofDecision {
+    if command_failure {
+        return ProofDecision::Block;
+    }
+
+    if input.strict
+        && input.config.strict.block_on_missing_changed_symbol_coverage
+        && summary.uncovered_symbols > 0
+    {
+        return ProofDecision::Block;
+    }
+
+    if input.strict
+        && input.config.strict.block_on_missing_high_risk_negative_case
+        && summary.missing_negative_cases > 0
+    {
+        return ProofDecision::Block;
+    }
+
+    if input
+        .symbols
+        .iter()
+        .any(|symbol| symbol.proof_status == SymbolProofStatus::AdvisoryNoCoverageArtifact)
+    {
+        return if input.config.strict.allow_advisory_without_coverage_artifact {
+            ProofDecision::Review
+        } else {
+            ProofDecision::Block
+        };
+    }
+
+    if summary.uncovered_symbols > 0 || summary.missing_negative_cases > 0 {
+        ProofDecision::Review
+    } else {
+        ProofDecision::Pass
+    }
+}
+
+fn negative_case_evidence_exists(repo: &Path, symbol: &ChangedSymbol, keywords: &[String]) -> bool {
+    let test_roots = ["tests", "src"];
+    let lower_symbol = symbol.name.to_lowercase();
+
+    for root in test_roots {
+        let root = repo.join(root);
+        if !root.exists() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(path) else { continue };
+            let lower = content.to_lowercase();
+            if lower.contains(&lower_symbol)
+                && keywords.iter().any(|keyword| lower.contains(&keyword.to_lowercase()))
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn display_path(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+        .replace('\\', "/")
+}
+```
+
+---
+
+## 5.14 Add `crates/jankurai-proofprint/src/report.rs`
+
+```rust
+use crate::model::{ProofDecision, ProofprintReceipt};
+use anyhow::{Context, Result};
+use std::fs;
+use std::path::Path;
+
+pub fn write_receipt(json_path: &Path, md_path: &Path, receipt: &ProofprintReceipt) -> Result<()> {
+    if let Some(parent) = json_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = md_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    fs::write(json_path, serde_json::to_string_pretty(receipt)?)
+        .with_context(|| format!("failed to write {}", json_path.display()))?;
+    fs::write(md_path, render_markdown(receipt))
+        .with_context(|| format!("failed to write {}", md_path.display()))?;
+    Ok(())
+}
+
+fn render_markdown(receipt: &ProofprintReceipt) -> String {
+    let mut out = String::new();
+    out.push_str("# Jankurai Proofprint Receipt\n\n");
+    out.push_str(&format!("**Decision:** `{}`\n\n", receipt.decision));
+    out.push_str(&format!("**Lane:** `{}`\n\n", receipt.lane));
+    out.push_str(&format!("**Commit:** `{}`\n\n", receipt.repo.commit));
+
+    out.push_str("## Summary\n\n");
+    out.push_str("| Metric | Value |\n|---|---:|\n");
+    out.push_str(&format!("| Changed files | {} |\n", receipt.summary.changed_files));
+    out.push_str(&format!("| Changed symbols | {} |\n", receipt.summary.changed_symbols));
+    out.push_str(&format!("| Covered symbols | {} |\n", receipt.summary.covered_symbols));
+    out.push_str(&format!("| Uncovered symbols | {} |\n", receipt.summary.uncovered_symbols));
+    out.push_str(&format!("| Public API symbols | {} |\n", receipt.summary.public_api_symbols));
+    out.push_str(&format!("| High-risk symbols | {} |\n", receipt.summary.high_risk_symbols));
+    out.push_str(&format!("| Missing negative cases | {} |\n", receipt.summary.missing_negative_cases));
+    out.push_str(&format!("| Commands run | {} |\n", receipt.summary.commands_run));
+    out.push_str(&format!("| Commands failed | {} |\n", receipt.summary.commands_failed));
+
+    out.push_str("\n## Changed symbol proof matrix\n\n");
+    out.push_str("| Status | File | Symbol | Lines | Hits | Risk |\n|---|---|---|---:|---:|---|\n");
+    for symbol in &receipt.symbols {
+        out.push_str(&format!(
+            "| `{:?}` | `{}` | `{}` `{}` | {}-{} | {} | {} |\n",
+            symbol.proof_status,
+            symbol.file,
+            symbol.kind,
+            symbol.name,
+            symbol.line_start,
+            symbol.line_end,
+            symbol.coverage_hits,
+            if symbol.risk_tags.is_empty() {
+                "-".to_string()
+            } else {
+                symbol.risk_tags.join(", ")
+            }
+        ));
+    }
+
+    out.push_str("\n## Commands\n\n");
+    if receipt.commands.is_empty() {
+        out.push_str("No commands were run by Proofprint.\n");
+    } else {
+        out.push_str("| Exit | Duration | Command | Log |\n|---:|---:|---|---|\n");
+        for cmd in &receipt.commands {
+            out.push_str(&format!(
+                "| {} | {} ms | `{}` | `{}` |\n",
+                cmd.exit_code, cmd.duration_ms, cmd.command, cmd.log_path
+            ));
+        }
+    }
+
+    if !receipt.notes.is_empty() {
+        out.push_str("\n## Notes\n\n");
+        for note in &receipt.notes {
+            out.push_str(&format!("- {}\n", note));
+        }
+    }
+
+    if receipt.decision == ProofDecision::Block {
+        out.push_str("\n## Merge action\n\nDo not merge until every blocked changed symbol has behavior proof or a tracked Jankurai exception.\n");
+    }
+
+    out
+}
+```
+
+---
+
+## 5.15 Add `schemas/proofprint.schema.json`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.local/schemas/proofprint.schema.json",
+  "title": "Jankurai Proofprint Receipt",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "tool",
+    "repo",
+    "lane",
+    "decision",
+    "summary",
+    "changed_files",
+    "symbols",
+    "commands",
+    "artifacts",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "tool": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "repo": {
+      "type": "object",
+      "required": ["root", "commit"],
+      "properties": {
+        "root": { "type": "string" },
+        "commit": { "type": "string" },
+        "changed_from": { "type": "string" }
+      }
+    },
+    "lane": { "type": "string" },
+    "decision": { "enum": ["pass", "review", "block"] },
+    "summary": {
+      "type": "object",
+      "required": [
+        "changed_files",
+        "changed_symbols",
+        "covered_symbols",
+        "uncovered_symbols",
+        "public_api_symbols",
+        "high_risk_symbols",
+        "missing_negative_cases",
+        "commands_run",
+        "commands_failed"
+      ],
+      "properties": {
+        "changed_files": { "type": "integer", "minimum": 0 },
+        "changed_symbols": { "type": "integer", "minimum": 0 },
+        "covered_symbols": { "type": "integer", "minimum": 0 },
+        "uncovered_symbols": { "type": "integer", "minimum": 0 },
+        "public_api_symbols": { "type": "integer", "minimum": 0 },
+        "high_risk_symbols": { "type": "integer", "minimum": 0 },
+        "missing_negative_cases": { "type": "integer", "minimum": 0 },
+        "commands_run": { "type": "integer", "minimum": 0 },
+        "commands_failed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "symbols": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "file",
+          "kind",
+          "name",
+          "line_start",
+          "line_end",
+          "signature_hash",
+          "public",
+          "risk_tags",
+          "coverage_hits",
+          "proof_status",
+          "required_evidence",
+          "notes"
+        ],
+        "properties": {
+          "file": { "type": "string" },
+          "kind": { "type": "string" },
+          "name": { "type": "string" },
+          "line_start": { "type": "integer", "minimum": 1 },
+          "line_end": { "type": "integer", "minimum": 1 },
+          "signature_hash": { "type": "string" },
+          "public": { "type": "boolean" },
+          "risk_tags": { "type": "array", "items": { "type": "string" } },
+          "coverage_hits": { "type": "integer", "minimum": 0 },
+          "proof_status": {
+            "enum": [
+              "covered",
+              "missing-coverage",
+              "missing-negative-case",
+              "advisory-no-coverage-artifact"
+            ]
+          },
+          "required_evidence": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "exit_code", "duration_ms", "log_path", "log_sha256"],
+        "properties": {
+          "command": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "log_path": { "type": "string" },
+          "log_sha256": { "type": "string" }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "kind", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" },
+          "sha256": { "type": "string" }
+        }
+      }
+    },
+    "notes": { "type": "array", "items": { "type": "string" } }
+  }
+}
+```
+
+---
+
+## 5.16 Add `crates/jankurai/templates/agent/proofprint.toml`
+
+```toml
+version = "0.1"
+default_lane = "rust-fast"
+
+[strict]
+default_strict = false
+block_on_missing_changed_symbol_coverage = true
+block_on_missing_high_risk_negative_case = true
+allow_advisory_without_coverage_artifact = true
+
+[risk]
+negative_case_keywords = [
+  "invalid",
+  "reject",
+  "denied",
+  "unauthorized",
+  "forbidden",
+  "malformed",
+  "error",
+  "panic",
+  "overflow",
+  "timeout",
+]
+
+[lanes.rust-fast]
+commands = ["cargo test --workspace"]
+require_coverage = true
+require_negative_cases_for_risk = true
+require_public_api_reverse_proof = true
+
+[lanes.rust-nextest]
+commands = ["cargo nextest run --workspace --no-fail-fast"]
+require_coverage = true
+require_negative_cases_for_risk = true
+require_public_api_reverse_proof = true
+
+[lanes.rust-hardening]
+commands = [
+  "cargo nextest run --workspace --no-fail-fast",
+  "cargo test --workspace --doc",
+]
+require_coverage = true
+require_negative_cases_for_risk = true
+require_public_api_reverse_proof = true
+```
+
+---
+
+## 5.17 Add `crates/jankurai/templates/tools/proofprint-lane.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_REF="${1:-origin/main}"
+OUT_DIR="target/jankurai/proofprint"
+mkdir -p "$OUT_DIR"
+
+# Prefer cargo-llvm-cov + nextest when present. Fall back to regular cargo test,
+# producing an advisory Proofprint receipt rather than pretending coverage exists.
+if command -v cargo-llvm-cov >/dev/null 2>&1 && cargo nextest --version >/dev/null 2>&1; then
+  cargo llvm-cov nextest \
+    --workspace \
+    --json \
+    --output-path "$OUT_DIR/coverage.json"
+
+  cargo proofprint \
+    --repo . \
+    --changed-from "$BASE_REF" \
+    --config agent/proofprint.toml \
+    --coverage-json "$OUT_DIR/coverage.json" \
+    --run "cargo nextest run --workspace --no-fail-fast" \
+    --out "$OUT_DIR/proofprint.json" \
+    --md "$OUT_DIR/proofprint.md"
+else
+  cargo proofprint \
+    --repo . \
+    --changed-from "$BASE_REF" \
+    --config agent/proofprint.toml \
+    --run "cargo test --workspace" \
+    --out "$OUT_DIR/proofprint.json" \
+    --md "$OUT_DIR/proofprint.md"
+fi
+```
+
+---
+
+## 5.18 Modify `crates/jankurai/src/commands.rs`
+
+Add one module:
+
+```rust
+pub mod proofprint;
+```
+
+It should sit near the current proof/witness/rust command modules:
+
+```rust
+pub mod proof;
+pub mod proofprint;
+pub mod publish;
+pub mod registry;
+pub mod rust;
+pub mod witness;
+```
+
+---
+
+## 5.19 Add `crates/jankurai/src/commands/proofprint.rs`
+
+```rust
+use anyhow::{bail, Context, Result};
+use std::path::PathBuf;
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct ProofprintArgs {
+    pub repo: PathBuf,
+    pub changed: Vec<PathBuf>,
+    pub changed_from: Option<String>,
+    pub config: String,
+    pub coverage_json: Option<String>,
+    pub lane: String,
+    pub out: String,
+    pub md: String,
+    pub strict: bool,
+    pub no_run: bool,
+}
+
+pub fn run(args: ProofprintArgs) -> Result<()> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("proofprint")
+        .arg("--repo")
+        .arg(&args.repo)
+        .arg("--config")
+        .arg(args.config)
+        .arg("--lane")
+        .arg(args.lane)
+        .arg("--out")
+        .arg(args.out)
+        .arg("--md")
+        .arg(args.md);
+
+    for changed in args.changed {
+        command.arg("--changed").arg(changed);
+    }
+
+    if let Some(changed_from) = args.changed_from {
+        command.arg("--changed-from").arg(changed_from);
+    }
+
+    if let Some(coverage_json) = args.coverage_json {
+        command.arg("--coverage-json").arg(coverage_json);
+    }
+
+    if args.strict {
+        command.arg("--strict");
+    }
+
+    if args.no_run {
+        command.arg("--no-run");
+    }
+
+    let status = command
+        .status()
+        .context("failed to invoke cargo proofprint; install jankurai-proofprint or run through cargo workspace")?;
+
+    if !status.success() {
+        bail!("cargo proofprint failed with status {status}");
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## 5.20 Modify `crates/jankurai/src/main.rs`
+
+Add the import:
+
+```rust
+use jankurai::commands::{
+    adopt, agent, bench, cell, certify, context_pack, doctor, exceptions, govern, hooks, init,
+    migrate, optimize, proof, proofprint, publish, registry, repair, repair_plan, rules, rust,
+    score, security, update, vibe, witness,
+};
+```
+
+Add a command variant:
+
+```rust
+Proofprint(ProofprintArgs),
+```
+
+Add args near `ProofPlanArgs` / `ProveArgs`:
+
+```rust
+#[derive(Args, Debug)]
+struct ProofprintArgs {
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+
+    #[arg(long)]
+    changed: Vec<PathBuf>,
+
+    #[arg(long, value_name = "REF")]
+    changed_from: Option<String>,
+
+    #[arg(long, value_name = "PATH", default_value = "agent/proofprint.toml")]
+    config: String,
+
+    #[arg(long, value_name = "PATH")]
+    coverage_json: Option<String>,
+
+    #[arg(long, default_value = "rust-fast")]
+    lane: String,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofprint/proofprint.json"
+    )]
+    out: String,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "target/jankurai/proofprint/proofprint.md"
+    )]
+    md: String,
+
+    #[arg(long)]
+    strict: bool,
+
+    #[arg(long)]
+    no_run: bool,
+}
+```
+
+Add match arm:
+
+```rust
+Some(Commands::Proofprint(args)) => {
+    proofprint::run(proofprint::ProofprintArgs {
+        repo: args.repo,
+        changed: args.changed,
+        changed_from: args.changed_from,
+        config: args.config,
+        coverage_json: args.coverage_json,
+        lane: args.lane,
+        out: args.out,
+        md: args.md,
+        strict: args.strict,
+        no_run: args.no_run,
+    })?;
+}
+```
+
+---
+
+## 5.21 Modify `jankurai prove` ingestion
+
+Where `jankurai prove` currently builds proof receipts/evidence index, add a Rust source check and optional Proofprint call.
+
+Conceptual patch:
+
+```rust
+fn should_run_proofprint(changed: &[PathBuf]) -> bool {
+    changed
+        .iter()
+        .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("rs"))
+}
+```
+
+Then, after mapped proof commands complete:
+
+```rust
+if should_run_proofprint(&changed_paths) {
+    crate::commands::proofprint::run(crate::commands::proofprint::ProofprintArgs {
+        repo: args.repo.clone(),
+        changed: changed_paths.clone(),
+        changed_from: args.changed_from.clone(),
+        config: "agent/proofprint.toml".to_string(),
+        coverage_json: Some("target/jankurai/proofprint/coverage.json".to_string()),
+        lane: "rust-fast".to_string(),
+        out: "target/jankurai/proofprint/proofprint.json".to_string(),
+        md: "target/jankurai/proofprint/proofprint.md".to_string(),
+        strict: false,
+        no_run: false,
+    })?;
+}
+```
+
+The existing evidence index should include:
+
+```json
+{
+  "kind": "proofprint",
+  "path": "target/jankurai/proofprint/proofprint.json",
+  "schema": "schemas/proofprint.schema.json",
+  "required_for": ["rust-source-change", "public-api-change", "high-risk-boundary-change"]
+}
+```
+
+---
+
+## 5.22 Modify `jankurai witness` ingestion
+
+Add a small reader:
+
+```rust
+#[derive(Debug, serde::Deserialize)]
+struct ProofprintLite {
+    decision: String,
+    summary: ProofprintSummaryLite,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ProofprintSummaryLite {
+    changed_symbols: usize,
+    uncovered_symbols: usize,
+    missing_negative_cases: usize,
+}
+
+fn read_proofprint(repo: &Path) -> Option<ProofprintLite> {
+    let path = repo.join("target/jankurai/proofprint/proofprint.json");
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+```
+
+Then in witness status computation:
+
+```rust
+if let Some(proofprint) = read_proofprint(&repo) {
+    match proofprint.decision.as_str() {
+        "block" => {
+            status = WitnessStatus::Blocked;
+            repair_items.push(format!(
+                "Proofprint blocked merge: {} uncovered changed symbols, {} missing negative cases",
+                proofprint.summary.uncovered_symbols,
+                proofprint.summary.missing_negative_cases
+            ));
+        }
+        "review" => {
+            if !matches!(status, WitnessStatus::Blocked) {
+                status = WitnessStatus::Review;
+            }
+        }
+        _ => {}
+    }
+}
+```
+
+Markdown witness should include:
+
+```md
+## Proofprint
+
+- Decision: `block`
+- Changed symbols: 8
+- Uncovered changed symbols: 2
+- Missing negative cases: 1
+- Receipt: `target/jankurai/proofprint/proofprint.json`
+```
+
+---
+
+## 5.23 Modify init/adopt scaffolding
+
+`jankurai init --level agents|full` should create:
+
+```text
+agent/proofprint.toml
+tools/proofprint-lane.sh
+```
+
+It should also add a Rust lane reference to generated or migrated `agent/test-map.json`:
+
+```json
+{
+  "arc": "rust-workspace",
+  "source_roots": ["crates", "src"],
+  "unit_tests": ["cargo test --workspace"],
+  "smoke_tests": ["tools/proofprint-lane.sh origin/main"],
+  "required_for_change_types": [
+    "rust-source-change",
+    "public-api-change",
+    "high-risk-boundary-change"
+  ],
+  "selection_reason": "Rust changes require changed-symbol proofprint receipt to prevent false-green merges.",
+  "estimated_cost": "medium"
+}
+```
+
+If the project has `cargo-nextest` and `cargo-llvm-cov`, init should prefer:
+
+```json
+"smoke_tests": ["tools/proofprint-lane.sh origin/main"]
+```
+
+If not, it should still add the lane in advisory mode.
+
+---
+
+## 5.24 Add `docs/proofprint.md`
+
+````md
+# Proofprint
+
+Proofprint is Jankurai’s changed-behavior receipt for Rust.
+
+It blocks false-green AI pull requests by checking whether changed Rust symbols were exercised by the mapped proof lane.
+
+## What it proves
+
+- Which Rust files changed.
+- Which symbols changed.
+- Which proof commands ran.
+- Which changed line ranges had coverage hits.
+- Which high-risk changed symbols require negative-case evidence.
+- Whether the result is pass, review, or block.
+
+## What it does not claim
+
+Proofprint is not a formal verifier. It does not prove semantic correctness. It proves that the project did not merge a change while pretending unexercised behavior had been tested.
+
+## Recommended CI lane
+
+```bash
+tools/proofprint-lane.sh origin/main
+jankurai witness . --changed-from origin/main
+```
+````
+
+---
+
+## 5.25 Add tests for the new crate
+
+### `crates/jankurai-proofprint/tests/rust_scan.rs`
+
+```rust
+use jankurai_proofprint::Cli;
+use std::fs;
+use std::process::Command;
+use tempfile::tempdir;
+
+#[test]
+fn proofprint_finds_uncovered_changed_symbol_without_coverage() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path();
+
+    fs::write(
+        repo.join("Cargo.toml"),
+        r#"
+[package]
+name = "fixture"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    fs::write(
+        repo.join("src/lib.rs"),
+        r#"
+pub fn add_one(value: i32) -> i32 {
+    value + 1
+}
+"#,
+    )
+    .unwrap();
+
+    Command::new("git").arg("init").current_dir(repo).status().unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    Command::new("git").args(["add", "."]).current_dir(repo).status().unwrap();
+    Command::new("git")
+        .args(["commit", "-m", "base"])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+
+    fs::write(
+        repo.join("src/lib.rs"),
+        r#"
+pub fn add_one(value: i32) -> i32 {
+    value + 2
+}
+"#,
+    )
+    .unwrap();
+
+    let receipt = jankurai_proofprint::run(Cli {
+        repo: repo.to_path_buf(),
+        changed_from: Some("HEAD".to_string()),
+        changed: Vec::new(),
+        config: "agent/proofprint.toml".into(),
+        coverage_json: None,
+        run_commands: Vec::new(),
+        lane: "rust-fast".to_string(),
+        out: "target/jankurai/proofprint/proofprint.json".into(),
+        md: "target/jankurai/proofprint/proofprint.md".into(),
+        strict: false,
+        no_run: true,
+    })
+    .unwrap();
+
+    assert_eq!(receipt.summary.changed_symbols, 1);
+    assert_eq!(receipt.summary.covered_symbols, 0);
+}
+```
+
+### `crates/jankurai-proofprint/tests/coverage.rs`
+
+```rust
+use std::fs;
+use tempfile::tempdir;
+
+#[test]
+fn llvm_segments_map_to_line_hits() {
+    let dir = tempdir().unwrap();
+    let repo = dir.path();
+    fs::create_dir_all(repo.join("target")).unwrap();
+    let coverage = repo.join("target/coverage.json");
+    fs::write(
+        &coverage,
+        serde_json::json!({
+            "data": [{
+                "files": [{
+                    "filename": repo.join("src/lib.rs").display().to_string(),
+                    "segments": [[2, 1, 4, true, true], [3, 1, 0, true, true]]
+                }]
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let index = jankurai_proofprint::coverage::CoverageIndex::from_llvm_json(repo, &coverage).unwrap();
+    assert_eq!(index.hits_for_range("src/lib.rs", 2, 2), 4);
+}
+```
+
+---
+
+## 6. Deep lane: mutation testing without making every PR expensive
+
+Proofprint’s default lane should be cheap enough for every PR. Mutation testing should be a **promotion**, not a default tax.
+
+Add to `agent/proofprint.toml`:
+
+```toml
+[lanes.rust-mutation]
+commands = [
+  "cargo mutants --package jankurai --timeout 60 --no-shuffle",
+]
+require_coverage = true
+require_negative_cases_for_risk = true
+require_public_api_reverse_proof = true
+```
+
+Then add optional parser support later:
+
+```bash
+cargo proofprint \
+  --changed-from origin/main \
+  --coverage-json target/jankurai/proofprint/coverage.json \
+  --mutants-dir target/mutants
+```
+
+Policy:
+
+* Normal PR: changed-symbol coverage receipt.
+* High-risk auth/security/db/concurrency PR: changed-symbol coverage + negative-case evidence.
+* Scheduled hardening: mutation lane.
+* Release: mutation lane for changed public APIs and high-risk modules.
+
+This keeps Proofprint fast while giving maintainers a ratchet path to stronger proof.
+
+---
+
+## 7. Security model
+
+Proofprint runs local commands, so it must follow Jankurai’s existing “bounded agent” philosophy.
+
+Rules:
+
+1. It only runs explicit commands from `agent/proofprint.toml` or `--run`.
+2. It writes logs under `target/jankurai/proofprint/`.
+3. It stores command output by digest and path, not by trusting terminal text.
+4. It never uploads code or test results.
+5. It treats missing coverage as review/block, never as pass.
+6. It must be CI-friendly and deterministic.
+7. It should support strict mode for protected branches.
+
+---
+
+## 8. Why this improves agent-first design
+
+Agents need three things:
+
+1. **A small target** — what changed?
+2. **A required proof** — what must run?
+3. **A receipt** — what evidence is acceptable?
+
+Proofprint gives them all three in machine-readable form.
+
+An agent can read `proofprint.md` and immediately know:
+
+* “I changed `verify_session`.”
+* “It has zero coverage hits.”
+* “It touches auth/deserialization/unwrap.”
+* “I need a negative test with malformed/unauthorized input.”
+* “The merge witness is blocked until I provide it.”
+
+That is exactly the opposite of vibe coding.
+
+---
+
+## 9. Implementation order
+
+### Phase 1: MVP
+
+1. Add `crates/jankurai-proofprint`.
+2. Implement changed file detection.
+3. Implement Rust symbol scanner.
+4. Implement LLVM coverage JSON line-hit parser.
+5. Emit JSON/Markdown receipt.
+6. Add `jankurai proofprint` wrapper.
+7. Add init templates.
+8. Add witness ingestion.
+
+### Phase 2: Project-quality hardening
+
+1. Read `agent/test-map.json` directly to select commands.
+2. Attach package ownership from existing Jankurai Rust map.
+3. Add public API reverse-dependency enforcement from witness graph diff.
+4. Add SARIF output for GitHub annotations.
+5. Add normalized support for LCOV and grcov.
+6. Add `cargo-mutants` deep-lane parser.
+7. Add semver receipt attachment for public crates.
+
+### Phase 3: Ecosystem-level value
+
+Publish as:
+
+```bash
+cargo install jankurai-proofprint
+```
+
+Then any Rust project can use:
+
+```bash
+cargo proofprint --changed-from origin/main --strict
+```
+
+without adopting all of Jankurai. But Jankurai users get the full merge-witness integration.
+
+---
+
+## 10. The value proposition in one paragraph
+
+`jankurai-proofprint` turns “the tests passed” into “the changed behavior was exercised and the evidence is attached.” It makes false-green AI pull requests visible, gives agents concrete repair instructions, gives reviewers a symbol-level proof matrix, gives CI a deterministic block/review/pass signal, and gives Jankurai a uniquely valuable proof-producing tool that complements the existing audit standard instead of duplicating it.
+
+---
+
+## 11. Pull request title and description
+
+### Title
+
+```text
+Add jankurai-proofprint changed-behavior proof receipts for Rust lanes
+```
+
+### Description
+
+````md
+## Summary
+
+Adds `jankurai-proofprint`, a cargo subcommand that emits Jankurai-native proof receipts showing whether changed Rust symbols were exercised by the mapped proof lane.
+
+## Why
+
+Passing tests are not enough for AI-assisted merges. A PR can be green while the changed behavior is untested. Proofprint closes that false-green gap by binding changed symbols to coverage hits, command evidence, high-risk boundary checks, and a block/review/pass decision.
+
+## Changes
+
+- Adds `crates/jankurai-proofprint`.
+- Adds `cargo proofprint` UX.
+- Adds `jankurai proofprint` wrapper.
+- Adds `agent/proofprint.toml` and `tools/proofprint-lane.sh` templates.
+- Adds `schemas/proofprint.schema.json`.
+- Adds witness ingestion plan for Proofprint receipts.
+
+## Example
+
+```bash
+cargo llvm-cov nextest --workspace --json --output-path target/jankurai/proofprint/coverage.json
+cargo proofprint --changed-from origin/main --coverage-json target/jankurai/proofprint/coverage.json --strict
+jankurai witness . --changed-from origin/main
+```
+
+## Merge behavior
+
+- `pass`: all changed symbols have behavior proof.
+- `review`: advisory gaps exist, usually missing coverage artifact.
+- `block`: changed behavior is unexercised, high-risk negative proof is missing, or proof commands failed.
+````
+

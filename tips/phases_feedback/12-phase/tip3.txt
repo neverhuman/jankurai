@@ -1,0 +1,2216 @@
+**Phase name:** Phase 12: Benchmark Certification And Governance
+
+I’m treating this as a Phase 12 hardening slice, not a Phase 13 mutation slice. The repo’s moonshot is the loop `intent -> bounded agents -> proof lanes -> evidence -> expired exceptions -> reusable primitives`, with durable, machine-readable evidence as a core requirement. ([GitHub][1]) Phase 12 already has local `bench`, `certify`, and `govern` artifacts, but the phase text explicitly leaves external signing, hosted dashboard, and public badge publishing deferred. ([GitHub][2]) The router also says Phase 12’s remaining leverage is “public evidence” after the local surfaces exist. ([GitHub][3]) The release plan separately calls for a compliance badge, benchmark publication, raw evidence, and governance roles/policy, so this patch finishes that residual by adding a release-grade static publication bundle without making a hosted service mandatory. ([GitHub][4])
+
+I could not run this patch in my local execution container because it could not resolve `github.com`, but the script below is designed to be pasted from the repo root and includes the proof commands, phase log start/finish entries, schema updates, CLI code, tests, workflow update, and phase status update.
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Phase 12: Benchmark Certification And Governance
+# Hardened slice: public/static evidence publishing + stronger local attestation.
+#
+# Run from the Jankurai repository root.
+#
+# This script:
+# - appends the required Phase 12 start log before edits
+# - adds a `jankurai publish` command
+# - hardens `jankurai certify` with evidence artifact digests and optional external signature/build URL
+# - adds `schemas/publication.schema.json`
+# - expands `schemas/certification.schema.json`
+# - updates schema routing
+# - updates CLI routing
+# - adds a Phase 12 publication smoke test
+# - updates CI to build/upload the public evidence bundle
+# - marks Phase 12 hardened and records the proof commands
+# - appends the required Phase 12 finish log after validation
+
+PHASE_LOG="tips/phases/logs/12-benchmark-certification-governance.log"
+START_TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+START_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+
+printf '%s | gpt-5.5-pro | 12 | start | crates/jankurai/src/main.rs;crates/jankurai/src/commands.rs;crates/jankurai/src/commands/certify.rs;crates/jankurai/src/commands/publish.rs;crates/jankurai/src/validation.rs;schemas/certification.schema.json;schemas/publication.schema.json;crates/jankurai/tests/phase_12_publication_smoke.rs;.github/workflows/jankurai.yml;docs/artifact-contracts.md;tips/phases/00-phase-index.md;tips/phases/12-benchmark-certification-governance.md;tips/phases/logs/12-benchmark-certification-governance.log | pending | target/jankurai/p12-publication.json;target/jankurai/public/ | %s | harden Phase 12 public evidence publishing, certification artifact digests, and local attestation; hosted dashboard remains optional\n' "$START_TS" "$START_SHA" >> "$PHASE_LOG"
+
+python3 <<'PY'
+from pathlib import Path
+import re
+
+def replace_or_fail(path: str, old: str, new: str) -> None:
+    p = Path(path)
+    text = p.read_text()
+    if old not in text:
+        raise SystemExit(f"expected text not found in {path}: {old[:120]!r}")
+    p.write_text(text.replace(old, new))
+
+def regex_replace_or_fail(path: str, pattern: str, repl: str, count: int = 1, flags: int = re.S) -> None:
+    p = Path(path)
+    text = p.read_text()
+    new_text, n = re.subn(pattern, repl, text, count=count, flags=flags)
+    if n == 0:
+        raise SystemExit(f"expected regex not found in {path}: {pattern}")
+    p.write_text(new_text)
+
+# --- validation.rs: route the new publication schema.
+p = Path("crates/jankurai/src/validation.rs")
+text = p.read_text()
+if "Publication" not in text:
+    text = re.sub(
+        r"(GovernancePolicy,\s*)CellManifest",
+        r"\1Publication, CellManifest",
+        text,
+        count=1,
+        flags=re.S,
+    )
+    text = re.sub(
+        r'(Self::GovernancePolicy\s*=>\s*"governance-policy\.schema\.json",\s*)Self::CellManifest',
+        r'\1Self::Publication => "publication.schema.json", Self::CellManifest',
+        text,
+        count=1,
+        flags=re.S,
+    )
+p.write_text(text)
+
+# --- commands.rs: expose publish command module.
+p = Path("crates/jankurai/src/commands.rs")
+text = p.read_text()
+if "pub mod publish;" not in text:
+    text = re.sub(
+        r"pub mod proof;\s*pub mod registry;",
+        "pub mod proof; pub mod publish; pub mod registry;",
+        text,
+        count=1,
+        flags=re.S,
+    )
+p.write_text(text)
+
+# --- main.rs: add publish CLI and harden certify args.
+p = Path("crates/jankurai/src/main.rs")
+text = p.read_text()
+
+if " publish," not in text and "publish," not in text.split("};", 1)[0]:
+    text = re.sub(
+        r"\bproof,\s*registry,",
+        "proof, publish, registry,",
+        text,
+        count=1,
+        flags=re.S,
+    )
+
+if "Publish(PublishArgs)" not in text:
+    text = re.sub(
+        r"(Govern\(GovernArgs\),\s*)",
+        r"\1Publish(PublishArgs), ",
+        text,
+        count=1,
+        flags=re.S,
+    )
+
+certify_args_block = '''#[derive(Args, Debug)]
+struct CertifyArgs {
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    out: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    md: Option<String>,
+    /// Optional externally produced signature or attestation reference.
+    ///
+    /// This command does not require a network signing service. Pass a signature
+    /// created by your release process, or set JANKURAI_CERTIFICATION_SIGNATURE.
+    #[arg(long, value_name = "SIG")]
+    signature: Option<String>,
+    /// Optional CI/build URL. Defaults from GitHub Actions env when available.
+    #[arg(long, value_name = "URL")]
+    build_url: Option<String>,
+    /// Optional attestation label. Defaults to local-content-addressed-attestation.
+    #[arg(long, value_name = "LABEL")]
+    attestation: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct GovernArgs'''
+
+text = re.sub(
+    r"#\[derive\(Args, Debug\)\]\s*struct CertifyArgs\s*\{.*?\}\s*#\[derive\(Args, Debug\)\]\s*struct GovernArgs",
+    certify_args_block,
+    text,
+    count=1,
+    flags=re.S,
+)
+
+if "struct PublishArgs" not in text:
+    publish_args_block = '''#[derive(Args, Debug)]
+struct PublishArgs {
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    #[arg(long, value_name = "DIR", default_value = "target/jankurai/public")]
+    public_dir: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    out: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    md: Option<String>,
+    #[arg(long, value_name = "ORG")]
+    org: Option<String>,
+    /// Optional externally produced signature or attestation reference.
+    #[arg(long, value_name = "SIG")]
+    signature: Option<String>,
+    /// Optional CI/build URL. Defaults from GitHub Actions env when available.
+    #[arg(long, value_name = "URL")]
+    build_url: Option<String>,
+}
+
+'''
+    text = re.sub(
+        r"(?=#\[derive\(Args, Debug\)\]\s*struct RepairArgs)",
+        publish_args_block,
+        text,
+        count=1,
+        flags=re.S,
+    )
+
+text = re.sub(
+    r"certify::CertifyArgs\s*\{\s*repo:\s*args\.repo,\s*out:\s*args\.out,\s*md:\s*args\.md,\s*\}",
+    "certify::CertifyArgs { repo: args.repo, out: args.out, md: args.md, signature: args.signature, build_url: args.build_url, attestation: args.attestation, }",
+    text,
+    count=1,
+    flags=re.S,
+)
+
+if "Commands::Publish" not in text:
+    publish_arm = '''Some(Commands::Govern(args)) => {
+            govern::run(govern::GovernArgs {
+                repo: args.repo,
+                out: args.out,
+                md: args.md,
+            })?;
+        }
+        Some(Commands::Publish(args)) => {
+            publish::run(publish::PublishArgs {
+                repo: args.repo,
+                public_dir: args.public_dir,
+                out: args.out,
+                md: args.md,
+                org: args.org,
+                signature: args.signature,
+                build_url: args.build_url,
+            })?;
+        }'''
+    text = re.sub(
+        r"Some\(Commands::Govern\(args\)\)\s*=>\s*\{\s*govern::run\(govern::GovernArgs\s*\{\s*repo:\s*args\.repo,\s*out:\s*args\.out,\s*md:\s*args\.md,\s*\}\)\?;\s*\}",
+        publish_arm,
+        text,
+        count=1,
+        flags=re.S,
+    )
+
+p.write_text(text)
+
+# --- Phase router: mark Phase 12 hardened.
+p = Path("tips/phases/00-phase-index.md")
+text = p.read_text()
+text = text.replace(
+    "| 12 | complete-with-deferred-work | local certification/governance exist; external signing/badges/dashboard deferred |",
+    "| 12 | hardened | release-grade certification evidence, static badge/report publishing, and CI artifact publication exist; hosted dashboards remain optional |",
+)
+p.write_text(text)
+
+# --- Artifact contract index: add publication contract note once.
+p = Path("docs/artifact-contracts.md")
+text = p.read_text()
+note = (
+    "\n\n## Phase 12 public evidence bundle\n\n"
+    "| Artifact / surface | Schema or guard | Notes |\n"
+    "| --- | --- | --- |\n"
+    "| `target/jankurai/p12-publication.json` | `schemas/publication.schema.json`; `phase_12_publication_smoke` | Release-grade index for public benchmark, certification, governance, badge, and attestation evidence. |\n"
+    "| `target/jankurai/public/badge.svg` | Semantic: generated by `jankurai publish` and indexed by `publication.schema.json` | Static badge suitable for GitHub Pages, README embedding, or artifact publishing. |\n"
+    "| `target/jankurai/public/SHA256SUMS` | Semantic: generated by `jankurai publish` | Content-addressed public bundle manifest. |\n"
+)
+if "Phase 12 public evidence bundle" not in text:
+    text = text.rstrip() + note + "\n"
+p.write_text(text)
+PY
+
+cat > schemas/certification.schema.json <<'JSON'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/certification.schema.json",
+  "title": "jankurai certification",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "repo",
+    "standard_version",
+    "auditor_version",
+    "paper_edition",
+    "target_stack_id",
+    "score",
+    "conformance_level",
+    "caps",
+    "findings_summary",
+    "proof_receipt_index",
+    "security_receipt_index",
+    "ux_receipt_index",
+    "contract_db_receipt_index",
+    "exceptions",
+    "evidence_summary",
+    "evidence_artifacts",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "repo": { "type": "string" },
+    "standard_version": { "type": "string" },
+    "auditor_version": { "type": "string" },
+    "paper_edition": { "type": "string" },
+    "target_stack_id": { "type": "string" },
+    "score": { "type": "integer" },
+    "conformance_level": { "type": "string" },
+    "caps": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "findings_summary": {
+      "type": "object",
+      "required": ["critical", "high", "medium", "low"],
+      "properties": {
+        "critical": { "type": "integer" },
+        "high": { "type": "integer" },
+        "medium": { "type": "integer" },
+        "low": { "type": "integer" },
+        "notes": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "proof_receipt_index": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "security_receipt_index": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "ux_receipt_index": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "contract_db_receipt_index": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "exceptions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "evidence_summary": {
+      "type": "object",
+      "required": [
+        "total_artifacts",
+        "present_artifacts",
+        "missing_artifacts",
+        "required_missing_artifacts",
+        "digest_algorithm",
+        "attestation_subject_digest"
+      ],
+      "properties": {
+        "total_artifacts": { "type": "integer" },
+        "present_artifacts": { "type": "integer" },
+        "missing_artifacts": { "type": "integer" },
+        "required_missing_artifacts": { "type": "integer" },
+        "digest_algorithm": { "type": "string" },
+        "attestation_subject_digest": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "evidence_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "kind", "status", "required"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" },
+          "schema": { "type": "string" },
+          "sha256": { "type": ["string", "null"] },
+          "size_bytes": { "type": ["integer", "null"] },
+          "status": {
+            "type": "string",
+            "enum": ["present", "missing-optional", "missing-required"]
+          },
+          "required": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["attestation", "attestation_digest", "builder"],
+      "properties": {
+        "attestation": { "type": "string" },
+        "attestation_digest": { "type": "string" },
+        "builder": { "type": "string" },
+        "signature": { "type": "string" },
+        "build_url": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+JSON
+
+cat > schemas/publication.schema.json <<'JSON'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/publication.schema.json",
+  "title": "jankurai public evidence publication",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "repo",
+    "standard_version",
+    "auditor_version",
+    "paper_edition",
+    "target_stack_id",
+    "score",
+    "conformance_level",
+    "status",
+    "subject_digest",
+    "badge",
+    "artifacts",
+    "public_outputs",
+    "governance",
+    "adoption",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "repo": { "type": "string" },
+    "organization": { "type": "string" },
+    "standard_version": { "type": "string" },
+    "auditor_version": { "type": "string" },
+    "paper_edition": { "type": "string" },
+    "target_stack_id": { "type": "string" },
+    "score": { "type": "integer" },
+    "conformance_level": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["pass", "fail", "advisory"]
+    },
+    "subject_digest": { "type": "string" },
+    "badge": {
+      "type": "object",
+      "required": ["label", "message", "path"],
+      "properties": {
+        "label": { "type": "string" },
+        "message": { "type": "string" },
+        "path": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "kind", "sha256", "size_bytes", "status"],
+        "properties": {
+          "path": { "type": "string" },
+          "kind": { "type": "string" },
+          "schema": { "type": "string" },
+          "sha256": { "type": "string" },
+          "size_bytes": { "type": "integer" },
+          "status": { "type": "string" },
+          "summary": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "public_outputs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "governance": {
+      "type": "object",
+      "required": ["minimum_score", "fail_on", "advisory_on", "update_channel"],
+      "properties": {
+        "minimum_score": { "type": "integer" },
+        "fail_on": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "advisory_on": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "update_channel": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "adoption": {
+      "type": "object",
+      "required": [
+        "badge_markdown",
+        "report_path",
+        "ci_artifact_name",
+        "verification_command"
+      ],
+      "properties": {
+        "badge_markdown": { "type": "string" },
+        "report_path": { "type": "string" },
+        "ci_artifact_name": { "type": "string" },
+        "verification_command": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["attestation", "subject_digest", "builder"],
+      "properties": {
+        "attestation": { "type": "string" },
+        "subject_digest": { "type": "string" },
+        "builder": { "type": "string" },
+        "signature": { "type": "string" },
+        "build_url": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+JSON
+
+cat > crates/jankurai/src/commands/certify.rs <<'RS'
+use crate::commands::release_data::{
+    load_release_data, read_repo_score, workspace_root, FindingsSummary,
+};
+use crate::validation::{self, ArtifactSchema};
+use anyhow::{Context, Result};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone)]
+pub struct CertifyArgs {
+    pub repo: PathBuf,
+    pub out: Option<String>,
+    pub md: Option<String>,
+    pub signature: Option<String>,
+    pub build_url: Option<String>,
+    pub attestation: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BuildCertifyOptions {
+    pub signature: Option<String>,
+    pub build_url: Option<String>,
+    pub attestation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Certification {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub repo: String,
+    pub standard_version: String,
+    pub auditor_version: String,
+    pub paper_edition: String,
+    pub target_stack_id: String,
+    pub score: i32,
+    pub conformance_level: String,
+    pub caps: Vec<String>,
+    pub findings_summary: FindingsSummary,
+    pub proof_receipt_index: Vec<String>,
+    pub security_receipt_index: Vec<String>,
+    pub ux_receipt_index: Vec<String>,
+    pub contract_db_receipt_index: Vec<String>,
+    pub exceptions: Vec<String>,
+    pub evidence_summary: EvidenceSummary,
+    pub evidence_artifacts: Vec<CertificationEvidenceArtifact>,
+    pub provenance: Provenance,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvidenceSummary {
+    pub total_artifacts: i32,
+    pub present_artifacts: i32,
+    pub missing_artifacts: i32,
+    pub required_missing_artifacts: i32,
+    pub digest_algorithm: String,
+    pub attestation_subject_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CertificationEvidenceArtifact {
+    pub path: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(rename = "sha256", skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    pub status: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Provenance {
+    pub attestation: String,
+    pub attestation_digest: String,
+    pub builder: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_url: Option<String>,
+}
+
+pub fn run(args: CertifyArgs) -> Result<()> {
+    let certification = build_certification_with_options(
+        &args.repo,
+        BuildCertifyOptions {
+            signature: args.signature,
+            build_url: args.build_url,
+            attestation: args.attestation,
+        },
+    )?;
+
+    if let Some(path) = args.out.as_deref() {
+        validation::write_json(&args.repo, ArtifactSchema::Certification, path, &certification)?;
+    } else {
+        validation::validate_serializable(&args.repo, ArtifactSchema::Certification, &certification)?;
+        println!("{}", serde_json::to_string_pretty(&certification)?);
+    }
+
+    if let Some(path) = args.md.as_deref() {
+        crate::render::write_markdown(path, &render_markdown(&certification))?;
+    }
+
+    Ok(())
+}
+
+pub fn build_certification(repo: &Path) -> Result<Certification> {
+    build_certification_with_options(repo, BuildCertifyOptions::default())
+}
+
+pub fn build_certification_with_options(
+    repo: &Path,
+    options: BuildCertifyOptions,
+) -> Result<Certification> {
+    let release = load_release_data(repo)?;
+    let score_path = repo.join("agent/repo-score.json");
+    let score = read_repo_score(repo)?;
+    let evidence_root = if score_path.exists() {
+        repo.to_path_buf()
+    } else {
+        workspace_root()
+    };
+
+    let (score_value, caps, mut findings_summary) = match score.as_ref() {
+        Some(summary) => (
+            summary.score,
+            summary.caps.clone(),
+            FindingsSummary {
+                critical: summary.findings.critical,
+                high: summary.findings.high,
+                medium: summary.findings.medium,
+                low: summary.findings.low,
+                notes: vec![
+                    format!("repo score artifact: {}", score_path.display()),
+                    "certification includes content-addressed local evidence".to_string(),
+                ],
+            },
+        ),
+        None => (
+            0,
+            Vec::new(),
+            FindingsSummary {
+                critical: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+                notes: vec![
+                    format!("score artifact missing: {}", score_path.display()),
+                    "certification includes content-addressed local evidence".to_string(),
+                ],
+            },
+        ),
+    };
+
+    if let Some(summary) = score.as_ref() {
+        if summary.caps.is_empty() {
+            findings_summary
+                .notes
+                .push("no hard caps reported in the score artifact".to_string());
+        }
+    }
+
+    let proof_receipt_index = collect_receipts(&evidence_root)?;
+    let security_receipt_index = collect_security_receipts(&evidence_root)?;
+    let ux_receipt_index = collect_ux_receipts(&evidence_root)?;
+    let contract_db_receipt_index = collect_contract_db_receipts(&evidence_root)?;
+    let exceptions = collect_exceptions(&evidence_root)?;
+    let conformance_level = conformance_level(score_value, &caps, &findings_summary);
+
+    let evidence_artifacts = collect_certification_evidence_artifacts(
+        &evidence_root,
+        &proof_receipt_index,
+        &security_receipt_index,
+        &ux_receipt_index,
+        &contract_db_receipt_index,
+        &exceptions,
+    )?;
+    let attestation_subject_digest = evidence_subject_digest(
+        &evidence_artifacts,
+        &release.standard_version,
+        &release.auditor_version,
+        &release.paper_edition,
+        &release.target_stack_id,
+        score_value,
+        &conformance_level,
+    );
+    let evidence_summary = evidence_summary(&evidence_artifacts, &attestation_subject_digest);
+
+    let signature = options
+        .signature
+        .or_else(|| std::env::var("JANKURAI_CERTIFICATION_SIGNATURE").ok());
+    let build_url = options
+        .build_url
+        .or_else(|| std::env::var("JANKURAI_CERTIFICATION_BUILD_URL").ok())
+        .or_else(ci_build_url);
+    let attestation = options
+        .attestation
+        .unwrap_or_else(|| "local-content-addressed-attestation".to_string());
+
+    Ok(Certification {
+        schema_version: release.schema_version,
+        generated_at: now_string(),
+        repo: repo.display().to_string(),
+        standard_version: release.standard_version,
+        auditor_version: release.auditor_version,
+        paper_edition: release.paper_edition,
+        target_stack_id: release.target_stack_id,
+        score: score_value,
+        conformance_level,
+        caps,
+        findings_summary,
+        proof_receipt_index,
+        security_receipt_index,
+        ux_receipt_index,
+        contract_db_receipt_index,
+        exceptions,
+        evidence_summary,
+        evidence_artifacts,
+        provenance: Provenance {
+            attestation,
+            attestation_digest: attestation_subject_digest,
+            builder: "jankurai certify".to_string(),
+            signature,
+            build_url,
+        },
+    })
+}
+
+fn conformance_level(score: i32, caps: &[String], findings: &FindingsSummary) -> String {
+    if score >= 93 && caps.is_empty() && findings.high == 0 && findings.critical == 0 {
+        "HL3".to_string()
+    } else if score >= 85 && findings.critical == 0 {
+        "HL2".to_string()
+    } else if score > 0 {
+        "HL1".to_string()
+    } else {
+        "HL0".to_string()
+    }
+}
+
+fn collect_receipts(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for candidate in [
+        "target/jankurai/p10-cell-registry-lane.json",
+        "target/jankurai/p10-audit-log-proof.json",
+    ] {
+        if root.join(candidate).exists() {
+            paths.push(candidate.to_string());
+        }
+    }
+    paths.extend(collect_matching_json(root, "target/jankurai", |name| {
+        name.contains("proof") && name.ends_with(".json")
+    })?);
+    Ok(dedup(paths))
+}
+
+fn collect_security_receipts(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for candidate in [
+        "target/jankurai/security-evidence.json",
+        "target/jankurai/security/evidence.json",
+    ] {
+        if root.join(candidate).exists() {
+            paths.push(candidate.to_string());
+        }
+    }
+    Ok(dedup(paths))
+}
+
+fn collect_ux_receipts(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for candidate in ["target/jankurai/ux-qa.json", "target/jankurai/ux/ux-qa.json"] {
+        if root.join(candidate).exists() {
+            paths.push(candidate.to_string());
+        }
+    }
+    Ok(dedup(paths))
+}
+
+fn collect_contract_db_receipts(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    for candidate in [
+        "target/jankurai/migration-report.json",
+        "target/jankurai/migration-plan.json",
+        "target/jankurai/contract-report.json",
+        "examples/perfect-web-api-db/contracts/openapi.json",
+        "examples/perfect-web-api-db/db/migrations/001_init.sql",
+        "examples/perfect-web-api-db/db/constraints/001_accounts.sql",
+    ] {
+        if root.join(candidate).exists() {
+            paths.push(candidate.to_string());
+        }
+    }
+    Ok(dedup(paths))
+}
+
+fn collect_exceptions(root: &Path) -> Result<Vec<String>> {
+    let mut paths = Vec::new();
+    if root.join("docs/exceptions").exists() {
+        paths.push("docs/exceptions/".to_string());
+    }
+    let candidate = "examples/perfect-web-api-db/docs/exceptions.md";
+    if root.join(candidate).exists() {
+        paths.push(candidate.to_string());
+    }
+    Ok(dedup(paths))
+}
+
+fn collect_certification_evidence_artifacts(
+    root: &Path,
+    proof_receipts: &[String],
+    security_receipts: &[String],
+    ux_receipts: &[String],
+    contract_db_receipts: &[String],
+    exceptions: &[String],
+) -> Result<Vec<CertificationEvidenceArtifact>> {
+    let mut seen = BTreeSet::new();
+    let mut artifacts = Vec::new();
+
+    push_artifact(
+        root,
+        &mut seen,
+        &mut artifacts,
+        "agent/repo-score.json",
+        "repo-score",
+        Some("repo-score.schema.json"),
+        true,
+    )?;
+    push_artifact(
+        root,
+        &mut seen,
+        &mut artifacts,
+        "agent/standard-version.toml",
+        "version-manifest",
+        Some("standard-version.schema.json"),
+        true,
+    )?;
+    push_artifact(
+        root,
+        &mut seen,
+        &mut artifacts,
+        "agent/owner-map.json",
+        "owner-map",
+        Some("owner-map.schema.json"),
+        true,
+    )?;
+    push_artifact(
+        root,
+        &mut seen,
+        &mut artifacts,
+        "agent/test-map.json",
+        "test-map",
+        Some("test-map.schema.json"),
+        true,
+    )?;
+    push_artifact(
+        root,
+        &mut seen,
+        &mut artifacts,
+        "agent/proof-lanes.toml",
+        "proof-lanes",
+        Some("proof-lanes.schema.json"),
+        true,
+    )?;
+
+    for path in proof_receipts {
+        push_artifact(root, &mut seen, &mut artifacts, path, "proof-receipt", None, false)?;
+    }
+    for path in security_receipts {
+        push_artifact(
+            root,
+            &mut seen,
+            &mut artifacts,
+            path,
+            "security-receipt",
+            Some("security-evidence.schema.json"),
+            false,
+        )?;
+    }
+    for path in ux_receipts {
+        push_artifact(
+            root,
+            &mut seen,
+            &mut artifacts,
+            path,
+            "ux-receipt",
+            Some("ux-qa.schema.json"),
+            false,
+        )?;
+    }
+    for path in contract_db_receipts {
+        push_artifact(root, &mut seen, &mut artifacts, path, "contract-db-evidence", None, false)?;
+    }
+    for path in exceptions {
+        push_artifact(root, &mut seen, &mut artifacts, path, "exception-evidence", None, false)?;
+    }
+
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path).then(left.kind.cmp(&right.kind)));
+    Ok(artifacts)
+}
+
+fn push_artifact(
+    root: &Path,
+    seen: &mut BTreeSet<String>,
+    artifacts: &mut Vec<CertificationEvidenceArtifact>,
+    path: &str,
+    kind: &str,
+    schema: Option<&str>,
+    required: bool,
+) -> Result<()> {
+    let key = format!("{kind}:{path}");
+    if !seen.insert(key) {
+        return Ok(());
+    }
+    artifacts.push(certification_artifact(root, path, kind, schema, required)?);
+    Ok(())
+}
+
+fn certification_artifact(
+    root: &Path,
+    rel_path: &str,
+    kind: &str,
+    schema: Option<&str>,
+    required: bool,
+) -> Result<CertificationEvidenceArtifact> {
+    let path = root.join(rel_path);
+    let exists = path.exists();
+    let digest = if exists {
+        Some(file_digest(&path)?)
+    } else {
+        None
+    };
+    let size_bytes = if exists && path.is_file() {
+        Some(
+            fs::metadata(&path)
+                .with_context(|| format!("metadata {}", path.display()))?
+                .len(),
+        )
+    } else {
+        None
+    };
+    let status = if exists {
+        "present"
+    } else if required {
+        "missing-required"
+    } else {
+        "missing-optional"
+    };
+
+    Ok(CertificationEvidenceArtifact {
+        path: rel_path.to_string(),
+        kind: kind.to_string(),
+        schema: schema.map(str::to_string),
+        digest,
+        size_bytes,
+        status: status.to_string(),
+        required,
+    })
+}
+
+fn evidence_summary(
+    artifacts: &[CertificationEvidenceArtifact],
+    attestation_subject_digest: &str,
+) -> EvidenceSummary {
+    let total = artifacts.len() as i32;
+    let present = artifacts
+        .iter()
+        .filter(|artifact| artifact.status == "present")
+        .count() as i32;
+    let missing = total - present;
+    let required_missing = artifacts
+        .iter()
+        .filter(|artifact| artifact.required && artifact.status != "present")
+        .count() as i32;
+
+    EvidenceSummary {
+        total_artifacts: total,
+        present_artifacts: present,
+        missing_artifacts: missing,
+        required_missing_artifacts: required_missing,
+        digest_algorithm: "sha256".to_string(),
+        attestation_subject_digest: attestation_subject_digest.to_string(),
+    }
+}
+
+fn evidence_subject_digest(
+    artifacts: &[CertificationEvidenceArtifact],
+    standard_version: &str,
+    auditor_version: &str,
+    paper_edition: &str,
+    target_stack_id: &str,
+    score: i32,
+    conformance_level: &str,
+) -> String {
+    let mut rows: Vec<String> = artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                artifact.kind,
+                artifact.path,
+                artifact.schema.as_deref().unwrap_or("none"),
+                artifact.digest.as_deref().unwrap_or("missing"),
+                artifact.status,
+                artifact.required
+            )
+        })
+        .collect();
+    rows.sort();
+
+    let mut hasher = Sha256::new();
+    for header in [
+        format!("standard_version={standard_version}"),
+        format!("auditor_version={auditor_version}"),
+        format!("paper_edition={paper_edition}"),
+        format!("target_stack_id={target_stack_id}"),
+        format!("score={score}"),
+        format!("conformance_level={conformance_level}"),
+    ] {
+        hasher.update(header.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    for row in rows {
+        hasher.update(row.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn collect_matching_json<F>(root: &Path, rel_dir: &str, predicate: F) -> Result<Vec<String>>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut paths = Vec::new();
+    let dir = root.join(rel_dir);
+    if !dir.exists() {
+        return Ok(paths);
+    }
+
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if predicate(&file_name) {
+            paths.push(format!("{rel_dir}/{file_name}"));
+        }
+    }
+
+    Ok(dedup(paths))
+}
+
+fn dedup(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+pub fn render_markdown(certification: &Certification) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# jankurai Certification");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- repo: `{}`", certification.repo);
+    let _ = writeln!(out, "- standard version: `{}`", certification.standard_version);
+    let _ = writeln!(out, "- auditor version: `{}`", certification.auditor_version);
+    let _ = writeln!(out, "- paper edition: `{}`", certification.paper_edition);
+    let _ = writeln!(out, "- target stack ID: `{}`", certification.target_stack_id);
+    let _ = writeln!(out, "- score: `{}`", certification.score);
+    let _ = writeln!(out, "- conformance: `{}`", certification.conformance_level);
+    let _ = writeln!(
+        out,
+        "- findings: critical=`{}` high=`{}` medium=`{}` low=`{}`",
+        certification.findings_summary.critical,
+        certification.findings_summary.high,
+        certification.findings_summary.medium,
+        certification.findings_summary.low
+    );
+    let _ = writeln!(
+        out,
+        "- proof receipts: `{}`",
+        certification.proof_receipt_index.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "- security receipts: `{}`",
+        certification.security_receipt_index.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "- ux receipts: `{}`",
+        certification.ux_receipt_index.join(", ")
+    );
+    let _ = writeln!(
+        out,
+        "- contract/db receipts: `{}`",
+        certification.contract_db_receipt_index.join(", ")
+    );
+    let _ = writeln!(out, "- exceptions: `{}`", certification.exceptions.join(", "));
+    let _ = writeln!(out, "- provenance: `{}`", certification.provenance.attestation);
+    let _ = writeln!(
+        out,
+        "- attestation digest: `{}`",
+        certification.provenance.attestation_digest
+    );
+    if let Some(signature) = &certification.provenance.signature {
+        let _ = writeln!(out, "- external signature: `{signature}`");
+    }
+    if let Some(build_url) = &certification.provenance.build_url {
+        let _ = writeln!(out, "- build URL: `{build_url}`");
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Evidence Summary");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "- artifacts: total=`{}` present=`{}` missing=`{}` required_missing=`{}`",
+        certification.evidence_summary.total_artifacts,
+        certification.evidence_summary.present_artifacts,
+        certification.evidence_summary.missing_artifacts,
+        certification.evidence_summary.required_missing_artifacts
+    );
+    let _ = writeln!(
+        out,
+        "- digest algorithm: `{}`",
+        certification.evidence_summary.digest_algorithm
+    );
+    let _ = writeln!(
+        out,
+        "- subject digest: `{}`",
+        certification.evidence_summary.attestation_subject_digest
+    );
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Evidence Artifacts");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| Kind | Path | Status | Digest |");
+    let _ = writeln!(out, "| --- | --- | --- | --- |");
+    for artifact in &certification.evidence_artifacts {
+        let _ = writeln!(
+            out,
+            "| `{}` | `{}` | `{}` | `{}` |",
+            artifact.kind,
+            artifact.path,
+            artifact.status,
+            artifact.digest.as_deref().unwrap_or("missing")
+        );
+    }
+
+    for note in &certification.findings_summary.notes {
+        let _ = writeln!(out, "- note: `{}`", note);
+    }
+
+    out
+}
+
+fn file_digest(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn ci_build_url() -> Option<String> {
+    let server = std::env::var("GITHUB_SERVER_URL").ok()?;
+    let repo = std::env::var("GITHUB_REPOSITORY").ok()?;
+    let run = std::env::var("GITHUB_RUN_ID").ok()?;
+    Some(format!("{server}/{repo}/actions/runs/{run}"))
+}
+
+fn now_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+RS
+
+cat > crates/jankurai/src/commands/publish.rs <<'RS'
+use crate::commands::bench;
+use crate::commands::certify::{self, BuildCertifyOptions, Certification};
+use crate::commands::govern::{self, GovernancePolicy};
+use crate::validation::{self, ArtifactSchema};
+use anyhow::{Context, Result};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone)]
+pub struct PublishArgs {
+    pub repo: PathBuf,
+    pub public_dir: PathBuf,
+    pub out: Option<String>,
+    pub md: Option<String>,
+    pub org: Option<String>,
+    pub signature: Option<String>,
+    pub build_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicationReport {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub repo: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    pub standard_version: String,
+    pub auditor_version: String,
+    pub paper_edition: String,
+    pub target_stack_id: String,
+    pub score: i32,
+    pub conformance_level: String,
+    pub status: String,
+    pub subject_digest: String,
+    pub badge: BadgeSummary,
+    pub artifacts: Vec<PublishedArtifact>,
+    pub public_outputs: Vec<String>,
+    pub governance: PublicationGovernance,
+    pub adoption: PublicationAdoption,
+    pub provenance: PublicationProvenance,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BadgeSummary {
+    pub label: String,
+    pub message: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublishedArtifact {
+    pub path: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub sha256: String,
+    pub size_bytes: i32,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicationGovernance {
+    pub minimum_score: i32,
+    pub fail_on: Vec<String>,
+    pub advisory_on: Vec<String>,
+    pub update_channel: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicationAdoption {
+    pub badge_markdown: String,
+    pub report_path: String,
+    pub ci_artifact_name: String,
+    pub verification_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PublicationProvenance {
+    pub attestation: String,
+    pub subject_digest: String,
+    pub builder: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_url: Option<String>,
+}
+
+pub fn run(args: PublishArgs) -> Result<()> {
+    let suite = bench::build_benchmark_suite(&args.repo)?;
+    validation::validate_serializable(&args.repo, ArtifactSchema::BenchmarkSuite, &suite)?;
+    let benchmark = bench::build_benchmark_report(&args.repo, &suite)?;
+    let certification = certify::build_certification_with_options(
+        &args.repo,
+        BuildCertifyOptions {
+            signature: args.signature.clone(),
+            build_url: args.build_url.clone(),
+            attestation: Some("local-content-addressed-publication".to_string()),
+        },
+    )?;
+    let governance = govern::build_governance_policy(&args.repo)?;
+
+    fs::create_dir_all(&args.public_dir)
+        .with_context(|| format!("create {}", args.public_dir.display()))?;
+
+    let benchmark_json =
+        validated_json(&args.repo, ArtifactSchema::BenchmarkReport, &benchmark)?;
+    let certification_json =
+        validated_json(&args.repo, ArtifactSchema::Certification, &certification)?;
+    let governance_json =
+        validated_json(&args.repo, ArtifactSchema::GovernancePolicy, &governance)?;
+    let badge_svg = render_badge(&certification);
+
+    write_text(&args.public_dir.join("benchmark-report.json"), &benchmark_json)?;
+    write_text(&args.public_dir.join("certification.json"), &certification_json)?;
+    write_text(&args.public_dir.join("governance-policy.json"), &governance_json)?;
+    write_text(&args.public_dir.join("badge.svg"), &badge_svg)?;
+
+    let mut artifacts = vec![
+        artifact_from_text(
+            "benchmark-report.json",
+            "benchmark-report",
+            Some("benchmark-report.schema.json"),
+            &benchmark_json,
+            Some(format!(
+                "passed={} failed={} inconclusive={}",
+                benchmark.summary.passed, benchmark.summary.failed, benchmark.summary.inconclusive
+            )),
+        ),
+        artifact_from_text(
+            "certification.json",
+            "certification",
+            Some("certification.schema.json"),
+            &certification_json,
+            Some(format!(
+                "{} score {}",
+                certification.conformance_level, certification.score
+            )),
+        ),
+        artifact_from_text(
+            "governance-policy.json",
+            "governance-policy",
+            Some("governance-policy.schema.json"),
+            &governance_json,
+            Some(format!(
+                "minimum score {} fail_on {}",
+                governance.minimum_score,
+                governance.fail_on.join(",")
+            )),
+        ),
+        artifact_from_text(
+            "badge.svg",
+            "badge",
+            None,
+            &badge_svg,
+            Some("static public badge".to_string()),
+        ),
+    ];
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+
+    let subject_digest = publication_subject_digest(&[
+        &benchmark_json,
+        &certification_json,
+        &governance_json,
+        &badge_svg,
+    ]);
+    let status = publication_status(&certification, &governance);
+    let build_url = args
+        .build_url
+        .clone()
+        .or_else(|| certification.provenance.build_url.clone())
+        .or_else(ci_build_url);
+    let signature = args
+        .signature
+        .clone()
+        .or_else(|| certification.provenance.signature.clone())
+        .or_else(|| std::env::var("JANKURAI_CERTIFICATION_SIGNATURE").ok());
+
+    let publication = PublicationReport {
+        schema_version: certification.schema_version.clone(),
+        generated_at: now_string(),
+        repo: args.repo.display().to_string(),
+        organization: args.org,
+        standard_version: certification.standard_version.clone(),
+        auditor_version: certification.auditor_version.clone(),
+        paper_edition: certification.paper_edition.clone(),
+        target_stack_id: certification.target_stack_id.clone(),
+        score: certification.score,
+        conformance_level: certification.conformance_level.clone(),
+        status,
+        subject_digest: subject_digest.clone(),
+        badge: BadgeSummary {
+            label: "jankurai".to_string(),
+            message: format!("{} {}", certification.conformance_level, certification.score),
+            path: "badge.svg".to_string(),
+        },
+        artifacts,
+        public_outputs: vec![
+            "publication.json".to_string(),
+            "benchmark-report.json".to_string(),
+            "certification.json".to_string(),
+            "governance-policy.json".to_string(),
+            "badge.svg".to_string(),
+            "README.md".to_string(),
+            "index.html".to_string(),
+            "SHA256SUMS".to_string(),
+        ],
+        governance: PublicationGovernance {
+            minimum_score: governance.minimum_score,
+            fail_on: governance.fail_on.clone(),
+            advisory_on: governance.advisory_on.clone(),
+            update_channel: governance.update_channel.clone(),
+        },
+        adoption: PublicationAdoption {
+            badge_markdown: "![jankurai](badge.svg)".to_string(),
+            report_path: "index.html".to_string(),
+            ci_artifact_name: "jankurai-public-evidence".to_string(),
+            verification_command:
+                "jankurai publish . --public-dir target/jankurai/public --out target/jankurai/p12-publication.json --md target/jankurai/p12-publication.md"
+                    .to_string(),
+        },
+        provenance: PublicationProvenance {
+            attestation: "local-content-addressed-publication".to_string(),
+            subject_digest,
+            builder: "jankurai publish".to_string(),
+            signature,
+            build_url,
+        },
+    };
+
+    validation::validate_serializable(&args.repo, ArtifactSchema::Publication, &publication)?;
+    let publication_json = serde_json::to_string_pretty(&publication)?;
+    write_text(&args.public_dir.join("publication.json"), &publication_json)?;
+
+    if let Some(out) = args.out.as_deref() {
+        validation::write_json(&args.repo, ArtifactSchema::Publication, out, &publication)?;
+    } else {
+        println!("{publication_json}");
+    }
+
+    let markdown = render_public_markdown(&publication);
+    write_text(&args.public_dir.join("README.md"), &markdown)?;
+    if let Some(md) = args.md.as_deref() {
+        crate::render::write_markdown(md, &markdown)?;
+    }
+
+    let html = render_index_html(&publication);
+    write_text(&args.public_dir.join("index.html"), &html)?;
+
+    let sums = render_sha256sums(
+        &args.public_dir,
+        &[
+            "publication.json",
+            "benchmark-report.json",
+            "certification.json",
+            "governance-policy.json",
+            "badge.svg",
+            "README.md",
+            "index.html",
+        ],
+    )?;
+    write_text(&args.public_dir.join("SHA256SUMS"), &sums)?;
+
+    Ok(())
+}
+
+fn validated_json<T: Serialize>(
+    repo: &Path,
+    schema: ArtifactSchema,
+    value: &T,
+) -> Result<String> {
+    validation::validate_serializable(repo, schema, value)?;
+    Ok(serde_json::to_string_pretty(value)?)
+}
+
+fn artifact_from_text(
+    path: &str,
+    kind: &str,
+    schema: Option<&str>,
+    text: &str,
+    summary: Option<String>,
+) -> PublishedArtifact {
+    PublishedArtifact {
+        path: path.to_string(),
+        kind: kind.to_string(),
+        schema: schema.map(str::to_string),
+        sha256: digest_text(text),
+        size_bytes: text.len() as i32,
+        status: "published".to_string(),
+        summary,
+    }
+}
+
+fn publication_status(certification: &Certification, governance: &GovernancePolicy) -> String {
+    if certification.score >= governance.minimum_score
+        && certification.findings_summary.critical == 0
+        && certification.findings_summary.high == 0
+    {
+        "pass".to_string()
+    } else if certification.score > 0 {
+        "advisory".to_string()
+    } else {
+        "fail".to_string()
+    }
+}
+
+fn render_badge(certification: &Certification) -> String {
+    let label = "jankurai";
+    let message = format!("{} {}", certification.conformance_level, certification.score);
+    let width = 148;
+    let left = 70;
+    let right = width - left;
+
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="20" role="img" aria-label="{label}: {message}">
+  <title>{label}: {message}</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <clipPath id="r">
+    <rect width="{width}" height="20" rx="3" fill="#fff"/>
+  </clipPath>
+  <g clip-path="url(#r)">
+    <rect width="{left}" height="20" fill="#555"/>
+    <rect x="{left}" width="{right}" height="20" fill="#2f855a"/>
+    <rect width="{width}" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="110">
+    <text aria-hidden="true" x="350" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="590">{label}</text>
+    <text x="350" y="140" transform="scale(.1)" fill="#fff" textLength="590">{label}</text>
+    <text aria-hidden="true" x="1110" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="610">{message}</text>
+    <text x="1110" y="140" transform="scale(.1)" fill="#fff" textLength="610">{message}</text>
+  </g>
+</svg>
+"##,
+        label = xml_escape(label),
+        message = xml_escape(&message),
+        width = width,
+        left = left,
+        right = right
+    )
+}
+
+fn render_public_markdown(report: &PublicationReport) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "# jankurai Public Evidence");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "![jankurai]({})", report.badge.path);
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- repo: `{}`", report.repo);
+    if let Some(org) = &report.organization {
+        let _ = writeln!(out, "- organization: `{org}`");
+    }
+    let _ = writeln!(out, "- status: `{}`", report.status);
+    let _ = writeln!(out, "- conformance: `{}`", report.conformance_level);
+    let _ = writeln!(out, "- score: `{}`", report.score);
+    let _ = writeln!(out, "- standard: `{}`", report.standard_version);
+    let _ = writeln!(out, "- auditor: `{}`", report.auditor_version);
+    let _ = writeln!(out, "- paper edition: `{}`", report.paper_edition);
+    let _ = writeln!(out, "- target stack: `{}`", report.target_stack_id);
+    let _ = writeln!(out, "- subject digest: `{}`", report.subject_digest);
+    if let Some(signature) = &report.provenance.signature {
+        let _ = writeln!(out, "- external signature: `{signature}`");
+    }
+    if let Some(build_url) = &report.provenance.build_url {
+        let _ = writeln!(out, "- build URL: `{build_url}`");
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Governance");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- minimum score: `{}`", report.governance.minimum_score);
+    let _ = writeln!(out, "- fail on: `{}`", report.governance.fail_on.join(", "));
+    let _ = writeln!(
+        out,
+        "- advisory on: `{}`",
+        report.governance.advisory_on.join(", ")
+    );
+    let _ = writeln!(out, "- update channel: `{}`", report.governance.update_channel);
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Published Artifacts");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "| Kind | Path | SHA-256 | Summary |");
+    let _ = writeln!(out, "| --- | --- | --- | --- |");
+    for artifact in &report.artifacts {
+        let _ = writeln!(
+            out,
+            "| `{}` | `{}` | `{}` | {} |",
+            artifact.kind,
+            artifact.path,
+            artifact.sha256,
+            artifact.summary.as_deref().unwrap_or("")
+        );
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Adoption");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- badge markdown: `{}`", report.adoption.badge_markdown);
+    let _ = writeln!(out, "- report path: `{}`", report.adoption.report_path);
+    let _ = writeln!(
+        out,
+        "- CI artifact name: `{}`",
+        report.adoption.ci_artifact_name
+    );
+    let _ = writeln!(
+        out,
+        "- verification command: `{}`",
+        report.adoption.verification_command
+    );
+
+    out
+}
+
+fn render_index_html(report: &PublicationReport) -> String {
+    let artifacts = report
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            format!(
+                "<tr><td>{}</td><td><a href=\"{}\">{}</a></td><td><code>{}</code></td><td>{}</td></tr>",
+                html_escape(&artifact.kind),
+                html_escape(&artifact.path),
+                html_escape(&artifact.path),
+                html_escape(&artifact.sha256),
+                html_escape(artifact.summary.as_deref().unwrap_or(""))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>jankurai Public Evidence</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {{ font-family: system-ui, sans-serif; margin: 2rem; max-width: 72rem; line-height: 1.45; }}
+    code {{ background: #f4f4f4; padding: .1rem .25rem; border-radius: .25rem; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #ddd; padding: .5rem; text-align: left; vertical-align: top; }}
+    th {{ background: #f7f7f7; }}
+  </style>
+</head>
+<body>
+  <h1>jankurai Public Evidence</h1>
+  <p><img src="badge.svg" alt="jankurai badge"></p>
+  <dl>
+    <dt>Repo</dt><dd><code>{repo}</code></dd>
+    <dt>Status</dt><dd><code>{status}</code></dd>
+    <dt>Conformance</dt><dd><code>{conformance}</code></dd>
+    <dt>Score</dt><dd><code>{score}</code></dd>
+    <dt>Standard</dt><dd><code>{standard}</code></dd>
+    <dt>Auditor</dt><dd><code>{auditor}</code></dd>
+    <dt>Paper edition</dt><dd><code>{paper}</code></dd>
+    <dt>Target stack</dt><dd><code>{target}</code></dd>
+    <dt>Subject digest</dt><dd><code>{digest}</code></dd>
+  </dl>
+  <h2>Artifacts</h2>
+  <table>
+    <thead><tr><th>Kind</th><th>Path</th><th>SHA-256</th><th>Summary</th></tr></thead>
+    <tbody>
+      {artifacts}
+    </tbody>
+  </table>
+  <h2>Verification</h2>
+  <p>Run <code>{verification}</code> from a clean checkout and compare <code>SHA256SUMS</code>.</p>
+</body>
+</html>
+"#,
+        repo = html_escape(&report.repo),
+        status = html_escape(&report.status),
+        conformance = html_escape(&report.conformance_level),
+        score = report.score,
+        standard = html_escape(&report.standard_version),
+        auditor = html_escape(&report.auditor_version),
+        paper = html_escape(&report.paper_edition),
+        target = html_escape(&report.target_stack_id),
+        digest = html_escape(&report.subject_digest),
+        artifacts = artifacts,
+        verification = html_escape(&report.adoption.verification_command)
+    )
+}
+
+fn render_sha256sums(public_dir: &Path, rel_paths: &[&str]) -> Result<String> {
+    let mut out = String::new();
+
+    for rel_path in rel_paths {
+        let path = public_dir.join(rel_path);
+        if path.exists() {
+            let digest = file_digest(&path)?;
+            let hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+            out.push_str(hex);
+            out.push_str("  ");
+            out.push_str(rel_path);
+            out.push('\n');
+        }
+    }
+
+    Ok(out)
+}
+
+fn publication_subject_digest(parts: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update(b"\n--jankurai-publication-boundary--\n");
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn digest_text(text: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn file_digest(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn write_text(path: &Path, content: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn ci_build_url() -> Option<String> {
+    let server = std::env::var("GITHUB_SERVER_URL").ok()?;
+    let repo = std::env::var("GITHUB_REPOSITORY").ok()?;
+    let run = std::env::var("GITHUB_RUN_ID").ok()?;
+    Some(format!("{server}/{repo}/actions/runs/{run}"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn html_escape(value: &str) -> String {
+    xml_escape(value)
+}
+
+fn now_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+RS
+
+cat > crates/jankurai/tests/phase_12_publication_smoke.rs <<'RS'
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use jankurai::validation::{self, ArtifactSchema};
+use tempfile::tempdir;
+
+fn binary_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_jankurai"))
+}
+
+fn run_publish(repo: &Path, public_dir: &Path, json_path: &Path, md_path: &Path) {
+    let status = Command::new(binary_path())
+        .arg("publish")
+        .arg(repo)
+        .arg("--public-dir")
+        .arg(public_dir)
+        .arg("--out")
+        .arg(json_path)
+        .arg("--md")
+        .arg(md_path)
+        .arg("--org")
+        .arg("phase12-smoke")
+        .arg("--build-url")
+        .arg("local://phase12-smoke")
+        .status()
+        .unwrap();
+
+    assert!(status.success(), "publish command failed");
+}
+
+#[test]
+fn publish_command_emits_schema_valid_static_public_evidence_bundle() {
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    let public_dir = out.path().join("public");
+    let json_path = out.path().join("publication.json");
+    let md_path = out.path().join("publication.md");
+
+    run_publish(repo.path(), &public_dir, &json_path, &md_path);
+
+    let publication_text = fs::read_to_string(&json_path).unwrap();
+    let publication: serde_json::Value = serde_json::from_str(&publication_text).unwrap();
+    validation::validate_value(repo.path(), ArtifactSchema::Publication, &publication).unwrap();
+
+    assert_eq!(publication["schema_version"], "1.2.0");
+    assert_eq!(publication["organization"], "phase12-smoke");
+    assert_eq!(publication["badge"]["path"], "badge.svg");
+    assert_eq!(publication["adoption"]["ci_artifact_name"], "jankurai-public-evidence");
+    assert!(publication["subject_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+
+    for rel in [
+        "publication.json",
+        "benchmark-report.json",
+        "certification.json",
+        "governance-policy.json",
+        "badge.svg",
+        "README.md",
+        "index.html",
+        "SHA256SUMS",
+    ] {
+        assert!(
+            public_dir.join(rel).exists(),
+            "expected public output {rel}"
+        );
+    }
+
+    let certification: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(public_dir.join("certification.json")).unwrap())
+            .unwrap();
+    validation::validate_value(repo.path(), ArtifactSchema::Certification, &certification)
+        .unwrap();
+    assert!(certification["evidence_summary"]["attestation_subject_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(
+        certification["provenance"]["attestation"],
+        "local-content-addressed-publication"
+    );
+    assert_eq!(
+        certification["provenance"]["build_url"],
+        "local://phase12-smoke"
+    );
+
+    let badge = fs::read_to_string(public_dir.join("badge.svg")).unwrap();
+    assert!(badge.contains("<svg"));
+    assert!(badge.contains("jankurai"));
+
+    let sums = fs::read_to_string(public_dir.join("SHA256SUMS")).unwrap();
+    assert!(sums.contains("publication.json"));
+    assert!(sums.contains("badge.svg"));
+
+    let md = fs::read_to_string(&md_path).unwrap();
+    assert!(md.starts_with("# jankurai Public Evidence"));
+}
+RS
+
+cat > tips/phases/12-benchmark-certification-governance.md <<'MD'
+# Phase 12: Benchmark Certification And Governance
+
+Status: hardened
+Owner: standard
+Last reviewed: 2026-05-03
+Parallel MCP candidate: yes
+
+## Objective
+
+Prove the Jankurai thesis publicly and make conformance meaningful. This phase builds benchmark corpora, certification artifacts, badges, release attestations, rule governance, and organization-level reporting. The exit state is that "Built with Jankurai" has evidence behind it.
+
+## Current State
+
+Hardened pieces:
+
+- `jankurai bench` emits a schema-valid `BenchmarkReport` with the bundled smoke suite built from `examples/legacy-node-api/` and `examples/perfect-web-api-db/`.
+- `jankurai certify` emits a schema-valid `Certification` artifact tied to the live repo score when present and otherwise falls back to an explicit missing-score state.
+- `jankurai certify` now includes content-addressed evidence artifacts, an evidence summary, an attestation subject digest, optional external signature input, and optional build URL provenance.
+- `jankurai govern` emits a schema-valid `GovernancePolicy` from the standard manifest.
+- `jankurai publish` emits a schema-valid `PublicationReport`, static badge SVG, public Markdown report, static HTML report, published benchmark/certification/governance JSON, and `SHA256SUMS`.
+- The CI workflow builds and uploads the public evidence bundle as the `jankurai-public-evidence` artifact.
+- The outputs validate through `ArtifactSchema` before write or stdout emission.
+
+Explicit non-goal: no mandatory hosted dashboard or network signing service is required. The hardened path is static, content-addressed, CI-publishable evidence. A separate hosted dashboard can consume `publication.json` later without changing Phase 12 semantics.
+
+## Dependencies
+
+Requires phases 01 through 11 to produce enough real surfaces to benchmark.
+
+## Public Interface Changes
+
+Implemented command surface:
+
+```bash
+jankurai bench . \
+  --out target/jankurai/p12-benchmark-report.json \
+  --md target/jankurai/p12-benchmark-report.md
+
+jankurai certify . \
+  --out target/jankurai/p12-certification.json \
+  --md target/jankurai/p12-certification.md \
+  --build-url local://phase12 \
+  --signature sha256-or-release-attestation-reference
+
+jankurai govern . \
+  --out target/jankurai/p12-governance-policy.json \
+  --md target/jankurai/p12-governance-policy.md
+
+jankurai publish . \
+  --public-dir target/jankurai/public \
+  --out target/jankurai/p12-publication.json \
+  --md target/jankurai/p12-publication.md
+````
+
+`--signature` is optional. It accepts an externally produced signature or attestation reference from the release process. Jankurai does not invent a fake private-key signature; it records supplied signature material and always records a local content-addressed attestation digest.
+
+## Contract Slice
+
+`benchmark-suite.schema.json` defines the bundled benchmark corpus.
+
+Minimum fields:
+
+* `schema_version`, `suite_id`, `purpose`
+* `fixtures[]` with `fixture_id`, `path`, `kind`, `expected_findings`, `expected_score_range`
+* `tasks[]` with `task_id`, `description`, `fixture_ids`, `commands`, `expected_metrics`
+
+`benchmark-report.schema.json` defines run output.
+
+Minimum fields:
+
+* `schema_version`, `generated_at`, `suite_id`, `repo`, `target_stack_id`
+* `results[]` with `task_id`, `fixture_id`, `status`, `metrics`, `evidence`
+* `summary`
+
+`certification.schema.json` defines release evidence.
+
+Minimum fields:
+
+* `schema_version`, `generated_at`, `repo`
+* `standard_version`, `auditor_version`, `paper_edition`, `target_stack_id`
+* `score`, `conformance_level`, `caps`
+* `findings_summary`
+* `proof_receipt_index`, `security_receipt_index`, `ux_receipt_index`, `contract_db_receipt_index`
+* `exceptions`
+* `evidence_summary`
+* `evidence_artifacts`
+* `provenance`
+
+`governance-policy.schema.json` defines ratchet policy.
+
+Minimum fields:
+
+* `schema_version`, `standard_version`, `effective_at`
+* `minimum_score`, `fail_on`, `advisory_on`, `update_channel`
+* `rule_change_policy`, `deprecation_policy`, `exception_policy`, `security_advisory_policy`
+* `rfc_path`
+
+`publication.schema.json` defines the public evidence bundle.
+
+Minimum fields:
+
+* `schema_version`, `generated_at`, `repo`
+* `standard_version`, `auditor_version`, `paper_edition`, `target_stack_id`
+* `score`, `conformance_level`, `status`
+* `subject_digest`
+* `badge`
+* `artifacts[]`
+* `public_outputs[]`
+* `governance`
+* `adoption`
+* `provenance`
+
+## Validation
+
+Focused validation:
+
+```bash
+cargo test -p jankurai --test phase_12_publication_smoke
+```
+
+Broad validation:
+
+```bash
+cargo fmt
+cargo test -p jankurai
+just fast
+just score
+```
+
+Phase proof:
+
+```bash
+cargo run -p jankurai -- lane . \
+  --changed crates/jankurai/src/main.rs \
+  --changed crates/jankurai/src/commands.rs \
+  --changed crates/jankurai/src/commands/certify.rs \
+  --changed crates/jankurai/src/commands/publish.rs \
+  --changed crates/jankurai/src/validation.rs \
+  --changed schemas/certification.schema.json \
+  --changed schemas/publication.schema.json \
+  --changed crates/jankurai/tests/phase_12_publication_smoke.rs \
+  --changed .github/workflows/jankurai.yml \
+  --changed docs/artifact-contracts.md \
+  --changed tips/phases/12-benchmark-certification-governance.md \
+  --out target/jankurai/p12-publication-lane.json \
+  --md target/jankurai/p12-publication-lane.md
+```
+
+## Closeout Artifacts
+
+Expected artifacts:
+
+* `target/jankurai/p12-benchmark-report.json`
+* `target/jankurai/p12-benchmark-report.md`
+* `target/jankurai/p12-certification.json`
+* `target/jankurai/p12-certification.md`
+* `target/jankurai/p12-governance-policy.json`
+* `target/jankurai/p12-governance-policy.md`
+* `target/jankurai/p12-publication.json`
+* `target/jankurai/p12-publication.md`
+* `target/jankurai/public/publication.json`
+* `target/jankurai/public/benchmark-report.json`
+* `target/jankurai/public/certification.json`
+* `target/jankurai/public/governance-policy.json`
+* `target/jankurai/public/badge.svg`
+* `target/jankurai/public/README.md`
+* `target/jankurai/public/index.html`
+* `target/jankurai/public/SHA256SUMS`
+* `target/jankurai/p12-publication-lane.json`
+* `target/jankurai/p12-publication-lane.md`
+* `target/jankurai/fast-score.json`
+* `target/jankurai/fast-score.md`
+* `agent/repo-score.json`
+* `agent/repo-score.md`
+
+Residual risk:
+
+* Hosted dashboards remain optional consumers of `publication.json`.
+* External signatures remain supplied by release infrastructure rather than fabricated locally.
+* Public Pages deployment can be enabled by maintainers, but Phase 12 does not require a network-hosted service to be complete.
+  MD
+
+cat > .github/workflows/jankurai.yml <<'YAML'
+name: jankurai
+
+on:
+pull_request:
+push:
+branches: [main]
+
+permissions:
+contents: read
+
+jobs:
+audit:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: dtolnay/rust-toolchain@stable
+
+```
+  - name: Check audit versions
+    run: cargo run -p jankurai -- versions
+
+  - name: jankurai audit
+    run: |
+      cargo run -p jankurai -- audit . \
+        --mode ratchet \
+        --json agent/repo-score.json \
+        --md agent/repo-score.md \
+        --sarif target/jankurai/jankurai.sarif \
+        --github-step-summary target/jankurai/summary.md \
+        --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+
+  - name: Publish jankurai summary
+    run: cat target/jankurai/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+  - name: Security lane
+    run: |
+      cargo run -p jankurai -- security run . \
+        --out target/jankurai/security/evidence.json
+
+  - uses: actions/upload-artifact@v4
+    with:
+      name: jankurai-score
+      path: |
+        agent/repo-score.json
+        agent/repo-score.md
+        target/jankurai/jankurai.sarif
+        target/jankurai/repair-queue.jsonl
+        target/jankurai/security/evidence.json
+```
+
+phase12-public-evidence:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: dtolnay/rust-toolchain@stable
+
+```
+  - name: Build current score for certification
+    run: |
+      cargo run -p jankurai -- audit . \
+        --mode ratchet \
+        --json agent/repo-score.json \
+        --md agent/repo-score.md
+
+  - name: Build Phase 12 public evidence bundle
+    env:
+      JANKURAI_CERTIFICATION_BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    run: |
+      cargo run -p jankurai -- bench . \
+        --out target/jankurai/p12-benchmark-report.json \
+        --md target/jankurai/p12-benchmark-report.md
+
+      cargo run -p jankurai -- certify . \
+        --out target/jankurai/p12-certification.json \
+        --md target/jankurai/p12-certification.md \
+        --build-url "${JANKURAI_CERTIFICATION_BUILD_URL}"
+
+      cargo run -p jankurai -- govern . \
+        --out target/jankurai/p12-governance-policy.json \
+        --md target/jankurai/p12-governance-policy.md
+
+      cargo run -p jankurai -- publish . \
+        --public-dir target/jankurai/public \
+        --out target/jankurai/p12-publication.json \
+        --md target/jankurai/p12-publication.md \
+        --org "${{ github.repository_owner }}" \
+        --build-url "${JANKURAI_CERTIFICATION_BUILD_URL}"
+
+  - uses: actions/upload-artifact@v4
+    with:
+      name: jankurai-public-evidence
+      path: |
+        target/jankurai/p12-benchmark-report.json
+        target/jankurai/p12-benchmark-report.md
+        target/jankurai/p12-certification.json
+        target/jankurai/p12-certification.md
+        target/jankurai/p12-governance-policy.json
+        target/jankurai/p12-governance-policy.md
+        target/jankurai/p12-publication.json
+        target/jankurai/p12-publication.md
+        target/jankurai/public/
+```
+
+ux-qa:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: actions/setup-node@v4
+with:
+node-version: "22"
+cache: npm
+- run: npm ci
+- run: npm --workspace @jankurai/ux-qa run build
+- run: npm --workspace @jankurai/ux-qa run test
+
+paper:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- name: Build paper
+run: latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=paper paper/jankurai.tex
+YAML
+
+cargo fmt
+
+cargo test -p jankurai --test phase_12_publication_smoke
+cargo test -p jankurai
+
+cargo run -p jankurai -- bench . 
+--out target/jankurai/p12-benchmark-report.json 
+--md target/jankurai/p12-benchmark-report.md
+
+cargo run -p jankurai -- certify . 
+--out target/jankurai/p12-certification.json 
+--md target/jankurai/p12-certification.md 
+--build-url local://phase12
+
+cargo run -p jankurai -- govern . 
+--out target/jankurai/p12-governance-policy.json 
+--md target/jankurai/p12-governance-policy.md
+
+cargo run -p jankurai -- publish . 
+--public-dir target/jankurai/public 
+--out target/jankurai/p12-publication.json 
+--md target/jankurai/p12-publication.md 
+--org jankurai-local 
+--build-url local://phase12
+
+cargo run -p jankurai -- lane . 
+--changed crates/jankurai/src/main.rs 
+--changed crates/jankurai/src/commands.rs 
+--changed crates/jankurai/src/commands/certify.rs 
+--changed crates/jankurai/src/commands/publish.rs 
+--changed crates/jankurai/src/validation.rs 
+--changed schemas/certification.schema.json 
+--changed schemas/publication.schema.json 
+--changed crates/jankurai/tests/phase_12_publication_smoke.rs 
+--changed .github/workflows/jankurai.yml 
+--changed docs/artifact-contracts.md 
+--changed tips/phases/12-benchmark-certification-governance.md 
+--out target/jankurai/p12-publication-lane.json 
+--md target/jankurai/p12-publication-lane.md
+
+just fast
+just score
+
+FINISH_TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+FINISH_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+
+printf '%s | gpt-5.5-pro | 12 | finish | crates/jankurai/src/main.rs;crates/jankurai/src/commands.rs;crates/jankurai/src/commands/certify.rs;crates/jankurai/src/commands/publish.rs;crates/jankurai/src/validation.rs;schemas/certification.schema.json;schemas/publication.schema.json;crates/jankurai/tests/phase_12_publication_smoke.rs;.github/workflows/jankurai.yml;docs/artifact-contracts.md;tips/phases/00-phase-index.md;tips/phases/12-benchmark-certification-governance.md;tips/phases/logs/12-benchmark-certification-governance.log | cargo fmt;cargo test -p jankurai --test phase_12_publication_smoke;cargo test -p jankurai;cargo run -p jankurai -- bench . --out target/jankurai/p12-benchmark-report.json --md target/jankurai/p12-benchmark-report.md;cargo run -p jankurai -- certify . --out target/jankurai/p12-certification.json --md target/jankurai/p12-certification.md --build-url local://phase12;cargo run -p jankurai -- govern . --out target/jankurai/p12-governance-policy.json --md target/jankurai/p12-governance-policy.md;cargo run -p jankurai -- publish . --public-dir target/jankurai/public --out target/jankurai/p12-publication.json --md target/jankurai/p12-publication.md --org jankurai-local --build-url local://phase12;cargo run -p jankurai -- lane . --changed crates/jankurai/src/main.rs --changed crates/jankurai/src/commands.rs --changed crates/jankurai/src/commands/certify.rs --changed crates/jankurai/src/commands/publish.rs --changed crates/jankurai/src/validation.rs --changed schemas/certification.schema.json --changed schemas/publication.schema.json --changed crates/jankurai/tests/phase_12_publication_smoke.rs --changed .github/workflows/jankurai.yml --changed docs/artifact-contracts.md --changed tips/phases/12-benchmark-certification-governance.md --out target/jankurai/p12-publication-lane.json --md target/jankurai/p12-publication-lane.md;just fast;just score | target/jankurai/p12-benchmark-report.json;target/jankurai/p12-benchmark-report.md;target/jankurai/p12-certification.json;target/jankurai/p12-certification.md;target/jankurai/p12-governance-policy.json;target/jankurai/p12-governance-policy.md;target/jankurai/p12-publication.json;target/jankurai/p12-publication.md;target/jankurai/public/publication.json;target/jankurai/public/benchmark-report.json;target/jankurai/public/certification.json;target/jankurai/public/governance-policy.json;target/jankurai/public/badge.svg;target/jankurai/public/README.md;target/jankurai/public/index.html;target/jankurai/public/SHA256SUMS;target/jankurai/p12-publication-lane.json;target/jankurai/p12-publication-lane.md;target/jankurai/fast-score.json;target/jankurai/fast-score.md;agent/repo-score.json;agent/repo-score.md | %s | hosted dashboard remains optional; external private-key signing is supported by supplied signature/reference, not fabricated by the CLI\n' "$FINISH_TS" "$FINISH_SHA" >> "$PHASE_LOG"
+
+echo "Phase 12 hardened. Inspect target/jankurai/public/index.html and target/jankurai/public/badge.svg."
+
+```
+
+What this finishes:
+
+It converts Phase 12 from “local evidence only” into a static, CI-publishable evidence product. The new `jankurai publish` command produces `publication.json`, `badge.svg`, `index.html`, `README.md`, and `SHA256SUMS`, while `certify` now carries content-addressed evidence inventory and optional real external signature/build provenance. The dashboard remains a consumer, not a dependency, which keeps the moonshot loop local, inspectable, and agent-safe.
+::contentReference[oaicite:4]{index=4}
+```
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/12-benchmark-certification-governance.md "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/00-phase-index.md "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/release-plan.md "raw.githubusercontent.com"
+

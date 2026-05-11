@@ -1,0 +1,2209 @@
+
+# Tuiwright: a Playwright-class Rust TUI tester
+
+> Working name: **Tuiwright**. The name is intentionally descriptive: a Playwright-like tool for terminal user interfaces. The design below is meant to be copied into a repository as a serious starting point, not just a concept sketch.
+
+## 0. What this tool is
+
+Tuiwright is a **black-box, PTY-backed test runner for Rust TUIs**. It runs the real application in a real pseudo-terminal, drives keyboard/mouse/paste/resize input, watches the terminal byte stream, builds a live terminal screen model, and emits artifacts that are useful in code review and CI:
+
+- deterministic text snapshots;
+- high-resolution PNG screenshots rendered from the terminal model;
+- animated GIF recordings suitable for web/README/CI artifacts;
+- Playwright-style locators and waits such as `get_by_text("Save").click()`;
+- traces containing input actions, output chunks, screenshots, failures, timing, and process metadata;
+- an optional web report viewer.
+
+The key design choice is that tests should observe **the same protocol a terminal emulator observes**, instead of calling widget internals. This makes the tester useful for Ratatui, Crossterm, Termion, ANSI output programs, shell TUIs, REPLs, prompts, progress renderers, and full-screen apps.
+
+## 1. Why this is needed
+
+Ratatui already has a `TestBackend` intended for integration tests of terminal UIs, and Ratatui’s documentation also describes snapshot testing with `insta`. That is useful, but it is not the same as launching the actual compiled binary under a terminal, typing into it, resizing it, clicking inside it, validating input modes, recording artifacts, and debugging behavior over time. Playwright’s value is not merely “assert this DOM node exists”; it is orchestration, waiting, user actions, artifact capture, visual checks, reports, and traceability. Tuiwright brings that shape to terminal software.
+
+## 2. Product goals
+
+### Non-negotiable goals
+
+1. **Real user driving**: run the actual binary under a PTY, not a fake widget backend.
+2. **Playwright-like ergonomics**: sessions, locators, actions, waits, expectations, screenshots, recordings, traces.
+3. **Rust-first and Rust-core**: the driver, emulator, renderer, recorder, diffing, and CLI are Rust. Optional Vite/TypeScript can be used only for a static report UI.
+4. **Deterministic visual output**: screenshots are rendered by a pinned terminal renderer: terminal size, theme, cell size, cursor policy, and font policy are fixed in CI.
+5. **TUI-framework agnostic**: works with Ratatui, Crossterm, Termion, TUIs written in other languages, shell scripts, prompts, and REPLs.
+6. **CI-safe artifacts**: text snapshots, PNG screenshots, GIFs, JSONL traces, and HTML reports must be self-contained and stable.
+7. **Good failure UX**: on failure, show last screen text, attach screenshot/GIF/trace, and generate a small human-readable report.
+8. **Fast enough for normal test suites**: default polling and sampling should be efficient; high-fidelity recordings can be opt-in.
+
+### Explicitly scoped reality
+
+A terminal emulator’s pixels depend on fonts, ligatures, emoji fallback, color profile, antialiasing, and platform rendering. Tuiwright should not claim pixel identity with every user’s terminal. It should provide **terminal-equivalent, high-resolution, deterministic screenshots** from a pinned renderer. In other words: the terminal state and escape protocol are real; the screenshot renderer is intentionally stable and repeatable.
+
+## 3. Architecture
+
+```text
+┌──────────────────────────────────────────────────────────────────────┐
+│ Test code                                                             │
+│  #[test] fn flow() { session.get_by_text("Save").click()?; ... }      │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │ Playwright-like API
+┌──────────────────────▼───────────────────────────────────────────────┐
+│ Tuiwright session                                                     │
+│  - spawn/kill/resize                                                   │
+│  - keyboard/mouse/paste                                                │
+│  - waits/locators/expectations                                         │
+│  - screenshots/recordings/traces                                       │
+└───────────────┬──────────────────────────────┬───────────────────────┘
+                │                              │
+        input bytes                     output bytes
+                │                              │
+┌───────────────▼──────────────┐  ┌────────────▼───────────────────────┐
+│ PTY master                    │  │ reader thread                      │
+│ portable-pty / ConPTY / Unix   │  │  - timestamps chunks               │
+│ sends encoded input            │  │  - feeds vt100 parser              │
+└───────────────┬──────────────┘  └────────────┬───────────────────────┘
+                │                              │
+┌───────────────▼──────────────────────────────▼───────────────────────┐
+│ Real app process running as if inside a terminal                      │
+└──────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────┐
+│ Terminal model                                                        │
+│ vt100 parser screen: cells, colors, attributes, cursor, mouse modes,  │
+│ bracketed paste, alternate screen, scrollback                         │
+└───────────────┬──────────────────────────────────────────────────────┘
+                │
+┌───────────────▼──────────────────────────────────────────────────────┐
+│ Artifact layer                                                        │
+│ text snapshot | PNG renderer | GIF encoder | trace JSONL | HTML report│
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+## 4. Crate layout
+
+```text
+tuiwright/
+  Cargo.toml
+  crates/
+    tuiwright/                # Rust library used by tests
+      src/
+        lib.rs
+        config.rs
+        keys.rs
+        locator.rs
+        render.rs
+        record.rs
+        session.rs
+        assertions.rs
+        trace.rs
+    tuiwright-cli/            # CLI for screenshots, recordings, report generation
+      src/main.rs
+  examples/
+    demo-tui/                 # Crossterm demo target for smoke testing
+      src/main.rs
+  crates/tuiwright/tests/
+    smoke.rs
+  report-ui/                  # Optional Vite static trace viewer
+    package.json
+    index.html
+    src/main.ts
+    src/style.css
+```
+
+## 5. User-facing Rust API
+
+The intended API should feel like this:
+
+```rust
+use std::time::Duration;
+use tuiwright::{Key, RecordingOptions, SpawnConfig, TuiSession};
+
+#[test]
+fn onboarding_flow() -> anyhow::Result<()> {
+    let app = TuiSession::spawn(
+        SpawnConfig::new("cargo")
+            .arg("run")
+            .arg("-q")
+            .arg("--bin")
+            .arg("my-tui")
+            .size(100, 32)
+            .trace_path("target/tuiwright/onboarding.trace.jsonl"),
+    )?;
+
+    app.wait_for_text("Welcome", Duration::from_secs(5))?;
+    app.type_text("alice")?;
+    app.press(Key::Enter)?;
+    app.get_by_text("Create project").click()?;
+    app.wait_for_text("Project name", Duration::from_secs(2))?;
+    app.paste("terminal-test")?;
+    app.press(Key::Enter)?;
+
+    app.screenshot("target/tuiwright/onboarding-final.png")?;
+    app.assert_text_snapshot("tests/snapshots/onboarding.txt")?;
+
+    Ok(())
+}
+```
+
+Recording a flow should be just as simple:
+
+```rust
+app.record_gif_during(
+    "target/tuiwright/onboarding.gif",
+    RecordingOptions::web_compressed_12fps(),
+    |tui| {
+        tui.wait_for_text("Welcome", Duration::from_secs(5))?;
+        tui.type_text("alice")?;
+        tui.press(Key::Enter)?;
+        tui.get_by_text("Create project").click()?;
+        Ok(())
+    },
+)?;
+```
+
+## 6. Selector model
+
+Tuiwright should start with robust terminal-native selectors and later grow semantic selectors:
+
+| Selector | Meaning | Status |
+|---|---|---|
+| `get_by_text("Save")` | first visible occurrence of text | MVP |
+| `get_by_regex(r"\bSave\b")` | regex over visible screen text | MVP |
+| `cell(row, col)` | exact cell position | MVP |
+| `region(top, left, bottom, right)` | rectangular terminal region | MVP |
+| `get_by_line_prefix("Name:")` | find labels/prompts | Phase 2 |
+| `get_by_ansi_attr(...)` | color/style based selectors | Phase 2 |
+| accessibility/semantic hints | app emits OSC metadata or sidecar JSON | Phase 3 |
+
+The optional semantic-hint protocol is important for future power. A Rust TUI could emit invisible OSC 1337-like metadata naming regions, roles, and labels. The black-box fallback remains text/cell based, but apps that opt in can get web-like semantics:
+
+```text
+OSC 777 ; tuiwright={"role":"button","name":"Save","rect":[10,4,18,4]} BEL
+```
+
+## 7. Synchronization model
+
+Like Playwright, the core problem is waiting. TUIs animate, redraw, debounce, and spawn subprocesses. Tuiwright should support:
+
+- `wait_for_text` / `wait_for_regex`;
+- `wait_until_idle(Duration)` based on no PTY output for a quiescence window;
+- `expect_screen().to_contain(...)`;
+- `expect_locator(...).to_be_visible()`;
+- `expect_screen().to_match_snapshot(...)`;
+- action auto-waiting, such as clicking a locator only after it exists;
+- global and per-action timeouts;
+- on-timeout artifact capture.
+
+## 8. Input model
+
+Keyboard input should be encoded as bytes sent to the PTY master:
+
+- normal text as UTF-8;
+- `Enter` as `\r`;
+- `Backspace` as `0x7f`;
+- arrows as normal or application-cursor mode depending on terminal mode;
+- bracketed paste wrapping when the app has enabled it;
+- mouse clicks as SGR mouse protocol events;
+- resize through PTY window-size APIs plus parser resize.
+
+Mouse support should eventually negotiate these modes from the terminal parser:
+
+- X10 mouse;
+- normal button tracking;
+- button-event tracking;
+- any-event tracking;
+- SGR 1006 encoding;
+- alternate scroll mode.
+
+The reference implementation below sends SGR mouse sequences because modern Crossterm/Ratatui stacks commonly support them.
+
+## 9. Screenshot model
+
+The screenshot pipeline should be:
+
+1. lock the current terminal screen model;
+2. clone the visible `vt100::Screen`;
+3. render every terminal cell into a fixed-size pixel grid;
+4. map ANSI 16/256/RGB colors into a deterministic theme;
+5. draw backgrounds, text, box drawing, block elements, underline, inverse, dim/bold, and cursor;
+6. save PNG;
+7. trace the artifact path and a content hash.
+
+The reference renderer uses a built-in bitmap font and special drawing for box/block characters. A production renderer should add optional system-font rendering using `fontdb` + `ab_glyph`, with CI recommending an explicit font path. Do **not** bundle or redistribute proprietary fonts.
+
+## 10. Recording model
+
+Recording should have two modes:
+
+1. **Artifact recording**: sample screenshots at `N` FPS while the flow runs, then encode GIF.
+2. **Trace replay**: store raw PTY output chunks and input actions, then replay into a renderer later to regenerate frames at arbitrary FPS.
+
+The MVP below implements artifact recording. The ideal v1 should implement both. Trace replay enables “record once, render many” and lets report UIs scrub through states without bloating test runtime.
+
+GIF encoders:
+
+- default permissive compatibility encoder: Rust `gif` crate;
+- optional web-compressed encoder: Rust `gifski` crate behind a `web-gif` feature. Note: `gifski` is AGPL-licensed, so keeping it optional prevents unintentionally changing the license posture of the core crate.
+
+## 11. Failure UX
+
+On failure, the framework should produce:
+
+```text
+TuiwrightError: timed out after 5s waiting for text "Project name"
+
+Last visible screen:
+┌────────────────────────────────────────┐
+│ Welcome                                │
+│ > Create project                       │
+│   Open project                         │
+└────────────────────────────────────────┘
+
+Artifacts:
+  screenshot: target/tuiwright/failures/onboarding-timeout.png
+  recording:  target/tuiwright/failures/onboarding-timeout.gif
+  trace:      target/tuiwright/onboarding.trace.jsonl
+```
+
+## 12. CI recommendations
+
+Use a fixed terminal size, fixed theme, fixed `TERM`, and deterministic app settings:
+
+```bash
+export TERM=xterm-256color
+export COLORTERM=truecolor
+export NO_COLOR=0
+export RUST_BACKTRACE=1
+export TUIWRIGHT_UPDATE=0
+cargo test --workspace
+```
+
+On CI failure, upload `target/tuiwright/**` as artifacts.
+
+## 13. Roadmap
+
+### Phase 1: MVP
+
+- Spawn apps in PTY.
+- Drive keyboard/text/paste/mouse/resize.
+- Parse terminal output.
+- Wait for text/regex/idle.
+- Generate PNG screenshots.
+- Generate GIF recordings.
+- Text snapshots.
+- JSONL traces.
+- CLI screenshot/record/report.
+
+### Phase 2: serious testing framework
+
+- Procedural macro `#[tuiwright::test]` that auto-attaches artifacts on failure.
+- Visual diff with threshold, mask regions, and anti-alias tolerance.
+- Trace replay renderer.
+- Scrollback capture.
+- Rich HTML report with timeline and screen scrubber.
+- Better Unicode rendering: grapheme clusters, emoji fallback, CJK width policy.
+- Full mouse-protocol negotiation.
+
+### Phase 3: ecosystem-grade
+
+- Semantic locator protocol for Rust TUI libraries.
+- Ratatui helper crate for optional role/name/rect metadata.
+- Fuzzing harness for random key/mouse actions.
+- Deterministic clock hooks for apps that opt in.
+- “Codegen” recorder that watches a manual session and emits a Rust test.
+- VS Code extension to open traces/screenshots inline.
+
+## 14. Copy/paste reference implementation
+
+The following single Bash script writes a complete workspace. It includes the Rust library, CLI, demo TUI, smoke test, and optional Vite report UI. Copy it into an empty directory as `bootstrap-tuiwright.sh`, run it, then run `cargo test`.
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p crates/tuiwright/src crates/tuiwright/tests crates/tuiwright-cli/src examples/demo-tui/src report-ui/src
+
+cat > Cargo.toml <<'EOF'
+[workspace]
+members = [
+  "crates/tuiwright",
+  "crates/tuiwright-cli",
+  "examples/demo-tui",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/tuiwright"
+rust-version = "1.76"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+font8x8 = "0.3"
+gif = "0.13"
+gifski = "1.34"
+image = { version = "0.25", default-features = false, features = ["png"] }
+portable-pty = "0.9"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+similar = "2"
+thiserror = "2"
+unicode-width = "0.2"
+vt100 = "0.16"
+sha2 = "0.10"
+tempfile = "3"
+crossterm = "0.29"
+EOF
+
+cat > crates/tuiwright/Cargo.toml <<'EOF'
+[package]
+name = "tuiwright"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+web-gif = ["dep:gifski"]
+
+[dependencies]
+anyhow.workspace = true
+font8x8.workspace = true
+gif.workspace = true
+gifski = { workspace = true, optional = true }
+image.workspace = true
+portable-pty.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+unicode-width.workspace = true
+vt100.workspace = true
+EOF
+
+cat > crates/tuiwright/src/lib.rs <<'EOF'
+//! Tuiwright: Playwright-style black-box testing for terminal UIs.
+//!
+//! Core principles:
+//! - run the real app in a real PTY;
+//! - parse terminal output into an in-memory screen;
+//! - drive keyboard/mouse/paste/resize using terminal byte protocols;
+//! - create deterministic screenshots, recordings, snapshots, and traces.
+
+pub mod assertions;
+pub mod config;
+pub mod keys;
+pub mod locator;
+pub mod record;
+pub mod render;
+pub mod session;
+pub mod trace;
+
+pub use assertions::*;
+pub use config::*;
+pub use keys::*;
+pub use locator::*;
+pub use record::*;
+pub use render::*;
+pub use session::*;
+pub use trace::*;
+EOF
+
+cat > crates/tuiwright/src/config.rs <<'EOF'
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// Terminal dimensions and pixel metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width: u16,
+    pub cell_height: u16,
+}
+
+impl Default for TerminalSize {
+    fn default() -> Self {
+        Self {
+            cols: 80,
+            rows: 24,
+            cell_width: 12,
+            cell_height: 20,
+        }
+    }
+}
+
+impl TerminalSize {
+    pub fn new(cols: u16, rows: u16) -> Self {
+        Self { cols, rows, ..Self::default() }
+    }
+
+    pub fn with_cell_pixels(mut self, cell_width: u16, cell_height: u16) -> Self {
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self
+    }
+}
+
+/// Spawn configuration for a TUI process.
+#[derive(Debug, Clone)]
+pub struct SpawnConfig {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+    pub size: TerminalSize,
+    pub scrollback: usize,
+    pub trace_path: Option<PathBuf>,
+    pub deterministic_env: bool,
+}
+
+impl SpawnConfig {
+    pub fn new(program: impl Into<String>) -> Self {
+        Self {
+            program: program.into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            size: TerminalSize::default(),
+            scrollback: 10_000,
+            trace_path: None,
+            deterministic_env: true,
+        }
+    }
+
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for arg in args {
+            self.args.push(arg.into());
+        }
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn cwd(mut self, path: impl AsRef<Path>) -> Self {
+        self.cwd = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn size(mut self, cols: u16, rows: u16) -> Self {
+        self.size.cols = cols;
+        self.size.rows = rows;
+        self
+    }
+
+    pub fn cell_pixels(mut self, width: u16, height: u16) -> Self {
+        self.size.cell_width = width;
+        self.size.cell_height = height;
+        self
+    }
+
+    pub fn scrollback(mut self, rows: usize) -> Self {
+        self.scrollback = rows;
+        self
+    }
+
+    pub fn trace_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.trace_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    pub fn deterministic_env(mut self, enabled: bool) -> Self {
+        self.deterministic_env = enabled;
+        self
+    }
+}
+EOF
+
+cat > crates/tuiwright/src/keys.rs <<'EOF'
+/// Keys that can be sent to the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Esc,
+    Tab,
+    Backspace,
+    Delete,
+    Insert,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    F(u8),
+    Ctrl(char),
+    Alt(char),
+}
+
+impl Key {
+    pub fn encode(self, application_cursor: bool) -> Vec<u8> {
+        match self {
+            Key::Char(c) => c.to_string().into_bytes(),
+            Key::Enter => b"\r".to_vec(),
+            Key::Esc => b"\x1b".to_vec(),
+            Key::Tab => b"\t".to_vec(),
+            Key::Backspace => vec![0x7f],
+            Key::Delete => b"\x1b[3~".to_vec(),
+            Key::Insert => b"\x1b[2~".to_vec(),
+            Key::Up => if application_cursor { b"\x1bOA" } else { b"\x1b[A" }.to_vec(),
+            Key::Down => if application_cursor { b"\x1bOB" } else { b"\x1b[B" }.to_vec(),
+            Key::Right => if application_cursor { b"\x1bOC" } else { b"\x1b[C" }.to_vec(),
+            Key::Left => if application_cursor { b"\x1bOD" } else { b"\x1b[D" }.to_vec(),
+            Key::Home => b"\x1b[H".to_vec(),
+            Key::End => b"\x1b[F".to_vec(),
+            Key::PageUp => b"\x1b[5~".to_vec(),
+            Key::PageDown => b"\x1b[6~".to_vec(),
+            Key::F(n) => match n {
+                1 => b"\x1bOP".to_vec(),
+                2 => b"\x1bOQ".to_vec(),
+                3 => b"\x1bOR".to_vec(),
+                4 => b"\x1bOS".to_vec(),
+                5 => b"\x1b[15~".to_vec(),
+                6 => b"\x1b[17~".to_vec(),
+                7 => b"\x1b[18~".to_vec(),
+                8 => b"\x1b[19~".to_vec(),
+                9 => b"\x1b[20~".to_vec(),
+                10 => b"\x1b[21~".to_vec(),
+                11 => b"\x1b[23~".to_vec(),
+                12 => b"\x1b[24~".to_vec(),
+                _ => Vec::new(),
+            },
+            Key::Ctrl(c) => {
+                let c = c.to_ascii_uppercase() as u8;
+                vec![c & 0x1f]
+            }
+            Key::Alt(c) => {
+                let mut out = vec![0x1b];
+                out.extend(c.to_string().as_bytes());
+                out
+            }
+        }
+    }
+}
+EOF
+
+cat > crates/tuiwright/src/trace.rs <<'EOF'
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub ts_ms: u128,
+    pub kind: String,
+    pub data: Value,
+}
+
+#[derive(Clone)]
+pub struct TraceWriter {
+    file: Arc<Mutex<File>>,
+    start: Instant,
+}
+
+impl TraceWriter {
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        if let Some(parent) = path.as_ref().parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating trace dir {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path.as_ref())
+            .with_context(|| format!("opening trace {}", path.as_ref().display()))?;
+        Ok(Self { file: Arc::new(Mutex::new(file)), start: Instant::now() })
+    }
+
+    pub fn event(&self, kind: impl Into<String>, data: Value) -> Result<()> {
+        let event = TraceEvent {
+            ts_ms: self.start.elapsed().as_millis(),
+            kind: kind.into(),
+            data,
+        };
+        let line = serde_json::to_string(&event)?;
+        let mut file = self.file.lock().expect("trace mutex poisoned");
+        writeln!(file, "{line}")?;
+        file.flush()?;
+        Ok(())
+    }
+}
+EOF
+
+cat > crates/tuiwright/src/render.rs <<'EOF'
+use anyhow::Result;
+use font8x8::UnicodeFonts;
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+use serde::{Deserialize, Serialize};
+use std::cmp::{max, min};
+use std::io::Cursor;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderOptions {
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub draw_cursor: bool,
+    pub trim_trailing_empty_rows: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            cell_width: 16,
+            cell_height: 28,
+            draw_cursor: true,
+            trim_trailing_empty_rows: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Theme {
+    pub default_fg: Rgba<u8>,
+    pub default_bg: Rgba<u8>,
+    pub indexed: [Rgba<u8>; 16],
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            default_fg: Rgba([0xd8, 0xde, 0xe9, 0xff]),
+            default_bg: Rgba([0x1f, 0x23, 0x2a, 0xff]),
+            indexed: [
+                Rgba([0x1f, 0x23, 0x2a, 0xff]),
+                Rgba([0xbf, 0x61, 0x6a, 0xff]),
+                Rgba([0xa3, 0xbe, 0x8c, 0xff]),
+                Rgba([0xeb, 0xcb, 0x8b, 0xff]),
+                Rgba([0x81, 0xa1, 0xc1, 0xff]),
+                Rgba([0xb4, 0x8e, 0xad, 0xff]),
+                Rgba([0x88, 0xc0, 0xd0, 0xff]),
+                Rgba([0xe5, 0xe9, 0xf0, 0xff]),
+                Rgba([0x4c, 0x56, 0x6a, 0xff]),
+                Rgba([0xbf, 0x61, 0x6a, 0xff]),
+                Rgba([0xa3, 0xbe, 0x8c, 0xff]),
+                Rgba([0xeb, 0xcb, 0x8b, 0xff]),
+                Rgba([0x81, 0xa1, 0xc1, 0xff]),
+                Rgba([0xb4, 0x8e, 0xad, 0xff]),
+                Rgba([0x8f, 0xbc, 0xbb, 0xff]),
+                Rgba([0xff, 0xff, 0xff, 0xff]),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalRenderer {
+    pub options: RenderOptions,
+    pub theme: Theme,
+}
+
+impl TerminalRenderer {
+    pub fn new(options: RenderOptions) -> Self {
+        Self { options, theme: Theme::default() }
+    }
+
+    pub fn render_screen(&self, screen: &vt100::Screen) -> RgbaImage {
+        let (rows, cols) = screen.size();
+        let rows = if self.options.trim_trailing_empty_rows {
+            self.visible_rows(screen, rows, cols)
+        } else {
+            rows
+        };
+
+        let width = cols as u32 * self.options.cell_width;
+        let height = rows as u32 * self.options.cell_height;
+        let mut img = RgbaImage::from_pixel(width.max(1), height.max(1), self.theme.default_bg);
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else { continue; };
+                if cell.is_wide_continuation() {
+                    continue;
+                }
+                let mut fg = self.color(cell.fgcolor(), true);
+                let mut bg = self.color(cell.bgcolor(), false);
+                if cell.inverse() {
+                    std::mem::swap(&mut fg, &mut bg);
+                }
+                if cell.dim() {
+                    fg = scale_color(fg, 0.55);
+                }
+                if cell.bold() {
+                    fg = brighten(fg, 1.15);
+                }
+
+                let x = col as u32 * self.options.cell_width;
+                let y = row as u32 * self.options.cell_height;
+                fill_rect(&mut img, x, y, self.options.cell_width, self.options.cell_height, bg);
+
+                if cell.has_contents() {
+                    let text = cell.contents();
+                    draw_cell_text(&mut img, x, y, self.options.cell_width, self.options.cell_height, text, fg);
+                }
+
+                if cell.underline() {
+                    let thickness = max(1, self.options.cell_height / 16);
+                    fill_rect(
+                        &mut img,
+                        x,
+                        y + self.options.cell_height.saturating_sub(thickness + 2),
+                        self.options.cell_width,
+                        thickness,
+                        fg,
+                    );
+                }
+            }
+        }
+
+        if self.options.draw_cursor && !screen.hide_cursor() {
+            let (row, col) = screen.cursor_position();
+            if row < rows && col < cols {
+                let x = col as u32 * self.options.cell_width;
+                let y = row as u32 * self.options.cell_height;
+                let thickness = max(2, self.options.cell_height / 7);
+                fill_rect(
+                    &mut img,
+                    x,
+                    y + self.options.cell_height.saturating_sub(thickness),
+                    self.options.cell_width,
+                    thickness,
+                    self.theme.default_fg,
+                );
+            }
+        }
+
+        img
+    }
+
+    pub fn render_png_bytes(&self, screen: &vt100::Screen) -> Result<Vec<u8>> {
+        let image = self.render_screen(screen);
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image).write_to(&mut cursor, ImageFormat::Png)?;
+        Ok(cursor.into_inner())
+    }
+
+    fn visible_rows(&self, screen: &vt100::Screen, rows: u16, cols: u16) -> u16 {
+        for row in (0..rows).rev() {
+            let mut any = false;
+            for col in 0..cols {
+                if screen.cell(row, col).map(|c| c.has_contents()).unwrap_or(false) {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                return row + 1;
+            }
+        }
+        1
+    }
+
+    fn color(&self, color: vt100::Color, foreground: bool) -> Rgba<u8> {
+        match color {
+            vt100::Color::Default => if foreground { self.theme.default_fg } else { self.theme.default_bg },
+            vt100::Color::Rgb(r, g, b) => Rgba([r, g, b, 0xff]),
+            vt100::Color::Idx(idx) => ansi_indexed_color(idx, &self.theme),
+        }
+    }
+}
+
+fn ansi_indexed_color(idx: u8, theme: &Theme) -> Rgba<u8> {
+    if idx < 16 {
+        return theme.indexed[idx as usize];
+    }
+    if idx >= 232 {
+        let level = 8 + (idx - 232) * 10;
+        return Rgba([level, level, level, 0xff]);
+    }
+    let idx = idx - 16;
+    let r = idx / 36;
+    let g = (idx % 36) / 6;
+    let b = idx % 6;
+    let conv = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+    Rgba([conv(r), conv(g), conv(b), 0xff])
+}
+
+fn scale_color(color: Rgba<u8>, factor: f32) -> Rgba<u8> {
+    Rgba([
+        ((color[0] as f32 * factor).round() as u8),
+        ((color[1] as f32 * factor).round() as u8),
+        ((color[2] as f32 * factor).round() as u8),
+        color[3],
+    ])
+}
+
+fn brighten(color: Rgba<u8>, factor: f32) -> Rgba<u8> {
+    Rgba([
+        min(255, (color[0] as f32 * factor).round() as u32) as u8,
+        min(255, (color[1] as f32 * factor).round() as u32) as u8,
+        min(255, (color[2] as f32 * factor).round() as u32) as u8,
+        color[3],
+    ])
+}
+
+fn fill_rect(img: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, color: Rgba<u8>) {
+    let max_x = min(img.width(), x.saturating_add(w));
+    let max_y = min(img.height(), y.saturating_add(h));
+    for yy in y..max_y {
+        for xx in x..max_x {
+            img.put_pixel(xx, yy, color);
+        }
+    }
+}
+
+fn draw_cell_text(img: &mut RgbaImage, x: u32, y: u32, cw: u32, ch: u32, text: &str, fg: Rgba<u8>) {
+    let ch0 = text.chars().find(|c| !c.is_control()).unwrap_or(' ');
+    if draw_box_or_block(img, x, y, cw, ch, ch0, fg) {
+        return;
+    }
+
+    let glyph = font8x8::BASIC_FONTS
+        .get(ch0)
+        .or_else(|| font8x8::BASIC_FONTS.get('?'));
+
+    let Some(glyph) = glyph else { return; };
+    let sx = max(1, cw / 10);
+    let sy = max(1, ch / 14);
+    let gw = 8 * sx;
+    let gh = 8 * sy;
+    let xoff = x + cw.saturating_sub(gw) / 2;
+    let yoff = y + ch.saturating_sub(gh) / 2;
+
+    for (gy, row_bits) in glyph.iter().enumerate() {
+        for gx in 0..8u32 {
+            if ((*row_bits >> gx) & 1) == 1 {
+                fill_rect(img, xoff + gx * sx, yoff + gy as u32 * sy, sx, sy, fg);
+            }
+        }
+    }
+}
+
+fn draw_box_or_block(img: &mut RgbaImage, x: u32, y: u32, cw: u32, ch: u32, c: char, fg: Rgba<u8>) -> bool {
+    let mid_x = x + cw / 2;
+    let mid_y = y + ch / 2;
+    let t = max(1, min(cw, ch) / 9);
+    let hline = |img: &mut RgbaImage, left: bool, right: bool| {
+        if left { fill_rect(img, x, mid_y.saturating_sub(t / 2), cw / 2 + t, t, fg); }
+        if right { fill_rect(img, mid_x.saturating_sub(t / 2), mid_y.saturating_sub(t / 2), cw / 2 + t, t, fg); }
+    };
+    let vline = |img: &mut RgbaImage, up: bool, down: bool| {
+        if up { fill_rect(img, mid_x.saturating_sub(t / 2), y, t, ch / 2 + t, fg); }
+        if down { fill_rect(img, mid_x.saturating_sub(t / 2), mid_y.saturating_sub(t / 2), t, ch / 2 + t, fg); }
+    };
+
+    match c {
+        '─' | '━' => { hline(img, true, true); true }
+        '│' | '┃' => { vline(img, true, true); true }
+        '┌' | '┏' => { hline(img, false, true); vline(img, false, true); true }
+        '┐' | '┓' => { hline(img, true, false); vline(img, false, true); true }
+        '└' | '┗' => { hline(img, false, true); vline(img, true, false); true }
+        '┘' | '┛' => { hline(img, true, false); vline(img, true, false); true }
+        '├' | '┣' => { hline(img, false, true); vline(img, true, true); true }
+        '┤' | '┫' => { hline(img, true, false); vline(img, true, true); true }
+        '┬' | '┳' => { hline(img, true, true); vline(img, false, true); true }
+        '┴' | '┻' => { hline(img, true, true); vline(img, true, false); true }
+        '┼' | '╋' => { hline(img, true, true); vline(img, true, true); true }
+        '█' => { fill_rect(img, x, y, cw, ch, fg); true }
+        '▀' => { fill_rect(img, x, y, cw, ch / 2, fg); true }
+        '▄' => { fill_rect(img, x, y + ch / 2, cw, ch - ch / 2, fg); true }
+        '▌' => { fill_rect(img, x, y, cw / 2, ch, fg); true }
+        '▐' => { fill_rect(img, x + cw / 2, y, cw - cw / 2, ch, fg); true }
+        '▁' => { fill_rect(img, x, y + ch * 7 / 8, cw, ch / 8 + 1, fg); true }
+        '▂' => { fill_rect(img, x, y + ch * 6 / 8, cw, ch * 2 / 8 + 1, fg); true }
+        '▃' => { fill_rect(img, x, y + ch * 5 / 8, cw, ch * 3 / 8 + 1, fg); true }
+        '▅' => { fill_rect(img, x, y + ch * 3 / 8, cw, ch * 5 / 8 + 1, fg); true }
+        '▆' => { fill_rect(img, x, y + ch * 2 / 8, cw, ch * 6 / 8 + 1, fg); true }
+        '▇' => { fill_rect(img, x, y + ch / 8, cw, ch * 7 / 8 + 1, fg); true }
+        _ => false,
+    }
+}
+EOF
+
+cat > crates/tuiwright/src/record.rs <<'EOF'
+use crate::render::{RenderOptions, TerminalRenderer};
+use anyhow::{bail, Context, Result};
+use gif::{Encoder, Frame, Repeat};
+use image::{DynamicImage, ImageFormat, RgbaImage};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::Cursor;
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GifEncoding {
+    /// Uses the permissive `gif` crate. Fast, dependency-light, decent for CI.
+    Compatibility,
+    /// Uses `gifski` behind the `web-gif` feature. Higher quality/compression; check license.
+    WebCompressed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingOptions {
+    pub fps: u32,
+    pub quality: u8,
+    pub encoding: GifEncoding,
+    pub render: RenderOptions,
+    pub max_frames: usize,
+}
+
+impl Default for RecordingOptions {
+    fn default() -> Self {
+        Self {
+            fps: 12,
+            quality: 90,
+            encoding: GifEncoding::Compatibility,
+            render: RenderOptions::default(),
+            max_frames: 60 * 12,
+        }
+    }
+}
+
+impl RecordingOptions {
+    pub fn web_compressed_12fps() -> Self {
+        Self { fps: 12, quality: 90, encoding: GifEncoding::WebCompressed, ..Self::default() }
+    }
+
+    pub fn compatibility_12fps() -> Self {
+        Self { fps: 12, quality: 90, encoding: GifEncoding::Compatibility, ..Self::default() }
+    }
+}
+
+#[derive(Clone)]
+pub struct CapturedFrame {
+    pub timestamp_ms: u128,
+    pub image: RgbaImage,
+}
+
+pub fn encode_gif(path: impl AsRef<Path>, frames: Vec<CapturedFrame>, options: &RecordingOptions) -> Result<()> {
+    if frames.is_empty() {
+        bail!("cannot encode GIF with zero frames");
+    }
+    if let Some(parent) = path.as_ref().parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating GIF dir {}", parent.display()))?;
+    }
+    match options.encoding {
+        GifEncoding::Compatibility => encode_gif_compat(path, frames),
+        GifEncoding::WebCompressed => encode_gif_web(path, frames, options.quality),
+    }
+}
+
+fn encode_gif_compat(path: impl AsRef<Path>, frames: Vec<CapturedFrame>) -> Result<()> {
+    let file = File::create(path.as_ref()).with_context(|| format!("creating GIF {}", path.as_ref().display()))?;
+    let width = frames[0].image.width() as u16;
+    let height = frames[0].image.height() as u16;
+    let mut encoder = Encoder::new(file, width, height, &[])?;
+    encoder.set_repeat(Repeat::Infinite)?;
+
+    for (idx, frame) in frames.iter().enumerate() {
+        let next_ts = frames
+            .get(idx + 1)
+            .map(|f| f.timestamp_ms)
+            .unwrap_or(frame.timestamp_ms + 100);
+        let delay_cs = ((next_ts.saturating_sub(frame.timestamp_ms)).max(10) / 10).min(u16::MAX as u128) as u16;
+        let mut rgba = frame.image.clone().into_raw();
+        let mut gif_frame = Frame::from_rgba_speed(width, height, &mut rgba, 10);
+        gif_frame.delay = delay_cs;
+        encoder.write_frame(&gif_frame)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "web-gif")]
+fn encode_gif_web(path: impl AsRef<Path>, frames: Vec<CapturedFrame>, quality: u8) -> Result<()> {
+    let settings = gifski::Settings {
+        quality: quality.clamp(1, 100),
+        fast: false,
+        repeat: gifski::Repeat::Infinite,
+        ..gifski::Settings::default()
+    };
+    let (collector, writer) = gifski::new(settings)?;
+    let out = File::create(path.as_ref()).with_context(|| format!("creating GIF {}", path.as_ref().display()))?;
+
+    let feeder = std::thread::spawn(move || -> Result<()> {
+        for (idx, frame) in frames.into_iter().enumerate() {
+            let mut cursor = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(frame.image).write_to(&mut cursor, ImageFormat::Png)?;
+            collector.add_frame_png_data(idx, cursor.into_inner(), frame.timestamp_ms as f64 / 1000.0)?;
+        }
+        drop(collector);
+        Ok(())
+    });
+
+    writer.write(out, &mut gifski::progress::NoProgress {})?;
+    feeder.join().expect("gifski feeder thread panicked")?;
+    Ok(())
+}
+
+#[cfg(not(feature = "web-gif"))]
+fn encode_gif_web(_path: impl AsRef<Path>, _frames: Vec<CapturedFrame>, _quality: u8) -> Result<()> {
+    bail!("web-compressed GIFs require enabling the `web-gif` Cargo feature; use RecordingOptions::compatibility_12fps() or build with --features web-gif")
+}
+
+pub fn frame_from_screen(screen: &vt100::Screen, renderer: &TerminalRenderer, timestamp_ms: u128) -> CapturedFrame {
+    CapturedFrame { timestamp_ms, image: renderer.render_screen(screen) }
+}
+EOF
+
+cat > crates/tuiwright/src/assertions.rs <<'EOF'
+use crate::session::TuiSession;
+use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
+use std::fs;
+use std::path::Path;
+
+pub fn assert_text_snapshot(session: &TuiSession, path: impl AsRef<Path>) -> Result<()> {
+    let actual = session.screen_text();
+    assert_text_snapshot_value(&actual, path)
+}
+
+pub fn assert_text_snapshot_value(actual: &str, path: impl AsRef<Path>) -> Result<()> {
+    let path = path.as_ref();
+    if should_update() || !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating snapshot dir {}", parent.display()))?;
+        }
+        fs::write(path, actual).with_context(|| format!("writing snapshot {}", path.display()))?;
+        return Ok(());
+    }
+
+    let expected = fs::read_to_string(path).with_context(|| format!("reading snapshot {}", path.display()))?;
+    if expected == actual {
+        return Ok(());
+    }
+
+    let diff = TextDiff::from_lines(&expected, actual);
+    let mut out = String::new();
+    for change in diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        out.push_str(sign);
+        out.push_str(&change.to_string());
+    }
+    bail!("text snapshot mismatch for {}\n{}", path.display(), out)
+}
+
+pub fn hash_file(path: impl AsRef<Path>) -> Result<String> {
+    let bytes = fs::read(path.as_ref()).with_context(|| format!("reading {}", path.as_ref().display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn should_update() -> bool {
+    matches!(std::env::var("TUIWRIGHT_UPDATE").as_deref(), Ok("1") | Ok("true") | Ok("yes"))
+}
+EOF
+
+cat > crates/tuiwright/src/locator.rs <<'EOF'
+use crate::session::TuiSession;
+use anyhow::{bail, Result};
+use regex::Regex;
+use std::time::Duration;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+pub enum LocatorQuery {
+    Text(String),
+    Regex(Regex),
+}
+
+pub struct Locator<'a> {
+    pub(crate) session: &'a TuiSession,
+    pub(crate) query: LocatorQuery,
+}
+
+impl<'a> Locator<'a> {
+    pub(crate) fn text(session: &'a TuiSession, text: impl Into<String>) -> Self {
+        Self { session, query: LocatorQuery::Text(text.into()) }
+    }
+
+    pub(crate) fn regex(session: &'a TuiSession, regex: Regex) -> Self {
+        Self { session, query: LocatorQuery::Regex(regex) }
+    }
+
+    pub fn wait(&self, timeout: Duration) -> Result<()> {
+        match &self.query {
+            LocatorQuery::Text(text) => self.session.wait_for_text(text, timeout),
+            LocatorQuery::Regex(regex) => self.session.wait_for_regex(regex, timeout),
+        }
+    }
+
+    pub fn click(&self) -> Result<()> {
+        let (row, col) = self.first_position()?;
+        self.session.mouse_click(row, col)
+    }
+
+    pub fn first_position(&self) -> Result<(u16, u16)> {
+        match &self.query {
+            LocatorQuery::Text(text) => self.find_text_position(text),
+            LocatorQuery::Regex(regex) => self.find_regex_position(regex),
+        }
+    }
+
+    fn find_text_position(&self, needle: &str) -> Result<(u16, u16)> {
+        let screen = self.session.screen();
+        let (_rows, cols) = screen.size();
+        for (row, line) in screen.rows(0, cols).enumerate() {
+            if let Some(byte_idx) = line.find(needle) {
+                let col = unicode_columns(&line[..byte_idx]) as u16;
+                let width = UnicodeWidthStr::width(needle).max(1) as u16;
+                return Ok((row as u16, col + width / 2));
+            }
+        }
+        bail!("locator text not found: {needle:?}")
+    }
+
+    fn find_regex_position(&self, regex: &Regex) -> Result<(u16, u16)> {
+        let screen = self.session.screen();
+        let (_rows, cols) = screen.size();
+        for (row, line) in screen.rows(0, cols).enumerate() {
+            if let Some(mat) = regex.find(&line) {
+                let col = unicode_columns(&line[..mat.start()]) as u16;
+                let width = unicode_columns(mat.as_str()).max(1) as u16;
+                return Ok((row as u16, col + width / 2));
+            }
+        }
+        bail!("locator regex not found: {regex}")
+    }
+}
+
+fn unicode_columns(s: &str) -> usize {
+    s.chars().map(|c| UnicodeWidthChar::width(c).unwrap_or(0)).sum()
+}
+EOF
+
+cat > crates/tuiwright/src/session.rs <<'EOF'
+use crate::assertions;
+use crate::config::{SpawnConfig, TerminalSize};
+use crate::keys::Key;
+use crate::locator::Locator;
+use crate::record::{encode_gif, frame_from_screen, CapturedFrame, RecordingOptions};
+use crate::render::{RenderOptions, TerminalRenderer};
+use crate::trace::TraceWriter;
+use anyhow::{bail, Context, Result};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, PtySystem};
+use regex::Regex;
+use serde_json::json;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+struct SharedState {
+    parser: vt100::Parser,
+    raw_output_bytes: usize,
+    last_change: Instant,
+    eof: bool,
+}
+
+type State = Arc<(Mutex<SharedState>, Condvar)>;
+
+pub struct TuiSession {
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    state: State,
+    reader_thread: Option<thread::JoinHandle<()>>,
+    trace: Option<TraceWriter>,
+    terminal_size: TerminalSize,
+    default_render: RenderOptions,
+}
+
+impl TuiSession {
+    pub fn spawn(config: SpawnConfig) -> Result<Self> {
+        let trace = config.trace_path.as_ref().map(TraceWriter::new).transpose()?;
+        if let Some(trace) = &trace {
+            trace.event("spawn.request", json!({
+                "program": &config.program,
+                "args": &config.args,
+                "cols": config.size.cols,
+                "rows": config.size.rows,
+            }))?;
+        }
+
+        let pty_system = native_pty_system();
+        let pair = pty_system.openpty(PtySize {
+            rows: config.size.rows,
+            cols: config.size.cols,
+            pixel_width: config.size.cell_width,
+            pixel_height: config.size.cell_height,
+        })?;
+
+        let mut cmd = CommandBuilder::new(config.program.as_str());
+        for arg in &config.args {
+            cmd.arg(arg.as_str());
+        }
+        if config.deterministic_env {
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            cmd.env("TUIWRIGHT", "1");
+            cmd.env("RUST_BACKTRACE", "1");
+        }
+        for (k, v) in &config.env {
+            cmd.env(k.as_str(), v.as_str());
+        }
+        if let Some(cwd) = &config.cwd {
+            cmd.cwd(cwd.as_os_str());
+        }
+
+        let child = pair.slave.spawn_command(cmd).context("spawning TUI process into PTY")?;
+        let mut reader = pair.master.try_clone_reader().context("cloning PTY reader")?;
+        let writer = pair.master.take_writer().context("taking PTY writer")?;
+
+        let state: State = Arc::new((
+            Mutex::new(SharedState {
+                parser: vt100::Parser::new(config.size.rows, config.size.cols, config.scrollback),
+                raw_output_bytes: 0,
+                last_change: Instant::now(),
+                eof: false,
+            }),
+            Condvar::new(),
+        ));
+
+        let read_state = Arc::clone(&state);
+        let read_trace = trace.clone();
+        let reader_thread = thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        let (lock, cv) = &*read_state;
+                        let mut guard = lock.lock().expect("state mutex poisoned");
+                        guard.eof = true;
+                        cv.notify_all();
+                        break;
+                    }
+                    Ok(n) => {
+                        let bytes = &buf[..n];
+                        {
+                            let (lock, cv) = &*read_state;
+                            let mut guard = lock.lock().expect("state mutex poisoned");
+                            guard.raw_output_bytes += n;
+                            guard.parser.process(bytes);
+                            guard.last_change = Instant::now();
+                            cv.notify_all();
+                        }
+                        if let Some(trace) = &read_trace {
+                            let preview = String::from_utf8_lossy(bytes);
+                            let _ = trace.event("pty.output", json!({
+                                "bytes": n,
+                                "preview": preview.chars().take(200).collect::<String>(),
+                            }));
+                        }
+                    }
+                    Err(err) => {
+                        let (lock, cv) = &*read_state;
+                        let mut guard = lock.lock().expect("state mutex poisoned");
+                        guard.eof = true;
+                        cv.notify_all();
+                        if let Some(trace) = &read_trace {
+                            let _ = trace.event("pty.read_error", json!({ "error": err.to_string() }));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let default_render = RenderOptions {
+            cell_width: config.size.cell_width as u32,
+            cell_height: config.size.cell_height as u32,
+            ..RenderOptions::default()
+        };
+
+        if let Some(trace) = &trace {
+            trace.event("spawn.ok", json!({ "pid": child.process_id() }))?;
+        }
+
+        Ok(Self {
+            master: pair.master,
+            child,
+            writer: Arc::new(Mutex::new(writer)),
+            state,
+            reader_thread: Some(reader_thread),
+            trace,
+            terminal_size: config.size,
+            default_render,
+        })
+    }
+
+    pub fn get_by_text(&self, text: impl Into<String>) -> Locator<'_> {
+        Locator::text(self, text)
+    }
+
+    pub fn get_by_regex(&self, regex: Regex) -> Locator<'_> {
+        Locator::regex(self, regex)
+    }
+
+    pub fn screen(&self) -> vt100::Screen {
+        let (lock, _) = &*self.state;
+        lock.lock().expect("state mutex poisoned").parser.screen().clone()
+    }
+
+    pub fn screen_text(&self) -> String {
+        self.screen().contents()
+    }
+
+    pub fn raw_output_bytes(&self) -> usize {
+        let (lock, _) = &*self.state;
+        lock.lock().expect("state mutex poisoned").raw_output_bytes
+    }
+
+    pub fn write_bytes(&self, bytes: &[u8]) -> Result<()> {
+        {
+            let mut writer = self.writer.lock().expect("writer mutex poisoned");
+            writer.write_all(bytes)?;
+            writer.flush()?;
+        }
+        if let Some(trace) = &self.trace {
+            trace.event("input.bytes", json!({
+                "bytes": bytes.len(),
+                "preview": String::from_utf8_lossy(bytes).chars().take(120).collect::<String>(),
+            }))?;
+        }
+        Ok(())
+    }
+
+    pub fn type_text(&self, text: &str) -> Result<()> {
+        if let Some(trace) = &self.trace {
+            trace.event("input.type_text", json!({ "text": text }))?;
+        }
+        self.write_bytes(text.as_bytes())
+    }
+
+    pub fn press(&self, key: Key) -> Result<()> {
+        let application_cursor = self.screen().application_cursor();
+        let bytes = key.encode(application_cursor);
+        if bytes.is_empty() {
+            bail!("unsupported key encoding: {key:?}");
+        }
+        if let Some(trace) = &self.trace {
+            trace.event("input.press", json!({ "key": format!("{key:?}") }))?;
+        }
+        self.write_bytes(&bytes)
+    }
+
+    pub fn paste(&self, text: &str) -> Result<()> {
+        if let Some(trace) = &self.trace {
+            trace.event("input.paste", json!({ "chars": text.chars().count() }))?;
+        }
+        if self.screen().bracketed_paste() {
+            let mut bytes = b"\x1b[200~".to_vec();
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.write_bytes(&bytes)
+        } else {
+            self.type_text(text)
+        }
+    }
+
+    /// Send an SGR mouse click at zero-based terminal row/column.
+    pub fn mouse_click(&self, row: u16, col: u16) -> Result<()> {
+        if let Some(trace) = &self.trace {
+            trace.event("input.mouse_click", json!({ "row": row, "col": col }))?;
+        }
+        let x = col + 1;
+        let y = row + 1;
+        let seq = format!("\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m");
+        self.write_bytes(seq.as_bytes())
+    }
+
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.terminal_size.cols = cols;
+        self.terminal_size.rows = rows;
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: self.terminal_size.cell_width,
+            pixel_height: self.terminal_size.cell_height,
+        })?;
+        {
+            let (lock, cv) = &*self.state;
+            let mut guard = lock.lock().expect("state mutex poisoned");
+            guard.parser.screen_mut().set_size(rows, cols);
+            guard.last_change = Instant::now();
+            cv.notify_all();
+        }
+        if let Some(trace) = &self.trace {
+            trace.event("terminal.resize", json!({ "cols": cols, "rows": rows }))?;
+        }
+        Ok(())
+    }
+
+    pub fn wait_for_text(&self, needle: &str, timeout: Duration) -> Result<()> {
+        self.wait_until(timeout, |screen| screen.contents().contains(needle))
+            .with_context(|| format!("timed out waiting for text {needle:?}\n\nLast screen:\n{}", self.screen_text()))
+    }
+
+    pub fn wait_for_regex(&self, regex: &Regex, timeout: Duration) -> Result<()> {
+        self.wait_until(timeout, |screen| regex.is_match(&screen.contents()))
+            .with_context(|| format!("timed out waiting for regex {regex}\n\nLast screen:\n{}", self.screen_text()))
+    }
+
+    pub fn wait_until_idle(&self, quiet_for: Duration, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().expect("state mutex poisoned");
+        loop {
+            if guard.last_change.elapsed() >= quiet_for {
+                return Ok(());
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                bail!("timed out waiting for terminal to be idle for {quiet_for:?}");
+            };
+            let wait = remaining.min(Duration::from_millis(25));
+            let (next_guard, _) = cv.wait_timeout(guard, wait).expect("state mutex poisoned");
+            guard = next_guard;
+        }
+    }
+
+    fn wait_until<F>(&self, timeout: Duration, mut predicate: F) -> Result<()>
+    where
+        F: FnMut(&vt100::Screen) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        let (lock, cv) = &*self.state;
+        let mut guard = lock.lock().expect("state mutex poisoned");
+        loop {
+            if predicate(guard.parser.screen()) {
+                return Ok(());
+            }
+            if guard.eof {
+                bail!("process reached EOF before condition was satisfied");
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                bail!("timed out after {timeout:?}");
+            };
+            let wait = remaining.min(Duration::from_millis(50));
+            let (next_guard, _) = cv.wait_timeout(guard, wait).expect("state mutex poisoned");
+            guard = next_guard;
+        }
+    }
+
+    pub fn screenshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.screenshot_with(path, self.default_render.clone())
+    }
+
+    pub fn screenshot_with(&self, path: impl AsRef<Path>, options: RenderOptions) -> Result<()> {
+        if let Some(parent) = path.as_ref().parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating screenshot dir {}", parent.display()))?;
+        }
+        let renderer = TerminalRenderer::new(options);
+        let screen = self.screen();
+        let image = renderer.render_screen(&screen);
+        image.save(path.as_ref()).with_context(|| format!("saving screenshot {}", path.as_ref().display()))?;
+        if let Some(trace) = &self.trace {
+            trace.event("artifact.screenshot", json!({ "path": path.as_ref().display().to_string() }))?;
+        }
+        Ok(())
+    }
+
+    pub fn png_bytes(&self) -> Result<Vec<u8>> {
+        let renderer = TerminalRenderer::new(self.default_render.clone());
+        renderer.render_png_bytes(&self.screen())
+    }
+
+    pub fn assert_text_snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
+        assertions::assert_text_snapshot(self, path)
+    }
+
+    pub fn record_gif_during<F>(&self, path: impl AsRef<Path>, options: RecordingOptions, flow: F) -> Result<()>
+    where
+        F: FnOnce(&TuiSession) -> Result<()>,
+    {
+        let done = Arc::new(AtomicBool::new(false));
+        let frames: Arc<Mutex<Vec<CapturedFrame>>> = Arc::new(Mutex::new(Vec::new()));
+        let sampler_state = Arc::clone(&self.state);
+        let sampler_done = Arc::clone(&done);
+        let sampler_frames = Arc::clone(&frames);
+        let sampler_options = options.clone();
+
+        let sampler = thread::spawn(move || {
+            let renderer = TerminalRenderer::new(sampler_options.render.clone());
+            let fps = sampler_options.fps.max(1);
+            let interval = Duration::from_secs_f64(1.0 / fps as f64);
+            let start = Instant::now();
+            while !sampler_done.load(Ordering::SeqCst) {
+                let screen = {
+                    let (lock, _) = &*sampler_state;
+                    lock.lock().expect("state mutex poisoned").parser.screen().clone()
+                };
+                let frame = frame_from_screen(&screen, &renderer, start.elapsed().as_millis());
+                let mut guard = sampler_frames.lock().expect("frames mutex poisoned");
+                if guard.len() < sampler_options.max_frames {
+                    guard.push(frame);
+                }
+                drop(guard);
+                thread::sleep(interval);
+            }
+            let screen = {
+                let (lock, _) = &*sampler_state;
+                lock.lock().expect("state mutex poisoned").parser.screen().clone()
+            };
+            let frame = frame_from_screen(&screen, &renderer, start.elapsed().as_millis());
+            sampler_frames.lock().expect("frames mutex poisoned").push(frame);
+        });
+
+        let flow_result = flow(self);
+        done.store(true, Ordering::SeqCst);
+        sampler.join().expect("recorder sampler panicked");
+        flow_result?;
+
+        let frames = match Arc::try_unwrap(frames) {
+            Ok(mutex) => mutex.into_inner().expect("frames mutex poisoned"),
+            Err(arc) => arc.lock().expect("frames mutex poisoned").clone(),
+        };
+        encode_gif(path.as_ref(), frames, &options)?;
+        if let Some(trace) = &self.trace {
+            trace.event("artifact.gif", json!({ "path": path.as_ref().display().to_string(), "fps": options.fps }))?;
+        }
+        Ok(())
+    }
+
+    pub fn kill(&mut self) -> Result<()> {
+        if let Some(trace) = &self.trace {
+            trace.event("process.kill", json!({}))?;
+        }
+        self.child.kill()?;
+        Ok(())
+    }
+}
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+EOF
+
+cat > crates/tuiwright-cli/Cargo.toml <<'EOF'
+[package]
+name = "tuiwright-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tuiwright"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+tuiwright = { path = "../tuiwright" }
+EOF
+
+cat > crates/tuiwright-cli/src/main.rs <<'EOF'
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use regex::Regex;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+use tuiwright::{Key, RecordingOptions, SpawnConfig, TuiSession};
+
+#[derive(Parser)]
+#[command(name = "tuiwright", version, about = "Playwright-style Rust TUI tester")]
+struct Args {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Launch a command, wait for optional text/regex, and save a screenshot.
+    Screenshot {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        #[arg(long)]
+        wait_text: Option<String>,
+        #[arg(long)]
+        wait_regex: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Launch a command and record a short GIF while sending a simple key script.
+    Record {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 80)]
+        cols: u16,
+        #[arg(long, default_value_t = 24)]
+        rows: u16,
+        #[arg(long, default_value_t = 12)]
+        fps: u32,
+        #[arg(long, default_value_t = 3)]
+        seconds: u64,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Convert a JSONL trace to a single-file HTML report.
+    Report {
+        #[arg(long)]
+        trace: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    match args.command {
+        Command::Screenshot { out, cols, rows, wait_text, wait_regex, timeout_secs, cmd } => {
+            let app = spawn_from_cmd(cmd, cols, rows, None)?;
+            let timeout = Duration::from_secs(timeout_secs);
+            if let Some(text) = wait_text {
+                app.wait_for_text(&text, timeout)?;
+            }
+            if let Some(pattern) = wait_regex {
+                app.wait_for_regex(&Regex::new(&pattern)?, timeout)?;
+            }
+            app.wait_until_idle(Duration::from_millis(100), timeout).ok();
+            app.screenshot(out)?;
+        }
+        Command::Record { out, cols, rows, fps, seconds, cmd } => {
+            let app = spawn_from_cmd(cmd, cols, rows, None)?;
+            let mut options = RecordingOptions::compatibility_12fps();
+            options.fps = fps;
+            app.record_gif_during(out, options, |tui| {
+                std::thread::sleep(Duration::from_secs(seconds));
+                let _ = tui.press(Key::Ctrl('c'));
+                Ok(())
+            })?;
+        }
+        Command::Report { trace, out } => write_report(trace, out)?,
+    }
+    Ok(())
+}
+
+fn spawn_from_cmd(cmd: Vec<String>, cols: u16, rows: u16, trace: Option<PathBuf>) -> Result<TuiSession> {
+    if cmd.is_empty() {
+        bail!("missing command after --");
+    }
+    let mut cfg = SpawnConfig::new(cmd[0].clone()).args(cmd.iter().skip(1).cloned()).size(cols, rows);
+    if let Some(trace) = trace {
+        cfg = cfg.trace_path(trace);
+    }
+    TuiSession::spawn(cfg)
+}
+
+fn write_report(trace: PathBuf, out: PathBuf) -> Result<()> {
+    let raw = fs::read_to_string(&trace).with_context(|| format!("reading trace {}", trace.display()))?;
+    let escaped = raw.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let html = format!(r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Tuiwright report</title>
+<style>
+body {{ font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; margin: 2rem; background: #111827; color: #e5e7eb; }}
+pre {{ background: #020617; border: 1px solid #334155; padding: 1rem; overflow: auto; border-radius: 12px; }}
+.event {{ border: 1px solid #334155; border-radius: 12px; margin: .75rem 0; padding: .75rem 1rem; background: #0f172a; }}
+.kind {{ color: #93c5fd; font-weight: 700; }}
+.time {{ color: #a7f3d0; }}
+</style>
+</head>
+<body>
+<h1>Tuiwright report</h1>
+<p>Trace: {}</p>
+<div id="events"></div>
+<script type="application/jsonl" id="trace">{}</script>
+<script>
+const raw = document.getElementById('trace').textContent.trim();
+const root = document.getElementById('events');
+for (const line of raw.split(/\n+/)) {{
+  try {{
+    const e = JSON.parse(line);
+    const div = document.createElement('div');
+    div.className = 'event';
+    div.innerHTML = `<div><span class="time">${{e.ts_ms}}ms</span> <span class="kind">${{e.kind}}</span></div><pre>${{JSON.stringify(e.data, null, 2)}}</pre>`;
+    root.appendChild(div);
+  }} catch (_) {{}}
+}}
+</script>
+</body>
+</html>"#, trace.display(), escaped);
+    if let Some(parent) = out.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&out, html).with_context(|| format!("writing report {}", out.display()))?;
+    Ok(())
+}
+EOF
+
+cat > examples/demo-tui/Cargo.toml <<'EOF'
+[package]
+name = "demo-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+crossterm.workspace = true
+EOF
+
+cat > examples/demo-tui/src/main.rs <<'EOF'
+use anyhow::Result;
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseEventKind};
+use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::{execute, queue};
+use std::io::{stdout, Write};
+use std::time::Duration;
+
+fn main() -> Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)?;
+    let result = run();
+    execute!(stdout(), Show, DisableMouseCapture, LeaveAlternateScreen)?;
+    terminal::disable_raw_mode()?;
+    result
+}
+
+fn run() -> Result<()> {
+    let mut selected = 0usize;
+    let items = ["Create project", "Settings", "Quit"];
+    let mut message = "Use arrows, Enter, mouse, or q".to_string();
+    loop {
+        draw(&items, selected, &message)?;
+        if event::poll(Duration::from_millis(250))? {
+            match event::read()? {
+                Event::Key(key) => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Down => selected = (selected + 1).min(items.len() - 1),
+                    KeyCode::Enter => {
+                        message = format!("Selected: {}", items[selected]);
+                        if items[selected] == "Quit" { break; }
+                    }
+                    KeyCode::Char(c) => message.push(c),
+                    _ => {}
+                },
+                Event::Mouse(mouse) => {
+                    if let MouseEventKind::Down(_) = mouse.kind {
+                        let row = mouse.row;
+                        if (4..4 + items.len() as u16).contains(&row) {
+                            selected = (row - 4) as usize;
+                            message = format!("Clicked: {}", items[selected]);
+                        }
+                    }
+                }
+                Event::Resize(_, _) => message = "Resized".to_string(),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn draw(items: &[&str], selected: usize, message: &str) -> Result<()> {
+    let mut out = stdout();
+    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+    queue!(out, Print("┌──────────────────────────────────────┐\r\n"))?;
+    queue!(out, Print("│ Demo TUI                             │\r\n"))?;
+    queue!(out, Print("├──────────────────────────────────────┤\r\n"))?;
+    for (idx, item) in items.iter().enumerate() {
+        queue!(out, Print("│ "))?;
+        if idx == selected {
+            queue!(out, SetAttribute(Attribute::Reverse), Print(format!("> {:<32}", item)), SetAttribute(Attribute::NoReverse))?;
+        } else {
+            queue!(out, Print(format!("  {:<32}", item)))?;
+        }
+        queue!(out, Print(" │\r\n"))?;
+    }
+    queue!(out, Print("├──────────────────────────────────────┤\r\n"))?;
+    queue!(out, Print(format!("│ {:<36} │\r\n", message.chars().take(36).collect::<String>())))?;
+    queue!(out, Print("└──────────────────────────────────────┘\r\n"))?;
+    out.flush()?;
+    Ok(())
+}
+EOF
+
+cat > crates/tuiwright/tests/smoke.rs <<'EOF'
+use std::time::Duration;
+use tuiwright::{Key, RecordingOptions, SpawnConfig, TuiSession};
+
+#[test]
+fn drives_a_shell_prompt_and_captures_artifacts() -> anyhow::Result<()> {
+    let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd.exe", vec!["/C", "set /p name=Name: & echo Hello %name%"])
+    } else {
+        ("bash", vec!["-lc", "printf 'Name: '; read name; printf '\\nHello %s\\n' \"$name\"; sleep 0.2"])
+    };
+
+    let app = TuiSession::spawn(
+        SpawnConfig::new(program)
+            .args(args)
+            .size(80, 24)
+            .trace_path("target/tuiwright/smoke.trace.jsonl"),
+    )?;
+
+    app.wait_for_text("Name:", Duration::from_secs(5))?;
+    app.type_text("Ada")?;
+    app.press(Key::Enter)?;
+    app.wait_for_text("Hello Ada", Duration::from_secs(5))?;
+    app.screenshot("target/tuiwright/smoke.png")?;
+    app.assert_text_snapshot("target/tuiwright/smoke.txt")?;
+    Ok(())
+}
+
+#[test]
+fn can_record_a_short_gif() -> anyhow::Result<()> {
+    let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd.exe", vec!["/C", "echo Ready & ping -n 2 127.0.0.1 > nul"])
+    } else {
+        ("bash", vec!["-lc", "printf 'Ready\\n'; sleep 0.5; printf 'Done\\n'; sleep 0.2"])
+    };
+
+    let app = TuiSession::spawn(SpawnConfig::new(program).args(args).size(80, 24))?;
+    app.record_gif_during(
+        "target/tuiwright/smoke.gif",
+        RecordingOptions::compatibility_12fps(),
+        |tui| {
+            tui.wait_for_text("Done", Duration::from_secs(5))?;
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+EOF
+
+cat > report-ui/package.json <<'EOF'
+{
+  "name": "tuiwright-report-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-basic-ssl": "latest",
+    "vite": "latest",
+    "typescript": "latest"
+  },
+  "devDependencies": {}
+}
+EOF
+
+cat > report-ui/index.html <<'EOF'
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Tuiwright Trace Viewer</title>
+  </head>
+  <body>
+    <main>
+      <h1>Tuiwright Trace Viewer</h1>
+      <p>Open a <code>*.trace.jsonl</code> file generated by <code>SpawnConfig::trace_path</code>.</p>
+      <input id="file" type="file" accept=".jsonl,.trace,.txt" />
+      <section id="summary"></section>
+      <section id="events"></section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+EOF
+
+cat > report-ui/src/main.ts <<'EOF'
+import './style.css';
+
+type TraceEvent = { ts_ms: number; kind: string; data: unknown };
+
+const fileInput = document.querySelector<HTMLInputElement>('#file')!;
+const summary = document.querySelector<HTMLElement>('#summary')!;
+const eventsRoot = document.querySelector<HTMLElement>('#events')!;
+
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files?.[0];
+  if (!file) return;
+  const text = await file.text();
+  const events: TraceEvent[] = text
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  render(events);
+});
+
+function render(events: TraceEvent[]) {
+  const counts = new Map<string, number>();
+  for (const event of events) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+  summary.innerHTML = `<h2>Summary</h2><p>${events.length} events</p><pre>${escapeHtml(JSON.stringify(Object.fromEntries(counts), null, 2))}</pre>`;
+  eventsRoot.innerHTML = '<h2>Timeline</h2>';
+  for (const event of events) {
+    const div = document.createElement('article');
+    div.className = 'event';
+    div.innerHTML = `
+      <header><span class="time">${event.ts_ms}ms</span> <span class="kind">${escapeHtml(event.kind)}</span></header>
+      <pre>${escapeHtml(JSON.stringify(event.data, null, 2))}</pre>
+    `;
+    eventsRoot.appendChild(div);
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;');
+}
+EOF
+
+cat > report-ui/src/style.css <<'EOF'
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+
+body { margin: 0; }
+main { max-width: 1100px; margin: 0 auto; padding: 32px; }
+code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+pre { background: #020617; border: 1px solid #334155; border-radius: 12px; padding: 16px; overflow: auto; }
+input { margin: 16px 0 24px; }
+.event { border: 1px solid #334155; border-radius: 14px; background: #111827; margin: 12px 0; overflow: hidden; }
+.event header { padding: 12px 16px; border-bottom: 1px solid #334155; background: #1e293b; }
+.event pre { border: 0; border-radius: 0; margin: 0; }
+.time { color: #86efac; font-weight: 700; }
+.kind { color: #93c5fd; font-weight: 800; }
+EOF
+
+cat > README.md <<'EOF'
+# Tuiwright reference workspace
+
+Run:
+
+```bash
+cargo test --workspace
+cargo run -p tuiwright-cli -- screenshot --out target/tuiwright/demo.png --wait-text "Demo TUI" -- cargo run -q -p demo-tui
+cargo run -p tuiwright-cli -- record --out target/tuiwright/demo.gif -- cargo run -q -p demo-tui
+```
+
+For web-compressed GIFs through gifski:
+
+```bash
+cargo test -p tuiwright --features web-gif
+```
+
+The core testing flow is in `crates/tuiwright`. The CLI is intentionally thin; normal users should write Rust tests with `TuiSession`.
+EOF
+
+if command -v cargo >/dev/null 2>&1; then
+  cargo fmt || true
+fi
+
+echo "Tuiwright workspace written. Try: cargo test --workspace"
+````
+
+## 15. Important implementation notes
+
+### PTY fidelity
+
+The reference implementation uses `portable-pty`, so the app believes it is attached to a terminal. This catches bugs that a widget-only backend cannot catch: raw mode mistakes, bracketed paste behavior, alternate screen cleanup, resize behavior, ANSI output, mouse capture, and subprocess interaction.
+
+### Terminal parser fidelity
+
+The reference uses `vt100::Parser`. It tracks screen cells, colors, attributes, cursor, alternate screen, bracketed paste, application cursor mode, and mouse/input modes. For a production v1, add tests that replay ANSI conformance samples and real-world logs from popular TUIs.
+
+### Rendering fidelity
+
+The built-in renderer is deterministic and CI-friendly. It is not meant to be the final beautiful renderer. A production renderer should add:
+
+- font discovery through `fontdb`;
+- rasterization through `ab_glyph` or `swash`;
+- configurable font path in `Tuiwright.toml`;
+- fallback for emoji and CJK;
+- grapheme cluster shaping;
+- ligature control;
+- richer box-drawing, braille, and block rendering.
+
+### GIF quality
+
+The compatibility encoder is easy and permissive. The web-compressed path should use `gifski` behind a feature because it produces better web GIFs but carries AGPL licensing. For commercial/open-core projects, make this a plugin or document the licensing clearly.
+
+### A serious v1 API should add macros
+
+The production library should expose:
+
+```rust
+#[tuiwright::test]
+async fn my_flow(t: tuiwright::TestContext) -> anyhow::Result<()> {
+    let app = t.spawn(SpawnConfig::cargo_bin("my-tui")?)?;
+    app.get_by_text("Welcome").wait().await?;
+    Ok(())
+}
+```
+
+The macro should:
+
+- allocate a test artifact directory;
+- auto-enable trace;
+- catch panics/errors;
+- capture failure screenshot and optional failure GIF;
+- print artifact links;
+- clean up the process robustly.
+
+### Configuration file
+
+A future `Tuiwright.toml` should look like:
+
+```toml
+[terminal]
+cols = 100
+rows = 32
+term = "xterm-256color"
+colorterm = "truecolor"
+
+[render]
+cell_width = 16
+cell_height = 28
+theme = "nord"
+font_path = "./ci/fonts/YourPinnedOpenFont.ttf"
+draw_cursor = true
+
+[recording]
+fps = 12
+encoder = "compatibility" # or "web-compressed"
+quality = 90
+retain = "on-failure" # off | on | retain-on-failure | on-first-retry
+
+[timeouts]
+action_ms = 2000
+expect_ms = 5000
+idle_ms = 100
+```
+
+## 16. Test examples worth adding immediately
+
+### Ratatui counter app
+
+- wait for `Count: 0`;
+- press `+`;
+- expect `Count: 1`;
+- screenshot;
+- resize to narrow layout;
+- expect responsive layout text.
+
+### Crossterm mouse app
+
+- click a visible button;
+- verify state changes;
+- assert trace contains mouse action.
+
+### Prompt/REPL app
+
+- wait for prompt;
+- paste multiline text;
+- verify bracketed paste does not execute partial commands when supported.
+
+### Alternate screen cleanup
+
+- spawn app;
+- quit;
+- verify final terminal state does not leave cursor hidden or mouse mode enabled.
+
+### Panic handling
+
+- spawn app that panics;
+- capture last screen, output chunks, exit status, and screenshot.
+
+## 17. Source notes used for this proposal
+
+- `portable-pty` provides a cross-platform PTY API with native PTY systems, `openpty`, reader/writer access, process spawning, resizing, and Windows support through its abstraction.
+- `vt100` provides a parser that processes terminal byte streams into an in-memory `Screen`, with access to cells, contents, cursor, alternate screen, bracketed paste, application cursor mode, and formatted contents.
+- Ratatui’s `TestBackend` is intended for terminal UI integration tests, and Ratatui documents snapshot testing with `insta`; this proposal goes beyond those by testing the compiled binary through a PTY.
+- Playwright’s user-facing power comes from screenshots, video recording, visual comparisons, and traces; this proposal mirrors those categories for TUIs.
+- `gifski` is a high-quality GIF encoder written in Rust and suitable for web GIF output, but its crate metadata lists AGPL licensing, so the design keeps it optional.
+
+## 18. What “done” should mean for a polished release
+
+A polished release should be able to run this exact test:
+
+```rust
+use tuiwright::prelude::*;
+
+#[tuiwright::test]
+fn complete_project_creation_flow(t: TestContext) -> anyhow::Result<()> {
+    let app = t.spawn(
+        SpawnConfig::cargo_bin("my-tui")?
+            .size(120, 40)
+            .env("MY_TUI_DETERMINISTIC", "1"),
+    )?;
+
+    app.expect().to_contain_text("Welcome")?;
+    app.get_by_text("New project").click()?;
+    app.get_by_text("Project name").wait()?;
+    app.keyboard().type_text("tuiwright-demo")?;
+    app.keyboard().press(Key::Enter)?;
+    app.expect().to_contain_text("Project created")?;
+    app.expect().to_have_screenshot("project-created.png")?;
+
+    Ok(())
+}
+```
+
+And on failure it should automatically produce:
+
+```text
+target/tuiwright/complete_project_creation_flow/
+  trace.jsonl
+  report.html
+  failure.png
+  failure.gif
+  stdout.txt
+  screen.txt
+```
+
+That is the benchmark: **TUI tests that are as debuggable and artifact-rich as browser tests**.

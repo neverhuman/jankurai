@@ -1,0 +1,195 @@
+name: jankurai
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jankurai-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: Install security tools
+        env:
+          GITLEAKS_VERSION: "8.30.0"
+          CARGO_AUDIT_VERSION: "0.22.1"
+          ZIZMOR_VERSION: "1.12.0"
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+          cargo install zizmor --version "$ZIZMOR_VERSION" --locked
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cd "$tmp"
+          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-targets --all-features --locked
+          npm --workspace @jankurai/ux-qa run build
+          npm --workspace @jankurai/ux-qa run test
+
+      - name: Install local jankurai
+        run: cargo install --path crates/jankurai --locked --force
+
+      - name: Prepare jankurai artifact directories
+        run: mkdir -p target/jankurai target/jankurai/security target/jankurai/public
+
+      - name: Resolve accepted baseline
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin main --depth=1
+            if git diff --name-only origin/main...HEAD | grep -qx 'agent/baselines/main.repo-score.json'; then
+              cp agent/baselines/main.repo-score.json target/jankurai/accepted-baseline.json
+            else
+              git show origin/main:agent/baselines/main.repo-score.json > target/jankurai/accepted-baseline.json
+            fi
+          elif [ -f agent/baselines/main.repo-score.json ]; then
+            cp agent/baselines/main.repo-score.json target/jankurai/accepted-baseline.json
+          else
+            echo "missing accepted baseline: commit agent/baselines/main.repo-score.json from a reviewed clean main audit" >&2
+            exit 1
+          fi
+
+      - name: Proofbind verify
+        run: |
+          set -euo pipefail
+          mode="required"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            mode="advisory"
+          fi
+          jankurai proofbind verify . --changed-from origin/main --mode "$mode"
+
+      - name: Proofmark rust
+        run: |
+          set -euo pipefail
+          mode="required"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            mode="advisory"
+          fi
+          jankurai proofmark rust . --mode "$mode" --obligations target/jankurai/proofbind/obligations.json
+
+      - name: Rust witness build
+        run: jankurai rust witness build .
+
+      - name: Security lane
+        run: jankurai security run . --strict --profile ci --out target/jankurai/security/evidence.json
+
+      - name: Start UX QA smoke server
+        run: |
+          set -euo pipefail
+          node tools/ux-qa-smoke-server.mjs > target/jankurai/ux-qa-server.log 2>&1 &
+          echo "$!" > target/jankurai/ux-qa-server.pid
+          for attempt in {1..30}; do
+            if curl -fsS "http://127.0.0.1:3000/?ux_state=success" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat target/jankurai/ux-qa-server.log >&2
+          exit 1
+
+      - name: UX QA smoke
+        run: jankurai ux audit --config agent/ux-qa.toml --out target/jankurai/ux-qa.json
+
+      - name: Coverage audit
+        run: |
+          mkdir -p target/jankurai/coverage
+          cargo run -p jankurai -- coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md
+
+      - name: Language bad-behavior fixtures
+        run: cargo test -p jankurai --test language_bad_behavior
+
+      - name: Migration evidence fixtures
+        run: cargo test -p jankurai --test migration_prompt_verify --test migration_slice_risk
+
+      - name: Final jankurai audit
+        run: |
+          jankurai audit . \
+            --mode ratchet \
+            --baseline target/jankurai/accepted-baseline.json \
+            --json target/jankurai/repo-score.json \
+            --md target/jankurai/repo-score.md \
+            --sarif target/jankurai/jankurai.sarif \
+            --github-step-summary target/jankurai/summary.md \
+            --repair-queue-jsonl target/jankurai/repair-queue.jsonl \
+            --proof-receipts target/jankurai/proofmark/proof-receipt.json
+
+      - name: Publish jankurai summary
+        if: always()
+        run: |
+          if [ -f target/jankurai/summary.md ]; then
+            cat target/jankurai/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@53e96ec3b35fce51c141c0d6f0e31028a448722d
+        with:
+          sarif_file: target/jankurai/jankurai.sarif
+
+      - name: Upload jankurai evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: jankurai-score
+          if-no-files-found: ignore
+          path: |
+            target/jankurai/accepted-baseline.json
+            target/jankurai/repo-score.json
+            target/jankurai/repo-score.md
+            target/jankurai/jankurai.sarif
+            target/jankurai/summary.md
+            target/jankurai/repair-queue.jsonl
+            target/jankurai/proofbind/obligations.json
+            target/jankurai/proofbind/surface-witness.json
+            target/jankurai/proofmark/proofmark-receipt.json
+            target/jankurai/proofmark/proof-receipt.json
+            target/jankurai/rust/witness-graph.json
+            target/jankurai/ux-qa.json
+            target/jankurai/ux-qa-server.log
+            target/jankurai/coverage/coverage-audit.json
+            target/jankurai/coverage/coverage-audit.md
+            target/jankurai/security/evidence.json
+            target/jankurai/migration-prompt-verification.json
+            target/jankurai/migration-prompt-verification.md
+            target/jankurai/migration-slice-risk.json
+            target/jankurai/migration-slice-risk.md

@@ -1,0 +1,3047 @@
+**Phase name:** `04 Init Profiles And Golden Repos`
+
+I’m treating this as the completion package for `tips/phases/04-init-profiles-golden-repos.md`.
+
+The key issue is that Phase 04’s written objective is broader than the current implementation: the phase says init should become a profile-driven repo generator, with public profiles including `rust-api`, `react-web`, `rust-ts-postgres`, `b2b-saas`, `ai-product`, `regulated-saas`, and `migration-target`; it also requires golden fixtures for idempotency and generated-adapter refresh. ([GitHub][1]) The repo currently exposes only four bundled profiles in `profiles.rs`, and `docs/install.md` still says only `rust-ts-postgres` is bundled. ([GitHub][2])
+
+The solution below finishes the phase by making init profile coverage match the phase contract, making generated repos align with the moonshot standard, and adding golden tests that prove the behavior. The moonshot requires a repo where agents can infer ownership, safe commands, proof lanes, generated-vs-source boundaries, and exception/evidence flows without tribal knowledge. ([GitHub][3]) The generated skeletons below intentionally avoid creating fake app package manifests because the existing doctor flags manifests without lockfiles; instead, they create explicit architecture slots and validation lanes that can mature in later phases without causing false-green CI. The existing agent-native standard also requires files like `AGENTS.md`, `agent/JANKURAI_STANDARD.md`, owner/test maps, generated zones, proof lanes, score artifacts, boundaries, and security policy, which this patch preserves and expands. ([GitHub][4])
+
+I could inspect the repository through GitHub, but I could not clone and execute tests inside this environment because DNS resolution to GitHub failed. So this is a copy-paste implementation package designed from the live repo contents, but it still needs to be run in your checkout with the validation commands at the bottom.
+
+Copy-paste this from the repository root:
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p \
+  crates/jankurai/src/init \
+  crates/jankurai/templates/profiles \
+  crates/jankurai/templates/agent \
+  crates/jankurai/tests \
+  schemas \
+  docs \
+  tips/phases
+
+cat > crates/jankurai/src/init/profiles.rs <<'EOF'
+use crate::validation::{self, ArtifactSchema};
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+const RUST_TS_POSTGRES_JSON: &str = include_str!("../../templates/profiles/rust-ts-postgres.json");
+const RUST_API_JSON: &str = include_str!("../../templates/profiles/rust-api.json");
+const REACT_WEB_JSON: &str = include_str!("../../templates/profiles/react-web.json");
+const B2B_SAAS_JSON: &str = include_str!("../../templates/profiles/b2b-saas.json");
+const AI_PRODUCT_JSON: &str = include_str!("../../templates/profiles/ai-product.json");
+const REGULATED_SAAS_JSON: &str = include_str!("../../templates/profiles/regulated-saas.json");
+const MIGRATION_TARGET_JSON: &str = include_str!("../../templates/profiles/migration-target.json");
+
+pub const SUPPORTED_PROFILE_IDS: &[&str] = &[
+    "rust-api",
+    "react-web",
+    "rust-ts-postgres",
+    "b2b-saas",
+    "ai-product",
+    "regulated-saas",
+    "migration-target",
+];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileManifest {
+    pub id: String,
+    pub display_name: String,
+    pub target_stack_id: String,
+    pub generated_paths: Vec<String>,
+    pub required_lanes: Vec<String>,
+    pub optional_lanes: Vec<String>,
+    pub agent_adapters: Vec<String>,
+    pub ci_templates: Vec<String>,
+    pub docs: Vec<String>,
+    pub security_controls: Vec<String>,
+    pub ux_controls: Vec<String>,
+    pub contract_system: Vec<String>,
+    pub db_policy: Vec<String>,
+    pub validation_commands: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileManifestFile {
+    id: String,
+    display_name: String,
+    target_stack_id: String,
+    generated_paths: Vec<String>,
+    required_lanes: Vec<String>,
+    optional_lanes: Vec<String>,
+    agent_adapters: Vec<String>,
+    ci_templates: Vec<String>,
+    docs: Vec<String>,
+    security_controls: Vec<String>,
+    ux_controls: Vec<String>,
+    contract_system: Vec<String>,
+    db_policy: Vec<String>,
+    validation_commands: Vec<String>,
+}
+
+impl From<ProfileManifestFile> for ProfileManifest {
+    fn from(value: ProfileManifestFile) -> Self {
+        Self {
+            id: value.id,
+            display_name: value.display_name,
+            target_stack_id: value.target_stack_id,
+            generated_paths: value.generated_paths,
+            required_lanes: value.required_lanes,
+            optional_lanes: value.optional_lanes,
+            agent_adapters: value.agent_adapters,
+            ci_templates: value.ci_templates,
+            docs: value.docs,
+            security_controls: value.security_controls,
+            ux_controls: value.ux_controls,
+            contract_system: value.contract_system,
+            db_policy: value.db_policy,
+            validation_commands: value.validation_commands,
+        }
+    }
+}
+
+pub fn resolve_profile(repo: &Path, profile: &str) -> Result<ProfileManifest> {
+    let trimmed = profile.trim();
+
+    if let Some(id) = normalize_profile_id(trimmed) {
+        let json = match id {
+            "rust-ts-postgres" => RUST_TS_POSTGRES_JSON,
+            "rust-api" => RUST_API_JSON,
+            "react-web" => REACT_WEB_JSON,
+            "b2b-saas" => B2B_SAAS_JSON,
+            "ai-product" => AI_PRODUCT_JSON,
+            "regulated-saas" => REGULATED_SAAS_JSON,
+            "migration-target" => MIGRATION_TARGET_JSON,
+            _ => unreachable!("normalize_profile_id returned unsupported id"),
+        };
+        return load_profile_manifest(json, true)
+            .with_context(|| format!("failed to load bundled init profile `{id}`"));
+    }
+
+    if let Some(path) = profile_json_path(repo, trimmed) {
+        return load_profile_file(repo, &path)
+            .with_context(|| format!("failed to load init profile `{}`", path.display()));
+    }
+
+    bail!(
+        "unknown init profile `{}`.\nsupported bundled profiles: {}\ncustom profiles: pass a repo-relative or absolute path to an init-profile JSON manifest",
+        profile,
+        supported_profile_summary()
+    )
+}
+
+pub fn supported_profile_summary() -> String {
+    SUPPORTED_PROFILE_IDS.join(", ")
+}
+
+fn load_profile_file(_repo: &Path, path: &Path) -> Result<ProfileManifest> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read init profile `{}`", path.display()))?;
+    load_profile_manifest(&text, false)
+}
+
+fn load_profile_manifest(text: &str, require_supported_id: bool) -> Result<ProfileManifest> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("init profile is not valid JSON")?;
+
+    validation::validate_value(ArtifactSchema::InitProfile, &value)
+        .context("init profile failed schemas/init-profile.schema.json")?;
+
+    let file: ProfileManifestFile =
+        serde_json::from_value(value).context("failed to deserialize init profile")?;
+    let manifest: ProfileManifest = file.into();
+
+    validate_manifest_contract(&manifest, require_supported_id)?;
+
+    Ok(manifest)
+}
+
+fn profile_json_path(repo: &Path, profile: &str) -> Option<PathBuf> {
+    if profile.is_empty() {
+        return None;
+    }
+
+    let candidate = Path::new(profile);
+
+    if candidate.is_absolute() && candidate.is_file() {
+        return Some(candidate.to_path_buf());
+    }
+
+    let repo_candidate = repo.join(candidate);
+    if repo_candidate.is_file() {
+        return Some(repo_candidate);
+    }
+
+    None
+}
+
+fn normalize_profile_id(profile: &str) -> Option<&'static str> {
+    match profile {
+        "" | "default" | "fullstack" | "rust-ts" | "rust-ts-postgres" => Some("rust-ts-postgres"),
+        "rust" | "api" | "rust-api" => Some("rust-api"),
+        "web" | "frontend" | "react" | "react-web" => Some("react-web"),
+        "saas" | "b2b" | "b2b-saas" => Some("b2b-saas"),
+        "ai" | "ml" | "ai-product" => Some("ai-product"),
+        "regulated" | "compliance" | "regulated-saas" => Some("regulated-saas"),
+        "migration" | "brownfield" | "migration-target" => Some("migration-target"),
+        _ => None,
+    }
+}
+
+fn validate_manifest_contract(manifest: &ProfileManifest, require_supported_id: bool) -> Result<()> {
+    if require_supported_id && !SUPPORTED_PROFILE_IDS.contains(&manifest.id.as_str()) {
+        bail!(
+            "bundled init profile `{}` is not listed in SUPPORTED_PROFILE_IDS",
+            manifest.id
+        );
+    }
+
+    if manifest.id.trim().is_empty() {
+        bail!("init profile id cannot be empty");
+    }
+    if manifest.display_name.trim().is_empty() {
+        bail!("init profile displayName cannot be empty");
+    }
+    if manifest.target_stack_id.trim().is_empty() {
+        bail!("init profile targetStackId cannot be empty");
+    }
+
+    ensure_list_has_no_duplicates("generatedPaths", &manifest.generated_paths)?;
+    ensure_list_has_no_duplicates("requiredLanes", &manifest.required_lanes)?;
+    ensure_list_has_no_duplicates("optionalLanes", &manifest.optional_lanes)?;
+    ensure_list_has_no_duplicates("agentAdapters", &manifest.agent_adapters)?;
+    ensure_list_has_no_duplicates("ciTemplates", &manifest.ci_templates)?;
+    ensure_list_has_no_duplicates("docs", &manifest.docs)?;
+    ensure_list_has_no_duplicates("securityControls", &manifest.security_controls)?;
+    ensure_list_has_no_duplicates("uxControls", &manifest.ux_controls)?;
+    ensure_list_has_no_duplicates("contractSystem", &manifest.contract_system)?;
+    ensure_list_has_no_duplicates("dbPolicy", &manifest.db_policy)?;
+    ensure_list_has_no_duplicates("validationCommands", &manifest.validation_commands)?;
+
+    for path in &manifest.generated_paths {
+        ensure_relative_template_path("generatedPaths", path)?;
+    }
+
+    ensure_category_subset("agentAdapters", &manifest.agent_adapters, &manifest.generated_paths)?;
+    ensure_category_subset("ciTemplates", &manifest.ci_templates, &manifest.generated_paths)?;
+    ensure_category_subset("docs", &manifest.docs, &manifest.generated_paths)?;
+    ensure_category_subset(
+        "securityControls",
+        &manifest.security_controls,
+        &manifest.generated_paths,
+    )?;
+    ensure_category_subset("uxControls", &manifest.ux_controls, &manifest.generated_paths)?;
+    ensure_category_subset("contractSystem", &manifest.contract_system, &manifest.generated_paths)?;
+    ensure_category_subset("dbPolicy", &manifest.db_policy, &manifest.generated_paths)?;
+
+    let required: BTreeSet<&str> = manifest.required_lanes.iter().map(String::as_str).collect();
+    for lane in &manifest.optional_lanes {
+        if required.contains(lane.as_str()) {
+            bail!("lane `{lane}` cannot appear in both requiredLanes and optionalLanes");
+        }
+    }
+
+    ensure_non_empty_commands(&manifest.validation_commands)?;
+
+    Ok(())
+}
+
+fn ensure_list_has_no_duplicates(name: &str, values: &[String]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("{name} cannot contain empty values");
+        }
+        if !seen.insert(trimmed.to_owned()) {
+            bail!("{name} contains duplicate value `{trimmed}`");
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_relative_template_path(field: &str, path: &str) -> Result<()> {
+    let path_ref = Path::new(path);
+
+    if path_ref.is_absolute() {
+        bail!("{field} path `{path}` must be relative");
+    }
+
+    for component in path_ref.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("{field} path `{path}` must be a clean relative path")
+            }
+        }
+    }
+
+    if path.contains('\\') {
+        bail!("{field} path `{path}` must use forward slashes");
+    }
+
+    Ok(())
+}
+
+fn ensure_category_subset(field: &str, values: &[String], generated_paths: &[String]) -> Result<()> {
+    let generated: BTreeSet<&str> = generated_paths.iter().map(String::as_str).collect();
+
+    for value in values {
+        if !generated.contains(value.as_str()) {
+            bail!("{field} path `{value}` must also be present in generatedPaths");
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_non_empty_commands(commands: &[String]) -> Result<()> {
+    for command in commands {
+        if command.trim().is_empty() {
+            bail!("validationCommands cannot contain empty commands");
+        }
+    }
+
+    Ok(())
+}
+EOF
+
+cat > schemas/init-profile.schema.json <<'EOF'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/init-profile.schema.json",
+  "title": "Jankurai init profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "displayName",
+    "targetStackId",
+    "generatedPaths",
+    "requiredLanes",
+    "optionalLanes",
+    "agentAdapters",
+    "ciTemplates",
+    "docs",
+    "securityControls",
+    "uxControls",
+    "contractSystem",
+    "dbPolicy",
+    "validationCommands"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "displayName": {
+      "type": "string",
+      "minLength": 1
+    },
+    "targetStackId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "generatedPaths": {
+      "$ref": "#/$defs/pathList"
+    },
+    "requiredLanes": {
+      "$ref": "#/$defs/laneList"
+    },
+    "optionalLanes": {
+      "$ref": "#/$defs/stringList"
+    },
+    "agentAdapters": {
+      "$ref": "#/$defs/pathList"
+    },
+    "ciTemplates": {
+      "$ref": "#/$defs/pathList"
+    },
+    "docs": {
+      "$ref": "#/$defs/pathList"
+    },
+    "securityControls": {
+      "$ref": "#/$defs/pathList"
+    },
+    "uxControls": {
+      "$ref": "#/$defs/pathList"
+    },
+    "contractSystem": {
+      "$ref": "#/$defs/pathList"
+    },
+    "dbPolicy": {
+      "$ref": "#/$defs/pathList"
+    },
+    "validationCommands": {
+      "$ref": "#/$defs/commandList"
+    }
+  },
+  "$defs": {
+    "pathString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9._/@+{}*=-]+$",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "^/"
+          },
+          {
+            "pattern": "\\.\\."
+          },
+          {
+            "pattern": "\\\\"
+          }
+        ]
+      }
+    },
+    "pathList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/pathString"
+      }
+    },
+    "stringList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "laneList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      }
+    },
+    "commandList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
+EOF
+
+cat > crates/jankurai/src/init/templates.rs <<'EOF'
+pub struct Template {
+    pub path: &'static str,
+    pub body: &'static str,
+}
+
+const GENERATED_MARKER: &str = "<!-- jankurai generated adapter -->";
+
+pub const TEMPLATES: &[Template] = &[
+    Template {
+        path: "AGENTS.md",
+        body: r#"# AGENTS.md
+
+This repository is governed by the Jankurai agent-native standard.
+
+## Required first read
+
+1. Read `agent/JANKURAI_STANDARD.md`.
+2. Read `agent/MASTER_PLAN.md`.
+3. Read `agent/owner-map.json`.
+4. Read `agent/test-map.json`.
+5. Read `agent/proof-lanes.toml`.
+6. Read `agent/generated-zones.toml`.
+7. Check `docs/exceptions/README.md` before accepting any exception.
+
+## Ground rules
+
+- Do not change source-owned files without following the owner map.
+- Do not overwrite generated files unless the path is listed in `agent/generated-zones.toml`.
+- Do not claim work is done without running the applicable proof lane.
+- Capture security and compliance evidence under `target/jankurai/` or `evidence/` as configured by the lane.
+- Prefer small, reviewable changes with a clear receipt.
+"#,
+    },
+    Template {
+        path: "CLAUDE.md",
+        body: r#"<!-- jankurai generated adapter -->
+# Claude adapter
+
+Follow `AGENTS.md` and `agent/JANKURAI_STANDARD.md` before editing.
+
+Use these files as the source of truth:
+
+- `agent/MASTER_PLAN.md`
+- `agent/owner-map.json`
+- `agent/test-map.json`
+- `agent/proof-lanes.toml`
+- `agent/generated-zones.toml`
+- `docs/exceptions/README.md`
+
+Never treat this adapter as the canonical standard. It is generated so Claude can find the repo contract quickly.
+"#,
+    },
+    Template {
+        path: "GEMINI.md",
+        body: r#"<!-- jankurai generated adapter -->
+# Gemini adapter
+
+Follow `AGENTS.md` and `agent/JANKURAI_STANDARD.md` before editing.
+
+Use these files as the source of truth:
+
+- `agent/MASTER_PLAN.md`
+- `agent/owner-map.json`
+- `agent/test-map.json`
+- `agent/proof-lanes.toml`
+- `agent/generated-zones.toml`
+- `docs/exceptions/README.md`
+
+Never treat this adapter as the canonical standard. It is generated so Gemini can find the repo contract quickly.
+"#,
+    },
+    Template {
+        path: "README-jankurai-scaffold.md",
+        body: r#"# Jankurai scaffold receipt
+
+This repository was initialized with `jankurai init`.
+
+The scaffold intentionally creates standard files, proof lanes, documentation slots, and architecture directories without inventing product code. Product implementation belongs in follow-up work after the repository has clear ownership, generated boundaries, security evidence, and validation commands.
+
+## Safe next steps
+
+1. Run `jankurai audit . --json agent/repo-score.json --md agent/repo-score.md`.
+2. Run `jankurai doctor . --fail-on high`.
+3. Run `jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json`.
+4. Add product code under the owned paths listed in `agent/owner-map.json`.
+5. Update `agent/test-map.json` and `agent/proof-lanes.toml` when new product lanes appear.
+"#,
+    },
+    Template {
+        path: "Justfile",
+        body: r#"# Jankurai proof lanes.
+# Install just from https://github.com/casey/just or read commands directly from this file.
+
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+audit:
+    jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+
+doctor:
+    jankurai doctor . --fail-on high
+
+security:
+    jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json
+
+fast: audit doctor
+
+proof: audit doctor security
+
+receipt:
+    mkdir -p target/jankurai
+    printf 'audit: agent/repo-score.json\nscorecard: agent/repo-score.md\nsecurity: target/jankurai/security/evidence.json\n' > target/jankurai/receipt.txt
+"#,
+    },
+    Template {
+        path: ".agents/agents.md",
+        body: r#"<!-- jankurai generated adapter -->
+# Agent adapter
+
+Read `AGENTS.md` and `agent/JANKURAI_STANDARD.md` first.
+
+The canonical standard lives in `agent/`. This adapter is a routing hint for agent runtimes that scan `.agents/`.
+"#,
+    },
+    Template {
+        path: ".agents/skills/jankurai/SKILL.md",
+        body: r#"<!-- jankurai generated adapter -->
+# Jankurai skill
+
+Before making changes:
+
+1. Read `AGENTS.md`.
+2. Read `agent/JANKURAI_STANDARD.md`.
+3. Identify the owner from `agent/owner-map.json`.
+4. Identify the proof lane from `agent/test-map.json`.
+5. Check generated boundaries in `agent/generated-zones.toml`.
+
+After making changes, run the smallest applicable proof lane and record the command in your response.
+"#,
+    },
+    Template {
+        path: ".agents/workflows/jankurai-audit.md",
+        body: r#"<!-- jankurai generated adapter -->
+# Jankurai audit workflow
+
+Run:
+
+```bash
+jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+jankurai doctor . --fail-on high
+````
+
+Use `target/jankurai/` for transient receipts and `evidence/` for durable project evidence.
+"#,
+},
+Template {
+path: ".claude/skills/jankurai/SKILL.md",
+body: r#"<!-- jankurai generated adapter -->
+
+# Jankurai Claude skill
+
+Follow the canonical files in `agent/`.
+
+Do not overwrite source-owned files.
+Do not edit generated files unless the path appears in `agent/generated-zones.toml`.
+Do not mark work complete without a proof-lane command.
+"#,
+},
+Template {
+path: ".cursor/rules/jankurai.mdc",
+body: r#"<!-- jankurai generated adapter -->
+
+# Jankurai Cursor rule
+
+Always read `AGENTS.md` and `agent/JANKURAI_STANDARD.md`.
+
+Use:
+
+* `agent/owner-map.json` for ownership.
+* `agent/test-map.json` for validation.
+* `agent/generated-zones.toml` for generated boundaries.
+* `docs/exceptions/README.md` for exceptions.
+  "#,
+  },
+  Template {
+  path: ".github/copilot-instructions.md",
+  body: r#"<!-- jankurai generated adapter -->
+
+# Copilot instructions
+
+This repository uses Jankurai.
+
+Before suggesting edits:
+
+* Respect `agent/owner-map.json`.
+* Use `agent/test-map.json` for proof.
+* Do not write into generated zones unless regeneration is requested.
+* Prefer commands from `agent/proof-lanes.toml`.
+  "#,
+  },
+  Template {
+  path: ".github/instructions/jankurai.instructions.md",
+  body: r#"<!-- jankurai generated adapter -->
+
+# Jankurai instructions
+
+The canonical repo contract is:
+
+* `AGENTS.md`
+* `agent/JANKURAI_STANDARD.md`
+* `agent/MASTER_PLAN.md`
+* `agent/owner-map.json`
+* `agent/test-map.json`
+* `agent/proof-lanes.toml`
+* `agent/generated-zones.toml`
+  "#,
+  },
+  Template {
+  path: ".github/instructions/jankurai-rust.instructions.md",
+  body: r#"<!-- jankurai generated adapter -->
+
+# Rust instructions
+
+Use domain/application/adapters boundaries.
+
+* `crates/domain/`: pure domain rules.
+* `crates/application/`: use cases and orchestration.
+* `crates/adapters/`: framework, transport, IO, and persistence adapters.
+* `crates/workers/`: background jobs.
+
+Keep generated code inside generated zones.
+"#,
+},
+Template {
+path: ".github/instructions/jankurai-web.instructions.md",
+body: r#"<!-- jankurai generated adapter -->
+
+# Web instructions
+
+Use the UX acceptance docs before shipping UI changes.
+
+* Check `agent/ux-qa.toml`.
+* Update contracts before changing API expectations.
+* Keep generated clients inside generated zones.
+* Add proof-lane commands to `agent/test-map.json`.
+  "#,
+  },
+  Template {
+  path: ".github/instructions/jankurai-python-ai.instructions.md",
+  body: r#"<!-- jankurai generated adapter -->
+
+# Python and AI instructions
+
+Use evaluation evidence before changing model, prompt, retrieval, or policy behavior.
+
+* Document evals in `docs/evals/README.md`.
+* Store durable evidence under `evidence/`.
+* Keep generated prompt/client artifacts in generated zones.
+  "#,
+  },
+  Template {
+  path: ".github/workflows/jankurai.yml",
+  body: r#"name: jankurai
+
+on:
+pull_request:
+push:
+branches:
+- main
+- master
+
+permissions:
+contents: read
+
+jobs:
+standard:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: dtolnay/rust-toolchain@stable
+- name: Install Jankurai
+run: cargo install --path crates/jankurai --locked
+- name: Audit
+run: jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+- name: Security lane
+run: jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json
+- name: Doctor
+run: jankurai doctor . --fail-on high
+"#,
+},
+Template {
+path: "agent/JANKURAI_STANDARD.md",
+body: include_str!("../../templates/agent/JANKURAI_STANDARD.md"),
+},
+Template {
+path: "agent/MASTER_PLAN.md",
+body: r#"# Master plan
+
+## Mission
+
+Make this repository safe for humans and agents by making ownership, validation, generated code, security evidence, and exceptions explicit.
+
+## Current baseline
+
+* Source of truth: `AGENTS.md` and `agent/JANKURAI_STANDARD.md`
+* Ownership: `agent/owner-map.json`
+* Validation: `agent/test-map.json` and `agent/proof-lanes.toml`
+* Generated zones: `agent/generated-zones.toml`
+* Exceptions: `docs/exceptions/README.md`
+* Security: `agent/security-policy.toml` and `tools/security-lane.sh`
+
+## Operating loop
+
+1. State the change.
+2. Identify impacted owners and paths.
+3. Identify required proof lanes.
+4. Make the smallest safe change.
+5. Run proof.
+6. Record evidence.
+7. Update maps when the architecture changes.
+
+## Backlog
+
+* Replace scaffold README slots with production implementation.
+* Add package manifests only when lockfile and proof lanes are ready.
+* Convert optional proof lanes into required lanes as product maturity increases.
+  "#,
+  },
+  Template {
+  path: "agent/audit-policy.toml",
+  body: include_str!("../../templates/agent/audit-policy.toml"),
+  },
+  Template {
+  path: "agent/boundaries.toml",
+  body: include_str!("../../templates/agent/boundaries.toml"),
+  },
+  Template {
+  path: "agent/security-policy.toml",
+  body: r#"schema_version = "1.0.0"
+
+[metadata]
+owner = "security"
+evidence_dir = "target/jankurai/security"
+durable_evidence_dir = "evidence/security"
+
+[required]
+commands = [
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+
+[controls]
+secrets = "Do not commit secrets. Use environment variables or secret manager references."
+dependencies = "Add manifests only with lockfiles and validation lanes."
+generated = "Do not edit generated outputs outside the generated-zones contract."
+exceptions = "Document accepted risk in docs/exceptions/README.md."
+"#,
+},
+Template {
+path: "agent/generated-zones.toml",
+body: include_str!("../../templates/agent/generated-zones.toml"),
+},
+Template {
+path: "agent/owner-map.json",
+body: include_str!("../../templates/agent/owner-map.json"),
+},
+Template {
+path: "agent/proof-lanes.toml",
+body: include_str!("../../templates/agent/proof-lanes.toml"),
+},
+Template {
+path: "agent/standard-version.toml",
+body: include_str!("../../templates/agent/standard-version.toml"),
+},
+Template {
+path: "agent/test-map.json",
+body: include_str!("../../templates/agent/test-map.json"),
+},
+Template {
+path: "agent/ux-qa.toml",
+body: r#"schema_version = "1.0.0"
+
+[metadata]
+owner = "ux"
+evidence_dir = "target/jankurai/ux"
+
+[checks]
+keyboard = "Interactive controls must be reachable without a mouse."
+focus = "Focus order must match visual order."
+contrast = "Text and essential UI affordances must pass the product contrast target."
+loading = "Loading, empty, and error states must be documented."
+contracts = "API-facing UI states must be tied to a contract or fixture."
+"#,
+},
+Template {
+path: "apps/api/README.md",
+body: r#"# API application slot
+
+This path is owned by the API layer.
+
+Expected responsibilities:
+
+* HTTP or RPC entry points.
+* Request validation.
+* Authentication and authorization boundaries.
+* Conversion between transport contracts and application use cases.
+* No domain rules that belong in `crates/domain/`.
+
+Before adding package manifests, add lockfiles and update `agent/test-map.json`.
+"#,
+},
+Template {
+path: "apps/web/README.md",
+body: r#"# Web application slot
+
+This path is owned by the web layer.
+
+Expected responsibilities:
+
+* UI routes and components.
+* Accessibility and UX acceptance evidence.
+* Contract-backed API calls.
+* Generated clients only in generated zones.
+
+Before adding package manifests, add lockfiles and update `agent/test-map.json`.
+"#,
+},
+Template {
+path: "contracts/README.md",
+body: r#"# Contracts
+
+Use this directory for API, event, database, and integration contracts.
+
+Rules:
+
+* Source contracts are reviewed.
+* Generated clients or adapters must live in a generated zone.
+* Breaking changes require evidence in the relevant proof lane.
+  "#,
+  },
+  Template {
+  path: "crates/domain/README.md",
+  body: r#"# Domain crate slot
+
+Domain code should be pure business logic.
+
+Allowed:
+
+* Value objects.
+* Entities.
+* Domain services.
+* Policy checks that do not perform IO.
+
+Avoid:
+
+* HTTP details.
+* Database clients.
+* Framework types.
+* Secrets or environment access.
+  "#,
+  },
+  Template {
+  path: "crates/application/README.md",
+  body: r#"# Application crate slot
+
+Application code coordinates use cases.
+
+Allowed:
+
+* Commands and queries.
+* Transaction boundaries.
+* Ports/interfaces for adapters.
+* Cross-domain orchestration.
+
+Avoid framework-specific implementation details.
+"#,
+},
+Template {
+path: "crates/adapters/README.md",
+body: r#"# Adapter crate slot
+
+Adapters contain IO and framework integration.
+
+Examples:
+
+* Database repositories.
+* HTTP clients.
+* Message queues.
+* External service SDK wrappers.
+* Generated adapter glue inside generated zones.
+  "#,
+  },
+  Template {
+  path: "crates/workers/README.md",
+  body: r#"# Worker crate slot
+
+Workers handle asynchronous and scheduled work.
+
+Rules:
+
+* Work items must be idempotent or document why not.
+* Retries and dead-letter behavior must be described.
+* Security-sensitive jobs must produce evidence.
+  "#,
+  },
+  Template {
+  path: "db/README.md",
+  body: r#"# Database
+
+Database changes must be intentional and auditable.
+
+Expected structure:
+
+* `db/migrations/`
+* `db/constraints/`
+* Data-retention and privacy notes in `docs/privacy/README.md` when applicable.
+
+Rules:
+
+* Do not apply destructive changes without an exception or migration plan.
+* Keep generated SQL in generated zones if generation is used.
+  "#,
+  },
+  Template {
+  path: "db/migrations/README.md",
+  body: r#"# Migrations
+
+Add migration files here when the database layer is implemented.
+
+Each migration should include:
+
+* Purpose.
+* Rollback or forward-fix strategy.
+* Data safety notes.
+* Linked proof lane.
+  "#,
+  },
+  Template {
+  path: "db/constraints/README.md",
+  body: r#"# Database constraints
+
+Use this path for invariant documentation and constraint definitions.
+
+Examples:
+
+* Unique constraints.
+* Foreign keys.
+* Check constraints.
+* Retention constraints.
+  "#,
+  },
+  Template {
+  path: "docs/agent-native-standard.md",
+  body: include_str!("../../templates/docs/agent-native-standard.md"),
+  },
+  Template {
+  path: "docs/install.md",
+  body: include_str!("../../templates/docs/install.md"),
+  },
+  Template {
+  path: "docs/ide-integrations.md",
+  body: include_str!("../../templates/docs/ide-integrations.md"),
+  },
+  Template {
+  path: "docs/architecture/README.md",
+  body: r#"# Architecture
+
+Document the system shape here.
+
+Minimum useful architecture notes:
+
+* Boundaries.
+* Runtime components.
+* External dependencies.
+* Data flow.
+* Trust boundaries.
+* Generated-vs-source ownership.
+  "#,
+  },
+  Template {
+  path: "docs/decisions/README.md",
+  body: r#"# Decisions
+
+Record architecture and product decisions here.
+
+Suggested format:
+
+* Context.
+* Decision.
+* Alternatives considered.
+* Consequences.
+* Proof or evidence.
+  "#,
+  },
+  Template {
+  path: "docs/exceptions/README.md",
+  body: r#"# Exceptions
+
+Exceptions are accepted deviations from the standard.
+
+Each exception should include:
+
+* Owner.
+* Date opened.
+* Risk.
+* Reason.
+* Expiration or review date.
+* Compensating control.
+* Evidence link.
+
+Do not hide exceptions in comments or chat history.
+"#,
+},
+Template {
+path: "docs/security/README.md",
+body: r#"# Security
+
+Use this directory for security model, threat notes, control evidence, and review receipts.
+
+Minimum topics:
+
+* Authentication and authorization.
+* Secrets.
+* Dependency policy.
+* Data classification.
+* Generated code boundaries.
+* Incident response.
+  "#,
+  },
+  Template {
+  path: "docs/runbooks/README.md",
+  body: r#"# Runbooks
+
+Runbooks describe operational actions.
+
+Each runbook should include:
+
+* Trigger.
+* Preconditions.
+* Steps.
+* Rollback.
+* Evidence to capture.
+* Escalation path.
+  "#,
+  },
+  Template {
+  path: "docs/observability/README.md",
+  body: r#"# Observability
+
+Document logs, metrics, traces, alerts, dashboards, and SLOs.
+
+Agents should use this file before changing runtime behavior that affects production diagnosis.
+"#,
+},
+Template {
+path: "docs/auth/README.md",
+body: r#"# Authentication and authorization
+
+Document identity, session, tenant, role, and permission behavior.
+
+Include:
+
+* Trust boundaries.
+* Permission model.
+* Admin override rules.
+* Audit-log expectations.
+  "#,
+  },
+  Template {
+  path: "docs/orgs/README.md",
+  body: r#"# Organizations and tenants
+
+Document organization, workspace, tenant, and membership behavior.
+
+Include:
+
+* Tenant isolation rules.
+* Ownership transfer.
+* Billing or entitlement boundaries.
+* Cross-tenant access risks.
+  "#,
+  },
+  Template {
+  path: "docs/admin/README.md",
+  body: r#"# Admin
+
+Document admin surfaces and elevated operations.
+
+Include:
+
+* Who can access.
+* What gets audited.
+* Break-glass behavior.
+* Approval or review requirements.
+  "#,
+  },
+  Template {
+  path: "docs/privacy/README.md",
+  body: r#"# Privacy
+
+Document personal data handling.
+
+Include:
+
+* Data categories.
+* Purpose and retention.
+* Deletion/export behavior.
+* Third-party processors.
+* User-facing controls.
+  "#,
+  },
+  Template {
+  path: "docs/compliance/README.md",
+  body: r#"# Compliance
+
+Document applicable compliance controls and evidence.
+
+Use this directory for control mapping, audit readiness, policy links, and durable evidence references.
+"#,
+},
+Template {
+path: "docs/data-classification/README.md",
+body: r#"# Data classification
+
+Classify data handled by the system.
+
+Suggested classes:
+
+* Public.
+* Internal.
+* Confidential.
+* Restricted.
+* Regulated.
+
+Tie each class to storage, logging, retention, and access rules.
+"#,
+},
+Template {
+path: "docs/backup-restore/README.md",
+body: r#"# Backup and restore
+
+Document backup, restore, retention, disaster recovery, and test-restore evidence.
+
+Include RPO, RTO, owner, cadence, and last verified restore.
+"#,
+},
+Template {
+path: "docs/evals/README.md",
+body: r#"# Evaluations
+
+Use this directory for AI, policy, prompt, retrieval, ranking, and model behavior evaluations.
+
+Each eval should include:
+
+* Scenario.
+* Dataset or fixture source.
+* Expected behavior.
+* Failure modes.
+* Evidence receipt.
+  "#,
+  },
+  Template {
+  path: "docs/migration/README.md",
+  body: r#"# Migration
+
+Document brownfield migration plans.
+
+Include:
+
+* Current state.
+* Target state.
+* Inventory.
+* Compatibility risks.
+* Cutover plan.
+* Rollback plan.
+* Evidence requirements.
+  "#,
+  },
+  Template {
+  path: "evidence/README.md",
+  body: r#"# Evidence
+
+Durable evidence that should survive local cleanup belongs here.
+
+Use `target/jankurai/` for transient local receipts.
+Use this directory for durable audit, migration, compliance, or release evidence.
+"#,
+},
+Template {
+path: "evidence/migration/README.md",
+body: r#"# Migration evidence
+
+Store migration inventories, cutover receipts, compatibility proof, and rollback evidence here.
+"#,
+},
+Template {
+path: "evidence/compliance/README.md",
+body: r#"# Compliance evidence
+
+Store durable compliance evidence and audit receipts here.
+"#,
+},
+Template {
+path: "ops/README.md",
+body: r#"# Operations
+
+Operational docs, scripts, deployment notes, and evidence routing live here.
+
+Keep production-affecting scripts tied to a proof lane.
+"#,
+},
+Template {
+path: "ops/security/README.md",
+body: r#"# Security operations
+
+Document security operations such as scanning, key rotation, incident handling, and evidence capture.
+"#,
+},
+Template {
+path: "ops/compliance/README.md",
+body: r#"# Compliance operations
+
+Document recurring compliance workflows, audit preparation, control checks, and evidence owners.
+"#,
+},
+Template {
+path: "python/ai-service/README.md",
+body: r#"# AI service slot
+
+This path is for AI, model, prompt, retrieval, and evaluation code.
+
+Rules:
+
+* Evaluation changes need evidence.
+* Generated prompts, clients, and fixtures belong in generated zones.
+* Model behavior changes must update `docs/evals/README.md`.
+  "#,
+  },
+  Template {
+  path: "python/ai-service/evals/README.md",
+  body: r#"# AI service evals
+
+Store local eval fixtures, eval runners, and result summaries here when the AI service is implemented.
+"#,
+},
+Template {
+path: "tools/security-lane.sh",
+body: r#"#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p target/jankurai/security
+
+# This script is intentionally conservative for a fresh scaffold:
+
+# - It verifies the files that define the security lane.
+
+# - It avoids pretending that dependency, SAST, or container scans exist before package manifests do.
+
+# - Add real scanners here when manifests, lockfiles, and runtime targets are introduced.
+
+required_files=(
+"AGENTS.md"
+"agent/JANKURAI_STANDARD.md"
+"agent/security-policy.toml"
+"agent/boundaries.toml"
+"agent/generated-zones.toml"
+"docs/security/README.md"
+"docs/exceptions/README.md"
+)
+
+for file in "${required_files[@]}"; do
+test -f "$file"
+done
+
+printf '{"status":"pass","lane":"security","checked_files":%s}\n' "${#required_files[@]}" > target/jankurai/security/lane-summary.json
+"#,
+},
+];
+
+pub fn generated_marker() -> &'static str {
+GENERATED_MARKER
+}
+EOF
+
+cat > crates/jankurai/templates/agent/owner-map.json <<'EOF'
+{
+"workspace": "jankurai",
+"owners": {
+"AGENTS.md": "agent",
+"README.md": "workspace",
+"README-jankurai-scaffold.md": "workspace",
+"Justfile": "workspace",
+".github/": "ops",
+".cursor/": "agent",
+".claude/": "agent",
+".agents/": "agent",
+"CLAUDE.md": "agent",
+"GEMINI.md": "agent",
+"agent/MASTER_PLAN.md": "agent",
+"agent/": "agent",
+"apps/api/": "api",
+"apps/web/": "web",
+"contracts/": "contracts",
+"crates/domain/": "domain",
+"crates/application/": "application",
+"crates/adapters/": "adapters",
+"crates/workers/": "workers",
+"crates/": "rust",
+"db/": "data",
+"docs/": "standard",
+"evidence/": "evidence",
+"ops/": "ops",
+"python/ai-service/": "ai",
+"tools/": "tools"
+}
+}
+EOF
+
+cat > crates/jankurai/templates/agent/test-map.json <<'EOF'
+{
+"version": "1.0.0",
+"default": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high"
+],
+"paths": {
+"AGENTS.md": [
+"jankurai doctor . --fail-on high"
+],
+"Justfile": [
+"jankurai doctor . --fail-on high"
+],
+".github/": [
+"jankurai doctor . --fail-on high"
+],
+".cursor/": [
+"jankurai doctor . --fail-on high"
+],
+".claude/": [
+"jankurai doctor . --fail-on high"
+],
+".agents/": [
+"jankurai doctor . --fail-on high"
+],
+"agent/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high"
+],
+"contracts/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"apps/api/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"apps/web/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"crates/domain/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"crates/application/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"crates/adapters/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"crates/workers/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"db/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high"
+],
+"docs/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"evidence/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"ops/": [
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+],
+"python/ai-service/": [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+],
+"tools/security-lane.sh": [
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+}
+EOF
+
+cat > crates/jankurai/templates/agent/proof-lanes.toml <<'EOF'
+schema_version = "1.0.0"
+
+[[lane]]
+name = "fast"
+purpose = "Minimum local proof for most documentation, policy, and scaffold changes."
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md && jankurai doctor . --fail-on high"
+required = true
+
+[[lane]]
+name = "audit"
+purpose = "Score the repository against the Jankurai standard."
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+required = true
+
+[[lane]]
+name = "doctor"
+purpose = "Fail on high-severity standard and repo-health defects."
+command = "jankurai doctor . --fail-on high"
+required = true
+
+[[lane]]
+name = "security"
+purpose = "Run the security evidence wrapper."
+command = "jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+required = true
+
+[[lane]]
+name = "contract"
+purpose = "Validate contract ownership and generated-client boundaries."
+command = "jankurai audit . --json target/jankurai/contracts-score.json --md target/jankurai/contracts-score.md"
+required = false
+
+[[lane]]
+name = "db"
+purpose = "Validate database policy, docs, and migration safety."
+command = "jankurai doctor . --fail-on high"
+required = false
+
+[[lane]]
+name = "web"
+purpose = "Validate web ownership and UX proof readiness."
+command = "jankurai audit . --json target/jankurai/web-score.json --md target/jankurai/web-score.md"
+required = false
+
+[[lane]]
+name = "ux"
+purpose = "Validate UX QA policy presence and accessibility review readiness."
+command = "jankurai audit . --json target/jankurai/ux-score.json --md target/jankurai/ux-score.md"
+required = false
+
+[[lane]]
+name = "ai-eval"
+purpose = "Validate AI eval documentation and evidence routing."
+command = "jankurai audit . --json target/jankurai/ai-score.json --md target/jankurai/ai-score.md"
+required = false
+
+[[lane]]
+name = "migration"
+purpose = "Validate brownfield migration inventory, cutover, rollback, and evidence slots."
+command = "jankurai audit . --json target/jankurai/migration-score.json --md target/jankurai/migration-score.md"
+required = false
+
+[[lane]]
+name = "release"
+purpose = "Full scaffold proof for release readiness."
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md && jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json && jankurai doctor . --fail-on high"
+required = false
+EOF
+
+cat > crates/jankurai/templates/agent/generated-zones.toml <<'EOF'
+schema_version = "1.0.0"
+
+[[zone]]
+path = "agent/repo-score.json"
+source = "jankurai audit"
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+
+[[zone]]
+path = "agent/repo-score.md"
+source = "jankurai audit"
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+
+[[zone]]
+path = "contracts/generated/**"
+source = "contract generator"
+command = "project-specific contract generation command"
+
+[[zone]]
+path = "apps/web/src/generated/**"
+source = "contract generator"
+command = "project-specific web client generation command"
+
+[[zone]]
+path = "apps/api/src/generated/**"
+source = "contract generator"
+command = "project-specific API adapter generation command"
+
+[[zone]]
+path = "crates/domain/src/generated/**"
+source = "domain generator"
+command = "project-specific domain generation command"
+
+[[zone]]
+path = "crates/application/src/generated/**"
+source = "application generator"
+command = "project-specific application generation command"
+
+[[zone]]
+path = "crates/adapters/src/generated/**"
+source = "adapter generator"
+command = "project-specific adapter generation command"
+
+[[zone]]
+path = "python/ai-service/generated/**"
+source = "AI artifact generator"
+command = "project-specific AI artifact generation command"
+EOF
+
+cat > crates/jankurai/templates/profiles/rust-ts-postgres.json <<'EOF'
+{
+"id": "rust-ts-postgres",
+"displayName": "Rust + TypeScript + Postgres",
+"targetStackId": "rust-ts-postgres",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-python-ai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"agent/ux-qa.toml",
+"apps/api/README.md",
+"apps/web/README.md",
+"contracts/README.md",
+"crates/domain/README.md",
+"crates/application/README.md",
+"crates/adapters/README.md",
+"crates/workers/README.md",
+"db/constraints/README.md",
+"db/migrations/README.md",
+"db/README.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/evals/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"ops/README.md",
+"ops/security/README.md",
+"python/ai-service/README.md",
+"python/ai-service/evals/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "contract", "db"],
+"optionalLanes": ["web", "ux", "ai-eval", "release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-python-ai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/evals/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"ops/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": ["agent/ux-qa.toml", "apps/web/README.md"],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [
+"db/README.md",
+"db/migrations/README.md",
+"db/constraints/README.md"
+],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile rust-ts-postgres --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > crates/jankurai/templates/profiles/rust-api.json <<'EOF'
+{
+"id": "rust-api",
+"displayName": "Rust API",
+"targetStackId": "rust-api",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"apps/api/README.md",
+"contracts/README.md",
+"crates/domain/README.md",
+"crates/application/README.md",
+"crates/adapters/README.md",
+"crates/workers/README.md",
+"db/constraints/README.md",
+"db/migrations/README.md",
+"db/README.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"ops/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "contract", "db"],
+"optionalLanes": ["release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"ops/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": [],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [
+"db/README.md",
+"db/migrations/README.md",
+"db/constraints/README.md"
+],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile rust-api --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > crates/jankurai/templates/profiles/react-web.json <<'EOF'
+{
+"id": "react-web",
+"displayName": "React Web",
+"targetStackId": "react-web",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-web.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"agent/ux-qa.toml",
+"apps/web/README.md",
+"contracts/README.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"ops/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "web", "ux"],
+"optionalLanes": ["contract", "release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-web.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"ops/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": ["agent/ux-qa.toml", "apps/web/README.md"],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile react-web --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > crates/jankurai/templates/profiles/b2b-saas.json <<'EOF'
+{
+"id": "b2b-saas",
+"displayName": "B2B SaaS",
+"targetStackId": "b2b-saas",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"agent/ux-qa.toml",
+"apps/api/README.md",
+"apps/web/README.md",
+"contracts/README.md",
+"crates/domain/README.md",
+"crates/application/README.md",
+"crates/adapters/README.md",
+"crates/workers/README.md",
+"db/constraints/README.md",
+"db/migrations/README.md",
+"db/README.md",
+"docs/agent-native-standard.md",
+"docs/admin/README.md",
+"docs/architecture/README.md",
+"docs/auth/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/orgs/README.md",
+"docs/privacy/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"ops/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "contract", "db", "web", "ux"],
+"optionalLanes": ["release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/admin/README.md",
+"docs/architecture/README.md",
+"docs/auth/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/orgs/README.md",
+"docs/privacy/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"ops/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": ["agent/ux-qa.toml", "apps/web/README.md"],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [
+"db/README.md",
+"db/migrations/README.md",
+"db/constraints/README.md"
+],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile b2b-saas --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > crates/jankurai/templates/profiles/ai-product.json <<'EOF'
+{
+"id": "ai-product",
+"displayName": "AI Product",
+"targetStackId": "ai-product",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-python-ai.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"contracts/README.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/evals/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"ops/README.md",
+"ops/security/README.md",
+"python/ai-service/README.md",
+"python/ai-service/evals/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "ai-eval"],
+"optionalLanes": ["contract", "release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-python-ai.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/evals/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"ops/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": [],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile ai-product --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > crates/jankurai/templates/profiles/regulated-saas.json <<'EOF'
+{
+"id": "regulated-saas",
+"displayName": "Regulated SaaS",
+"targetStackId": "regulated-saas",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"agent/ux-qa.toml",
+"apps/api/README.md",
+"apps/web/README.md",
+"contracts/README.md",
+"crates/domain/README.md",
+"crates/application/README.md",
+"crates/adapters/README.md",
+"crates/workers/README.md",
+"db/constraints/README.md",
+"db/migrations/README.md",
+"db/README.md",
+"docs/agent-native-standard.md",
+"docs/admin/README.md",
+"docs/architecture/README.md",
+"docs/auth/README.md",
+"docs/backup-restore/README.md",
+"docs/compliance/README.md",
+"docs/data-classification/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/orgs/README.md",
+"docs/privacy/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"evidence/compliance/README.md",
+"ops/README.md",
+"ops/compliance/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "contract", "db", "web", "ux"],
+"optionalLanes": ["release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/admin/README.md",
+"docs/architecture/README.md",
+"docs/auth/README.md",
+"docs/backup-restore/README.md",
+"docs/compliance/README.md",
+"docs/data-classification/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/observability/README.md",
+"docs/orgs/README.md",
+"docs/privacy/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"evidence/compliance/README.md",
+"ops/README.md",
+"ops/compliance/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"docs/data-classification/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": ["agent/ux-qa.toml", "apps/web/README.md"],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [
+"db/README.md",
+"db/migrations/README.md",
+"db/constraints/README.md"
+],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile regulated-saas --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > crates/jankurai/templates/profiles/migration-target.json <<'EOF'
+{
+"id": "migration-target",
+"displayName": "Migration Target",
+"targetStackId": "migration-target",
+"generatedPaths": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+"README-jankurai-scaffold.md",
+"Justfile",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"contracts/README.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/migration/README.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"evidence/migration/README.md",
+"ops/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"requiredLanes": ["audit", "doctor", "security", "migration"],
+"optionalLanes": ["contract", "release"],
+"agentAdapters": [
+"AGENTS.md",
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md"
+],
+"ciTemplates": [".github/workflows/jankurai.yml", "Justfile"],
+"docs": [
+"README-jankurai-scaffold.md",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"docs/migration/README.md",
+"docs/observability/README.md",
+"docs/runbooks/README.md",
+"docs/security/README.md",
+"evidence/README.md",
+"evidence/migration/README.md",
+"ops/README.md"
+],
+"securityControls": [
+"agent/security-policy.toml",
+"agent/boundaries.toml",
+"docs/security/README.md",
+"ops/security/README.md",
+"tools/security-lane.sh"
+],
+"uxControls": [],
+"contractSystem": ["contracts/README.md"],
+"dbPolicy": [],
+"validationCommands": [
+"cargo test -p jankurai init_golden",
+"jankurai init . --profile migration-target --dry-run",
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json"
+]
+}
+EOF
+
+cat > docs/install.md <<'EOF'
+
+# Install and initialize
+
+## Install
+
+From a checkout:
+
+```bash
+cargo install --path crates/jankurai --locked
+```
+
+Or run from the workspace:
+
+```bash
+cargo run -p jankurai -- --help
+```
+
+## Initialize a repository
+
+```bash
+jankurai init . --profile rust-ts-postgres
+```
+
+Use `--dry-run` first when initializing an existing repository:
+
+```bash
+jankurai init . --profile migration-target --dry-run
+```
+
+Write a machine-readable plan:
+
+```bash
+jankurai init . --profile regulated-saas --plan-json target/jankurai/init-plan.json --dry-run
+```
+
+Show a diff-style plan:
+
+```bash
+jankurai init . --profile b2b-saas --diff --dry-run
+```
+
+## Bundled profiles
+
+| Profile            | Use when                                                                                                |
+| ------------------ | ------------------------------------------------------------------------------------------------------- |
+| `rust-api`         | The repository is primarily a Rust API/service with contracts, database policy, and security lanes.     |
+| `react-web`        | The repository is primarily a React/web frontend with UX and contract readiness lanes.                  |
+| `rust-ts-postgres` | The repository is a full-stack Rust + TypeScript + Postgres product. This is also the default profile.  |
+| `b2b-saas`         | The product needs tenant, org, auth, admin, privacy, and SaaS evidence slots.                           |
+| `ai-product`       | The product includes AI, model, prompt, retrieval, or eval workflows.                                   |
+| `regulated-saas`   | The product needs stronger compliance, data classification, backup/restore, and durable evidence slots. |
+| `migration-target` | The repository is brownfield or being migrated into the Jankurai standard.                              |
+
+Aliases:
+
+* `default`, `fullstack`, `rust-ts` -> `rust-ts-postgres`
+* `api`, `rust` -> `rust-api`
+* `web`, `frontend`, `react` -> `react-web`
+* `saas`, `b2b` -> `b2b-saas`
+* `ai`, `ml` -> `ai-product`
+* `regulated`, `compliance` -> `regulated-saas`
+* `migration`, `brownfield` -> `migration-target`
+
+## Local custom profiles
+
+A custom profile is a JSON file that matches `schemas/init-profile.schema.json`.
+
+```bash
+jankurai init . --profile ./profiles/my-profile.json --dry-run
+```
+
+Custom profile paths may be absolute or repo-relative. Every path listed in profile categories such as `docs`, `securityControls`, `contractSystem`, or `dbPolicy` must also appear in `generatedPaths`.
+
+## Safe re-run behavior
+
+`jankurai init` is designed to be re-run.
+
+* Missing files are created.
+* Existing user-owned files are preserved.
+* `AGENTS.md` and `agent/JANKURAI_STANDARD.md` use controlled merge behavior.
+* Generated adapter files are not overwritten by default.
+* Passing `--force-generated-adapters` refreshes only adapter files that contain the Jankurai generated-adapter marker.
+
+Generated adapters include files such as:
+
+* `CLAUDE.md`
+* `GEMINI.md`
+* `.cursor/rules/jankurai.mdc`
+* `.claude/skills/jankurai/SKILL.md`
+* `.agents/skills/jankurai/SKILL.md`
+* `.github/instructions/*.md`
+
+## After init
+
+Run the baseline proof lanes:
+
+```bash
+jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+jankurai doctor . --fail-on high
+jankurai security run . --script tools/security-lane.sh --out target/jankurai/security/evidence.json
+```
+
+Optional helper:
+
+```bash
+just proof
+```
+
+## What init intentionally does not do
+
+Init does not create fake application package manifests, dependency lockfiles, deployment targets, or product code. It creates the repo contract and architecture slots. Add real package manifests only when the lockfile, owner map, test map, and proof lanes are ready.
+EOF
+
+cat > crates/jankurai/tests/init_golden.rs <<'EOF'
+use assert_cmd::cargo::cargo_bin;
+use jankurai::init::{self, profiles, templates};
+use serde_json::json;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::tempdir;
+
+static BUNDLED_PROFILES: &[&str] = &[
+"rust-api",
+"react-web",
+"rust-ts-postgres",
+"b2b-saas",
+"ai-product",
+"regulated-saas",
+"migration-target",
+];
+
+fn binary_path() -> PathBuf {
+cargo_bin("jankurai")
+}
+
+fn init_args(repo: &Path, profile: &str) -> init::InitArgs {
+init::InitArgs {
+path: repo.to_path_buf(),
+profile: profile.to_string(),
+dry_run: false,
+plan_json: None,
+diff: false,
+force_generated_adapters: false,
+}
+}
+
+fn dry_run_plan(repo: &Path, profile: &str) -> serde_json::Value {
+let plan_path = repo.join(format!("plan-{}.json", profile.replace('/', "-")));
+init::run(init::InitArgs {
+path: repo.to_path_buf(),
+profile: profile.to_string(),
+dry_run: true,
+plan_json: Some(plan_path.clone()),
+diff: false,
+force_generated_adapters: false,
+})
+.expect("dry-run init should succeed");
+
+```
+let text = fs::read_to_string(plan_path).expect("plan json should be written");
+serde_json::from_str(&text).expect("plan json should parse")
+```
+
+}
+
+#[test]
+fn bundled_profile_list_is_phase_04_complete() {
+let supported: BTreeSet<&str> = profiles::SUPPORTED_PROFILE_IDS.iter().copied().collect();
+let expected: BTreeSet<&str> = BUNDLED_PROFILES.iter().copied().collect();
+
+```
+assert_eq!(supported, expected);
+assert_eq!(
+    profiles::supported_profile_summary(),
+    "rust-api, react-web, rust-ts-postgres, b2b-saas, ai-product, regulated-saas, migration-target"
+);
+```
+
+}
+
+#[test]
+fn profile_manifests_are_valid_and_template_complete() {
+let dir = tempdir().unwrap();
+let template_paths: BTreeSet<&str> = templates::TEMPLATES.iter().map(|template| template.path).collect();
+
+```
+for profile in BUNDLED_PROFILES {
+    let manifest = profiles::resolve_profile(dir.path(), profile).unwrap();
+
+    assert_eq!(manifest.id, *profile);
+    assert!(!manifest.display_name.is_empty());
+    assert!(!manifest.target_stack_id.is_empty());
+    assert!(!manifest.generated_paths.is_empty());
+    assert!(!manifest.required_lanes.is_empty());
+    assert!(!manifest.validation_commands.is_empty());
+
+    for path in &manifest.generated_paths {
+        assert!(
+            template_paths.contains(path.as_str()),
+            "profile {profile} references missing template {path}"
+        );
+    }
+
+    for path in manifest
+        .agent_adapters
+        .iter()
+        .chain(manifest.ci_templates.iter())
+        .chain(manifest.docs.iter())
+        .chain(manifest.security_controls.iter())
+        .chain(manifest.ux_controls.iter())
+        .chain(manifest.contract_system.iter())
+        .chain(manifest.db_policy.iter())
+    {
+        assert!(
+            manifest.generated_paths.contains(path),
+            "profile {profile} category path {path} must also be in generatedPaths"
+        );
+    }
+}
+```
+
+}
+
+#[test]
+fn unknown_profile_errors_with_all_supported_profiles() {
+let dir = tempdir().unwrap();
+let err = profiles::resolve_profile(dir.path(), "does-not-exist").unwrap_err();
+let text = err.to_string();
+
+```
+assert!(text.contains("unknown init profile"));
+for profile in BUNDLED_PROFILES {
+    assert!(text.contains(profile), "error should mention {profile}");
+}
+```
+
+}
+
+#[test]
+fn profile_aliases_resolve_to_expected_ids() {
+let dir = tempdir().unwrap();
+
+```
+let cases = [
+    ("default", "rust-ts-postgres"),
+    ("fullstack", "rust-ts-postgres"),
+    ("api", "rust-api"),
+    ("rust", "rust-api"),
+    ("web", "react-web"),
+    ("frontend", "react-web"),
+    ("saas", "b2b-saas"),
+    ("b2b", "b2b-saas"),
+    ("ai", "ai-product"),
+    ("ml", "ai-product"),
+    ("regulated", "regulated-saas"),
+    ("compliance", "regulated-saas"),
+    ("migration", "migration-target"),
+    ("brownfield", "migration-target")
+];
+
+for (alias, expected) in cases {
+    let manifest = profiles::resolve_profile(dir.path(), alias).unwrap();
+    assert_eq!(manifest.id, expected, "alias {alias}");
+}
+```
+
+}
+
+#[test]
+fn init_plan_paths_match_profile_manifest_for_all_bundled_profiles() {
+for profile in BUNDLED_PROFILES {
+let dir = tempdir().unwrap();
+let manifest = profiles::resolve_profile(dir.path(), profile).unwrap();
+let plan = dry_run_plan(dir.path(), profile);
+
+```
+    assert_eq!(plan["profile"], *profile);
+    assert_eq!(plan["manifest"]["id"], *profile);
+
+    let mut action_paths: Vec<String> = plan["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|action| action["path"].as_str().unwrap().to_string())
+        .collect();
+
+    let mut expected = manifest.generated_paths.clone();
+
+    action_paths.sort();
+    expected.sort();
+
+    assert_eq!(action_paths, expected, "plan paths for {profile}");
+
+    for action in plan["actions"].as_array().unwrap() {
+        assert_eq!(action["action"], "create", "empty repo should create all paths");
+        assert!(action["reason"].as_str().unwrap().contains("missing"));
+    }
+}
+```
+
+}
+
+#[test]
+fn init_all_bundled_profiles_apply_then_audit_and_doctor() {
+for profile in BUNDLED_PROFILES {
+let dir = tempdir().unwrap();
+
+```
+    init::run(init_args(dir.path(), profile)).expect("init should apply");
+
+    assert!(dir.path().join("AGENTS.md").is_file(), "{profile} AGENTS.md");
+    assert!(dir.path().join("agent/JANKURAI_STANDARD.md").is_file(), "{profile} standard");
+    assert!(dir.path().join("agent/owner-map.json").is_file(), "{profile} owner map");
+    assert!(dir.path().join("agent/test-map.json").is_file(), "{profile} test map");
+    assert!(dir.path().join("agent/proof-lanes.toml").is_file(), "{profile} proof lanes");
+    assert!(dir.path().join("agent/generated-zones.toml").is_file(), "{profile} generated zones");
+    assert!(dir.path().join("tools/security-lane.sh").is_file(), "{profile} security lane");
+
+    assert_profile_specific_files(profile, dir.path());
+
+    let audit_ok = Command::new(binary_path())
+        .arg("audit")
+        .arg(dir.path())
+        .arg("--json")
+        .arg(dir.path().join("agent/repo-score.json"))
+        .arg("--md")
+        .arg(dir.path().join("agent/repo-score.md"))
+        .status()
+        .expect("audit should execute")
+        .success();
+
+    assert!(audit_ok, "audit failed for {profile}");
+
+    let doctor_ok = Command::new(binary_path())
+        .arg("doctor")
+        .arg(dir.path())
+        .arg("--fail-on")
+        .arg("high")
+        .status()
+        .expect("doctor should execute")
+        .success();
+
+    assert!(doctor_ok, "doctor failed for {profile}");
+}
+```
+
+}
+
+#[test]
+fn init_is_idempotent_for_default_profile() {
+let dir = tempdir().unwrap();
+
+```
+init::run(init_args(dir.path(), "rust-ts-postgres")).unwrap();
+
+let before_agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+let before_standard = fs::read_to_string(dir.path().join("agent/JANKURAI_STANDARD.md")).unwrap();
+let before_claude = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+let before_justfile = fs::read_to_string(dir.path().join("Justfile")).unwrap();
+
+init::run(init_args(dir.path(), "rust-ts-postgres")).unwrap();
+
+assert_eq!(before_agents, fs::read_to_string(dir.path().join("AGENTS.md")).unwrap());
+assert_eq!(
+    before_standard,
+    fs::read_to_string(dir.path().join("agent/JANKURAI_STANDARD.md")).unwrap()
+);
+assert_eq!(before_claude, fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap());
+assert_eq!(before_justfile, fs::read_to_string(dir.path().join("Justfile")).unwrap());
+
+let plan = dry_run_plan(dir.path(), "rust-ts-postgres");
+for action in plan["actions"].as_array().unwrap() {
+    assert_ne!(
+        action["action"], "overwrite",
+        "idempotent dry run must not overwrite {}",
+        action["path"]
+    );
+}
+```
+
+}
+
+#[test]
+fn init_refreshes_generated_adapter_only_when_forced() {
+let dir = tempdir().unwrap();
+
+```
+init::run(init_args(dir.path(), "rust-api")).unwrap();
+
+let adapter_path = dir.path().join("CLAUDE.md");
+let stale_adapter = "<!-- jankurai generated adapter -->\n# old adapter\nold pointer\n";
+fs::write(&adapter_path, stale_adapter).unwrap();
+
+init::run(init_args(dir.path(), "rust-api")).unwrap();
+
+assert_eq!(
+    fs::read_to_string(&adapter_path).unwrap(),
+    stale_adapter,
+    "generated adapter should not refresh unless forced"
+);
+
+let mut forced = init_args(dir.path(), "rust-api");
+forced.force_generated_adapters = true;
+
+init::run(forced).unwrap();
+
+let refreshed = fs::read_to_string(&adapter_path).unwrap();
+assert!(refreshed.contains("agent/JANKURAI_STANDARD.md"));
+assert!(!refreshed.contains("old pointer"));
+```
+
+}
+
+#[test]
+fn init_preserves_user_owned_files() {
+let dir = tempdir().unwrap();
+
+```
+fs::create_dir_all(dir.path().join("contracts")).unwrap();
+fs::write(
+    dir.path().join("contracts/README.md"),
+    "# Existing contracts\n\nDo not overwrite.\n",
+)
+.unwrap();
+
+init::run(init_args(dir.path(), "rust-ts-postgres")).unwrap();
+
+assert_eq!(
+    fs::read_to_string(dir.path().join("contracts/README.md")).unwrap(),
+    "# Existing contracts\n\nDo not overwrite.\n"
+);
+```
+
+}
+
+#[test]
+fn local_custom_profile_can_be_loaded_and_applied() {
+let dir = tempdir().unwrap();
+let profile_path = dir.path().join("custom-profile.json");
+
+```
+let manifest = json!({
+    "id": "custom-lite",
+    "displayName": "Custom Lite",
+    "targetStackId": "custom-lite",
+    "generatedPaths": [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "README-jankurai-scaffold.md",
+        "Justfile",
+        "agent/JANKURAI_STANDARD.md",
+        "agent/MASTER_PLAN.md",
+        "agent/audit-policy.toml",
+        "agent/boundaries.toml",
+        "agent/security-policy.toml",
+        "agent/generated-zones.toml",
+        "agent/owner-map.json",
+        "agent/proof-lanes.toml",
+        "agent/standard-version.toml",
+        "agent/test-map.json",
+        "docs/agent-native-standard.md",
+        "docs/exceptions/README.md",
+        "docs/install.md",
+        "docs/security/README.md",
+        "ops/security/README.md",
+        "tools/security-lane.sh"
+    ],
+    "requiredLanes": ["audit", "doctor", "security"],
+    "optionalLanes": [],
+    "agentAdapters": ["AGENTS.md", "CLAUDE.md"],
+    "ciTemplates": ["Justfile"],
+    "docs": [
+        "README-jankurai-scaffold.md",
+        "docs/agent-native-standard.md",
+        "docs/exceptions/README.md",
+        "docs/install.md",
+        "docs/security/README.md"
+    ],
+    "securityControls": [
+        "agent/security-policy.toml",
+        "agent/boundaries.toml",
+        "docs/security/README.md",
+        "ops/security/README.md",
+        "tools/security-lane.sh"
+    ],
+    "uxControls": [],
+    "contractSystem": [],
+    "dbPolicy": [],
+    "validationCommands": [
+        "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+        "jankurai doctor . --fail-on high"
+    ]
+});
+
+fs::write(&profile_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+let loaded = profiles::resolve_profile(dir.path(), profile_path.to_str().unwrap()).unwrap();
+assert_eq!(loaded.id, "custom-lite");
+
+init::run(init_args(dir.path(), profile_path.to_str().unwrap())).unwrap();
+
+assert!(dir.path().join("AGENTS.md").is_file());
+assert!(dir.path().join("agent/JANKURAI_STANDARD.md").is_file());
+assert!(!dir.path().join("apps/web/README.md").exists());
+```
+
+}
+
+fn assert_profile_specific_files(profile: &str, repo: &Path) {
+match profile {
+"rust-api" => {
+assert!(repo.join("apps/api/README.md").is_file());
+assert!(repo.join("crates/domain/README.md").is_file());
+assert!(repo.join("db/README.md").is_file());
+assert!(!repo.join("apps/web/README.md").exists());
+assert!(!repo.join("python/ai-service/README.md").exists());
+assert!(!repo.join("agent/ux-qa.toml").exists());
+}
+"react-web" => {
+assert!(repo.join("apps/web/README.md").is_file());
+assert!(repo.join("agent/ux-qa.toml").is_file());
+assert!(!repo.join("apps/api/README.md").exists());
+assert!(!repo.join("db/README.md").exists());
+assert!(!repo.join("crates/domain/README.md").exists());
+}
+"rust-ts-postgres" => {
+assert!(repo.join("apps/api/README.md").is_file());
+assert!(repo.join("apps/web/README.md").is_file());
+assert!(repo.join("crates/domain/README.md").is_file());
+assert!(repo.join("db/README.md").is_file());
+assert!(repo.join("python/ai-service/README.md").is_file());
+assert!(repo.join("agent/ux-qa.toml").is_file());
+}
+"b2b-saas" => {
+assert!(repo.join("docs/auth/README.md").is_file());
+assert!(repo.join("docs/orgs/README.md").is_file());
+assert!(repo.join("docs/admin/README.md").is_file());
+assert!(repo.join("docs/privacy/README.md").is_file());
+assert!(repo.join("evidence/README.md").is_file());
+assert!(repo.join("apps/web/README.md").is_file());
+assert!(repo.join("db/README.md").is_file());
+}
+"ai-product" => {
+assert!(repo.join("python/ai-service/README.md").is_file());
+assert!(repo.join("python/ai-service/evals/README.md").is_file());
+assert!(repo.join("docs/evals/README.md").is_file());
+assert!(repo.join("evidence/README.md").is_file());
+assert!(!repo.join("db/README.md").exists());
+assert!(!repo.join("apps/web/README.md").exists());
+assert!(!repo.join("agent/ux-qa.toml").exists());
+}
+"regulated-saas" => {
+assert!(repo.join("docs/compliance/README.md").is_file());
+assert!(repo.join("docs/data-classification/README.md").is_file());
+assert!(repo.join("docs/backup-restore/README.md").is_file());
+assert!(repo.join("evidence/compliance/README.md").is_file());
+assert!(repo.join("ops/compliance/README.md").is_file());
+assert!(repo.join("apps/api/README.md").is_file());
+assert!(repo.join("apps/web/README.md").is_file());
+assert!(repo.join("db/README.md").is_file());
+}
+"migration-target" => {
+assert!(repo.join("docs/migration/README.md").is_file());
+assert!(repo.join("evidence/migration/README.md").is_file());
+assert!(repo.join("contracts/README.md").is_file());
+assert!(!repo.join("db/README.md").exists());
+assert!(!repo.join("apps/web/README.md").exists());
+assert!(!repo.join("agent/ux-qa.toml").exists());
+}
+other => panic!("unhandled profile {other}"),
+}
+}
+EOF
+
+cat > tips/phases/04-init-profiles-golden-repos.md <<'EOF'
+
+# Phase 04 — Init Profiles And Golden Repos
+
+Status: complete after applying the Phase 04 completion patch.
+
+Owner: tools/init.
+
+## Objective
+
+Turn `jankurai init` from a one-size bootstrapper into a profile-driven repository generator.
+
+A generated repository must be immediately understandable by humans and agents:
+
+* who owns each path;
+* which proof lane applies;
+* which files are generated;
+* where security evidence lives;
+* where exceptions are recorded;
+* how generated adapters can be refreshed safely;
+* how to validate the scaffold without relying on tribal knowledge.
+
+## Public interface
+
+Bundled profiles:
+
+* `rust-api`
+* `react-web`
+* `rust-ts-postgres`
+* `b2b-saas`
+* `ai-product`
+* `regulated-saas`
+* `migration-target`
+
+Aliases:
+
+* `default`, `fullstack`, `rust-ts` -> `rust-ts-postgres`
+* `api`, `rust` -> `rust-api`
+* `web`, `frontend`, `react` -> `react-web`
+* `saas`, `b2b` -> `b2b-saas`
+* `ai`, `ml` -> `ai-product`
+* `regulated`, `compliance` -> `regulated-saas`
+* `migration`, `brownfield` -> `migration-target`
+
+Local profiles:
+
+```bash
+jankurai init . --profile ./profiles/my-profile.json --dry-run
+```
+
+Profile manifests are validated by `schemas/init-profile.schema.json` and by runtime invariants:
+
+* no duplicate paths;
+* no absolute paths;
+* no `..` paths;
+* no backslash paths;
+* category paths must also appear in `generatedPaths`;
+* required and optional lanes cannot overlap;
+* validation commands must be non-empty.
+
+## Acceptance criteria
+
+* `jankurai init . --profile <id> --dry-run` works for all bundled profiles.
+* Plan JSON includes the selected manifest and deterministic action list.
+* Apply mode never overwrites user-owned files.
+* Controlled merge still works for `AGENTS.md` and `agent/JANKURAI_STANDARD.md`.
+* Generated adapters are preserved by default and refreshed only with `--force-generated-adapters`.
+* Generated repositories include owner map, test map, proof lanes, generated zones, security policy, boundaries, standard version, docs, security lane, and profile-specific architecture slots.
+* Golden tests prove bundled profile coverage, schema/runtime validation, idempotency, local custom profiles, audit/doctor compatibility, and generated-adapter refresh.
+* `docs/install.md` documents all profiles and re-run behavior.
+
+## Non-goals
+
+* Init does not create fake product code.
+* Init does not create package manifests without lockfiles.
+* Init does not claim SAST, dependency scanning, deploy, E2E, or AI eval systems exist before they are implemented.
+* Init creates architecture slots and proof-lane contracts that later phases can fill in.
+
+## Validation
+
+```bash
+cargo fmt
+cargo test -p jankurai init_golden
+cargo test -p jankurai init_doctor
+cargo test -p jankurai init_profiles
+cargo test -p jankurai validation
+cargo run -p jankurai -- init /tmp/jankurai-rust-api --profile rust-api --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-react-web --profile react-web --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-rust-ts-postgres --profile rust-ts-postgres --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-b2b-saas --profile b2b-saas --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-ai-product --profile ai-product --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-regulated-saas --profile regulated-saas --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-migration-target --profile migration-target --dry-run
+```
+
+For a real generated repo:
+
+```bash
+cargo run -p jankurai -- init /tmp/jankurai-golden-regulated --profile regulated-saas
+cargo run -p jankurai -- audit /tmp/jankurai-golden-regulated --json /tmp/jankurai-golden-regulated/agent/repo-score.json --md /tmp/jankurai-golden-regulated/agent/repo-score.md
+cargo run -p jankurai -- doctor /tmp/jankurai-golden-regulated --fail-on high
+cargo run -p jankurai -- security run /tmp/jankurai-golden-regulated --script /tmp/jankurai-golden-regulated/tools/security-lane.sh --out /tmp/jankurai-golden-regulated/target/jankurai/security/evidence.json
+```
+
+## Phase receipt
+
+Completed work:
+
+* Added all seven public bundled profiles.
+* Added alias support and local JSON profile loading.
+* Strengthened schema validation and runtime manifest invariants.
+* Expanded generated templates to include architecture slots for API, web, Rust crates, DB, contracts, AI, evidence, ops, compliance, migration, runbooks, observability, security, and UX.
+* Updated owner map, test map, proof lanes, generated zones, security policy, and docs.
+* Added golden tests for profile completeness, deterministic plans, apply/audit/doctor, idempotency, adapter refresh, user-file preservation, aliases, and custom profiles.
+* Updated install docs.
+
+Known limitation:
+
+* Profile templates are scaffold contracts, not finished product implementations. Later product phases should add real package manifests, lockfiles, deploy targets, scanners, E2E tests, and AI eval runners.
+  EOF
+
+chmod +x /tmp/nonexistent 2>/dev/null || true
+
+cargo fmt
+
+echo
+echo "Phase 04 patch written. Now run:"
+echo "  cargo test -p jankurai init_golden"
+echo "  cargo test -p jankurai init_doctor"
+echo "  cargo test -p jankurai validation"
+
+````
+
+After applying it, the validation I would run from the repo root is:
+
+```bash
+cargo fmt
+cargo test -p jankurai init_golden
+cargo test -p jankurai init_doctor
+cargo test -p jankurai validation
+cargo run -p jankurai -- init /tmp/jankurai-golden-rust-api --profile rust-api --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-golden-react-web --profile react-web --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-golden-rust-ts-postgres --profile rust-ts-postgres --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-golden-b2b-saas --profile b2b-saas --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-golden-ai-product --profile ai-product --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-golden-regulated-saas --profile regulated-saas --dry-run
+cargo run -p jankurai -- init /tmp/jankurai-golden-migration-target --profile migration-target --dry-run
+````
+
+The design choice I’d defend most strongly is **not** generating fake `Cargo.toml`, `package.json`, `pyproject.toml`, or app source code in Phase 04. The current doctor already catches suspicious manifests without lockfiles and echo-only workflows, so a “richer-looking” scaffold would actually undermine the moonshot by manufacturing false proof. This patch instead creates high-signal repo geometry, agent contracts, proof lanes, durable evidence slots, and profile-specific ownership so later phases can add real implementation safely.
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/04-init-profiles-golden-repos.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/init/profiles.rs "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/agent-native-standard.md "raw.githubusercontent.com"
+

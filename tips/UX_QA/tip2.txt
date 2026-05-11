@@ -1,0 +1,553 @@
+## The CEO’s complaint is real
+
+“Is this button too close to the edge?” is not a normal functional-testing problem. It is a **rendered-experience problem**. Traditional tests can prove that a button exists, is clickable, and calls the right API. They usually cannot tell whether the resulting UI feels cramped, whether a label wraps awkwardly, whether a card grid looks broken at 375px, whether a sticky footer covers the CTA, or whether a visual change is intentional.
+
+The answer is not simply “use Playwright screenshots.” The durable answer is:
+
+> **Constrain the frontend so fewer bad layouts are possible, then automate rendered visual inspection across component states, user flows, breakpoints, themes, locales, and content extremes.**
+
+Human QA should become the reviewer of **high-signal exceptions**, not the primary detector of every pixel problem.
+
+---
+
+# 1. What the current best practice looks like
+
+The strongest current pattern is:
+
+**Design system + tokens + Storybook + Playwright + visual regression + accessibility automation + generated API mocks + review apps + human approval loop.**
+
+The modern stack helps a lot. Vite 8 now ships with Rolldown as a unified Rust-based bundler and claims 10–30x faster builds, which matters because fast builds make broad UI test matrices feasible. TypeScript 7.0 beta is also moving to a native Go-based compiler/tooling foundation that Microsoft says is often about 10x faster than TypeScript 6.0, which shortens the feedback loop for large frontend codebases. ([vitejs][1])
+
+The QA gap is also why Storybook has become more important. Storybook can turn stories into component tests, run interaction tests through the Vitest addon, run accessibility tests, and run visual tests against story baselines. Storybook’s visual testing docs explicitly frame visual tests as a way to snapshot every story and compare it to the last known-good baseline. ([Storybook][2])
+
+Playwright is the right browser automation core. Its own best-practice guidance says tests should verify user-visible behavior, remain isolated, control database/test data, prefer user-facing locators, and use web-first assertions. For visual checks, Playwright supports `toHaveScreenshot()` baseline comparison and can capture full-page or element screenshots as buffers for downstream processing. ([Playwright][3])
+
+---
+
+# 2. The first move: modernize the frontend to reduce visual freedom
+
+Your instinct is correct: the best way to reduce manual UX QA is to reduce custom HTML/CSS/JS.
+
+The goal is not “no custom UI.” The goal is **bounded custom UI**.
+
+## Frontend best practices for this stack
+
+For **TypeScript + React + Vite + PostgreSQL + generated contracts**, I would enforce these:
+
+| Area                        | Best practice                                                                                                                                                                                                                                                                                                                                                          |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Components**              | Build almost everything from a controlled design-system component library. Use Radix, React Aria, Material UI, or a shadcn/Radix-style internal system depending on team preference. Radix positions itself around accessible, customizable primitives; React Aria is explicitly built around accessibility across devices and assistive technologies. ([Radix UI][4]) |
+| **Design tokens**           | Use tokens for color, spacing, typography, radius, shadows, z-index, breakpoints, and motion. The Design Tokens Community Group announced a stable 2025.10 spec for a vendor-neutral format that supports theming, modern color spaces, token relationships, and cross-platform consistency. ([W3C][5])                                                                |
+| **CSS discipline**          | Ban arbitrary spacing/color/typography except in approved component internals. Use CSS variables or Tailwind tokens, but do not allow random `mt-[13px]`, `z-[9999]`, inline styles, uncontrolled absolute positioning, or bespoke breakpoints.                                                                                                                        |
+| **Story coverage**          | Every reusable component must have stories for default, loading, empty, error, disabled, long text, overflow, dark mode, mobile, tablet, desktop, and RTL/locale variants.                                                                                                                                                                                             |
+| **Generated contracts**     | Use OpenAPI/protobuf/JSON Schema to generate TypeScript clients, mocks, and validators. MSW is useful because it intercepts network requests and can be reused across browser, Node, Storybook, and test environments. ([Mock Service Worker][6])                                                                                                                      |
+| **Deterministic data**      | Use PostgreSQL seeded scenarios for E2E, and generated mock scenarios for component/page tests: long names, empty states, error states, max-length strings, weird currencies, slow network, missing optional fields.                                                                                                                                                   |
+| **Preview environments**    | Every PR gets a real preview URL. GitLab Review Apps are a good model: temporary environments per branch/MR so stakeholders and automation can validate changes before production. ([GitLab Docs][7])                                                                                                                                                                  |
+| **Accessibility as a gate** | Use axe-core through Storybook and Playwright, but remember automation is partial. Deque’s own automated accessibility coverage report puts automated coverage at about 57.38%, so automated a11y reduces human review but does not fully eliminate expert review. ([Deque][8])                                                                                        |
+
+The frontend stack should make it difficult for an AI agent or junior developer to invent a new visual language. Most UI should be assembled from components with known behavior, known tokens, known states, and known visual baselines.
+
+---
+
+# 3. Tool stack I would use today
+
+There are three strong deployment options.
+
+## Enterprise / maximum coverage
+
+Use:
+
+**Storybook + Chromatic + Playwright + Applitools + axe-core + MSW + generated contracts + preview apps**
+
+Chromatic is strongest for Storybook-native component visual testing; it says it catches visual and functional bugs in stories across browsers, viewports, and themes before merge. Applitools is strongest where you want Visual AI and cross-browser/device/viewport rendering at scale; its Ultrafast Grid runs visual tests across browser/device combinations, and its platform claims visual, functional, and accessibility validation. ([Chromatic][9])
+
+## Product/startup stack
+
+Use:
+
+**Storybook + Playwright + Percy or Chromatic + axe-core + MSW + preview apps**
+
+Percy is especially useful for responsive page-level visual testing; BrowserStack’s Percy docs describe automatically detecting visual regressions on mobile, tablet, and desktop widths. ([BrowserStack][10])
+
+## Cost-conscious/open-source stack
+
+Use:
+
+**Storybook + Playwright screenshots + Argos + axe-core + MSW + custom rules**
+
+Argos is a practical open-source-oriented visual review platform with Playwright/Storybook fit; it explicitly positions itself as pixel-diff-based, scalable visual testing without AI overhead. Lost Pixel used to be an attractive open-source alternative, but its GitHub page now says the product is being sunset and the team is building what’s next, so I would not make it a new strategic dependency. ([Argos][11])
+
+---
+
+# 4. The automated QA system I would build
+
+I would build a **Visual QA Control Plane** around the frontend. Think of it as a CI/CD service that converts every PR into screenshots, DOM geometry, accessibility data, design-token checks, visual diffs, and AI-ranked findings.
+
+## High-level flow
+
+```text
+Pull request
+  ↓
+Build app + Storybook
+  ↓
+Create preview environment
+  ↓
+Generate deterministic data from contracts + Postgres seeds
+  ↓
+Capture component screenshots, page screenshots, DOM boxes, CSS, a11y tree
+  ↓
+Run deterministic UX/layout rules
+  ↓
+Run visual regression diffing
+  ↓
+Run AI/VLM reviewer on ambiguous visual issues
+  ↓
+Score findings by severity and confidence
+  ↓
+Block, warn, or route to human review
+  ↓
+Human labels decision
+  ↓
+System learns thresholds, patterns, and exceptions
+```
+
+The key is **not** to rely on one detector. Pixel diffing catches regressions. Rules catch objective violations. Accessibility scanners catch known WCAG issues. Vision models catch semantic layout weirdness. Human feedback trains the prioritization layer.
+
+Academic research is already moving in this direction: a 2024 survey of vision-based GUI testing reviewed 271 papers, including 92 vision-based studies, and categorized the field around GUI test generation, record/replay, frameworks, report analysis, GUI element detection, usability, and accessibility testing. ([arXiv][12])
+
+---
+
+# 5. The detectors I would implement
+
+## A. Hard deterministic layout rules
+
+These should be cheap, fast, and CI-blocking.
+
+| Detector                      | What it catches                                                                                                                                                                                                                                                                              |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Edge clearance**            | Buttons, inputs, cards, menus, and modals too close to viewport/container edges.                                                                                                                                                                                                             |
+| **Tap target size**           | Interactive controls below WCAG or platform thresholds. WCAG 2.2 target-size minimum treats targets below 24×24 CSS pixels as undersized unless spacing exceptions apply; Apple recommends at least 44×44 pt hit regions for buttons; Material recommends 48×48dp touch targets. ([W3C][13]) |
+| **Interactive overlap**       | Buttons/links/inputs overlapping other clickable or readable elements.                                                                                                                                                                                                                       |
+| **Text clipping**             | `scrollWidth > clientWidth`, `scrollHeight > clientHeight`, truncated labels without approved ellipsis, hidden descenders, clipped icons.                                                                                                                                                    |
+| **Forbidden button wrapping** | Button labels should not wrap unless the component explicitly allows two-line CTAs.                                                                                                                                                                                                          |
+| **Horizontal overflow**       | Body or major containers wider than viewport, except approved carousels/tables.                                                                                                                                                                                                              |
+| **Sticky obstruction**        | Sticky headers/footers covering focused elements, modals, toasts, dropdowns, or bottom CTAs.                                                                                                                                                                                                 |
+| **Focus visibility**          | Focus ring missing, clipped, too low contrast, or hidden behind overlays.                                                                                                                                                                                                                    |
+| **Z-index abuse**             | Non-token z-index values or overlays below the content they must cover.                                                                                                                                                                                                                      |
+| **Token violations**          | Raw colors, raw spacing, raw font sizes, arbitrary radii, ad hoc shadows.                                                                                                                                                                                                                    |
+| **Responsive breakage**       | Layout valid at 1440px but broken at 1280, 1024, 768, 430, 390, 360, and browser zoom/text zoom states.                                                                                                                                                                                      |
+| **CLS / visual stability**    | Page content shifts after load. Google describes CLS as a Core Web Vital for visual stability and recommends a CLS score under 0.1. ([Google for Developers][14])                                                                                                                            |
+
+These checks should use Playwright to collect bounding boxes, computed styles, role/name metadata, viewport data, and screenshots. The rule engine should run on the DOM geometry, not only on pixels.
+
+## B. Component visual regression
+
+Every Storybook story should be snapshotted. This catches changes at the smallest controlled unit: button, menu, modal, card, table, form, toast, nav, etc.
+
+Use Chromatic for the best Storybook-native workflow, or Playwright/Argos for a cheaper controlled pipeline. Storybook’s visual testing system turns every story into a test and compares snapshots to last known-good baselines. ([Storybook][15])
+
+## C. Page and flow visual regression
+
+Component testing is not enough. Many UX defects happen only when components combine.
+
+Capture key flows:
+
+* unauthenticated landing
+* signup
+* login
+* checkout/payment
+* onboarding
+* dashboard
+* settings
+* search results
+* create/edit forms
+* destructive actions
+* mobile nav
+* empty/error/loading states
+
+Use Playwright for deterministic flows and Percy/Applitools/Argos for snapshot review. Playwright can mock network traffic, capture screenshots, and preserve traces/videos for debugging failed runs. ([Playwright][16])
+
+## D. Accessibility gates
+
+Use:
+
+* Storybook a11y addon
+* `axe-core` in Playwright
+* keyboard navigation tests
+* focus trap tests
+* screen-reader-name tests
+* color contrast tests
+* reduced-motion tests
+* target size tests
+* text spacing/zoom tests
+
+W3C’s WCAG overview frames WCAG 2.2 as the latest standard family with testable success criteria, and W3C encourages use of the latest WCAG version. ([W3C][17])
+
+The important caveat: accessibility automation is not complete. Use it to block known violations and route ambiguous cases to human experts.
+
+## E. Vision/AI semantic review
+
+Pixel diffs alone are too noisy. Modern visual AI tools increasingly claim to evaluate whether a change matters semantically, not just whether pixels changed. Mabl describes context-aware visual regression as looking at whether a button remains clickable, distinct, and aligned with design language, and says human feedback can train the system’s tolerance levels. ([Mabl][18])
+
+I would use a vision model as a **triage reviewer**, not as the only authority. It should answer questions like:
+
+* “Is any text unreadable?”
+* “Does any CTA look cramped?”
+* “Is the button visually too close to the edge?”
+* “Is the hierarchy confusing?”
+* “Does the mobile layout look broken?”
+* “Is the modal aligned and fully visible?”
+* “Does this screen appear production-quality?”
+* “What changed visually from the baseline, and does it look intentional?”
+
+AI visual testing vendors claim these systems can catch overlapping elements, clipped text, broken responsive designs, cross-browser inconsistencies, and missing visual elements that functional assertions miss. Treat those claims as useful direction, but still combine them with deterministic rules and human labeling. ([Virtuoso QA][19])
+
+---
+
+# 6. The next-generation system: learn from humans
+
+The goal is to convert subjective QA into structured data.
+
+## Store every visual decision
+
+Use PostgreSQL as the review intelligence layer:
+
+| Table                     | Purpose                                                                  |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `visual_snapshots`        | PR, route/story, viewport, theme, locale, screenshot URI, DOM hash       |
+| `ui_elements`             | Bounding boxes, roles, accessible names, CSS, token usage                |
+| `visual_diffs`            | Pixel diff, structural diff, AI summary, affected regions                |
+| `violations`              | Rule ID, severity, confidence, DOM selector, screenshot crop             |
+| `human_feedback`          | approved, rejected, intentional, false positive, duplicate, needs design |
+| `baselines`               | approved visual snapshots by branch/release/story/route                  |
+| `rule_exceptions`         | explicit exceptions with owner, expiry, and rationale                    |
+| `design_debt`             | recurring issues by component/team/page                                  |
+| `model_training_examples` | labeled crops/screens with category and outcome                          |
+
+Store images in object storage. Store metadata, decisions, and embeddings in PostgreSQL, optionally with `pgvector` for similarity search.
+
+## Feedback taxonomy
+
+Humans should not just click “approve.” They should label the failure type:
+
+* true layout bug
+* intentional visual change
+* acceptable variance
+* design-system violation
+* accessibility violation
+* copy/content issue
+* responsive-only issue
+* browser-only issue
+* false positive
+* needs design review
+* needs product review
+
+This makes the system smarter. If humans repeatedly approve a certain responsive rearrangement, the classifier learns it is normal. If humans repeatedly reject cramped CTAs, the rule threshold tightens.
+
+## Active learning
+
+The system should not ask humans to review everything. It should route only:
+
+* new pattern
+* low model confidence
+* high business risk page
+* high severity but uncertain root cause
+* first occurrence of a new component
+* design-token exception
+* baseline-changing PR
+
+Over time, human QA becomes less “look at every screen” and more “approve rare exceptions and teach the system.”
+
+---
+
+# 7. What should block a PR?
+
+## Always block
+
+* TypeScript errors
+* broken generated API contract
+* missing Storybook story for a new component
+* critical axe violations
+* focus trap failures
+* clipped interactive text
+* overlapping interactive controls
+* body horizontal overflow
+* target-size violations on interactive elements
+* critical visual regressions in locked components
+* broken checkout/signup/auth/onboarding screenshots
+* unapproved design-token violations
+* severe CLS regression
+
+## Warn but do not always block
+
+* small pixel diffs in dynamic regions
+* low-risk typography shifts
+* spacing changes inside experimental components
+* visual AI “looks cramped” findings below confidence threshold
+* new baseline required for an intentional redesign
+
+## Route to human review
+
+* first launch of a new design pattern
+* ambiguous mobile layout
+* possible brand/aesthetic issue
+* conversion-critical screen changes
+* marketing page hero changes
+* AI-generated UI changes affecting multiple components
+* diff too large for automated classification
+
+This is the difference between useful automation and noisy automation. If every 1px diff blocks a PR, engineers will disable the system. If only objective/high-risk issues block, people trust it.
+
+---
+
+# 8. The exact QA stack I would build
+
+## Foundation
+
+* **TypeScript strict mode**
+* **React**
+* **Vite 8/Rolldown**
+* **Storybook**
+* **Vitest**
+* **Testing Library**
+* **Playwright**
+* **PostgreSQL test fixtures**
+* **OpenAPI/protobuf/JSON Schema generated clients**
+* **MSW for mocks**
+* **axe-core**
+* **Chromatic or Argos**
+* **Percy or Applitools for page/cross-browser visual testing**
+* **GitHub/GitLab preview environments**
+
+## Custom system
+
+Build an internal package:
+
+```text
+@company/visual-qa
+  /capture
+    playwright screenshot capture
+    DOM geometry extractor
+    accessibility tree extractor
+    computed CSS extractor
+  /rules
+    edge clearance
+    target size
+    overlap
+    clipping
+    wrapping
+    token violations
+    focus visibility
+    z-index
+    horizontal overflow
+    sticky obstruction
+  /vision
+    screenshot crop classifier
+    visual-diff summarizer
+    UX issue ranker
+  /review
+    PR annotations
+    dashboard
+    human labeling
+    baseline approval
+  /learning
+    threshold tuning
+    false-positive suppression
+    recurring pattern detection
+```
+
+The capture should include:
+
+* full-page screenshot
+* viewport screenshot
+* component crop screenshots
+* DOM bounding boxes
+* computed styles
+* accessibility tree
+* role/name map
+* token usage
+* network mocks used
+* seed data ID
+* browser/OS/device
+* theme/locale/viewport
+* commit SHA
+* source component map
+
+This lets the system explain failures: not just “pixels changed,” but “the primary CTA wrapped to two lines at 390px because the label from seed `long_product_name_v3` exceeded the allowed button width.”
+
+---
+
+# 9. Test matrix that actually catches the CEO’s example
+
+For each critical route and major component, run:
+
+| Dimension   | Values                                                |
+| ----------- | ----------------------------------------------------- |
+| Viewport    | 1440, 1280, 1024, 768, 430, 390, 360                  |
+| Browser     | Chromium, Firefox, WebKit/Safari path                 |
+| Theme       | light, dark, high contrast if supported               |
+| Locale      | English, long-language locale, RTL locale if relevant |
+| Text length | normal, max realistic, absurd edge case               |
+| Data state  | loading, empty, error, partial, full                  |
+| Auth role   | anonymous, basic, admin, restricted                   |
+| Network     | fast, slow, failed request                            |
+| Motion      | normal, reduced motion                                |
+| Zoom/text   | 100%, 125%, 200% text where applicable                |
+
+Do not run the full matrix on every PR blindly. Use change-impact mapping:
+
+* changed `Button.tsx` → all button stories + key CTA pages
+* changed `Modal.tsx` → all modal stories + checkout/settings flows
+* changed CSS tokens → full visual suite
+* changed API schema → impacted stories/fixtures/generated mocks
+* changed copy → text overflow/visual suite for affected screens
+* changed layout component → affected routes across breakpoints
+
+---
+
+# 10. How generated contracts help visual QA
+
+Generated contracts are not just backend/frontend safety. They are QA fuel.
+
+From OpenAPI/protobuf/JSON Schema you can generate:
+
+* TypeScript API clients
+* Zod/Valibot validators
+* MSW mock handlers
+* test fixtures
+* Storybook scenarios
+* Playwright route mocks
+* edge-case data generators
+
+This prevents the classic problem where Storybook looks perfect with fake “John Smith” data but production breaks with “Alexandria Montgomery-Van der Meer International Holdings LLC.”
+
+The contract should include realistic examples and edge cases: max string lengths, nullable values, missing images, long currency labels, international addresses, permission restrictions, empty arrays, large arrays, and failure responses.
+
+---
+
+# 11. Why Figma/design integration matters
+
+Figma should not be a screenshot source of truth by itself. But Figma should feed the design system.
+
+Use:
+
+* Figma variables/tokens → DTCG token files
+* Figma Code Connect → map design components to real code components
+* Storybook → live implementation catalog
+* Chromatic/visual tests → verify implementation drift
+* AI agents → use Code Connect/design-system context when generating UI
+
+Figma says Code Connect bridges codebase components with Figma Dev Mode and improves the Figma MCP server’s ability to guide AI agents using direct references to actual code. That is exactly the direction you want: agents should use real components, not invent approximate HTML/CSS from a screenshot. ([Figma Help Center][20])
+
+---
+
+# 12. 30/60/90-day rollout
+
+## First 30 days: stop the bleeding
+
+* Add Storybook if not already present.
+* Require stories for all shared components.
+* Add Playwright E2E for top 5 flows.
+* Add `axe-core` checks in Storybook and Playwright.
+* Add basic Playwright screenshots for top pages.
+* Freeze fonts, dates, random IDs, animations, and test data in CI.
+* Add review apps/preview URLs for every PR.
+* Enforce strict TypeScript and design-token usage.
+
+Success metric: top visual regressions become visible in PRs.
+
+## Days 31–60: make it reliable
+
+* Add Chromatic, Percy, Applitools, or Argos.
+* Add responsive snapshots.
+* Add long-text, empty, loading, and error stories.
+* Add generated MSW mocks from API contracts.
+* Add Postgres seed scenarios.
+* Add layout rule engine: clipping, overlap, target size, edge spacing, horizontal overflow.
+* Create a visual review dashboard.
+
+Success metric: human QA stops checking every screen and reviews flagged deltas.
+
+## Days 61–90: add intelligence
+
+* Add AI/VLM reviewer for ambiguous visual defects.
+* Store human labels in PostgreSQL.
+* Add confidence scoring and false-positive suppression.
+* Add recurring-defect reports by component/team.
+* Add auto-generated fix suggestions.
+* Add PR risk scoring.
+* Add design-token drift detection from Figma/Storybook/code.
+
+Success metric: most manual UX review becomes exception-based.
+
+## Months 4–12: self-improving QA
+
+* Train internal classifiers on your labeled visual defects.
+* Auto-approve low-risk repeated diffs.
+* Auto-block known bad patterns.
+* Generate new Storybook stories from production bug patterns.
+* Generate new edge-case fixtures from API schema changes.
+* Let an AI agent propose fixes, but require tests and human approval before merge.
+* Use production telemetry and support tickets to create new QA rules.
+
+Success metric: escaped visual defects drop, QA review time drops, and false positives stay low.
+
+---
+
+# 13. The most important principle
+
+Do **not** try to eliminate humans by making AI the final judge of taste. That will create false confidence.
+
+Instead:
+
+> **Use automation to detect objective defects, use AI to triage ambiguous visual issues, and use humans to label edge cases so the system becomes smarter every week.**
+
+The future QA workflow should look like this:
+
+```text
+AI/dev writes UI
+  ↓
+Design system constrains it
+  ↓
+Types/contracts validate it
+  ↓
+Storybook isolates it
+  ↓
+Playwright renders it
+  ↓
+Visual QA engine inspects it
+  ↓
+AI summarizes likely UX issues
+  ↓
+Human reviews only uncertain/high-risk findings
+  ↓
+Feedback becomes new rules, thresholds, fixtures, and baselines
+```
+
+That is how you eat away at the pixel-review gap.
+
+My strongest recommendation:
+
+**Build a design-system-first React/Vite/TypeScript frontend, enforce tokens and component boundaries, run Storybook visual/a11y/interaction tests on every component, run Playwright visual journeys on every critical flow, add a custom DOM+computer-vision rule engine, and store human feedback in PostgreSQL so the QA system learns what your company considers a real UX defect.**
+
+[1]: https://vite.dev/blog/announcing-vite8 "Vite 8.0 is out! | Vite"
+[2]: https://storybook.js.org/docs/writing-tests/interaction-testing "Interaction tests | Storybook docs"
+[3]: https://playwright.dev/docs/best-practices "Best Practices | Playwright"
+[4]: https://www.radix-ui.com/primitives/docs/overview/introduction?utm_source=chatgpt.com "Introduction – Radix Primitives"
+[5]: https://www.w3.org/community/design-tokens/2025/10/28/design-tokens-specification-reaches-first-stable-version/ "Design Tokens specification reaches first stable version | Design Tokens Community Group"
+[6]: https://mswjs.io/?utm_source=chatgpt.com "Mock Service Worker - API mocking library for browser and ..."
+[7]: https://docs.gitlab.com/ci/review_apps/ "Review apps | GitLab Docs"
+[8]: https://www.deque.com/automated-accessibility-coverage-report/ "The Automated Accessibility Coverage Report - Deque"
+[9]: https://www.chromatic.com/storybook "Visual testing for Storybook • Chromatic"
+[10]: https://www.browserstack.com/docs/percy/visual-testing-workflows/view-percy-build-results/responsive-testing "Responsive Visual Testing | BrowserStack Docs"
+[11]: https://argos-ci.com/ "Argos · Visual Regression for Playwright & Storybook"
+[12]: https://arxiv.org/html/2310.13518v2 "Vision-Based Mobile App GUI Testing: A Survey"
+[13]: https://www.w3.org/WAI/WCAG22/Understanding/target-size-minimum.html?utm_source=chatgpt.com "Understanding SC 2.5.8: Target Size (Minimum) (Level AA)"
+[14]: https://developers.google.com/search/docs/appearance/core-web-vitals?utm_source=chatgpt.com "Understanding Core Web Vitals and Google search results"
+[15]: https://storybook.js.org/docs/writing-tests/visual-testing "Visual tests | Storybook docs"
+[16]: https://playwright.dev/docs/mock?utm_source=chatgpt.com "Mock APIs"
+[17]: https://www.w3.org/WAI/standards-guidelines/wcag/ " WCAG 2 Overview | Web Accessibility Initiative (WAI) | W3C"
+[18]: https://www.mabl.com/blog/visual-ai-context-aware-regression-detection "How Visual AI Enables Context-Aware Regression Detection | Mabl"
+[19]: https://www.virtuosoqa.com/post/ai-visual-testing "AI Visual Testing: How It Works, Top Tools & Practices"
+[20]: https://help.figma.com/hc/en-us/articles/23920389749655-Code-Connect "Code Connect – Figma Learn - Help Center"
+

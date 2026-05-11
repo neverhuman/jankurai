@@ -1,0 +1,432 @@
+## Phase name: Phase 10 — Reuse Registry Certified Cells
+
+I would finish and harden **Phase 10** by adding the next certified cell in the documented order: **`auth-session`**.
+
+This matches the repo’s moonshot loop: `intent -> bounded agents -> proof lanes -> evidence -> expired exceptions -> reusable primitives`, where repeated fixes should collapse into reusable cells/templates instead of copy-paste folklore. ([GitHub][1]) Phase 10 already has the registry/cell command surface, three certified cells, dry-run-only install semantics, and `cell --mode prove` evidence emission; its own follow-up says the next registry cell is **auth/session shell**. ([GitHub][2]) The Phase 00 router also explicitly prioritizes “Phase 10 auth/session or cell hardening” before Phase 12 and Phase 13. ([GitHub][3])
+
+Below is a **single pasteable implementation script**. It adds the `auth-session` certified cell, hardens certification lifecycle honesty, expands the smoke tests, updates the Phase 10 receipt/log, and runs the correct proof/validation commands.
+
+I have **not executed this in your checkout**; the script itself runs validation and writes the evidence artifacts.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Phase 10 hardening patch:
+# - Adds certified auth-session cell after rbac.
+# - Hardens lifecycle/certification consistency.
+# - Expands command_surface_smoke coverage.
+# - Updates Phase 10 receipt and append-only log.
+# - Emits registry/cell proof artifacts and runs validation.
+
+ROOT="$(pwd)"
+LOG="tips/phases/logs/10-reuse-registry-certified-cells.log"
+PHASE_DOC="tips/phases/10-reuse-registry-certified-cells.md"
+CELL_CATALOG="crates/jankurai/src/commands/cell_catalog.rs"
+SMOKE_TEST="crates/jankurai/tests/command_surface_smoke.rs"
+
+mkdir -p target/jankurai tips/phases/logs
+
+SHA_BEFORE="$(git rev-parse HEAD 2>/dev/null || echo pending)"
+TS_START="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+# Required by agent/MASTER_PLAN.md: append start before edits.
+if ! grep -q "auth-session hardening start" "$LOG" 2>/dev/null; then
+  printf '%s | agent | 10 | auth-session hardening start | crates/jankurai/src/commands/cell_catalog.rs;crates/jankurai/tests/command_surface_smoke.rs;tips/phases/10-reuse-registry-certified-cells.md;tips/phases/logs/10-reuse-registry-certified-cells.log | not-run | none | %s | add fourth certified cell auth-session; keep install dry-run only\n' "$TS_START" "$SHA_BEFORE" >> "$LOG"
+fi
+
+python3 <<'PY'
+from pathlib import Path
+import re
+
+cell_catalog_path = Path("crates/jankurai/src/commands/cell_catalog.rs")
+text = cell_catalog_path.read_text()
+
+# 1) Add auth_session_manifest to the built-in registry order after rbac.
+if "auth_session_manifest(repo, catalog)" not in text:
+    text = text.replace(
+        "rbac_manifest(repo, catalog),",
+        "rbac_manifest(repo, catalog),\n        auth_session_manifest(repo, catalog),",
+        1,
+    )
+
+# 2) Harden certified_manifest so lifecycle and certification_status cannot diverge.
+#    If evidence is missing, an intended certified cell is downgraded to experimental/candidate.
+if "let is_certified = evidence" not in text:
+    pattern = re.compile(
+        r'manifest\.proof_commands\s*=\s*proof_commands\(catalog,\s*&manifest\.proof_lanes\);\s*'
+        r'manifest\.certification_status\s*=\s*if\s+evidence\s*'
+        r'\.iter\(\)\s*'
+        r'\.all\(\|item\|\s*!item\.required\s*\|\|\s*item\.status\s*==\s*"present"\)\s*'
+        r'\{\s*"certified"\.to_string\(\)\s*\}\s*else\s*\{\s*"candidate"\.to_string\(\)\s*\};\s*'
+        r'manifest\.certification_evidence\s*=\s*evidence;',
+        re.S,
+    )
+    replacement = '''
+    manifest.proof_commands = proof_commands(catalog, &manifest.proof_lanes);
+
+    let is_certified = evidence
+        .iter()
+        .all(|item| !item.required || item.status == "present");
+
+    manifest.certification_status = if is_certified {
+        "certified".to_string()
+    } else {
+        "candidate".to_string()
+    };
+
+    if !is_certified && manifest.lifecycle == "certified" {
+        manifest.lifecycle = "experimental".to_string();
+    }
+
+    manifest.certification_evidence = evidence;'''
+    text, n = pattern.subn(replacement, text, count=1)
+    if n != 1:
+        raise SystemExit("could not harden certified_manifest; pattern not found")
+
+# 3) Add the auth-session certified cell manifest.
+if "fn auth_session_manifest(" not in text:
+    auth_fn = r'''
+fn auth_session_manifest(repo: &Path, catalog: &RepoCatalog) -> CellManifest {
+    let source_paths = strings(&[
+        "examples/perfect-web-api-db/backend/src/domain.rs",
+        "examples/perfect-web-api-db/backend/src/application.rs",
+        "examples/perfect-web-api-db/backend/src/adapters.rs",
+        "examples/perfect-web-api-db/frontend/src/App.tsx",
+        "examples/perfect-web-api-db/ops/security.md",
+        "examples/perfect-web-api-db/docs/architecture.md",
+        "examples/perfect-web-api-db/docs/exceptions.md",
+        "examples/perfect-web-api-db/README.md",
+    ]);
+    let contract_paths = strings(&["examples/perfect-web-api-db/contracts/openapi.json"]);
+    let migration_paths = strings(&[
+        "examples/perfect-web-api-db/db/migrations/001_init.sql",
+        "examples/perfect-web-api-db/db/constraints/001_accounts.sql",
+    ]);
+    let ui_routes = strings(&["examples/perfect-web-api-db/ux/routes.md"]);
+    let proof_lanes = strings(&[
+        "test-cli",
+        "audit",
+        "db-migration-analyze",
+        "ux-qa",
+        "security",
+    ]);
+
+    certified_manifest(
+        repo,
+        catalog,
+        CellManifest {
+            cell_id: "auth-session".to_string(),
+            version: "0.1.0".to_string(),
+            category: "authentication".to_string(),
+            lifecycle: "certified".to_string(),
+            supported_profiles: strings(&["perfect-web-api-db"]),
+            dependencies: strings(&["audit-log", "rbac"]),
+            source_paths,
+            generated_paths: Vec::new(),
+            contract_paths,
+            migration_paths,
+            ui_routes,
+            proof_lanes,
+            proof_commands: Vec::new(),
+            security_assumptions: strings(&[
+                "bearer token validation is an API-edge concern and never a domain-layer side effect",
+                "authorization remains domain-owned through RBAC checks before application commands run",
+                "session/token material is never committed to source, fixtures, logs, or proof artifacts",
+                "auth/session events that affect access are observable through audit-log evidence",
+                "permission-denied UI states are covered as user-facing auth evidence",
+            ]),
+            observability_events: strings(&[
+                "auth.session.created",
+                "auth.session.expired",
+                "auth.token.rejected",
+                "authorization.denied",
+            ]),
+            docs: strings(&[
+                "examples/perfect-web-api-db/ops/security.md",
+                "examples/perfect-web-api-db/docs/architecture.md",
+                "examples/perfect-web-api-db/docs/exceptions.md",
+                "examples/perfect-web-api-db/ux/routes.md",
+            ]),
+            upgrade_notes: strings(&[
+                "introduce a real session table or provider adapter only after the API-edge validation boundary is explicit",
+                "keep auth token parsing at the transport/API edge; keep authorization decisions in domain/application",
+                "add generated OpenAPI auth endpoints before exposing login/session refresh UI",
+                "expand UX state coverage with login, expired-session, and permission-denied routes when a running app is added",
+            ]),
+            rollback_notes: strings(&[
+                "dry-run install writes no files",
+                "remove auth/session provider integration by reverting API-edge adapters and generated contract changes",
+                "never roll back auth/session migrations without a reviewed access-control and audit-log migration plan",
+            ]),
+            certification_status: "candidate".to_string(),
+            certification_evidence: Vec::new(),
+            install_strategy: "dry-run-plan".to_string(),
+            conflict_policy: "never-overwrite".to_string(),
+        },
+    )
+}
+
+'''
+    text = text.replace("fn certified_manifest(", auth_fn + "\nfn certified_manifest(", 1)
+
+cell_catalog_path.write_text(text)
+PY
+
+python3 <<'PY'
+from pathlib import Path
+
+test_path = Path("crates/jankurai/tests/command_surface_smoke.rs")
+text = test_path.read_text()
+
+# Add auth-session lookup after rbac lookup.
+if 'expect("auth-session cell")' not in text:
+    needle = (
+        'let rbac = cells\n'
+        '        .iter()\n'
+        '        .find(|cell| cell["cell_id"] == "rbac")\n'
+        '        .expect("rbac cell");'
+    )
+    if needle in text:
+        replacement = needle + '''
+    let auth_session = cells
+        .iter()
+        .find(|cell| cell["cell_id"] == "auth-session")
+        .expect("auth-session cell");'''
+        text = text.replace(needle, replacement, 1)
+    else:
+        # Fallback for the repo's currently-minified Rust source.
+        needle = 'let rbac = cells .iter() .find(|cell| cell["cell_id"] == "rbac") .expect("rbac cell");'
+        replacement = needle + ' let auth_session = cells .iter() .find(|cell| cell["cell_id"] == "auth-session") .expect("auth-session cell");'
+        text = text.replace(needle, replacement, 1)
+
+# Add hardened assertions after rbac assertions.
+if 'auth_session["manifest"]["cell_id"]' not in text and 'auth_session["certification_status"]' not in text:
+    needle = (
+        'assert!(rbac["proof_lanes"]\n'
+        '        .as_array()\n'
+        '        .unwrap()\n'
+        '        .iter()\n'
+        '        .any(|lane| lane == "security"));'
+    )
+    insertion = '''
+    assert_eq!(registry["certified_cell_count"], 4);
+    assert_eq!(auth_session["certification_status"], "certified");
+    assert_eq!(auth_session["lifecycle"], "certified");
+    assert!(auth_session["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|dependency| dependency == "audit-log"));
+    assert!(auth_session["dependencies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|dependency| dependency == "rbac"));
+    assert!(auth_session["proof_lanes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|lane| lane == "security"));
+    assert!(auth_session["security_assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|assumption| assumption
+            .as_str()
+            .unwrap()
+            .contains("API-edge")));'''
+    if needle in text:
+        text = text.replace(needle, needle + insertion, 1)
+    else:
+        needle = 'assert!(rbac["proof_lanes"] .as_array() .unwrap() .iter() .any(|lane| lane == "security"));'
+        text = text.replace(needle, needle + insertion.replace("\n", " "), 1)
+
+# Add auth-session prove smoke after rbac prove smoke.
+if '--cell-id", "auth-session"' not in text:
+    needle = (
+        'assert_eq!(rbac_prove["manifest"]["cell_id"], "rbac");\n'
+        '    assert_eq!(rbac_prove["manifest"]["certification_status"], "certified");'
+    )
+    insertion = '''
+    let (auth_session_prove, _auth_session_md) =
+        run_command(&repo, &["cell", "--cell-id", "auth-session", "--mode", "prove"]);
+    validation::validate_value(&repo, ArtifactSchema::CellManifest, &auth_session_prove["manifest"])
+        .unwrap();
+    assert_eq!(auth_session_prove["manifest"]["cell_id"], "auth-session");
+    assert_eq!(
+        auth_session_prove["manifest"]["certification_status"],
+        "certified"
+    );
+    assert_eq!(auth_session_prove["manifest"]["lifecycle"], "certified");
+    assert!(!auth_session_prove["certification_evidence"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!auth_session_prove["proof_commands"]
+        .as_array()
+        .unwrap()
+        .is_empty());'''
+    if needle in text:
+        text = text.replace(needle, needle + insertion, 1)
+    else:
+        needle = 'assert_eq!(rbac_prove["manifest"]["cell_id"], "rbac"); assert_eq!(rbac_prove["manifest"]["certification_status"], "certified");'
+        text = text.replace(needle, needle + insertion.replace("\n", " "), 1)
+
+test_path.write_text(text)
+PY
+
+python3 <<'PY'
+from pathlib import Path
+
+phase_path = Path("tips/phases/10-reuse-registry-certified-cells.md")
+text = phase_path.read_text()
+
+text = text.replace(
+    "# Phase 10: Reuse Registry Certified Cells Status: complete",
+    "# Phase 10: Reuse Registry Certified Cells Status: hardened",
+    1,
+)
+
+text = text.replace(
+    "Current certified cells: - `audit-log` - `crud-resource` - `rbac`",
+    "Current certified cells: - `audit-log` - `crud-resource` - `rbac` - `auth-session`",
+    1,
+)
+
+text = text.replace(
+    "4. auth/session shell 5. organization/team shell",
+    "4. auth/session shell — certified as registry cell `auth-session` (depends on `audit-log` and `rbac`) 5. organization/team shell",
+    1,
+)
+
+text = text.replace(
+    "Phase status: complete; **three** certified cells (`audit-log`, `crud-resource`, `rbac`)",
+    "Phase status: hardened; **four** certified cells (`audit-log`, `crud-resource`, `rbac`, `auth-session`)",
+    1,
+)
+
+text = text.replace(
+    "Follow-up phases: next registry cell **auth/session shell** (Initial Cell Order item 4); phases 11–13 as before",
+    "Follow-up phases: next registry cell **organization/team shell** (Initial Cell Order item 5); phases 11–13 as before",
+    1,
+)
+
+receipt = """
+## Phase 10 Hardening Receipt
+
+- Phase status: hardened
+- Hardened slice: fourth certified cell, `auth-session`
+- Files changed: `crates/jankurai/src/commands/cell_catalog.rs`, `crates/jankurai/tests/command_surface_smoke.rs`, `tips/phases/10-reuse-registry-certified-cells.md`, `tips/phases/logs/10-reuse-registry-certified-cells.log`
+- Public interfaces changed: `jankurai registry` now includes four built-in cells; `jankurai cell . --cell-id auth-session` and `jankurai cell . --cell-id auth-session --mode prove` emit schema-valid dry-run/prove evidence
+- Certification hardening: a built-in cell with missing required path or proof-lane evidence no longer keeps lifecycle `certified`; it is downgraded to lifecycle `experimental` with certification status `candidate`
+- Install behavior: still dry-run only; conflict policy remains `never-overwrite`; no mutating install or provider-backed auth implementation added
+- Auth/session evidence source: `examples/perfect-web-api-db/` account/domain authorization, application ports, bearerAuth OpenAPI contract, account constraints/migration, security docs, UX permission-denied route matrix, and audit/RBAC dependencies
+- Validation: `cargo test -p jankurai --test command_surface_smoke`; `cargo test -p jankurai`; `cargo run -p jankurai -- registry . --out target/jankurai/p10-registry-auth-session.json --md target/jankurai/p10-registry-auth-session.md`; `cargo run -p jankurai -- cell . --cell-id auth-session --mode prove --out target/jankurai/p10-auth-session-cell.json --md target/jankurai/p10-auth-session-cell.md`; `cargo run -p jankurai -- lane . --changed crates/jankurai/src/commands/cell_catalog.rs --changed crates/jankurai/tests/command_surface_smoke.rs --out target/jankurai/p10-auth-session-cell-lane.json --md target/jankurai/p10-auth-session-cell-lane.md`; `just fast`; `just score`
+- Residual risk: provider-backed authentication, mutating install execution, and real generated login/session UI remain deferred; those should wait for the organization/team cell and Phase 13 mutation gates
+- Next cell: `organization-team`
+"""
+
+if "## Phase 10 Hardening Receipt" not in text:
+    text = text.rstrip() + "\n\n" + receipt.lstrip()
+
+phase_path.write_text(text)
+PY
+
+# Prefer rtk if this repo wrapper exists, but do not require it for ordinary local runs.
+if command -v rtk >/dev/null 2>&1; then
+  RUNNER=(rtk)
+else
+  RUNNER=()
+fi
+
+echo "Running Phase 10 focused validation..."
+"${RUNNER[@]}" cargo test -p jankurai --test command_surface_smoke
+"${RUNNER[@]}" cargo test -p jankurai
+
+echo "Emitting Phase 10 auth/session evidence artifacts..."
+"${RUNNER[@]}" cargo run -p jankurai -- registry . \
+  --out target/jankurai/p10-registry-auth-session.json \
+  --md target/jankurai/p10-registry-auth-session.md
+
+"${RUNNER[@]}" cargo run -p jankurai -- cell . \
+  --cell-id auth-session \
+  --mode prove \
+  --out target/jankurai/p10-auth-session-cell.json \
+  --md target/jankurai/p10-auth-session-cell.md
+
+"${RUNNER[@]}" cargo run -p jankurai -- lane . \
+  --changed crates/jankurai/src/commands/cell_catalog.rs \
+  --changed crates/jankurai/tests/command_surface_smoke.rs \
+  --out target/jankurai/p10-auth-session-cell-lane.json \
+  --md target/jankurai/p10-auth-session-cell-lane.md
+
+"${RUNNER[@]}" just fast
+"${RUNNER[@]}" just score
+
+SHA_AFTER="$(git rev-parse HEAD 2>/dev/null || echo pending)"
+TS_FINISH="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+if ! grep -q "auth-session hardening finish" "$LOG" 2>/dev/null; then
+  printf '%s | agent | 10 | auth-session hardening finish | crates/jankurai/src/commands/cell_catalog.rs;crates/jankurai/tests/command_surface_smoke.rs;tips/phases/10-reuse-registry-certified-cells.md;tips/phases/logs/10-reuse-registry-certified-cells.log | cargo test -p jankurai --test command_surface_smoke;cargo test -p jankurai;cargo run -p jankurai -- registry . --out target/jankurai/p10-registry-auth-session.json --md target/jankurai/p10-registry-auth-session.md;cargo run -p jankurai -- cell . --cell-id auth-session --mode prove --out target/jankurai/p10-auth-session-cell.json --md target/jankurai/p10-auth-session-cell.md;cargo run -p jankurai -- lane . --changed crates/jankurai/src/commands/cell_catalog.rs --changed crates/jankurai/tests/command_surface_smoke.rs --out target/jankurai/p10-auth-session-cell-lane.json --md target/jankurai/p10-auth-session-cell-lane.md;just fast;just score | target/jankurai/p10-registry-auth-session.json;target/jankurai/p10-registry-auth-session.md;target/jankurai/p10-auth-session-cell.json;target/jankurai/p10-auth-session-cell.md;target/jankurai/p10-auth-session-cell-lane.json;target/jankurai/p10-auth-session-cell-lane.md;target/jankurai/fast-score.json;target/jankurai/fast-score.md;agent/repo-score.json;agent/repo-score.md | %s | provider-backed auth and mutating install remain deferred; next cell organization/team\n' "$TS_FINISH" "$SHA_AFTER" >> "$LOG"
+fi
+
+echo
+echo "Phase 10 auth-session hardening patch complete."
+echo "Review changed files:"
+git status --short
+echo
+echo "Suggested final inspection:"
+echo "  jq '.cells[] | select(.cell_id==\"auth-session\")' target/jankurai/p10-registry-auth-session.json"
+echo "  jq '.manifest.certification_status, .manifest.lifecycle, .proof_commands' target/jankurai/p10-auth-session-cell.json"
+```
+
+### Why this finishes Phase 10 instead of drifting into Phase 13
+
+This keeps Phase 10 inside the intended cell-registry boundary. The installer remains **dry-run-only** and **never-overwrite**, which matches the existing Phase 10 contract. ([GitHub][2]) It does not create branches, mutate real projects, or add provider-backed auth behavior, because that would collide with the Phase 13 safety model, where real repo mutation and PR creation are still deferred behind stronger gates. ([GitHub][4])
+
+The important hardening addition is not just “one more manifest.” It makes certification status evidence-bound: if a built-in cell’s required paths or proof lanes are missing, it can no longer keep lifecycle `certified`; it becomes `experimental` + `candidate`. That directly supports the moonshot’s demand that evidence be durable and machine-readable instead of a doc label. ([GitHub][1])
+
+### Expected result after the patch
+
+Phase 10 should be considered:
+
+```text
+Status: hardened
+Certified cells:
+- audit-log
+- crud-resource
+- rbac
+- auth-session
+Next cell:
+- organization/team shell
+```
+
+The resulting public command surface stays:
+
+```bash
+jankurai registry .
+jankurai cell . --cell-id auth-session
+jankurai cell . --cell-id auth-session --mode prove
+```
+
+The key artifacts should be:
+
+```text
+target/jankurai/p10-registry-auth-session.json
+target/jankurai/p10-registry-auth-session.md
+target/jankurai/p10-auth-session-cell.json
+target/jankurai/p10-auth-session-cell.md
+target/jankurai/p10-auth-session-cell-lane.json
+target/jankurai/p10-auth-session-cell-lane.md
+target/jankurai/fast-score.json
+target/jankurai/fast-score.md
+agent/repo-score.json
+agent/repo-score.md
+```
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/10-reuse-registry-certified-cells.md "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/00-phase-index.md "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/13-autonomous-repair-optimization.md "raw.githubusercontent.com"
+

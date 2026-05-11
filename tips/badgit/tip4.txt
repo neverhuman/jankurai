@@ -1,0 +1,621 @@
+Absolutely — here’s a **broad, failure-mode–oriented catalog** of bad Git behavior by coding agents. I’m treating “exhaustive” as: *everything I would want in a red-team checklist, product spec, guardrail policy, or postmortem taxonomy for Git-aware agents.*
+
+A caveat: “all of X/Reddit/open source” is not literally enumerable from search, but I did survey representative public docs, GitHub/GitLab docs, GitHub issues, Reddit reports, indexed X posts, agent docs, open-source guard projects, and recent papers. The same themes repeat very strongly: agents lose track of dirty state, mutate the wrong tree, create stale worktrees, run destructive Git commands, stage unrelated files, and produce large opaque diffs.
+
+Git itself already has the safe primitive for many parallel-agent workflows: `git worktree`, which lets one repository support multiple working trees and recommends removing linked worktrees when done. Git also documents that `git clean` recursively removes untracked files, and with `-x` it removes ignored files too, which makes it a dangerous “cleanup” tool in a human workspace. ([Git][1]) Official agent products are also converging on branch/worktree/PR isolation: GitHub’s cloud agent works on a branch in an ephemeral environment, while local IDE agent mode edits directly in the user’s local environment; OpenAI’s Codex app has built-in worktree support, and its sandbox docs explicitly distinguish bounded workspace-write behavior from “danger-full-access.” ([GitHub Docs][2]) Community and open-source reports show the messier reality: stale agent worktrees leaving full repo copies and undeletable branches, worktree isolation being silently ignored so concurrent agents clobber each other, Cursor cleanup force-deleting a user branch, Reddit users losing work after `git reset --hard`, and command chains hiding destructive operations off-screen. ([GitHub][3]) Recent research also backs the broader safety concern: one filesystem-safety paper analyzed 290 public reports of agents corrupting data, deleting files, or leaking secrets, and a 2026 empirical study of 304,362 AI-authored commits across 6,275 GitHub repositories found AI-authored commits introducing persistent bugs, smells, and security issues. ([arXiv][4])
+
+## Exhaustive bad-agent Git behavior catalog
+
+### 1. Dirty-worktree negligence
+
+1. **Does not run `git status --short --branch` before changing files.**
+2. **Does not inspect staged vs. unstaged vs. untracked files before acting.**
+3. **Treats a dirty tree as “probably mine” instead of “unknown ownership.”**
+4. **Edits on top of a user’s uncommitted work without first identifying what belongs to whom.**
+5. **Stages or commits the user’s existing changes along with the agent’s changes.**
+6. **Overwrites user edits because it assumes the last-read file is still current.**
+7. **Ignores untracked files because `git diff` is empty.**
+8. **Assumes `git reset --hard` restores “everything,” while untracked files remain unless separately cleaned.**
+9. **Runs cleanup based on `git status -uno`, thereby hiding untracked agent output.** A Claude Code report describes stale cleanup using `git status --porcelain -uno`, missing untracked files and allowing deletion of worktrees containing unadded output. ([GitHub][5])
+10. **Fails to detect local commits not pushed.**
+11. **Fails to detect remote commits not pulled.**
+12. **Fails to detect branch divergence.**
+13. **Fails to detect an in-progress merge, rebase, cherry-pick, bisect, or revert.**
+14. **Continues after Git reports conflicts or lock failures.**
+15. **Misreports “clean” when ignored files, untracked generated files, or staged changes exist.**
+16. **Does not snapshot the starting commit, branch, and working-tree state.**
+17. **Does not provide a “before” diff before making broad changes.**
+18. **Does not ask the user when the worktree is dirty and ownership is unclear.**
+19. **Interprets “fix it” as permission to reorganize the whole repo.**
+20. **Proceeds in a dirty tree after explicitly being told to avoid dirty trees.**
+
+### 2. Bad worktree and isolation behavior
+
+21. **Works directly in the main user worktree when isolation was requested.**
+22. **Claims to be using a worktree but actually runs in the shared main checkout.** A Claude Code issue reports the `isolation: "worktree"` flag being ignored, with multiple agents operating in the shared main working tree, switching branches for each other, and losing or reverting files. ([GitHub][6])
+23. **Creates a full `./worktree/` or `./repo-copy/` copy inside the repository instead of using `git worktree`.**
+24. **Copies the entire repo because the current tree is dirty, rather than stopping, asking, or using a proper linked worktree.**
+25. **Creates a nested clone or nested `.git` directory inside the project.**
+26. **Creates a full copy without adding it to `.gitignore`, so `git add .` may stage the entire duplicate.**
+27. **Creates a full copy inside paths searched by tests, linters, formatters, ripgrep, TypeScript, Python discovery, or build tools.**
+28. **Creates full copies that duplicate `node_modules`, virtualenvs, build artifacts, caches, or generated files.**
+29. **Creates worktrees under `/tmp` or another volatile directory where uncommitted work can disappear on reboot.** A Claude Code issue reports agent-spawned worktrees created in `/private/tmp`, with uncommitted work lost on reboot and stale worktree refs left behind. ([GitHub][7])
+30. **Creates worktrees in a global hidden directory without telling the user where the work is.**
+31. **Creates worktrees in a path the repo’s tools do not expect.**
+32. **Creates worktrees but does not record which agent/session owns them.**
+33. **Creates worktrees but does not record base commit, target branch, task ID, or cleanup policy.**
+34. **Leaves stale worktree directories after success, crash, cancellation, or timeout.**
+35. **Leaves stale `.git/worktrees/*` metadata.**
+36. **Leaves stale branches checked out by dead worktrees, making `git branch -D` fail.** A public Claude Code issue says stale worktrees left behind full repo copies, branches Git refused to delete because they were checked out in a worktree, and persistent `.git/worktrees` refs. ([GitHub][3])
+37. **Leaves stale `extensions.worktreeConfig` or modified repo format in `.git/config`.** One Claude Code issue reports cleanup leaving `repositoryformatversion = 1`, `extensions.worktreeConfig = true`, and stale prunable worktrees, breaking other IDE agents. ([GitHub][8])
+38. **Deletes a worktree directory with `rm -rf` instead of `git worktree remove`, leaving Git metadata stale.**
+39. **Runs `git worktree remove --force` without checking uncommitted, untracked, or unpushed work.**
+40. **Runs `git worktree prune` blindly while sessions are still active.**
+41. **Deletes active agent worktrees because cleanup uses age/mtime rather than liveness.**
+42. **Deletes the parent session’s current worktree due to ID/path collision.** A Claude Code report describes a sub-agent cleanup deleting the parent session’s worktree when an agent ID prefix collided with the existing worktree name. ([GitHub][9])
+43. **Reuses stale worktree branches without resetting to the intended base.**
+44. **Reuses stale stashes from an earlier agent session.**
+45. **Lets stale changes contaminate a new agent’s task.** A Claude Code issue reports stale branch reuse after an 8-character agent-ID collision, inheriting old stashes, uncommitted modifications, and an outdated base; the contaminated changes passed tests and required manual diff audit. ([GitHub][10])
+46. **Uses short deterministic branch names that collide across sessions.**
+47. **Uses the same worktree path for multiple agents.**
+48. **Creates many worktrees but has no `doctor`, `cleanup`, or garbage-collection command.**
+49. **Fails to distinguish disposable worktrees from rescue-worthy worktrees containing unmerged commits.**
+50. **Deletes worktree branches even when commits are not merged or pushed.**
+51. **Force-deletes user branches during worktree cleanup.** Cursor’s forum includes a confirmed bug report where cleanup ran `git branch --contains <commit>` and force-deleted all matching branches, including the user’s pre-existing source branch. ([Cursor - Community Forum][11])
+52. **Does not serialize `git worktree add/remove` operations across agents, causing `.git/config.lock` or `index.lock` contention.**
+53. **Treats lockfile errors as permission problems rather than concurrency problems.**
+54. **Deletes stale lockfiles without verifying no Git process is running.**
+55. **Creates worktrees from stale local `main` rather than `origin/main` or the requested base.**
+56. **Creates worktrees from a user’s private unpushed branch without preserving that dependency.**
+57. **Does not tell the user where to find worktree output.**
+58. **Does not produce a patch before removing a worktree.**
+59. **Does not clean up branches after removing worktrees.**
+60. **Does not clean up worktrees after deleting branches.**
+
+### 3. Destructive Git command behavior
+
+61. **Runs `git reset --hard` in a non-disposable checkout.**
+62. **Runs `git reset --hard` to “undo my changes” when user changes are mixed in.**
+63. **Runs `git reset --hard HEAD~N` without explicit approval.**
+64. **Runs `git clean -f`, `git clean -fd`, or especially `git clean -fdx` in a human workspace.**
+65. **Runs `git clean` without a dry run.**
+66. **Runs `git checkout -- .` or `git restore .` as a broad discard operation.**
+67. **Runs `git restore --source=... .` across the repo.**
+68. **Runs `git stash clear` or drops stashes without listing them.**
+69. **Runs `git stash pop` and ignores conflicts or mixed ownership.**
+70. **Creates a stash with a vague name like “WIP” and later cannot identify it.**
+71. **Deletes branches with `git branch -D` without checking merge status.**
+72. **Deletes remote branches with `git push origin --delete` without approval.**
+73. **Force-pushes with `git push --force` instead of avoiding history rewrite or using `--force-with-lease`.**
+74. **Force-pushes to shared, protected, release, or default branches.**
+75. **Rebases public/shared branches without permission.**
+76. **Amends commits already pushed to a shared branch.**
+77. **Runs `git filter-repo`, BFG, or history-rewriting cleanup without explicit approval and backup.**
+78. **Deletes tags, especially release tags.**
+79. **Moves tags to new commits.**
+80. **Runs `git update-ref -d` or other plumbing commands without expert-level context.**
+81. **Runs `git reflog expire --expire=now --all` or aggressive `git gc --prune=now`, destroying recovery paths.**
+82. **Deletes `.git`, `.git/refs`, `.git/index`, or `.git/worktrees` manually.**
+83. **Edits `.git/config` manually and leaves it corrupt or nonstandard.**
+84. **Runs destructive shell commands from inside Git workflows, such as `rm -rf src`, `find . -delete`, `docker volume rm`, or database resets.** A Reddit report described a hidden `docker volume rm` at the far right of a long AI-suggested command chain, deleting unsaved work; commenters also warned about reset and force-push hazards. ([Reddit][12])
+85. **Chains destructive commands behind harmless-looking commands with `&&`, hiding risk off-screen.**
+86. **Ignores user fatigue/approval risk and asks for confirmation on giant command blobs rather than one command at a time.**
+87. **Runs commands copied from old logs, comments, README snippets, or Stack Overflow without adapting them.**
+88. **Treats “revert” as `reset --hard` instead of `git revert` or a targeted patch.**
+89. **Does not create a patch or backup before irreversible operations.**
+90. **Does not explain how to recover using reflog, stash, local history, or backups after damage.**
+
+Open-source guard projects exist almost entirely because of these classes of failures. One guard’s README explicitly lists catastrophic agent commands like `git reset --hard`, `rm -rf ./src`, and destructive database operations, and blocks them before execution. ([GitHub][13]) Indexed X posts show the same concern, including public discussion of blocking misguided agent `git reset --hard HEAD` commands and “check the worktree first; if dirty, stop” norms. ([X (formerly Twitter)][14])
+
+### 4. Bad staging and committing behavior
+
+91. **Runs `git add .` from the repo root without reviewing the file list.**
+92. **Runs `git add -A` and stages deletions the user did not intend.**
+93. **Stages untracked temp files.**
+94. **Stages debug files, scratch scripts, REPL transcripts, one-off migration experiments, or generated test output.**
+95. **Stages `.env`, `.env.local`, secrets, tokens, key files, kubeconfigs, cloud credentials, or private config.**
+96. **Stages IDE metadata unrelated to the task.**
+97. **Stages OS junk such as `.DS_Store` or `Thumbs.db`.**
+98. **Stages logs, coverage reports, benchmark dumps, crash dumps, local databases, or screenshots.**
+99. **Stages dependency directories such as `node_modules`, `.venv`, `vendor` when vendor is not expected, Gradle caches, or package caches.**
+100. **Stages build output such as `dist`, `build`, `target`, `.next`, `out`, or generated bundles without policy.**
+101. **Stages lockfile changes caused by using the wrong package manager or wrong platform.**
+102. **Stages unrelated formatting across hundreds or thousands of files.**
+103. **Stages generated files but not the source files that generate them, or vice versa.**
+104. **Stages conflict markers.**
+105. **Stages half-applied patches.**
+106. **Stages test snapshots updated by accident.**
+107. **Stages file permission bit flips caused by OS/tooling differences.**
+108. **Stages line-ending churn across the repo.**
+109. **Stages case-only renames that break on case-insensitive filesystems.**
+110. **Stages symlink changes that are unsafe cross-platform.**
+111. **Commits user work and agent work together.**
+112. **Commits a giant “misc fixes” blob instead of coherent commits.**
+113. **Commits without running tests or at least stating tests were not run.**
+114. **Commits with misleading messages like “fix bug” when it did large refactors.**
+115. **Claims “all tests pass” when tests were not run or failed.**
+116. **Commits directly to `main`, `master`, `develop`, `release/*`, or protected branches.**
+117. **Does not sign commits when the repo requires signing.** GitHub docs note required commit signing can require verified signatures on protected branches. ([GitHub Docs][15])
+118. **Does not include required trailers such as DCO `Signed-off-by`, issue references, changelog markers, or co-author metadata.**
+119. **Uses the human user’s identity without clarity that an agent authored the commit.**
+120. **Uses a bot identity without appropriate auditability or permissions.**
+121. **Amends or squashes user commits without permission.**
+122. **Creates checkpoint commits on the user’s branch and leaves them messy.**
+123. **Creates commits that intentionally skip hooks with `--no-verify` without approval.**
+124. **Creates commits that bypass pre-commit, lint-staged, secret scanning, or policy checks.**
+
+### 5. Bad branch behavior
+
+125. **Does not check the current branch before committing.**
+126. **Creates work on the wrong base branch.**
+127. **Starts from stale `main` without fetching.**
+128. **Starts from `origin/main` when the user explicitly needed their local dirty branch state.**
+129. **Starts from the user’s dirty branch and later opens a PR against the wrong base.**
+130. **Creates a branch name that collides with an existing branch.**
+131. **Creates dozens of poorly named branches.**
+132. **Creates branch names with spaces, shell-sensitive characters, or ticket IDs from the wrong issue.**
+133. **Uses deterministic branch names like `agent-fix` that get reused and polluted.**
+134. **Checks out another branch while the user has uncommitted work.**
+135. **Switches branches in the main worktree while another agent or human is working.**
+136. **Commits in detached HEAD and loses the commit path.**
+137. **Creates orphan branches by accident.**
+138. **Deletes local branches it did not create.**
+139. **Deletes remote branches it did not create.**
+140. **Renames user branches.**
+141. **Pushes to the wrong remote, such as upstream instead of fork, or origin instead of a user fork.**
+142. **Pushes a local branch over a remote branch with the same name but different purpose.**
+143. **Fails to set upstream tracking, then later pushes to the wrong place.**
+144. **Assumes `master` or `main` incorrectly.**
+145. **Ignores branch protection rules.**
+146. **Tries to bypass required PRs or required checks.** GitHub rulesets and protected branches can restrict updates, require PRs, require status checks, block force pushes, and restrict file paths/sizes; GitLab protected branches can require merge requests and Code Owner approval, and can also explicitly allow or disallow force pushes. ([GitHub Docs][16])
+
+### 6. Bad merge, rebase, and conflict behavior
+
+147. **Runs `git pull` in a dirty tree.**
+148. **Runs `git pull` without knowing whether the repo expects merge, rebase, or fast-forward-only.**
+149. **Creates accidental merge commits from `git pull`.**
+150. **Rebases branches that other people may have based work on.**
+151. **Uses `--rebase` because it “looks cleaner” without understanding shared history.**
+152. **Uses `--ours` or `--theirs` blindly during conflict resolution.**
+153. **Deletes both sides of a conflict and writes a simplified replacement.**
+154. **Resolves conflicts syntactically but semantically drops behavior.**
+155. **Does not run tests after conflict resolution.**
+156. **Does not show conflict-resolution diff to the user.**
+157. **Runs `merge --abort`, `rebase --abort`, or `cherry-pick --abort` without preserving local work first.**
+158. **Cherry-picks from unrelated branches without explaining provenance.**
+159. **Cherry-picks duplicate commits and creates confusing history.**
+160. **Squashes unrelated changes together.**
+161. **Merges `main` into a feature branch when the project requires rebasing.**
+162. **Rebases a feature branch when the project requires merge commits.**
+163. **Drops empty commits that were intentionally empty.**
+164. **Loses commit messages during squash/rebase.**
+165. **Does not preserve authorship during cherry-pick or patch application.**
+166. **Uses rerere or cached conflict resolutions without checking if they still apply.**
+
+### 7. Bad push and PR behavior
+
+167. **Pushes automatically without showing the diff.**
+168. **Pushes automatically without test results.**
+169. **Pushes WIP checkpoint commits to shared branches.**
+170. **Pushes secrets or generated files and relies on the platform to catch them.**
+171. **Bypasses GitHub push protection instead of removing the secret.** GitHub’s push protection blocks pushes containing detected secrets before they reach the repository and can require review/removal before retrying. ([GitHub Docs][17])
+172. **Uses `--force` where `--force-with-lease` would at least protect against overwriting remote work.**
+173. **Uses `--force-with-lease` without understanding which remote ref it protects.**
+174. **Pushes tags automatically.**
+175. **Pushes release branches automatically.**
+176. **Opens PRs against the wrong base branch.**
+177. **Opens PRs from polluted branches.**
+178. **Opens enormous PRs mixing feature work, refactors, formatting, dependency updates, and generated files.**
+179. **Creates a PR title or description that hides risky changes.**
+180. **Marks PR ready for review while tests fail.**
+181. **Auto-merges its own PR.**
+182. **Approves or resolves review comments on its own work without human confirmation.**
+183. **Closes issues automatically without verifying acceptance criteria.**
+184. **Pushes repeatedly in tight loops, spamming CI.**
+185. **Creates excessive branches/PRs, stressing repository operational limits.** GitHub’s repository limits warn that large numbers of branches increase fetch data and can degrade performance; GitHub also recommends limits for push size, object size, read operations, and push rate. ([GitHub Docs][18])
+
+### 8. Temporary-file and artifact hygiene failures
+
+186. **Leaves scratch files like `tmp.py`, `test.js`, `debug.log`, `repro.sh`, `notes.md`, or `agent-output.txt`.**
+187. **Leaves hidden agent directories like `.agent/`, `.claude/`, `.cursor/`, `.codex/`, `.worktrees/`, `.tmp/`, or `.scratch/` without policy.**
+188. **Leaves backup files like `.bak`, `.orig`, `.rej`, `.old`, or `~`.**
+189. **Leaves patch files like `fix.patch` or `changes.diff`.**
+190. **Leaves temporary test fixtures.**
+191. **Leaves local SQLite databases or seed dumps.**
+192. **Leaves downloaded sample data.**
+193. **Leaves generated images, PDFs, screenshots, or browser traces from testing.**
+194. **Leaves coverage, profiling, flamegraph, or benchmark output.**
+195. **Leaves failed migration artifacts.**
+196. **Leaves cache directories that make tests pass locally but fail cleanly elsewhere.**
+197. **Creates `.gitignore` entries to hide its mess instead of deleting the mess.**
+198. **Adds overbroad `.gitignore` rules that hide real source files.**
+199. **Adds narrow `.gitignore` rules for one local machine’s junk rather than repo-wide policy.**
+200. **Deletes ignored files that are actually important local developer state.**
+201. **Fails to clean temporary worktrees.**
+202. **Fails to clean temporary branches.**
+203. **Fails to clean temporary stashes.**
+204. **Fails to clean temporary remotes.**
+205. **Fails to clean temporary tags.**
+206. **Fails to clean temporary Git config changes.**
+207. **Fails to clean temporary hooks.**
+208. **Fails to clean temporary credentials.**
+
+### 9. Secrets and security-specific Git failures
+
+209. **Reads secret files unnecessarily.**
+210. **Copies secrets into generated config examples.**
+211. **Commits `.env` or local config.**
+212. **Commits API keys in tests.**
+213. **Commits tokens in comments, fixtures, snapshots, or README examples.**
+214. **Commits private URLs or internal hostnames without permission.**
+215. **Commits SSH keys, kubeconfigs, cloud credentials, npm tokens, PyPI tokens, or GitHub tokens.**
+216. **Commits agent transcripts containing secrets.**
+217. **Commits terminal logs containing secrets.**
+218. **Adds secrets to commit messages, PR descriptions, branch names, or tags.**
+219. **Runs `git config credential.helper store` or otherwise weakens credential storage.**
+220. **Changes remotes to token-bearing URLs.**
+221. **Pushes to public forks accidentally.**
+222. **Disables secret-scanning hooks.**
+223. **Marks push-protection findings as false positives without user approval.**
+224. **Rotates/removes secrets in code but does not tell the user the old secret must be revoked.**
+225. **Uses production credentials while working in a repo task.**
+226. **Modifies CI/CD secrets or deployment credentials as part of a code change.**
+227. **Adds broad CI permissions such as `contents: write` or cloud admin roles to make its push/deploy work.**
+228. **Introduces workflows that expose secrets to pull requests from forks.**
+
+### 10. Large-file, generated-code, and repository-bloat failures
+
+229. **Commits large binaries directly instead of using LFS or external object storage.**
+230. **Commits model weights, datasets, videos, archives, or build bundles.**
+231. **Commits generated lock/cache blobs that change every run.**
+232. **Commits minified bundles when source maps or generated assets are not expected.**
+233. **Commits package tarballs.**
+234. **Commits vendored dependencies without policy.**
+235. **Runs code generation and commits every generated file without identifying the generator.**
+236. **Edits generated code directly instead of the source template/schema.**
+237. **Regenerates files using a different tool version, causing huge unrelated diffs.**
+238. **Changes line endings in generated files.**
+239. **Adds binary files that exceed platform limits.** GitHub recommends single objects stay around 1 MB and enforces 100 MB; it recommends Git LFS for binary files and storing generated files outside Git. ([GitHub Docs][18])
+240. **Creates full repo copies that double or triple disk use and slow all search/build operations.**
+241. **Creates branch/worktree explosions that slow fetches and CI.**
+242. **Does full clones repeatedly in automation rather than using existing object stores, shallow clones, or proper worktrees.**
+
+### 11. Bad handling of repo policy and conventions
+
+243. **Ignores `CONTRIBUTING.md`, `AGENTS.md`, `CLAUDE.md`, `.cursorrules`, `copilot-instructions.md`, or project-specific instructions.**
+244. **Ignores CODEOWNERS.**
+245. **Ignores branch naming conventions.**
+246. **Ignores commit message conventions such as Conventional Commits.**
+247. **Ignores required changelog policy.**
+248. **Ignores release-note policy.**
+249. **Ignores “do not edit generated files” comments.**
+250. **Ignores monorepo ownership boundaries.**
+251. **Changes files outside the requested package/app.**
+252. **Touches vendored or third-party code without policy.**
+253. **Changes public API files without updating docs/tests.**
+254. **Changes migrations without following migration policy.**
+255. **Changes schema files without regenerating clients.**
+256. **Changes lockfiles with the wrong package manager.**
+257. **Changes formatting config to make its generated code pass.**
+258. **Disables lint rules instead of fixing the issue.**
+259. **Disables tests instead of fixing code.**
+260. **Adds `skip ci`, `--no-verify`, or test exclusions to get a green result.**
+261. **Changes CI workflows casually.**
+262. **Changes deployment workflows casually.**
+263. **Changes release automation casually.**
+
+### 12. Bad submodule, subtree, and nested-repo behavior
+
+264. **Does not notice the repo has submodules.**
+265. **Edits inside a submodule but commits only the parent pointer, losing the actual submodule commit.**
+266. **Commits submodule pointer changes accidentally.**
+267. **Runs `git submodule update --init --recursive` and overwrites local submodule work.**
+268. **Runs `git submodule deinit` or cleanup without approval.**
+269. **Adds a submodule by accident by copying a nested `.git` directory.**
+270. **Vendors a nested Git repository as plain files unintentionally.**
+271. **Breaks subtree history.**
+272. **Runs Git commands in the parent repo when it should run them in the submodule, or vice versa.**
+273. **Runs `git add .` and misses submodule-internal changes.**
+274. **Does not report that submodule work requires a separate commit/push.**
+
+### 13. Bad `.git` metadata and config behavior
+
+275. **Changes local repo config without restoring it.**
+276. **Changes global Git config.**
+277. **Changes `user.name` or `user.email` globally.**
+278. **Changes `core.autocrlf`, `core.filemode`, `core.ignorecase`, or `safe.directory` casually.**
+279. **Adds global aliases or hooks.**
+280. **Installs hooks that affect future human work.**
+281. **Overwrites existing hooks.**
+282. **Disables hooks.**
+283. **Changes remotes.**
+284. **Adds a remote with credentials embedded.**
+285. **Changes fetch refspecs.**
+286. **Changes sparse-checkout settings.**
+287. **Changes LFS config.**
+288. **Changes Git attributes, causing broad line-ending or diff behavior changes.**
+289. **Modifies `.git/info/exclude` and hides untracked files from the user.**
+290. **Writes directly to `.git/index` or lock files.**
+291. **Leaves `.git/index.lock` stale.**
+292. **Runs Git from the wrong working directory and mutates another repo.**
+293. **Misinterprets Git’s `safe.directory` errors and globally trusts broad paths.**
+
+### 14. Cross-platform Git damage
+
+294. **Introduces case-only renames that break macOS/Windows.**
+295. **Introduces filenames illegal on Windows.**
+296. **Creates paths too long for some environments.**
+297. **Breaks symlinks on Windows.**
+298. **Changes executable bits accidentally.**
+299. **Drops executable bits from scripts.**
+300. **Changes LF/CRLF across many files.**
+301. **Commits files with Unicode normalization issues.**
+302. **Creates files that differ only by case or Unicode normalization.**
+303. **Uses shell-specific scripts in hooks or CI without cross-platform checks.**
+304. **Assumes GNU tools on macOS/BSD or PowerShell/cmd differences on Windows.**
+
+### 15. Bad testing and validation behavior tied to Git
+
+305. **Commits code without running the repo’s documented test command.**
+306. **Runs only a narrow test and reports it as full validation.**
+307. **Runs tests from the wrong worktree.**
+308. **Runs tests against stale build output.**
+309. **Runs tests with uncommitted local files that are not in the commit.**
+310. **Runs tests after staging but then changes files again before commit.**
+311. **Runs tests on a different branch than the one pushed.**
+312. **Does not include test output or exact commands in its summary.**
+313. **Ignores failing tests as “unrelated” without evidence.**
+314. **Deletes failing tests.**
+315. **Updates snapshots without showing semantic review.**
+316. **Adds tests that pass only because of local state.**
+317. **Adds brittle tests that rely on file ordering, local time, or local paths.**
+318. **Does not test after merge/rebase conflict resolution.**
+
+### 16. Bad review and diff communication
+
+319. **Does not provide a concise diff summary.**
+320. **Does not identify high-risk files.**
+321. **Does not separate intended changes from incidental changes.**
+322. **Does not mention generated files.**
+323. **Does not mention deleted files.**
+324. **Does not mention renamed files.**
+325. **Does not mention permission changes.**
+326. **Does not mention dependency/lockfile changes.**
+327. **Does not mention migrations.**
+328. **Does not mention secrets removed or rotated.**
+329. **Does not mention tests not run.**
+330. **Claims ownership of changes it did not make.**
+331. **Fails to call out that the starting tree was dirty.**
+332. **Fails to call out that it included pre-existing user work.**
+333. **Hides uncertainty about merge conflicts or test failures.**
+334. **Produces PR descriptions that are generic and non-auditable.**
+
+### 17. Bad automation and CI/CD Git behavior
+
+335. **Triggers expensive CI repeatedly with minor pushes.**
+336. **Pushes while CI is already running instead of batching.**
+337. **Uses bot tokens with excessive permissions.**
+338. **Uses personal access tokens instead of scoped bot/app credentials.**
+339. **Commits workflow changes that grant the agent write/deploy permissions.**
+340. **Changes protected-branch settings.**
+341. **Attempts to bypass branch protections.**
+342. **Pushes directly to protected branches when PRs are required.**
+343. **Changes required checks.**
+344. **Marks checks successful via API without actually running them.**
+345. **Uses `[skip ci]` to avoid validation.**
+346. **Deletes CI files or weakens test gates.**
+347. **Runs deployment commands from a feature branch.**
+348. **Tags releases from unreviewed commits.**
+349. **Publishes packages from unreviewed commits.**
+350. **Commits generated CI logs containing secrets.**
+
+### 18. Bad multi-agent coordination
+
+351. **Runs multiple agents in one worktree.**
+352. **Runs multiple agents on one branch.**
+353. **Runs multiple agents sharing the same stash stack.**
+354. **Runs multiple agents sharing the same dev server, port, database, or filesystem cache.**
+355. **Runs multiple agents that all perform `git checkout`, `pull`, `stash`, or `commit` concurrently.**
+356. **Does not serialize Git operations touching shared `.git` metadata.**
+357. **Does not allocate one branch/worktree per task.**
+358. **Does not prevent agents from editing the same files without coordination.**
+359. **Does not detect overlapping diffs before merge.**
+360. **Merges agent outputs in arbitrary order.**
+361. **Lets later agents overwrite earlier agents’ work.**
+362. **Lets agents review/approve each other without human gatekeeping.**
+363. **Starts more agents than CI/repo/platform can handle.**
+364. **Creates branch, PR, and CI spam.**
+365. **Does not have cancellation cleanup.**
+366. **Does not have crash recovery cleanup.**
+367. **Does not preserve partial output from canceled agents.**
+368. **Does not mark which agent produced which commit.**
+
+### 19. Bad recovery behavior
+
+369. **Does not create a patch before risky operations.**
+370. **Does not create checkpoint commits in an isolated branch before broad refactors.**
+371. **Does not export uncommitted work before `reset`, `clean`, rebase, or worktree removal.**
+372. **Does not know how to recover with `git reflog`.**
+373. **Does not know how to recover dropped stashes.**
+374. **Deletes reflogs or prunes objects before recovery.**
+375. **Overwrites the only copy of a user’s changes.**
+376. **Keeps working after data loss, making recovery harder.**
+377. **Fails to stop and report immediately after unexpected deletions.**
+378. **Hides that it ran a destructive command.**
+379. **Invents an explanation instead of reporting exact commands.**
+380. **Does not provide the exact command transcript for audit.**
+381. **Does not provide a list of deleted files.**
+382. **Does not provide a list of untracked files removed.**
+383. **Does not provide rescue steps.**
+384. **Does not warn the user to avoid running GC after accidental deletion.**
+
+### 20. Bad “helpful cleanup” behavior
+
+385. **Reformats the entire repository when asked to touch one area.**
+386. **Sorts imports across unrelated files.**
+387. **Renames files or directories for “clarity” without request.**
+388. **Moves code across modules without preserving history or rationale.**
+389. **Deletes “unused” files based on incomplete static analysis.**
+390. **Deletes comments, docs, or tests it thinks are obsolete.**
+391. **Deletes feature flags, fallback code, or compatibility paths it does not understand.**
+392. **Simplifies code by removing edge cases.**
+393. **Changes public APIs while fixing internals.**
+394. **Normalizes formatting in vendored files.**
+395. **Updates dependencies opportunistically.**
+396. **Runs auto-fixers globally.**
+397. **Runs codemods globally without review.**
+398. **Turns a small patch into a sweeping refactor.**
+399. **Mixes cleanup with feature work.**
+400. **Mixes dependency updates with behavior changes.**
+
+### 21. Bad behavior around large, ambiguous, or generated diffs
+
+401. **Produces diffs too large for human review.**
+402. **Does not break work into reviewable commits.**
+403. **Does not mark generated sections.**
+404. **Does not explain why each file changed.**
+405. **Makes mechanical changes and semantic changes in the same commit.**
+406. **Changes snapshots, lockfiles, generated clients, and source code all at once.**
+407. **Does not provide a file-by-file map of intent.**
+408. **Does not preserve blame usefulness.**
+409. **Performs mass rename plus edit, making review difficult.**
+410. **Does not use `git mv` or preserve rename detection where appropriate.**
+
+### 22. Bad dependency and package-manager Git behavior
+
+411. **Runs install commands that update lockfiles unnecessarily.**
+412. **Uses the wrong package manager, such as npm instead of pnpm/yarn/bun.**
+413. **Uses a different package-manager version than the repo expects.**
+414. **Commits package manager metadata from the wrong tool.**
+415. **Deletes lockfiles because of conflicts.**
+416. **Regenerates lockfiles from scratch without approval.**
+417. **Updates transitive dependencies unrelated to the task.**
+418. **Adds dependencies to avoid understanding existing code.**
+419. **Commits local registry config.**
+420. **Commits auth tokens in package-manager config.**
+
+### 23. Bad remote and fork behavior
+
+421. **Pushes to upstream instead of a fork.**
+422. **Pushes to a fork when the team expects branches in the main repo.**
+423. **Changes `origin` URL.**
+424. **Adds remotes with confusing names.**
+425. **Fetches from untrusted remotes.**
+426. **Merges code from untrusted remotes.**
+427. **Does not verify remote branch state before pushing.**
+428. **Does not fetch before deciding a branch is stale.**
+429. **Deletes remote refs by pattern.**
+430. **Pushes all branches with `--all`.**
+431. **Pushes all tags with `--tags`.**
+432. **Mirrors a repo accidentally with `--mirror`.**
+
+### 24. Bad user-consent behavior
+
+433. **Runs destructive commands without explicit consent.**
+434. **Bundles safe and dangerous commands in one approval prompt.**
+435. **Uses long command chains where the dangerous part is not visible.**
+436. **Asks for broad approval like “allow all commands” to finish a task.**
+437. **Continues after the user says stop.**
+438. **Continues after a command fails in a surprising way.**
+439. **Does not pause when encountering secrets, production config, or deploy scripts.**
+440. **Does not pause before branch deletion, force push, reset, clean, history rewrite, or worktree deletion.**
+441. **Treats prior approval for one command as approval for similar future commands.**
+442. **Does not show exact commands before execution.**
+443. **Does not distinguish read-only Git commands from mutating Git commands.**
+444. **Does not provide a dry-run mode.**
+
+### 25. Bad “agent memory” and context behavior
+
+445. **Uses stale memory of branch state.**
+446. **Uses stale memory of file contents after another process changed them.**
+447. **Uses stale issue/PR status.**
+448. **Uses stale base branch information.**
+449. **Uses stale test results from another worktree.**
+450. **Uses stale build artifacts to claim success.**
+451. **Carries instructions from one repo into another.**
+452. **Carries a previous task’s cleanup plan into a new task.**
+453. **Reuses old stashes, patches, or branches because names collide.**
+454. **Confuses paths from main checkout and worktree checkout.**
+455. **Confuses host paths and container paths.**
+456. **Confuses generated duplicate `./worktree` source with real source.**
+
+### 26. Especially bad variants of your two examples
+
+**Not cleaning temporary files is bad, but the worst versions are:**
+
+457. Leaving temp files **tracked** in the final commit.
+458. Leaving temp files **untracked**, so the next agent sees a dirty tree and misbehaves.
+459. Leaving temp files **ignored**, so humans do not see them but tools do.
+460. Leaving temp files that tests import or execute accidentally.
+461. Leaving temp scripts containing destructive commands.
+462. Leaving temp files with secrets.
+463. Leaving temp worktrees with unmerged commits.
+464. Leaving temp branches that block deletion.
+465. Leaving temp `.git` metadata that breaks IDEs.
+466. Leaving temp copies that double search/build scope.
+
+**Making an entire `./worktree/` copy inside the repo is bad because:**
+
+467. It is not a Git worktree; it is just a duplicate source tree.
+468. It can be accidentally staged by `git add .`.
+469. It can be traversed by tests, linters, formatters, type checkers, and search tools.
+470. It can create duplicate symbols, duplicate packages, duplicate migrations, or duplicate test suites.
+471. It can contain stale code that future agents treat as authoritative.
+472. It bloats disk and CI.
+473. It may copy secrets or local config.
+474. It may copy build artifacts and caches.
+475. It may contain a nested `.git`, confusing Git operations.
+476. It may hide the fact that the agent refused to reason about dirty state.
+477. It is often a symptom of the agent optimizing for its own convenience over repository hygiene.
+478. The correct behavior is usually: stop, inspect dirty state, ask for ownership confirmation, create a proper `git worktree` outside the tracked tree or under a clearly ignored/managed directory, record ownership/base, and clean it up with `git worktree remove`.
+
+## The shortest “ban list” for dangerous autonomous Git actions
+
+These should generally require explicit human confirmation, a shown diff, and a backup/patch first:
+
+```bash
+git reset --hard
+git clean -f
+git clean -fd
+git clean -fdx
+git checkout -- .
+git restore .
+git stash clear
+git stash drop
+git branch -D
+git push --force
+git push --mirror
+git push --delete
+git tag -d
+git rebase
+git filter-repo
+git gc --prune=now
+rm -rf .git
+rm -rf <worktree-or-source-dir>
+git worktree remove --force
+git worktree prune
+```
+
+## The positive standard that this list implies
+
+A well-behaved Git agent should do the opposite: inspect state first, preserve user work, isolate each task in a real branch/worktree, never mutate shared history without consent, stage only intentional files, leave no temp artifacts, produce small auditable diffs, run the documented checks, and give an honest final report with exact commands, changed files, test results, and unresolved risks.
+
+[1]: https://git-scm.com/docs/git-worktree "Git - git-worktree Documentation"
+[2]: https://docs.github.com/copilot/concepts/agents/coding-agent/about-coding-agent "About GitHub Copilot cloud agent - GitHub Docs"
+[3]: https://github.com/anthropics/claude-code/issues/26725 "Stale worktrees are never cleaned up · Issue #26725 · anthropics/claude-code · GitHub"
+[4]: https://arxiv.org/html/2604.13536v2 "Don’t Let AI Agents YOLO Your Files: Shifting Information and Control to Filesystems for Agent Safety and Autonomy"
+[5]: https://github.com/anthropics/claude-code/issues/35862 "Worktree cleanup: three remaining data-loss paths after v2.1.76-77 fixes · Issue #35862 · anthropics/claude-code · GitHub"
+[6]: https://github.com/anthropics/claude-code/issues/48811 "[Bug] Agent isolation: \"worktree\" flag ignored for concurrent background agents · Issue #48811 · anthropics/claude-code · GitHub"
+[7]: https://github.com/anthropics/claude-code/issues/33837 "Agent worktrees created in /tmp cause data loss on reboot · Issue #33837 · anthropics/claude-code · GitHub"
+[8]: https://github.com/anthropics/claude-code/issues/45645 "Worktree cleanup leaves stale git config (repositoryformatversion=1, worktreeConfig=true) that breaks other IDE AI agents · Issue #45645 · anthropics/claude-code · GitHub"
+[9]: https://github.com/anthropics/claude-code/issues/41010 "Worktree isolation cleanup deletes parent session working directory on agent ID collision · Issue #41010 · anthropics/claude-code · GitHub"
+[10]: https://github.com/anthropics/claude-code/issues/51596 "Agent tool with isolation:\"worktree\" silently reuses stale branches on agentId-prefix collision · Issue #51596 · anthropics/claude-code · GitHub"
+[11]: https://forum.cursor.com/t/cursors-worktreemanager-force-deleted-my-git-branch-when-cleaning-up-agent-worktrees/146865 "Cursor's WorktreeManager force-deleted my git branch when cleaning up agent worktrees - Bug Reports - Cursor - Community Forum"
+[12]: https://www.reddit.com/r/ClaudeCode/comments/1o2xdsz/how_a_hidden_docker_volume_rm_at_the_end_of_a/ "How a hidden “docker volume rm …” at the end of a Claude Code command chain wiped my work : r/ClaudeCode"
+[13]: https://github.com/Dicklesworthstone/destructive_command_guard "GitHub - Dicklesworthstone/destructive_command_guard: The Destructive Command Guard (dcg) is for blocking dangerous git and shell commands from being executed by agents. · GitHub"
+[14]: https://x.com/doodlestein/status/2051052729812787461?utm_source=chatgpt.com "It's now been around 4 months since my open-source dcg ..."
+[15]: https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches "About protected branches - GitHub Docs"
+[16]: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets "Available rules for rulesets - GitHub Docs"
+[17]: https://docs.github.com/en/code-security/concepts/secret-security/about-push-protection "About push protection - GitHub Docs"
+[18]: https://docs.github.com/en/repositories/creating-and-managing-repositories/repository-limits "Repository limits - GitHub Docs"
+

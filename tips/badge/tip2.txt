@@ -1,0 +1,256 @@
+I studied it. The best move is to make this a **first-class Jankurai Score Badge** feature, generated from the normal `jankurai audit` score path, while keeping the existing `publish --badge-json/--badge-svg` feature as the stricter “certification/public evidence” badge.
+
+Jankurai already has most of the machinery: normal adoption writes repo score JSON/Markdown and score history, `init`/templates already wire score commands into project scaffolds, and audit reports already contain `score`, `raw_score`, `decision`, `minimum_score`, conformance level, fingerprints, git status, findings, and policy data. The existing `publish` command also already emits a `CertificationBadge` JSON/SVG, but that path depends on Phase 12 certification, benchmark, and governance artifacts, so it is too heavyweight for “every repo using Jankurai.” It should remain the badge for repos that have completed public evidence/certification.   
+
+## Recommended standard
+
+Use this as the README contract:
+
+```md
+<!-- jankurai-badge:start -->
+[![Jankurai score](assets/jankurai-badge.svg)](agent/repo-score.md)
+<!-- jankurai-badge:end -->
+```
+
+The generated files should be:
+
+```text
+assets/jankurai-badge.svg       # human-visible logo + score badge
+agent/jankurai-badge.json       # machine-readable badge metadata
+agent/repo-score.json           # existing audit report
+agent/repo-score.md             # existing human-readable score report
+agent/score-history.jsonl       # existing rolling history
+```
+
+I would **not** put the README badge image under `target/jankurai/`, because `target/` is usually ephemeral and CI-artifact-oriented. The README should point at a tracked, stable relative path. GitHub supports images in Markdown and recommends relative paths so links keep working across branches/forks. ([GitHub Docs][1])
+
+## What the badge should show
+
+The SVG should be a small inline badge with a logo mark plus score text, for example:
+
+```text
+[J logo] Jankurai 92/100 · HL3
+```
+
+Suggested message rules:
+
+```text
+pass:   Jankurai 92/100 · HL3
+review: Jankurai 78/100 · review
+block:  Jankurai 61/100 · block
+stale:  Jankurai stale
+```
+
+Suggested color rules:
+
+```text
+pass / HL3:     brightgreen
+review / HL2:   yellow
+block:          red
+dirty/stale:    orange or yellow
+unknown:        lightgrey
+```
+
+The important standard distinction is:
+
+```text
+Jankurai Score Badge        = generated from normal full audit; every adopted repo can have this.
+Jankurai Certification Badge = generated from publish/certify/bench/govern; only use when public evidence passes.
+```
+
+That avoids overclaiming. The existing `publish` badge currently builds a certification badge from certification, benchmark, and governance inputs and chooses `brightgreen`, `yellow`, or `red` based on publishability; keep that path, but don’t make ordinary users run Phase 12 just to get their README badge. 
+
+## CLI I would add
+
+Add a new command:
+
+```bash
+jankurai badge update . \
+  --from agent/repo-score.json \
+  --svg assets/jankurai-badge.svg \
+  --json agent/jankurai-badge.json \
+  --readme README.md \
+  --link agent/repo-score.md \
+  --yes
+```
+
+Also add:
+
+```bash
+jankurai badge verify . \
+  --from agent/repo-score.json \
+  --svg assets/jankurai-badge.svg \
+  --json agent/jankurai-badge.json \
+  --readme README.md
+```
+
+`update` writes the SVG/JSON and inserts or replaces the README marker block. `verify` is CI-safe and fails if the badge is missing, stale, or not generated from the current report fingerprint.
+
+A convenience flag can come later:
+
+```bash
+jankurai audit . \
+  --mode advisory \
+  --json agent/repo-score.json \
+  --md agent/repo-score.md \
+  --badge
+```
+
+But I would start with a separate `badge update` command. It keeps audit focused and makes README mutation explicit.
+
+## README insertion behavior
+
+The README sync should be idempotent and conservative:
+
+1. If both markers exist, replace only the content between them.
+2. If markers do not exist, insert after the existing badge block near the top.
+3. If no badge block exists, insert after the `# Title`.
+4. Never rewrite unrelated README content.
+5. Support `--dry-run`.
+6. Support `--no-readme` for projects that want only SVG/JSON artifacts.
+
+The current `init` implementation already has a safety posture of planning, refusing writes without `--yes`/`--apply`, and merging/keeping existing files rather than blindly overwriting them. The badge inserter should follow that same model. 
+
+## Machine-readable badge JSON
+
+Add a schema such as `schemas/jankurai-score-badge.schema.json`. The existing certification badge schema is already close, but the ordinary score badge should include audit-specific freshness fields:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "kind": "jankurai-score-badge",
+  "label": "jankurai",
+  "message": "92/100 · HL3",
+  "color": "brightgreen",
+  "score": 92,
+  "raw_score": 94,
+  "minimum_score": 85,
+  "decision": "pass",
+  "observed_conformance_level": "HL3",
+  "standard_version": "0.7.0",
+  "auditor_version": "0.7.0",
+  "source_report": "agent/repo-score.json",
+  "source_report_fingerprint": "sha256:...",
+  "git_head": "abc1234",
+  "dirty_worktree": false,
+  "generated_at": "..."
+}
+```
+
+This lets agents, CI, and humans detect stale badges without parsing the SVG. The report and score-history code already records enough of this data, including score, raw score, caps, finding counts, decision, minimum score, scope, report fingerprint, and report paths. 
+
+## SVG implementation
+
+Refactor the existing badge renderer into a shared badge module:
+
+```text
+crates/jankurai/src/commands/badge.rs
+crates/jankurai/src/badge.rs
+```
+
+Then have both `badge update` and `publish --badge-svg` use the shared renderer.
+
+The current `publish` renderer creates a classic shield-style SVG with text. For the new badge, extend it with an inline vector logo mark rather than embedding a PNG. That keeps the badge self-contained, cacheable, and dependency-free. 
+
+A simple first version could be:
+
+```text
+20px tall SVG
+left tile: Jankurai logo mark / stylized J
+middle: “Jankurai”
+right: “92/100 · HL3”
+```
+
+Later, you can add `--style shield|compact|logo`.
+
+## How it becomes automatic
+
+There are three places to wire it in.
+
+First, update the generated `Justfile` score target so local scoring regenerates the badge:
+
+```make
+score:
+	jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md --score-history agent/score-history.jsonl --score-history-csv agent/score-history.csv
+	jankurai badge update . --from agent/repo-score.json --svg assets/jankurai-badge.svg --json agent/jankurai-badge.json --readme README.md --yes
+```
+
+The current templates already generate score targets and hooks that run audit and stage score artifacts, so this fits naturally into the scaffold. 
+
+Second, update `jankurai init --level score|full` and `jankurai update --apply` to backfill the README marker and badge artifacts. That makes the badge standard appear automatically in newly adopted repos and older repos after update.
+
+Third, add CI support carefully. Existing `jankurai ci install --github` creates a read-only workflow that audits and uploads artifacts. README mutation needs a separate opt-in default-branch job with `contents: write`, because GitHub’s token permissions should be least-privilege and `contents: write` is what allows repository content changes.  ([GitHub Docs][2]) ([GitHub Docs][3])
+
+Recommended CI split:
+
+```yaml
+# Pull requests: verify only, no mutation.
+permissions:
+  contents: read
+
+steps:
+  - run: jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md
+  - run: jankurai badge verify . --from agent/repo-score.json
+```
+
+```yaml
+# Push to main: update and commit if changed.
+permissions:
+  contents: write
+
+steps:
+  - run: jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md --score-history agent/score-history.jsonl --score-history-csv agent/score-history.csv
+  - run: jankurai badge update . --from agent/repo-score.json --svg assets/jankurai-badge.svg --json agent/jankurai-badge.json --readme README.md --yes
+  - run: |
+      git config user.name "jankurai-bot"
+      git config user.email "jankurai-bot@users.noreply.github.com"
+      git add README.md assets/jankurai-badge.svg agent/jankurai-badge.json agent/repo-score.json agent/repo-score.md agent/score-history.jsonl agent/score-history.csv
+      git diff --cached --quiet || git commit -m "Update Jankurai badge"
+      git push
+```
+
+Do **not** auto-commit on `pull_request`, especially from forks. PR workflows should verify or upload a proposed badge artifact; only trusted default-branch workflows should push badge updates.
+
+## The feature set I would ship first
+
+The minimum useful PR would be:
+
+```text
+1. Add `jankurai badge update`.
+2. Add `jankurai badge verify`.
+3. Generate `assets/jankurai-badge.svg`.
+4. Generate `agent/jankurai-badge.json`.
+5. Insert/update the README marker block.
+6. Update init/update templates so new adopted repos get the badge.
+7. Add docs showing the standard README block.
+8. Keep `publish --badge-*` as the certification badge path.
+```
+
+Tests to add:
+
+```text
+badge_renders_svg_with_logo_and_score
+badge_json_contains_report_fingerprint
+badge_update_inserts_readme_block_after_existing_badges
+badge_update_replaces_existing_marker_idempotently
+badge_verify_fails_when_svg_or_json_is_stale
+badge_update_refuses_readme_write_without_yes
+ci_template_does_not_grant_contents_write_unless_badge_update_enabled
+```
+
+## Bottom line
+
+Make the default badge a **local, tracked, audit-derived score badge**:
+
+```md
+<!-- jankurai-badge:start -->
+[![Jankurai score](assets/jankurai-badge.svg)](agent/repo-score.md)
+<!-- jankurai-badge:end -->
+```
+
+Then let `jankurai init`, `jankurai update`, local `score`, and opt-in default-branch CI keep it current. This turns the badge into a real Jankurai standard artifact instead of a cosmetic README snippet, and it preserves the stronger `publish` badge for projects that have completed the public evidence/certification flow.
+
+[1]: https://docs.github.com/en/get-started/writing-on-github/getting-started-with-writing-and-formatting-on-github/basic-writing-and-formatting-syntax?referrer=grok.com "Basic writing and formatting syntax - GitHub Docs"
+[2]: https://docs.github.com/en/actions/reference/authentication-in-a-workflow "Use GITHUB_TOKEN for authentication in workflows - GitHub Docs"
+[3]: https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions?from=20421&from_column=20421 "Workflow syntax for GitHub Actions - GitHub Docs"
+

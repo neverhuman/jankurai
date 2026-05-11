@@ -1,0 +1,860 @@
+I dug through the source archive, the paper, the Rust auditor, the UX QA package, CI, agent files, and current agent-IDE conventions. The idea is genuinely strong: **jankurai can become the “repo nervous system” for AI coding**—not just a linter, but the standard that tells every agent where truth lives, what boundaries are non-negotiable, and what proof must exist before changes count.
+
+My conclusion: the next version should not primarily add more prose. It should become **installable, evidence-backed, and self-enforcing**. The paper already has the thesis. The project now needs to make adoption feel like:
+
+```bash
+jankurai init --profile rust-vite-react-postgres --toolpacks all
+jankurai audit --ci
+```
+
+…and then every agent, every IDE, and CI immediately know what “good” means.
+
+There are also a few release blockers worth fixing before this becomes public-standard quality:
+
+| Breakpoint                                                                                                                                 | Why it matters                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| `AGENTS.md` contains `/Users/bentaylor/Code/jankurai`                                                                                     | This leaks a local path into the public standard and teaches agents the wrong repo root.                    |
+| No `Cargo.lock`, but README uses `cargo install ... --locked`; no `package-lock.json`, but CI/Justfile use `npm ci`                        | The install path is currently not reproducible and likely fails for fresh users.                            |
+| `.github/workflows/jankurai-audit.yml` has `echo "gitleaks..."`, `echo "syft..."`, etc.                                                   | The current audit detects those strings as security evidence, so placeholder text can fake a security lane. |
+| `repo-score.json` has score `72`, no findings, no timestamp, no caps, and says “lockfile present” even though the archive has no lockfiles | This is the most important trust gap: the report can be stale or misleading without any attestation.        |
+| `crates/jankurai/src/audit/mod.rs` is ~2,114 lines, but the auditor excludes `crates/jankurai/` from runtime stack checks                | Jankurai is not fully auditing itself. That undermines the “new standard” claim.                           |
+| `weak_name_hits()` is a stub                                                                                                               | The paper promises naming/entropy detection that does not yet exist.                                        |
+| `owner-map.json`, `test-map.json`, and `generated-zones.toml` are present but not really enforced as first-class audit inputs              | The standard has the right machine maps, but the CLI does not yet fully trust/use them.                     |
+| The source archive includes many AppleDouble `._*` files                                                                                   | Release packaging needs cleanup, or agents/audits will inspect junk.                                        |
+| `packages/ux-qa/dist/` and `test-results/` are committed but not declared as generated zones                                               | Generated/runtime artifacts need consistent treatment.                                                      |
+| Docs disagree on `repo-score.json` location and LOC limits                                                                                 | The standard needs one canonical answer.                                                                    |
+
+Also: I could not run the full Rust test suite in this environment because the sandbox has no internet and the archive has no lockfile/vendor cache; `cargo test` attempted to fetch crates. That failure itself is useful evidence: the project needs deterministic install/CI artifacts before it can be the standard.
+
+## Best possible 3 upgrades
+
+### 1. **StandardKit Init: one-command adoption across every agent IDE**
+
+This is the highest-leverage upgrade. Today the project has a good standard, but adoption still requires humans to copy files, understand every agent IDE, and wire CI manually. That is the exact “human scatter” this project wants to eliminate.
+
+Build a real initializer:
+
+```bash
+jankurai init
+jankurai init --profile rust-vite-react-postgres
+jankurai init --toolpacks codex,claude,cursor,copilot,gemini,antigravity
+jankurai init --ci github --ux-qa --beads --dry-run
+jankurai doctor --fix
+```
+
+The installer should detect the repo, propose changes, ask only when mutation is risky, then write the minimum set of files. `AGENTS.md` is a strong universal root because Codex explicitly reads `AGENTS.md` before work and layers root/nested files with closer files overriding earlier guidance. ([OpenAI Developers][1]) But it should not be the only file: Claude Code currently reads `CLAUDE.md`, not `AGENTS.md`, and recommends creating `CLAUDE.md` that imports `@AGENTS.md`; Claude also recommends keeping instructions concise, under roughly 200 lines per `CLAUDE.md`. ([Claude][2]) GitHub Copilot expects `.github/copilot-instructions.md` plus optional path-specific `.github/instructions/*.instructions.md`, and Copilot code review only reads the first 4,000 characters of any custom instruction file. ([GitHub Docs][3]) Gemini CLI uses `GEMINI.md` as its default context file and loads workspace, parent, and just-in-time context files. ([Gemini CLI][4]) Antigravity now has enough public signal to support a first-class adapter too: Google’s codelab uses `.agents/agents.md`, `.agents/skills/`, and `.agents/workflows/`, and a March 2026 Antigravity update says it added support for reading `AGENTS.md` in addition to `GEMINI.md`. ([Google Codelabs][5])
+
+**The new standard should have one source of truth and many thin adapters.**
+
+Canonical files:
+
+```text
+AGENTS.md                          # root universal short bootstrap
+agent/JANKURAI_STANDARD.md        # canonical standard brief
+agent/owner-map.json               # path ownership
+agent/test-map.json                # path -> proof command
+agent/generated-zones.toml         # generated/read-only zones
+agent/proof-lanes.toml             # fast/full/security/ux/audit lanes
+agent/audit-policy.toml            # caps, thresholds, hard/soft policy
+agent/standard-version.toml        # version binding
+```
+
+Generated toolpack files:
+
+```text
+CLAUDE.md
+.claude/rules/jankurai.md
+.cursor/rules/jankurai.mdc
+.github/copilot-instructions.md
+.github/instructions/jankurai-rust.instructions.md
+.github/instructions/jankurai-web.instructions.md
+GEMINI.md
+.agents/agents.md
+.agents/skills/jankurai-audit.md
+.agents/workflows/jankurai-check.md
+```
+
+The root `AGENTS.md` should be tiny:
+
+```md
+# Agent bootstrap
+
+Read `agent/JANKURAI_STANDARD.md` first.
+
+Hard rules:
+- Do not edit generated zones unless regenerating from source.
+- Respect `agent/owner-map.json`.
+- Run the proof command from `agent/test-map.json` for every touched path.
+- Run `jankurai audit --changed` before final response when code changes.
+- Rust owns product logic. TypeScript/React owns UI. Python is allowed only for bounded AI/data service work.
+
+Repo-local commands:
+- Fast: `just fast`
+- Audit: `jankurai audit --json agent/repo-score.json --md agent/repo-score.md`
+- UX: `just ux`
+```
+
+For Claude:
+
+```md
+@AGENTS.md
+
+## Claude Code
+
+Use plan mode for migrations, security-sensitive changes, generated-zone regeneration, and cross-boundary refactors.
+Run `/memory` if instruction loading seems stale.
+```
+
+For Copilot, keep the repo-wide file below 4,000 characters and move path rules into `.github/instructions/*.instructions.md`.
+
+For Cursor, generate `.cursor/rules/jankurai.mdc` with frontmatter/globs. Cursor’s current docs describe Project, Team, User Rules and `AGENTS.md`, and Project Rules live under `.cursor/rules`. ([Cursor][6])
+
+For Antigravity, add:
+
+```text
+.agents/agents.md                  # role map, not the whole standard
+.agents/skills/jankurai-audit.md  # how to run audit and read findings
+.agents/workflows/check.md         # slash workflow for audit + repair
+```
+
+Do **not** duplicate the whole standard in every adapter. Duplication creates drift. Every adapter should point back to `AGENTS.md` and `agent/JANKURAI_STANDARD.md`.
+
+Files to add or touch:
+
+```text
+crates/jankurai/src/main.rs
+crates/jankurai/src/init/mod.rs
+crates/jankurai/src/init/detect.rs
+crates/jankurai/src/init/plan.rs
+crates/jankurai/src/init/templates.rs
+crates/jankurai/src/init/write.rs
+crates/jankurai/src/init/toolpacks.rs
+crates/jankurai/src/init/ci.rs
+crates/jankurai/templates/agent/AGENTS.md
+crates/jankurai/templates/agent/JANKURAI_STANDARD.md
+crates/jankurai/templates/toolpacks/CLAUDE.md
+crates/jankurai/templates/toolpacks/cursor/jankurai.mdc
+crates/jankurai/templates/toolpacks/copilot/copilot-instructions.md
+crates/jankurai/templates/toolpacks/gemini/GEMINI.md
+crates/jankurai/templates/toolpacks/antigravity/agents.md
+crates/jankurai/templates/toolpacks/antigravity/skills/jankurai-audit.md
+crates/jankurai/templates/toolpacks/antigravity/workflows/check.md
+docs/install.md
+docs/toolpacks.md
+docs/ci.md
+README.md
+```
+
+Recommended CLI shape:
+
+```rust
+enum Command {
+    Audit(AuditArgs),
+    Init(InitArgs),
+    Doctor(DoctorArgs),
+    Upgrade(UpgradeArgs),
+    Versions,
+}
+
+struct InitArgs {
+    profile: Profile,
+    toolpacks: Vec<Toolpack>,
+    ci: Option<CiProvider>,
+    ux_qa: bool,
+    beads: bool,
+    dry_run: bool,
+    yes: bool,
+    force: bool,
+}
+```
+
+`jankurai init` should produce a mutation plan before writing:
+
+```json
+{
+  "status": "needs_confirmation",
+  "detected": {
+    "rust": true,
+    "vite": true,
+    "react": true,
+    "typescript": true,
+    "postgres": false,
+    "python": "scripts-only"
+  },
+  "writes": [
+    {"path": "AGENTS.md", "action": "create"},
+    {"path": "agent/JANKURAI_STANDARD.md", "action": "create"},
+    {"path": "CLAUDE.md", "action": "create-import-adapter"},
+    {"path": ".cursor/rules/jankurai.mdc", "action": "create-tool-adapter"},
+    {"path": ".github/workflows/jankurai.yml", "action": "create-ci"}
+  ],
+  "risks": [
+    {"path": "package.json", "reason": "no lockfile; npm ci will fail"}
+  ]
+}
+```
+
+Tests to add:
+
+```text
+crates/jankurai/tests/init_empty_repo.rs
+crates/jankurai/tests/init_existing_agents.rs
+crates/jankurai/tests/init_toolpacks.rs
+crates/jankurai/tests/init_idempotent.rs
+crates/jankurai/tests/init_no_absolute_paths.rs
+crates/jankurai/tests/init_package_manager_lock.rs
+crates/jankurai/tests/doctor_detects_missing_lockfiles.rs
+```
+
+Acceptance criteria:
+
+```text
+cargo test -p jankurai init_
+jankurai init --dry-run creates no files
+jankurai init --yes is idempotent
+jankurai init never writes absolute local user paths
+jankurai doctor reports missing Cargo.lock/package-lock.json
+jankurai doctor --fix can generate lockfiles when tools are available
+```
+
+This upgrade makes jankurai feel like a standard, not a document.
+
+---
+
+### 2. **EvidenceGraph Audit: make the score impossible to fake**
+
+The current auditor has the right ambition but is too string-search driven. It can be fooled by comments, docs, placeholders, or stale generated reports. This is the central risk if jankurai is going to become a global standard: **agents will optimize for the score unless the score is evidence-backed.**
+
+The new audit should build a single repo model first, then score from evidence. I would call this internal layer `EvidenceGraph`.
+
+```text
+RepoInventory
+  -> ManifestGraph
+  -> AgentInstructionGraph
+  -> CiCommandGraph
+  -> OwnershipGraph
+  -> TestRouteGraph
+  -> GeneratedZoneGraph
+  -> StackBoundaryGraph
+  -> FindingGraph
+  -> Report
+```
+
+Concrete current false-positive risks to fix:
+
+```text
+has_security_lane() looks for "gitleaks", "syft", "grype", "zizmor", "security"
+has_secret_or_dependency_scans() also uses raw string search
+has_generated_contracts() returns true if any file text contains "generated"
+has_web_surface() returns true if any file text contains "react", "vite", or "storybook"
+has_fast_lane() treats "jankurai" as a fast lane
+weak_name_hits() returns vec![]
+owner_for_path() ignores agent/owner-map.json and uses hard-coded prefixes
+```
+
+That means docs, echo commands, or README text can become proof. This has to change.
+
+The evidence model should distinguish:
+
+```rust
+enum EvidenceKind {
+    ExecutableCommand,
+    PlaceholderCommand,
+    CommentOnly,
+    DocumentationMention,
+    ManifestDeclaration,
+    GeneratedHeader,
+    GitDiff,
+    Lockfile,
+    ToolOutput,
+    Missing,
+}
+
+struct Evidence {
+    kind: EvidenceKind,
+    path: Utf8PathBuf,
+    line: Option<usize>,
+    command: Option<String>,
+    confidence: Confidence,
+}
+```
+
+Example: this workflow step should be classified as `PlaceholderCommand`, not security proof:
+
+```yaml
+- name: Security lane placeholders
+  run: |
+    echo "gitleaks detect --source ."
+    echo "syft . -o spdx-json"
+```
+
+A real lane should require actual executable commands, for example:
+
+```yaml
+- name: Secret scan
+  run: gitleaks detect --source . --redact --exit-code 1
+
+- name: Rust dependency advisories
+  run: cargo audit --deny warnings
+
+- name: Rust dependency policy
+  run: cargo deny check
+
+- name: GitHub Actions security
+  run: zizmor .github/workflows
+```
+
+Those tools are good fits for the proof pack: RustSec’s `cargo-audit` audits `Cargo.lock` for vulnerable crates, `cargo-deny` supports advisories, licenses, bans, sources, and duplicate dependency detection, and `cargo-vet` helps projects verify third-party Rust dependencies have been audited by trusted entities. ([RustSec][7]) For speed, `cargo-nextest` is the obvious default Rust test runner because it advertises faster execution, per-test isolation, and CI support. ([Nexte][8]) For broader supply chain, OSV-Scanner, Gitleaks, Dependency Review, Syft/Grype, actionlint, and zizmor are all appropriate external receipts rather than strings in a YAML file. ([GitHub][9])
+
+The report should add provenance:
+
+```json
+{
+  "schema_version": "2.0.0",
+  "standard_version": "0.3.0",
+  "auditor_version": "0.3.0",
+  "generated_at": "2026-05-02T00:00:00Z",
+  "repo": {
+    "git_sha": "abc123",
+    "dirty": false,
+    "tracked_file_count": 412,
+    "input_digest": "sha256:..."
+  },
+  "command": "jankurai audit --ci --json agent/repo-score.json --md agent/repo-score.md",
+  "score": 87,
+  "raw_score": 91,
+  "hard_findings": [],
+  "soft_findings": [],
+  "caps_applied": [],
+  "evidence_summary": {
+    "security_lane": "executable",
+    "ux_qa": "artifact-backed",
+    "generated_zones": "verified",
+    "owner_map": "verified",
+    "test_map": "verified"
+  }
+}
+```
+
+The audit should also fail stale score files. If `repo-score.json` exists but has no `git_sha`, no `generated_at`, or an input digest not matching the current inventory, that should be a high-severity finding:
+
+```text
+HLT-020-STALE-SCORE
+Severity: high
+Path: agent/repo-score.json
+Why: score report has no provenance or does not match current repository state.
+Agent fix: rerun `jankurai audit --ci --json agent/repo-score.json --md agent/repo-score.md`.
+```
+
+Hard checks should be rare, deterministic, and difficult to dispute:
+
+```text
+HARD:
+- missing AGENTS.md / agent standard
+- stale or missing audit report in CI
+- security lane placeholder counted as proof
+- secret-like token in non-test path
+- generated file edited without source regeneration
+- changed path has no owner-map route
+- changed path has no test-map proof route
+- UI app exists but no rendered UX lane
+- Python owns product truth outside approved AI/data boundary
+- direct DB access from UI/domain/frontend/Python
+- destructive migration without lock/backfill/rollback evidence
+- no lockfile for package manager used by CI
+```
+
+Soft checks should guide agents without blocking unnecessarily:
+
+```text
+SOFT:
+- large files/functions approaching thresholds
+- weak names: util, misc, helper, manager, common, old, temp
+- TODO/fallback markers in product code
+- duplicated blocks
+- too many generated-client touchpoints
+- missing observability receipts
+- unpinned GitHub Actions
+- TypeScript `any` sprawl
+- Rust `unwrap()`/`expect()` outside tests without ledger
+- snapshot-only tests without semantic assertions
+```
+
+Files to add or split:
+
+```text
+crates/jankurai/src/audit/mod.rs                  # split this file; it is too large
+crates/jankurai/src/audit/inventory.rs
+crates/jankurai/src/audit/evidence.rs
+crates/jankurai/src/audit/manifests.rs
+crates/jankurai/src/audit/ci.rs
+crates/jankurai/src/audit/maps.rs
+crates/jankurai/src/audit/generated.rs
+crates/jankurai/src/audit/boundaries.rs
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/ratchet.rs
+crates/jankurai/src/audit/attestation.rs
+crates/jankurai/src/audit/cache.rs
+crates/jankurai/src/output/json.rs
+crates/jankurai/src/output/markdown.rs
+crates/jankurai/src/output/sarif.rs
+crates/jankurai/src/output/github_summary.rs
+schemas/jankurai-report.schema.json
+agent/audit-policy.toml
+docs/audit-rubric.md
+docs/report-schema.md
+```
+
+Useful Rust crates to consider:
+
+```text
+gix                 # git status/diff without shelling out
+camino              # UTF-8 repo paths
+globset             # path/glob policy matching
+ignore              # keep current fast walker
+aho-corasick        # fast marker detection; configure case-insensitive where needed
+serde_path_to_error # better config parse diagnostics
+schemars            # JSON Schema generation
+miette              # excellent human diagnostics
+indexmap            # stable output order
+rayon               # real parallel scan use, or remove if unused
+```
+
+Tests to add as fixtures:
+
+```text
+fixtures/missing_lockfiles/
+fixtures/stale_score/
+fixtures/security_echo_placeholder/
+fixtures/security_real_commands/
+fixtures/generated_hand_edit/
+fixtures/generated_source_changed_ok/
+fixtures/ownerless_changed_path/
+fixtures/testmap_missing_route/
+fixtures/docs_mention_react_no_web_surface/
+fixtures/real_vite_missing_ux_lane/
+fixtures/python_ai_service_allowed/
+fixtures/python_product_truth_blocked/
+fixtures/direct_db_from_web_blocked/
+fixtures/rust_domain_sql_blocked/
+fixtures/destructive_migration_unsafe/
+fixtures/destructive_migration_with_backfill_ok/
+fixtures/snapshot_only_false_green/
+fixtures/semantic_test_ok/
+fixtures/weak_name_junk_drawer/
+fixtures/appledouble_ignored/
+```
+
+Key test assertions:
+
+```rust
+#[test]
+fn echo_security_commands_do_not_count_as_security_lane() {}
+
+#[test]
+fn stale_repo_score_is_high_severity() {}
+
+#[test]
+fn owner_map_is_parsed_not_hardcoded() {}
+
+#[test]
+fn changed_mode_only_scores_relevant_path_rules() {}
+
+#[test]
+fn docs_mentions_do_not_create_web_surface() {}
+
+#[test]
+fn generated_zone_requires_manifest_and_header() {}
+
+#[test]
+fn jankurai_audits_its_own_audit_code() {}
+```
+
+CI should become simple:
+
+```yaml
+name: jankurai
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  jankurai:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: cargo install jankurai --locked
+      - run: jankurai audit --ci --sarif jankurai.sarif --json agent/repo-score.json --md agent/repo-score.md
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: jankurai.sarif
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jankurai
+          path: |
+            agent/repo-score.json
+            agent/repo-score.md
+            jankurai.sarif
+```
+
+For the current repo, immediate fixes under this upgrade:
+
+```text
+1. Add Cargo.lock.
+2. Add package-lock.json or switch to pnpm and add pnpm-lock.yaml.
+3. Remove placeholder security lane or replace with real commands.
+4. Move report output consistently to either agent/repo-score.* or root repo-score.*. I recommend agent/repo-score.*.
+5. Add generated_at/git_sha/input_digest to report.
+6. Add crates/jankurai/ back into self-audit, or create a `--self-profile` that audits tool implementation.
+7. Split crates/jankurai/src/audit/mod.rs.
+8. Parse owner-map/test-map/generated-zones for real.
+9. Add JSON Schema and SARIF output.
+10. Make `--json - --md -` illegal or require `--format`, because concatenating JSON and Markdown on stdout is agent-hostile.
+```
+
+This upgrade is what makes the score credible.
+
+---
+
+### 3. **ProofPack: the blessed stack, UX QA, and repair loop**
+
+The paper’s strongest move is picking one best-known stack instead of letting every repo “vibe” into a unique snowflake. Keep that. Do not expand into ten blessed stacks. The standard should say:
+
+> Default product stack: **Rust core + TypeScript/React/Vite UI + PostgreSQL truth + generated contracts + bounded Python only for AI/data service work.**
+
+Then ship a proof pack that makes this layout easier than improvising.
+
+Canonical layout:
+
+```text
+apps/
+  web/                         # Vite React UI only
+    src/
+      app/
+      routes/
+      components/
+      generated/               # generated client only
+      test/
+crates/
+  domain/                      # pure business invariants, no IO, no DB, no HTTP
+  application/                 # use cases, transaction boundaries, ports
+  api/                         # HTTP/RPC surface, generated contract bindings
+  adapters/                    # Postgres, queues, email, object storage, external APIs
+  workers/                     # async jobs
+contracts/
+  openapi/
+  schemas/
+db/
+  migrations/
+  seeds/
+python/
+  ai-service/                  # only model/data/AI boundary, never product truth
+agent/
+  JANKURAI_STANDARD.md
+  owner-map.json
+  test-map.json
+  generated-zones.toml
+  proof-lanes.toml
+  audit-policy.toml
+.github/
+  workflows/
+```
+
+Boundary table to put in the paper, standard, and generated `AGENTS.md`:
+
+| Layer                | Owns                                                           | Must not own                                              |
+| -------------------- | -------------------------------------------------------------- | --------------------------------------------------------- |
+| `crates/domain`      | invariants, entities, value objects, pure decisions            | SQL, HTTP, filesystem, env vars, timers                   |
+| `crates/application` | use cases, ports, transaction orchestration                    | concrete DB drivers, React/UI, generated UI code          |
+| `crates/adapters`    | Postgres/sqlx, queues, email, external APIs                    | business decisions                                        |
+| `crates/api`         | protocol boundary, request/response mapping, auth extraction   | product invariants not delegated to domain/application    |
+| `apps/web`           | React views, routing, client state, generated API client usage | handwritten API shapes, DB access, business truth         |
+| `contracts`          | OpenAPI/JSON Schema/proto source of truth                      | hand-edited generated clients                             |
+| `db/migrations`      | schema, constraints, safe migrations                           | product behavior hidden in SQL without domain mirror      |
+| `python/ai-service`  | model calls, embeddings, evals, feature extraction             | durable product truth, direct ownership of core DB tables |
+
+The UX QA package is a great differentiator. Keep it, but make it installable and less brittle by default.
+
+Current UX QA strengths:
+
+```text
+- deterministic Playwright geometry scan
+- artifact-backed screenshot/crop/ARIA outputs
+- checks for target size, edge clearance, overlap, clipping, wrapping, overflow, sticky obstruction, focus, labels, nested scrollbars, z-index
+```
+
+Current UX QA risks:
+
+```text
+- CLI uses `networkidle`, which can be bad for apps with websockets/long polling
+- no auth/setup/action script support
+- no config file
+- no route/story discovery
+- no `try/finally` around browser close
+- edge-clearance may be noisy for valid nav/full-bleed controls
+- sticky-obstruction flags fixed/sticky elements even when they are legitimate containing nav
+- focus-visible only checks outline/box-shadow and may miss valid focus styles
+- screenshots/crops can explode artifact count on large failure pages
+```
+
+Add:
+
+```text
+packages/ux-qa/src/config.ts
+packages/ux-qa/src/route-discovery.ts
+packages/ux-qa/src/storybook.ts
+packages/ux-qa/src/auth.ts
+packages/ux-qa/src/actions.ts
+packages/ux-qa/src/reporters/sarif.ts
+packages/ux-qa/src/reporters/jankurai.ts
+packages/ux-qa/src/rules/sticky-obstruction.ts
+packages/ux-qa/src/rules/edge-clearance.ts
+packages/ux-qa/src/rules/focus-visible.ts
+ux-qa.config.ts
+```
+
+Example config:
+
+```ts
+import type { JankuraiUxConfig } from "@jankurai/ux-qa";
+
+export default {
+  baseUrl: "http://127.0.0.1:5173",
+  routes: [
+    { id: "home", path: "/" },
+    { id: "settings", path: "/settings", auth: "user" }
+  ],
+  viewports: [
+    { width: 390, height: 844 },
+    { width: 1440, height: 900 }
+  ],
+  thresholds: {
+    edgeClearancePx: 12,
+    minimumTargetPx: 24,
+    maximumZIndex: 1000
+  },
+  allow: {
+    edgeClearanceSelectors: ["[data-edge-control]"],
+    nestedScrollbarSelectors: ["[data-scroll-region]"],
+    stickyContainerSelectors: ["header[role=banner]"]
+  },
+  artifacts: {
+    screenshot: "on-failure",
+    ariaSnapshot: true,
+    maxCrops: 20
+  }
+} satisfies JankuraiUxConfig;
+```
+
+The standard CI should install both the Rust auditor and UX QA:
+
+```bash
+cargo install jankurai --locked
+npm i -D @jankurai/ux-qa @playwright/test
+npx playwright install chromium
+jankurai audit --ci
+jankurai-ux-qa audit --config ux-qa.config.ts --out agent/ux-qa.json
+jankurai audit --ci --merge-ux agent/ux-qa.json
+```
+
+Make `jankurai audit` read UX receipts:
+
+```json
+{
+  "ux_qa": {
+    "status": "artifact_backed",
+    "routes_checked": 8,
+    "viewports": ["390x844", "1440x900"],
+    "violations": 0,
+    "artifacts": [
+      "agent/artifacts/ux/home.390x844.png",
+      "agent/artifacts/ux/home.390x844.aria.yml"
+    ]
+  }
+}
+```
+
+Add tests:
+
+```text
+packages/ux-qa/tests/config.spec.ts
+packages/ux-qa/tests/sticky-header-no-false-positive.spec.ts
+packages/ux-qa/tests/edge-allowlist.spec.ts
+packages/ux-qa/tests/focus-visible-border-style.spec.ts
+packages/ux-qa/tests/auth-state.spec.ts
+packages/ux-qa/tests/action-script.spec.ts
+packages/ux-qa/tests/artifact-limit.spec.ts
+packages/ux-qa/tests/jankurai-report.spec.ts
+```
+
+The proof pack should also export issues for agents. Beads is worth supporting because it is explicitly an agent-oriented issue tracker: its current README describes it as a distributed graph issue tracker for AI agents, and the quickstart initializes it inside a project with `bd init`; the FAQ describes `bd` as lightweight, git-based, dependency-aware task management for AI coding agents. ([GitHub][10])
+
+Add:
+
+```bash
+jankurai issues export --format beads --from agent/repo-score.json
+jankurai issues export --format github --from agent/repo-score.json
+jankurai issues export --format markdown --from agent/repo-score.json
+```
+
+Output examples:
+
+```text
+.beads/issues.jsonl
+.github/ISSUE_TEMPLATE/jankurai-finding.md
+docs/repair/2026-05-02-HLT-020-stale-score.md
+```
+
+Each finding should have a stable fingerprint:
+
+```json
+{
+  "fingerprint": "HLT-020:agent/repo-score.json:sha256...",
+  "title": "Stale jankurai score report",
+  "severity": "high",
+  "owner": "agent",
+  "proof_lane": "audit",
+  "task": "Regenerate agent/repo-score.json with provenance",
+  "command": "jankurai audit --ci --json agent/repo-score.json --md agent/repo-score.md",
+  "blocks": ["release"]
+}
+```
+
+Files to add:
+
+```text
+crates/jankurai/src/issues/mod.rs
+crates/jankurai/src/issues/beads.rs
+crates/jankurai/src/issues/github.rs
+crates/jankurai/src/issues/markdown.rs
+templates/rust-vite-react-postgres/
+templates/rust-vite-react-postgres/apps/web/
+templates/rust-vite-react-postgres/crates/domain/
+templates/rust-vite-react-postgres/crates/application/
+templates/rust-vite-react-postgres/crates/adapters/
+templates/rust-vite-react-postgres/crates/api/
+templates/rust-vite-react-postgres/contracts/
+templates/rust-vite-react-postgres/db/migrations/
+templates/rust-vite-react-postgres/python/ai-service/
+templates/rust-vite-react-postgres/Justfile
+templates/rust-vite-react-postgres/.github/workflows/jankurai.yml
+docs/boundaries.md
+docs/proof-pack.md
+docs/ux-qa.md
+docs/issues.md
+```
+
+Recommended `Justfile`:
+
+```just
+set shell := ["bash", "-lc"]
+
+default: fast
+
+setup:
+    cargo fetch
+    npm ci
+    npx playwright install chromium
+
+fast:
+    cargo fmt --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo nextest run --workspace
+    npm run typecheck
+    npm run test
+    jankurai audit --changed --md -
+
+security:
+    cargo audit --deny warnings
+    cargo deny check
+    gitleaks detect --source . --redact --exit-code 1
+    zizmor .github/workflows
+    osv-scanner scan source -r .
+
+ux:
+    npm run build
+    npx playwright test
+    jankurai-ux-qa audit --config ux-qa.config.ts --out agent/ux-qa.json
+
+audit:
+    jankurai audit --ci --json agent/repo-score.json --md agent/repo-score.md
+
+full: setup fast security ux audit
+```
+
+For Rust-specific proof, add optional lanes:
+
+```text
+cargo llvm-cov       # coverage
+cargo public-api     # public API diff
+cargo semver-checks  # semver breakage checks
+cargo machete        # unused deps
+cargo udeps          # unused deps, nightly only
+cargo geiger         # unsafe usage visibility
+cargo mutants        # mutation testing, slower/advisory
+```
+
+`cargo-public-api` currently advertises listing/diffing Rust public APIs between releases/commits, and `cargo-llvm-cov` wraps LLVM source-based Rust coverage. ([Crates.io][11])
+
+## Paper improvements to make the standard land
+
+The paper is compelling, but to maximize adoption, I would sharpen it in three ways:
+
+1. **Add “Install contract: first 60 seconds.”**
+   Show exactly what command to run, exactly what files appear, and exactly how Codex, Claude, Cursor, Copilot, Gemini, and Antigravity consume them.
+
+2. **Add “Minimal Viable Standard” before the full standard.**
+   Many teams will not adopt HL5 immediately. Define HL1 as five files plus one CI lane:
+
+   ```text
+   AGENTS.md
+   agent/JANKURAI_STANDARD.md
+   agent/owner-map.json
+   agent/test-map.json
+   agent/generated-zones.toml
+   .github/workflows/jankurai.yml
+   ```
+
+3. **Make the stack rubric reproducible as data.**
+   The Rust/TS/React/Vite/Postgres result is persuasive, but it will be more defensible if the paper’s ranking table is generated from:
+
+   ```text
+   paper/rubric/stack-rubric.toml
+   paper/rubric/scores/*.toml
+   ```
+
+   Then `just paper` regenerates the table/figure. That turns the stack choice from “manifesto” into “auditable rubric.”
+
+## Final priority order
+
+Do these in this order:
+
+1. **StandardKit Init** — because adoption must be one command.
+2. **EvidenceGraph Audit** — because the score must be trustworthy and impossible to fake with placeholders.
+3. **ProofPack** — because the standard needs a blessed stack, real UX QA, CI lanes, and issue repair loops.
+
+That is the clean path to making jankurai the default standard for agent-optimized codebases: **one install, one stack, one proof graph, many IDE adapters, zero ambiguous human scatter.**
+
+[1]: https://developers.openai.com/codex/guides/agents-md "Custom instructions with AGENTS.md – Codex | OpenAI Developers"
+[2]: https://code.claude.com/docs/en/memory "How Claude remembers your project - Claude Code Docs"
+[3]: https://docs.github.com/copilot/how-tos/configure-custom-instructions-in-your-ide/add-repository-instructions-in-your-ide "Adding repository custom instructions for GitHub Copilot in your IDE - GitHub Docs"
+[4]: https://geminicli.com/docs/cli/gemini-md/ "Provide context with GEMINI.md files | Gemini CLI"
+[5]: https://codelabs.developers.google.com/autonomous-ai-developer-pipelines-antigravity "Build Autonomous Developer Pipelines using agents.md and skills.md in Antigravity  |  Google Codelabs"
+[6]: https://cursor.com/docs/rules?utm_source=chatgpt.com "Rules | Cursor Docs"
+[7]: https://rustsec.org/?utm_source=chatgpt.com "About RustSec › RustSec Advisory Database"
+[8]: https://nexte.st/?utm_source=chatgpt.com "cargo-nextest: Home"
+[9]: https://github.com/google/osv-scanner?utm_source=chatgpt.com "google/osv-scanner: Vulnerability scanner written in Go ..."
+[10]: https://github.com/gastownhall/beads "GitHub - gastownhall/beads: Beads - A memory upgrade for your coding agent · GitHub"
+[11]: https://crates.io/crates/cargo-public-api?utm_source=chatgpt.com "cargo-public-api - crates.io: Rust Package Registry"
+

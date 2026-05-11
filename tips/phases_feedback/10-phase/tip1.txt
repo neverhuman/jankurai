@@ -1,0 +1,2232 @@
+## Phase: **10 — Reuse Registry Certified Cells**
+
+The hardening target should be **Phase 10**, specifically the unfinished “next certified cell” slice: add and certify the **auth/session shell** after the existing `audit-log`, `crud-resource`, and `rbac` cells. The repo’s moonshot says repeated fixes should collapse into reusable primitives, and Phase 10’s objective is exactly that: certified cells with source, contracts, migrations, UI, tests, UX proof, security assumptions, observability, docs, and upgrade paths. ([GitHub][1])
+
+The current router already points to Phase 10 as the best next leverage area and explicitly names “Phase 10 auth/session or cell hardening” as the preferred next slice. It also says Phase 10 is currently complete-with-deferred-work, meaning this is a hardening/completion pass, not a risky rewrite. ([GitHub][2])
+
+The Phase 10 log says the previous slice finished the third certified cell, `rbac`, and left “next cell auth/session per Initial Cell Order.” That is the most precise pending work. ([GitHub][3])
+
+This patch keeps the important safety boundary: it does **not** enable unsafe real-repo mutation. It hardens the registry with a fourth certified cell, adds concrete auth/session reference surfaces under the existing reference platform, adds dependency-bound certification evidence, adds upgrade/deprecation planning modes, adds focused smoke tests, and updates the phase/router receipts. That fits Phase 13’s safety posture: autonomous repair should build on certified cells, but real mutation stays gated by proof and permission controls. ([GitHub][4])
+
+Copy-paste this from the **repo root**.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+PHASE_LOG="tips/phases/logs/10-reuse-registry-certified-cells.log"
+START_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+START_SHA="$(git rev-parse HEAD 2>/dev/null || echo pending)"
+CHANGED_PATHS="crates/jankurai/src/commands/cell_catalog.rs;crates/jankurai/src/commands/cell.rs;crates/jankurai/src/main.rs;crates/jankurai/tests/phase10_auth_session_cell_smoke.rs;examples/perfect-web-api-db/backend/src/lib.rs;examples/perfect-web-api-db/backend/src/auth_session.rs;examples/perfect-web-api-db/contracts/auth-session.openapi.json;examples/perfect-web-api-db/db/migrations/002_auth_sessions.sql;examples/perfect-web-api-db/db/constraints/002_auth_sessions.sql;examples/perfect-web-api-db/docs/auth-session-cell.md;examples/perfect-web-api-db/ops/auth-session-security.md;examples/perfect-web-api-db/ux/auth-session-routes.md;tips/phases/10-reuse-registry-certified-cells.md;tips/phases/00-phase-index.md;tips/phases/logs/10-reuse-registry-certified-cells.log"
+
+mkdir -p "$(dirname "$PHASE_LOG")" target/jankurai
+
+printf '%s | codex | 10 | start | %s | not-run | none | %s | harden Phase 10 by certifying auth-session and dependency-bound cell proof\n' \
+  "$START_TS" "$CHANGED_PATHS" "$START_SHA" >> "$PHASE_LOG"
+
+python3 - <<'PY'
+from pathlib import Path
+import textwrap
+
+ROOT = Path.cwd()
+
+def write(rel: str, text: str) -> None:
+    path = ROOT / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(textwrap.dedent(text).strip() + "\n", encoding="utf-8")
+
+def read(rel: str) -> str:
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+def replace_once(rel: str, old: str, new: str) -> None:
+    path = ROOT / rel
+    text = path.read_text(encoding="utf-8")
+    if old not in text:
+        raise SystemExit(f"patch anchor not found in {rel}: {old[:200]}")
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+# ---------------------------------------------------------------------------
+# Phase 10 registry catalog hardening.
+#
+# Adds the fourth certified built-in cell: auth-session.
+# Also makes certification evidence dependency-bound, so a dependent cell cannot
+# claim certification if an upstream cell is missing or downgraded.
+# ---------------------------------------------------------------------------
+
+write("crates/jankurai/src/commands/cell_catalog.rs", r'''
+    use crate::commands::context_data::RepoCatalog;
+    use serde::Serialize;
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::Path;
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct CellManifest {
+        pub cell_id: String,
+        pub version: String,
+        pub category: String,
+        pub lifecycle: String,
+        pub supported_profiles: Vec<String>,
+        pub dependencies: Vec<String>,
+        pub source_paths: Vec<String>,
+        pub generated_paths: Vec<String>,
+        pub contract_paths: Vec<String>,
+        pub migration_paths: Vec<String>,
+        pub ui_routes: Vec<String>,
+        pub proof_lanes: Vec<String>,
+        pub proof_commands: Vec<String>,
+        pub security_assumptions: Vec<String>,
+        pub observability_events: Vec<String>,
+        pub docs: Vec<String>,
+        pub upgrade_notes: Vec<String>,
+        pub rollback_notes: Vec<String>,
+        pub certification_status: String,
+        pub certification_evidence: Vec<CellEvidence>,
+        pub install_strategy: String,
+        pub conflict_policy: String,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct CellEvidence {
+        pub kind: String,
+        pub path: String,
+        pub required: bool,
+        pub status: String,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct EvidenceCounts {
+        pub present: usize,
+        pub missing: usize,
+        pub review_required: usize,
+    }
+
+    pub fn built_in_manifests(repo: &Path, catalog: &RepoCatalog) -> Vec<CellManifest> {
+        let mut manifests = vec![
+            audit_log_manifest(repo, catalog),
+            crud_resource_manifest(repo, catalog),
+            rbac_manifest(repo, catalog),
+            auth_session_manifest(repo, catalog),
+        ];
+
+        attach_dependency_evidence(&mut manifests);
+        manifests
+    }
+
+    pub fn manifest_for_cell(repo: &Path, catalog: &RepoCatalog, cell_id: &str) -> CellManifest {
+        built_in_manifests(repo, catalog)
+            .into_iter()
+            .find(|manifest| manifest.cell_id == cell_id)
+            .unwrap_or_else(|| fallback_manifest(catalog, cell_id))
+    }
+
+    pub fn evidence_counts(manifest: &CellManifest) -> EvidenceCounts {
+        let mut counts = EvidenceCounts {
+            present: 0,
+            missing: 0,
+            review_required: 0,
+        };
+
+        for evidence in &manifest.certification_evidence {
+            match evidence.status.as_str() {
+                "present" => counts.present += 1,
+                "missing" => counts.missing += 1,
+                "review-required" => counts.review_required += 1,
+                _ => {}
+            }
+        }
+
+        counts
+    }
+
+    pub fn owner_for_cell(catalog: &RepoCatalog, cell_id: &str) -> String {
+        if let Some(owner) = cell_id.split_once('-').map(|(owner, _)| owner.to_string()) {
+            if catalog.owners.values().any(|candidate| candidate == &owner) {
+                return owner;
+            }
+        }
+
+        "workspace".to_string()
+    }
+
+    pub fn category_for_owner(owner: &str) -> &'static str {
+        match owner {
+            "agent" => "agent-surface",
+            "paper" => "documentation",
+            "ops" => "governance",
+            "standard" => "standard",
+            "tools" => "tooling",
+            _ => "engineering",
+        }
+    }
+
+    pub fn source_paths_for_owner(catalog: &RepoCatalog, owner: &str) -> Vec<String> {
+        let mut paths = catalog.prefixes_for_owner(owner);
+        if paths.is_empty() {
+            paths.push("crates/jankurai/src/commands/".to_string());
+        }
+        paths
+    }
+
+    fn audit_log_manifest(repo: &Path, catalog: &RepoCatalog) -> CellManifest {
+        let source_paths = strings(&[
+            "examples/perfect-web-api-db/backend/src/domain.rs",
+            "examples/perfect-web-api-db/backend/src/application.rs",
+            "examples/perfect-web-api-db/backend/src/adapters.rs",
+            "examples/perfect-web-api-db/ops/observability.md",
+            "examples/perfect-web-api-db/docs/architecture.md",
+            "examples/perfect-web-api-db/README.md",
+        ]);
+        let contract_paths = strings(&["examples/perfect-web-api-db/contracts/openapi.json"]);
+        let migration_paths = strings(&[
+            "examples/perfect-web-api-db/db/migrations/001_init.sql",
+            "examples/perfect-web-api-db/db/constraints/001_accounts.sql",
+        ]);
+        let proof_lanes = strings(&["test-cli", "audit", "db-migration-analyze", "security"]);
+
+        evidence_bound_manifest(
+            repo,
+            catalog,
+            CellManifest {
+                cell_id: "audit-log".to_string(),
+                version: "0.1.0".to_string(),
+                category: "observability".to_string(),
+                lifecycle: "certified".to_string(),
+                supported_profiles: strings(&["perfect-web-api-db"]),
+                dependencies: Vec::new(),
+                source_paths,
+                generated_paths: Vec::new(),
+                contract_paths,
+                migration_paths,
+                ui_routes: Vec::new(),
+                proof_lanes,
+                proof_commands: Vec::new(),
+                security_assumptions: strings(&[
+                    "audit events are append-only and written through the application port",
+                    "actors and targets are traceable without embedding secrets",
+                ]),
+                observability_events: strings(&[
+                    "audit_events_total",
+                    "resource.created",
+                    "resource.deleted",
+                ]),
+                docs: strings(&[
+                    "examples/perfect-web-api-db/ops/observability.md",
+                    "examples/perfect-web-api-db/ops/security.md",
+                    "examples/perfect-web-api-db/docs/architecture.md",
+                ]),
+                upgrade_notes: strings(&[
+                    "extend the AuditLog port before adding provider-specific sinks",
+                    "regenerate client contracts when audit event APIs become public",
+                ]),
+                rollback_notes: strings(&[
+                    "dry-run install writes no files",
+                    "for applied templates, remove audit table additions only through a reviewed migration",
+                ]),
+                certification_status: "candidate".to_string(),
+                certification_evidence: Vec::new(),
+                install_strategy: "dry-run-plan".to_string(),
+                conflict_policy: "never-overwrite".to_string(),
+            },
+            vec![marker_evidence(
+                repo,
+                "examples/perfect-web-api-db/backend/src/domain.rs",
+                "AuditEvent",
+                "domain-audit-event",
+            )],
+        )
+    }
+
+    fn crud_resource_manifest(repo: &Path, catalog: &RepoCatalog) -> CellManifest {
+        let source_paths = strings(&[
+            "examples/perfect-web-api-db/backend/src/domain.rs",
+            "examples/perfect-web-api-db/backend/src/application.rs",
+            "examples/perfect-web-api-db/backend/src/adapters.rs",
+            "examples/perfect-web-api-db/frontend/src/App.tsx",
+            "examples/perfect-web-api-db/docs/architecture.md",
+            "examples/perfect-web-api-db/README.md",
+        ]);
+        let contract_paths = strings(&["examples/perfect-web-api-db/contracts/openapi.json"]);
+        let migration_paths = strings(&["examples/perfect-web-api-db/db/migrations/001_init.sql"]);
+        let ui_routes = strings(&["examples/perfect-web-api-db/ux/routes.md"]);
+        let proof_lanes = strings(&["test-cli", "audit", "db-migration-analyze", "ux-qa", "security"]);
+
+        evidence_bound_manifest(
+            repo,
+            catalog,
+            CellManifest {
+                cell_id: "crud-resource".to_string(),
+                version: "0.1.0".to_string(),
+                category: "product-ui".to_string(),
+                lifecycle: "certified".to_string(),
+                supported_profiles: strings(&["perfect-web-api-db"]),
+                dependencies: strings(&["audit-log"]),
+                source_paths,
+                generated_paths: Vec::new(),
+                contract_paths,
+                migration_paths,
+                ui_routes,
+                proof_lanes,
+                proof_commands: Vec::new(),
+                security_assumptions: strings(&[
+                    "CRUD authorization is enforced in the Rust application layer",
+                    "frontend uses contract-shaped data and does not own durable truth",
+                ]),
+                observability_events: strings(&["resource.created", "resource.deleted"]),
+                docs: strings(&[
+                    "examples/perfect-web-api-db/ux/routes.md",
+                    "examples/perfect-web-api-db/ops/security.md",
+                    "examples/perfect-web-api-db/docs/architecture.md",
+                ]),
+                upgrade_notes: strings(&[
+                    "add generated clients before exposing more resource endpoints",
+                    "expand route states in ux/routes.md with every new CRUD surface",
+                ]),
+                rollback_notes: strings(&[
+                    "dry-run install writes no files",
+                    "for applied templates, reverse resource tables through reviewed migrations",
+                ]),
+                certification_status: "candidate".to_string(),
+                certification_evidence: Vec::new(),
+                install_strategy: "dry-run-plan".to_string(),
+                conflict_policy: "never-overwrite".to_string(),
+            },
+            vec![marker_evidence(
+                repo,
+                "examples/perfect-web-api-db/contracts/openapi.json",
+                "createResource",
+                "contract-create-resource",
+            )],
+        )
+    }
+
+    fn rbac_manifest(repo: &Path, catalog: &RepoCatalog) -> CellManifest {
+        let source_paths = strings(&[
+            "examples/perfect-web-api-db/backend/src/domain.rs",
+            "examples/perfect-web-api-db/backend/src/application.rs",
+            "examples/perfect-web-api-db/backend/src/adapters.rs",
+            "examples/perfect-web-api-db/docs/architecture.md",
+            "examples/perfect-web-api-db/docs/exceptions.md",
+            "examples/perfect-web-api-db/README.md",
+        ]);
+        let contract_paths = strings(&["examples/perfect-web-api-db/contracts/openapi.json"]);
+        let migration_paths = strings(&[
+            "examples/perfect-web-api-db/db/migrations/001_init.sql",
+            "examples/perfect-web-api-db/db/constraints/001_accounts.sql",
+        ]);
+        let ui_routes = strings(&["examples/perfect-web-api-db/ux/routes.md"]);
+        let proof_lanes = strings(&["test-cli", "audit", "db-migration-analyze", "ux-qa", "security"]);
+
+        evidence_bound_manifest(
+            repo,
+            catalog,
+            CellManifest {
+                cell_id: "rbac".to_string(),
+                version: "0.1.0".to_string(),
+                category: "authorization".to_string(),
+                lifecycle: "certified".to_string(),
+                supported_profiles: strings(&["perfect-web-api-db"]),
+                dependencies: strings(&["crud-resource"]),
+                source_paths,
+                generated_paths: Vec::new(),
+                contract_paths,
+                migration_paths,
+                ui_routes,
+                proof_lanes,
+                proof_commands: Vec::new(),
+                security_assumptions: strings(&[
+                    "roles and permissions are enforced in the Rust application layer before any command runs",
+                    "API security schemes in OpenAPI align with session or token checks at the edge",
+                    "dangerous role changes emit audit events through the audit-log cell",
+                ]),
+                observability_events: strings(&["authorization.denied", "authorization.allowed"]),
+                docs: strings(&[
+                    "examples/perfect-web-api-db/ops/security.md",
+                    "examples/perfect-web-api-db/docs/architecture.md",
+                    "examples/perfect-web-api-db/docs/exceptions.md",
+                ]),
+                upgrade_notes: strings(&[
+                    "model new roles in domain.rs before exposing them in OpenAPI",
+                    "expand ux/routes.md with permission-denied coverage for each protected surface",
+                ]),
+                rollback_notes: strings(&[
+                    "dry-run install writes no files",
+                    "reverse RBAC table or policy changes only through reviewed migrations",
+                ]),
+                certification_status: "candidate".to_string(),
+                certification_evidence: Vec::new(),
+                install_strategy: "dry-run-plan".to_string(),
+                conflict_policy: "never-overwrite".to_string(),
+            },
+            vec![marker_evidence(
+                repo,
+                "examples/perfect-web-api-db/backend/src/domain.rs",
+                "can_manage_members",
+                "domain-rbac-member-management",
+            )],
+        )
+    }
+
+    fn auth_session_manifest(repo: &Path, catalog: &RepoCatalog) -> CellManifest {
+        let source_paths = strings(&[
+            "examples/perfect-web-api-db/backend/src/auth_session.rs",
+            "examples/perfect-web-api-db/backend/src/lib.rs",
+            "examples/perfect-web-api-db/backend/src/domain.rs",
+            "examples/perfect-web-api-db/backend/src/application.rs",
+        ]);
+        let contract_paths = strings(&["examples/perfect-web-api-db/contracts/auth-session.openapi.json"]);
+        let migration_paths = strings(&[
+            "examples/perfect-web-api-db/db/migrations/002_auth_sessions.sql",
+            "examples/perfect-web-api-db/db/constraints/002_auth_sessions.sql",
+        ]);
+        let ui_routes = strings(&["examples/perfect-web-api-db/ux/auth-session-routes.md"]);
+        let proof_lanes = strings(&["test-cli", "audit", "db-migration-analyze", "ux-qa", "security"]);
+
+        evidence_bound_manifest(
+            repo,
+            catalog,
+            CellManifest {
+                cell_id: "auth-session".to_string(),
+                version: "0.1.0".to_string(),
+                category: "identity".to_string(),
+                lifecycle: "certified".to_string(),
+                supported_profiles: strings(&["perfect-web-api-db"]),
+                dependencies: strings(&["rbac", "audit-log"]),
+                source_paths,
+                generated_paths: Vec::new(),
+                contract_paths,
+                migration_paths,
+                ui_routes,
+                proof_lanes,
+                proof_commands: Vec::new(),
+                security_assumptions: strings(&[
+                    "raw session tokens are never persisted; only token hashes cross durable boundaries",
+                    "authentication is an API-edge/session concern while authorization remains RBAC/domain-owned",
+                    "session creation, revocation, expiry, and failed authentication emit audit-friendly events",
+                    "session storage is durable product truth and therefore belongs in Rust application/adapters plus PostgreSQL migrations",
+                ]),
+                observability_events: strings(&[
+                    "session.created",
+                    "session.revoked",
+                    "session.expired",
+                    "authentication.failed",
+                ]),
+                docs: strings(&[
+                    "examples/perfect-web-api-db/docs/auth-session-cell.md",
+                    "examples/perfect-web-api-db/ops/auth-session-security.md",
+                    "examples/perfect-web-api-db/docs/architecture.md",
+                ]),
+                upgrade_notes: strings(&[
+                    "keep auth/session as a shell until provider-specific OAuth, SAML, or passkey integrations have their own adapters",
+                    "add generated clients before exposing session endpoints to production UI code",
+                    "run security, DB migration analysis, and UX route proof whenever session state or credentials handling changes",
+                ]),
+                rollback_notes: strings(&[
+                    "dry-run install writes no files",
+                    "remove auth_sessions only through reviewed migration rollback after confirming no active sessions depend on it",
+                    "provider-backed login, key rotation, and token invalidation remain manual-review changes",
+                ]),
+                certification_status: "candidate".to_string(),
+                certification_evidence: Vec::new(),
+                install_strategy: "dry-run-plan".to_string(),
+                conflict_policy: "never-overwrite".to_string(),
+            },
+            vec![
+                marker_evidence(
+                    repo,
+                    "examples/perfect-web-api-db/backend/src/auth_session.rs",
+                    "SessionTokenHash",
+                    "domain-session-token-hash",
+                ),
+                marker_evidence(
+                    repo,
+                    "examples/perfect-web-api-db/contracts/auth-session.openapi.json",
+                    "createSession",
+                    "contract-create-session",
+                ),
+                marker_evidence(
+                    repo,
+                    "examples/perfect-web-api-db/db/migrations/002_auth_sessions.sql",
+                    "auth_sessions",
+                    "db-auth-sessions-table",
+                ),
+                marker_evidence(
+                    repo,
+                    "examples/perfect-web-api-db/ops/auth-session-security.md",
+                    "No raw session token",
+                    "security-no-raw-session-token",
+                ),
+                marker_evidence(
+                    repo,
+                    "examples/perfect-web-api-db/ux/auth-session-routes.md",
+                    "/session/new",
+                    "ux-session-new-route",
+                ),
+            ],
+        )
+    }
+
+    fn evidence_bound_manifest(
+        repo: &Path,
+        catalog: &RepoCatalog,
+        mut manifest: CellManifest,
+        extra_evidence: Vec<CellEvidence>,
+    ) -> CellManifest {
+        let mut evidence = Vec::new();
+
+        for path in manifest
+            .source_paths
+            .iter()
+            .chain(manifest.generated_paths.iter())
+            .chain(manifest.contract_paths.iter())
+            .chain(manifest.migration_paths.iter())
+            .chain(manifest.ui_routes.iter())
+            .chain(manifest.docs.iter())
+        {
+            push_evidence_unique(&mut evidence, path_evidence(repo, path));
+        }
+
+        for item in extra_evidence {
+            push_evidence_unique(&mut evidence, item);
+        }
+
+        for lane in &manifest.proof_lanes {
+            push_evidence_unique(&mut evidence, lane_evidence(catalog, lane));
+        }
+
+        manifest.proof_commands = proof_commands(catalog, &manifest.proof_lanes);
+        manifest.certification_evidence = evidence;
+        refresh_certification_status(&mut manifest);
+        manifest
+    }
+
+    fn attach_dependency_evidence(manifests: &mut [CellManifest]) {
+        let initial_status: BTreeMap<String, String> = manifests
+            .iter()
+            .map(|manifest| {
+                (
+                    manifest.cell_id.clone(),
+                    manifest.certification_status.clone(),
+                )
+            })
+            .collect();
+
+        for manifest in manifests.iter_mut() {
+            for dependency in manifest.dependencies.clone() {
+                let status = match initial_status.get(&dependency).map(String::as_str) {
+                    Some("certified") => "present",
+                    Some(_) => "review-required",
+                    None => "missing",
+                };
+
+                push_evidence_unique(
+                    &mut manifest.certification_evidence,
+                    CellEvidence {
+                        kind: "dependency".to_string(),
+                        path: dependency,
+                        required: true,
+                        status: status.to_string(),
+                    },
+                );
+            }
+        }
+
+        for manifest in manifests.iter_mut() {
+            refresh_certification_status(manifest);
+        }
+    }
+
+    fn refresh_certification_status(manifest: &mut CellManifest) {
+        let required_evidence_is_present = manifest
+            .certification_evidence
+            .iter()
+            .all(|item| !item.required || item.status == "present");
+
+        manifest.certification_status =
+            if manifest.lifecycle == "certified" && required_evidence_is_present {
+                "certified".to_string()
+            } else {
+                "candidate".to_string()
+            };
+    }
+
+    fn fallback_manifest(catalog: &RepoCatalog, cell_id: &str) -> CellManifest {
+        let owner = owner_for_cell(catalog, cell_id);
+        let source_paths = source_paths_for_owner(catalog, &owner);
+        let proof_lanes = if catalog.proof_lane_names().is_empty() {
+            strings(&["fast", "audit"])
+        } else {
+            catalog.proof_lane_names()
+        };
+
+        CellManifest {
+            cell_id: cell_id.to_string(),
+            version: "0.0.0".to_string(),
+            category: category_for_owner(&owner).to_string(),
+            lifecycle: "draft".to_string(),
+            supported_profiles: strings(&["workspace"]),
+            dependencies: Vec::new(),
+            source_paths,
+            generated_paths: Vec::new(),
+            contract_paths: Vec::new(),
+            migration_paths: Vec::new(),
+            ui_routes: Vec::new(),
+            proof_lanes: proof_lanes.clone(),
+            proof_commands: proof_commands(catalog, &proof_lanes),
+            security_assumptions: Vec::new(),
+            observability_events: Vec::new(),
+            docs: Vec::new(),
+            upgrade_notes: strings(&[
+                "add local contracts, tests, and proof lanes before certification",
+            ]),
+            rollback_notes: strings(&["dry-run install writes no files"]),
+            certification_status: "candidate".to_string(),
+            certification_evidence: vec![CellEvidence {
+                kind: "review".to_string(),
+                path: cell_id.to_string(),
+                required: true,
+                status: "review-required".to_string(),
+            }],
+            install_strategy: "manual".to_string(),
+            conflict_policy: "review-required".to_string(),
+        }
+    }
+
+    fn path_evidence(repo: &Path, path: &str) -> CellEvidence {
+        CellEvidence {
+            kind: "path".to_string(),
+            path: path.to_string(),
+            required: true,
+            status: if repo.join(path).exists() {
+                "present".to_string()
+            } else {
+                "missing".to_string()
+            },
+        }
+    }
+
+    fn marker_evidence(repo: &Path, path: &str, marker: &str, label: &str) -> CellEvidence {
+        let status = fs::read_to_string(repo.join(path))
+            .map(|text| text.contains(marker))
+            .unwrap_or(false);
+
+        CellEvidence {
+            kind: "content-marker".to_string(),
+            path: format!("{path}#{label}"),
+            required: true,
+            status: if status { "present" } else { "missing" }.to_string(),
+        }
+    }
+
+    fn lane_evidence(catalog: &RepoCatalog, lane: &str) -> CellEvidence {
+        CellEvidence {
+            kind: "proof-lane".to_string(),
+            path: lane.to_string(),
+            required: true,
+            status: if catalog.proof_lanes.iter().any(|item| item.name == lane) {
+                "present".to_string()
+            } else {
+                "missing".to_string()
+            },
+        }
+    }
+
+    fn proof_commands(catalog: &RepoCatalog, lanes: &[String]) -> Vec<String> {
+        let mut commands = Vec::new();
+
+        for lane_name in lanes {
+            for lane in &catalog.proof_lanes {
+                if lane.name == *lane_name && !commands.contains(&lane.command) {
+                    commands.push(lane.command.clone());
+                }
+            }
+        }
+
+        commands
+    }
+
+    fn push_evidence_unique(values: &mut Vec<CellEvidence>, value: CellEvidence) {
+        if !values
+            .iter()
+            .any(|existing| existing.kind == value.kind && existing.path == value.path)
+        {
+            values.push(value);
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+''')
+
+# ---------------------------------------------------------------------------
+# Harden cell plan output with dependency closure, upgrade/deprecation plans,
+# and an explicit certification decision.
+# ---------------------------------------------------------------------------
+
+write("crates/jankurai/src/commands/cell.rs", r'''
+    use crate::commands::cell_catalog::{
+        evidence_counts, manifest_for_cell, owner_for_cell, CellEvidence, CellManifest,
+    };
+    use crate::commands::context_data::RepoCatalog;
+    use crate::validation::{self, ArtifactSchema};
+    use anyhow::Result;
+    use serde::Serialize;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone)]
+    pub struct CellArgs {
+        pub repo: PathBuf,
+        pub cell_id: String,
+        pub mode: String,
+        pub out: Option<String>,
+        pub md: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct CellPlan {
+        pub schema_version: String,
+        pub command: String,
+        pub repo: String,
+        pub generated_at: String,
+        pub status: String,
+        pub mode: String,
+        pub lifecycle_action: String,
+        pub cell_id: String,
+        pub owner: String,
+        pub category: String,
+        pub source_paths: Vec<String>,
+        pub proof_lanes: Vec<String>,
+        pub manifest: CellManifest,
+        pub install_plan: InstallPlan,
+        pub dependency_closure: Vec<DependencyStatus>,
+        pub certification_decision: CertificationDecision,
+        pub certification_evidence: Vec<CellEvidence>,
+        pub proof_commands: Vec<String>,
+        pub upgrade_plan: Vec<String>,
+        pub deprecation_plan: Vec<String>,
+        pub notes: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct InstallPlan {
+        pub dry_run: bool,
+        pub planned_writes: Vec<String>,
+        pub conflict_policy: String,
+        pub forbidden_overwrites: Vec<String>,
+        pub required_reviews: Vec<String>,
+        pub generated_zone_policy: String,
+        pub rollback_limitations: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct DependencyStatus {
+        pub cell_id: String,
+        pub status: String,
+        pub required: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize)]
+    pub struct CertificationDecision {
+        pub status: String,
+        pub merge_ready: bool,
+        pub required_evidence_present: usize,
+        pub required_evidence_missing: usize,
+        pub required_review_items: usize,
+        pub reason: String,
+    }
+
+    pub fn run(args: CellArgs) -> Result<()> {
+        let plan = build_cell_plan(&args.repo, &args.cell_id, &args.mode)?;
+        validation::validate_serializable(&args.repo, ArtifactSchema::CellManifest, &plan.manifest)?;
+
+        if let Some(path) = args.out.as_deref() {
+            crate::render::write_json(path, &serde_json::to_string_pretty(&plan)?)?;
+        } else {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+
+        if let Some(path) = args.md.as_deref() {
+            crate::render::write_markdown(path, &render_markdown(&plan))?;
+        }
+
+        Ok(())
+    }
+
+    pub fn build_cell_plan(repo: &Path, cell_id: &str, mode: &str) -> Result<CellPlan> {
+        let catalog = RepoCatalog::load(repo)?;
+        let manifest = manifest_for_cell(repo, &catalog, cell_id);
+        let owner = manifest
+            .source_paths
+            .first()
+            .and_then(|path| catalog.owner_for_path(path))
+            .map(|owner| owner.to_string())
+            .unwrap_or_else(|| owner_for_cell(&catalog, cell_id));
+
+        let install_plan = build_install_plan(&manifest);
+        let dependency_closure = build_dependency_closure(&manifest);
+        let certification_decision = build_certification_decision(&manifest);
+        let evidence_mode = emits_evidence(mode);
+
+        let certification_evidence = if evidence_mode {
+            manifest.certification_evidence.clone()
+        } else {
+            Vec::new()
+        };
+        let proof_commands = if evidence_mode {
+            manifest.proof_commands.clone()
+        } else {
+            Vec::new()
+        };
+
+        Ok(CellPlan {
+            schema_version: "1.0.0".to_string(),
+            command: "jankurai cell".to_string(),
+            repo: repo.display().to_string(),
+            generated_at: now_string(),
+            status: "complete".to_string(),
+            mode: mode.to_string(),
+            lifecycle_action: lifecycle_action(mode),
+            cell_id: cell_id.to_string(),
+            owner,
+            category: manifest.category.clone(),
+            source_paths: manifest.source_paths.clone(),
+            proof_lanes: manifest.proof_lanes.clone(),
+            install_plan,
+            dependency_closure,
+            certification_decision,
+            certification_evidence,
+            proof_commands,
+            upgrade_plan: build_upgrade_plan(&manifest, mode),
+            deprecation_plan: build_deprecation_plan(&manifest, mode),
+            manifest,
+            notes: mode_notes(mode),
+        })
+    }
+
+    fn build_install_plan(manifest: &CellManifest) -> InstallPlan {
+        let planned_writes = unique_paths(
+            manifest
+                .source_paths
+                .iter()
+                .chain(manifest.generated_paths.iter())
+                .chain(manifest.contract_paths.iter())
+                .chain(manifest.migration_paths.iter())
+                .chain(manifest.ui_routes.iter())
+                .chain(manifest.docs.iter())
+                .cloned()
+                .collect(),
+        );
+
+        let mut required_reviews = Vec::new();
+
+        if manifest.certification_status != "certified" {
+            required_reviews.push(
+                "owner review required because required certification evidence is missing or pending"
+                    .to_string(),
+            );
+        }
+
+        if manifest.conflict_policy != "never-overwrite" {
+            required_reviews.push("conflict policy requires human review".to_string());
+        }
+
+        InstallPlan {
+            dry_run: true,
+            forbidden_overwrites: planned_writes.clone(),
+            planned_writes,
+            conflict_policy: manifest.conflict_policy.clone(),
+            required_reviews,
+            generated_zone_policy: if manifest.generated_paths.is_empty() {
+                "cell declares no generated paths; install plan must not hand-edit generated zones"
+                    .to_string()
+            } else {
+                "change source contracts/templates and regenerate declared generated paths".to_string()
+            },
+            rollback_limitations: manifest.rollback_notes.clone(),
+        }
+    }
+
+    fn build_dependency_closure(manifest: &CellManifest) -> Vec<DependencyStatus> {
+        manifest
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                let status = manifest
+                    .certification_evidence
+                    .iter()
+                    .find(|item| {
+                        item.kind == "dependency" && item.path.as_str() == dependency.as_str()
+                    })
+                    .map(|item| item.status.clone())
+                    .unwrap_or_else(|| "missing".to_string());
+
+                DependencyStatus {
+                    cell_id: dependency.clone(),
+                    status,
+                    required: true,
+                }
+            })
+            .collect()
+    }
+
+    fn build_certification_decision(manifest: &CellManifest) -> CertificationDecision {
+        let counts = evidence_counts(manifest);
+        let merge_ready = manifest.certification_status == "certified"
+            && counts.missing == 0
+            && counts.review_required == 0;
+
+        CertificationDecision {
+            status: manifest.certification_status.clone(),
+            merge_ready,
+            required_evidence_present: counts.present,
+            required_evidence_missing: counts.missing,
+            required_review_items: counts.review_required,
+            reason: if merge_ready {
+                "all required source, contract, migration, UX, documentation, dependency, content-marker, and proof-lane evidence is present".to_string()
+            } else if counts.missing > 0 {
+                "required certification evidence is missing".to_string()
+            } else if counts.review_required > 0 {
+                "required certification evidence needs review".to_string()
+            } else {
+                "cell is not in certified lifecycle".to_string()
+            },
+        }
+    }
+
+    fn build_upgrade_plan(manifest: &CellManifest, mode: &str) -> Vec<String> {
+        if mode != "upgrade-plan" {
+            return Vec::new();
+        }
+
+        let mut plan = vec![
+            format!(
+                "current cell `{}` is version `{}` and lifecycle `{}`",
+                manifest.cell_id, manifest.version, manifest.lifecycle
+            ),
+            "compute target version compatibility before applying templates".to_string(),
+            "dry-run every planned write and refuse silent overwrite of user-owned files".to_string(),
+            "rerun all proof commands after contract, migration, UI, security, or docs changes".to_string(),
+        ];
+
+        plan.extend(manifest.upgrade_notes.clone());
+        plan
+    }
+
+    fn build_deprecation_plan(manifest: &CellManifest, mode: &str) -> Vec<String> {
+        if mode != "deprecate-plan" {
+            return Vec::new();
+        }
+
+        let mut plan = vec![
+            format!(
+                "mark cell `{}` as deprecated only after dependent cells have migration guidance",
+                manifest.cell_id
+            ),
+            "keep manifest readable so old receipts and repair plans remain auditable".to_string(),
+            "emit replacement cell guidance before removing proof lanes or docs".to_string(),
+        ];
+
+        plan.extend(manifest.rollback_notes.clone());
+        plan
+    }
+
+    fn emits_evidence(mode: &str) -> bool {
+        matches!(mode, "prove" | "upgrade-plan" | "deprecate-plan")
+    }
+
+    fn lifecycle_action(mode: &str) -> String {
+        match mode {
+            "install-ready" => "install-dry-run".to_string(),
+            "prove" => "prove-certification".to_string(),
+            "upgrade-plan" => "upgrade-plan".to_string(),
+            "deprecate-plan" => "deprecate-plan".to_string(),
+            other => format!("unknown-mode:{other}"),
+        }
+    }
+
+    fn mode_notes(mode: &str) -> Vec<String> {
+        let mut notes = vec![
+            "cell output is generated from current ownership and proof routing".to_string(),
+            "install-ready mode emits a dry-run plan only and never writes files".to_string(),
+            "prove mode emits evidence and proof commands without executing them".to_string(),
+            "upgrade-plan and deprecate-plan are metadata plans; provider-backed mutation remains deferred".to_string(),
+        ];
+
+        match mode {
+            "prove" => notes.push(
+                "certification is dependency-bound: required upstream cells must also be certified"
+                    .to_string(),
+            ),
+            "upgrade-plan" => notes.push(
+                "upgrade planning must preserve conflict policy and generated-zone ownership".to_string(),
+            ),
+            "deprecate-plan" => notes.push(
+                "deprecation planning must preserve receipt auditability and dependent-cell migration paths"
+                    .to_string(),
+            ),
+            _ => {}
+        }
+
+        notes
+    }
+
+    fn render_markdown(plan: &CellPlan) -> String {
+        use std::fmt::Write;
+
+        let mut out = String::new();
+        let _ = writeln!(out, "# jankurai Cell Plan");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "- command: `{}`", plan.command);
+        let _ = writeln!(out, "- mode: `{}`", plan.mode);
+        let _ = writeln!(out, "- lifecycle action: `{}`", plan.lifecycle_action);
+        let _ = writeln!(out, "- cell: `{}`", plan.cell_id);
+        let _ = writeln!(out, "- owner: `{}`", plan.owner);
+        let _ = writeln!(out, "- category: `{}`", plan.category);
+        let _ = writeln!(
+            out,
+            "- certification: `{}`",
+            plan.manifest.certification_status
+        );
+        let _ = writeln!(
+            out,
+            "- certification reason: {}",
+            plan.certification_decision.reason
+        );
+        let _ = writeln!(
+            out,
+            "- evidence: present `{}`, missing `{}`, review `{}`",
+            plan.certification_decision.required_evidence_present,
+            plan.certification_decision.required_evidence_missing,
+            plan.certification_decision.required_review_items
+        );
+        let _ = writeln!(
+            out,
+            "- install strategy: `{}`",
+            plan.manifest.install_strategy
+        );
+        let _ = writeln!(
+            out,
+            "- conflict policy: `{}`",
+            plan.install_plan.conflict_policy
+        );
+        let _ = writeln!(out, "- dry run: `{}`", plan.install_plan.dry_run);
+        let _ = writeln!(out, "- source paths: `{}`", join_or_none(&plan.source_paths));
+        let _ = writeln!(out, "- proof lanes: `{}`", join_or_none(&plan.proof_lanes));
+        let _ = writeln!(
+            out,
+            "- proof commands: `{}`",
+            join_or_none(&plan.proof_commands)
+        );
+        let _ = writeln!(out, "- notes: `{}`", join_or_none(&plan.notes));
+
+        if !plan.dependency_closure.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "## Dependency Closure");
+            for dependency in &plan.dependency_closure {
+                let _ = writeln!(
+                    out,
+                    "- `{}`: `{}` required `{}`",
+                    dependency.cell_id, dependency.status, dependency.required
+                );
+            }
+        }
+
+        if !plan.upgrade_plan.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "## Upgrade Plan");
+            for step in &plan.upgrade_plan {
+                let _ = writeln!(out, "- {}", step);
+            }
+        }
+
+        if !plan.deprecation_plan.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "## Deprecation Plan");
+            for step in &plan.deprecation_plan {
+                let _ = writeln!(out, "- {}", step);
+            }
+        }
+
+        out
+    }
+
+    fn unique_paths(paths: Vec<String>) -> Vec<String> {
+        let mut unique = Vec::new();
+        for path in paths {
+            if !unique.contains(&path) {
+                unique.push(path);
+            }
+        }
+        unique
+    }
+
+    fn join_or_none(values: &[String]) -> String {
+        if values.is_empty() {
+            "none".to_string()
+        } else {
+            values.join(", ")
+        }
+    }
+
+    fn now_string() -> String {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string()
+    }
+''')
+
+# ---------------------------------------------------------------------------
+# Allow the new metadata lifecycle modes at the CLI boundary.
+# ---------------------------------------------------------------------------
+
+replace_once(
+    "crates/jankurai/src/main.rs",
+    '#[arg(long, default_value = "install-ready", value_parser = ["install-ready", "prove"])] mode: String,',
+    '#[arg(long, default_value = "install-ready", value_parser = ["install-ready", "prove", "upgrade-plan", "deprecate-plan"])] mode: String,',
+)
+
+# ---------------------------------------------------------------------------
+# Add concrete auth/session reference surfaces. These are source fixtures, not
+# generated files. They give the auth-session cell source, contract, DB, UX,
+# security, observability, and upgrade/deprecation evidence.
+# ---------------------------------------------------------------------------
+
+write("examples/perfect-web-api-db/backend/src/lib.rs", r'''
+    // Root library module for the perfect-web-api-db reference backend.
+    //
+    // Layer responsibilities (from Jankurai JANKURAI_STANDARD.md):
+    //
+    // domain — IDs, invariants, pure decisions. No IO.
+    // application — commands, authorization, idempotency, transactions. No UI.
+    // adapters — DB, queue clients, external APIs, filesystem. No domain rules.
+    //
+    // auth_session — certified-cell reference shell for session state. It is
+    // intentionally dependency-light and provider-neutral; production provider
+    // adapters live outside this pure/application shell.
+
+    pub mod adapters;
+    pub mod application;
+    pub mod auth_session;
+    pub mod domain;
+
+    pub fn service_name() -> &'static str {
+        "perfect-web-api-db"
+    }
+''')
+
+write("examples/perfect-web-api-db/backend/src/auth_session.rs", r'''
+    // Auth/session certified-cell shell.
+    //
+    // Boundary contract:
+    // - Owns session identity, token-hash invariants, expiry/revocation decisions,
+    //   session port traits, and application-level create/revoke orchestration.
+    // - Does not own OAuth/SAML/passkey providers, HTTP extraction, raw credentials,
+    //   DB SQL, environment variables, random generation, or wall-clock reads.
+    //
+    // Production split recommendation:
+    // - Move pure value objects to domain/auth_session.rs.
+    // - Move command functions and port traits to application/auth_session.rs.
+    // - Keep provider integrations and SQL in adapters.
+
+    use crate::domain::{Account, AccountId, DomainError};
+    use std::cell::RefCell;
+    use std::fmt;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct SessionId(pub String);
+
+    impl fmt::Display for SessionId {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct SessionTokenHash(pub String);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SessionPolicy {
+        pub ttl_seconds: u64,
+        pub max_active_sessions_per_account: usize,
+    }
+
+    impl SessionPolicy {
+        pub fn standard() -> Self {
+            Self {
+                ttl_seconds: 60 * 60 * 8,
+                max_active_sessions_per_account: 5,
+            }
+        }
+
+        pub fn validate(&self) -> Result<(), SessionError> {
+            if self.ttl_seconds == 0 {
+                return Err(SessionError::InvalidPolicy {
+                    reason: "ttl_seconds must be greater than zero".to_string(),
+                });
+            }
+
+            if self.max_active_sessions_per_account == 0 {
+                return Err(SessionError::InvalidPolicy {
+                    reason: "max_active_sessions_per_account must be greater than zero".to_string(),
+                });
+            }
+
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Session {
+        pub id: SessionId,
+        pub account_id: AccountId,
+        pub token_hash: SessionTokenHash,
+        pub created_at_epoch_seconds: u64,
+        pub expires_at_epoch_seconds: u64,
+        pub revoked_at_epoch_seconds: Option<u64>,
+    }
+
+    impl Session {
+        pub fn new(
+            id: impl Into<String>,
+            account_id: AccountId,
+            token_hash: impl Into<String>,
+            now_epoch_seconds: u64,
+            policy: &SessionPolicy,
+        ) -> Result<Self, SessionError> {
+            policy.validate()?;
+
+            let token_hash = token_hash.into();
+            if token_hash.trim().is_empty() {
+                return Err(SessionError::EmptyTokenHash);
+            }
+
+            if token_hash.len() < 32 {
+                return Err(SessionError::WeakTokenHash);
+            }
+
+            Ok(Self {
+                id: SessionId(id.into()),
+                account_id,
+                token_hash: SessionTokenHash(token_hash),
+                created_at_epoch_seconds: now_epoch_seconds,
+                expires_at_epoch_seconds: now_epoch_seconds.saturating_add(policy.ttl_seconds),
+                revoked_at_epoch_seconds: None,
+            })
+        }
+
+        pub fn is_active(&self, now_epoch_seconds: u64) -> bool {
+            self.revoked_at_epoch_seconds.is_none()
+                && now_epoch_seconds < self.expires_at_epoch_seconds
+        }
+
+        pub fn revoke(&mut self, now_epoch_seconds: u64) {
+            if self.revoked_at_epoch_seconds.is_none() {
+                self.revoked_at_epoch_seconds = Some(now_epoch_seconds);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SessionError {
+        EmptyTokenHash,
+        WeakTokenHash,
+        AccountInactive,
+        PermissionDenied { action: String },
+        TooManyActiveSessions {
+            account_id: AccountId,
+            limit: usize,
+        },
+        SessionNotFound { id: SessionId },
+        SessionExpired { id: SessionId },
+        SessionRevoked { id: SessionId },
+        InvalidPolicy { reason: String },
+        AdapterFailure { reason: String },
+    }
+
+    impl fmt::Display for SessionError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::EmptyTokenHash => f.write_str("session token hash must not be empty"),
+                Self::WeakTokenHash => {
+                    f.write_str("session token hash must be at least 32 characters")
+                }
+                Self::AccountInactive => f.write_str("inactive account cannot hold a session"),
+                Self::PermissionDenied { action } => {
+                    write!(f, "session action denied: {action}")
+                }
+                Self::TooManyActiveSessions { account_id, limit } => write!(
+                    f,
+                    "account {account_id} exceeds active session limit {limit}"
+                ),
+                Self::SessionNotFound { id } => write!(f, "session {id} not found"),
+                Self::SessionExpired { id } => write!(f, "session {id} expired"),
+                Self::SessionRevoked { id } => write!(f, "session {id} revoked"),
+                Self::InvalidPolicy { reason } => write!(f, "invalid session policy: {reason}"),
+                Self::AdapterFailure { reason } => {
+                    write!(f, "session adapter failed: {reason}")
+                }
+            }
+        }
+    }
+
+    impl From<DomainError> for SessionError {
+        fn from(value: DomainError) -> Self {
+            match value {
+                DomainError::AccountInactive => Self::AccountInactive,
+                DomainError::PermissionDenied { action, .. } => Self::PermissionDenied { action },
+                other => Self::AdapterFailure {
+                    reason: other.to_string(),
+                },
+            }
+        }
+    }
+
+    pub trait SessionRepository {
+        fn count_active_for_account(
+            &self,
+            account_id: &AccountId,
+            now_epoch_seconds: u64,
+        ) -> Result<usize, String>;
+
+        fn save(&self, session: &Session) -> Result<(), String>;
+
+        fn find_by_id(&self, id: &SessionId) -> Result<Option<Session>, String>;
+    }
+
+    pub trait SessionAuditLog {
+        fn record_session_event(&self, event: SessionEvent) -> Result<(), String>;
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SessionEvent {
+        pub actor_id: AccountId,
+        pub session_id: SessionId,
+        pub action: SessionEventAction,
+        pub outcome: SessionEventOutcome,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SessionEventAction {
+        Created,
+        Revoked,
+        Expired,
+        AuthenticationFailed,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SessionEventOutcome {
+        Success,
+        Denied,
+        Error(String),
+    }
+
+    pub fn create_session(
+        actor: &Account,
+        session_id: impl Into<String>,
+        token_hash: impl Into<String>,
+        now_epoch_seconds: u64,
+        policy: &SessionPolicy,
+        sessions: &impl SessionRepository,
+        audit_log: &impl SessionAuditLog,
+    ) -> Result<Session, SessionError> {
+        actor.authorize("read")?;
+
+        let active_count = sessions
+            .count_active_for_account(&actor.id, now_epoch_seconds)
+            .map_err(|reason| SessionError::AdapterFailure { reason })?;
+
+        if active_count >= policy.max_active_sessions_per_account {
+            let _ = audit_log.record_session_event(SessionEvent {
+                actor_id: actor.id.clone(),
+                session_id: SessionId("pending".to_string()),
+                action: SessionEventAction::AuthenticationFailed,
+                outcome: SessionEventOutcome::Denied,
+            });
+
+            return Err(SessionError::TooManyActiveSessions {
+                account_id: actor.id.clone(),
+                limit: policy.max_active_sessions_per_account,
+            });
+        }
+
+        let session = Session::new(
+            session_id,
+            actor.id.clone(),
+            token_hash,
+            now_epoch_seconds,
+            policy,
+        )?;
+
+        sessions
+            .save(&session)
+            .map_err(|reason| SessionError::AdapterFailure { reason })?;
+
+        let _ = audit_log.record_session_event(SessionEvent {
+            actor_id: actor.id.clone(),
+            session_id: session.id.clone(),
+            action: SessionEventAction::Created,
+            outcome: SessionEventOutcome::Success,
+        });
+
+        Ok(session)
+    }
+
+    pub fn revoke_session(
+        actor: &Account,
+        session_id: &SessionId,
+        now_epoch_seconds: u64,
+        sessions: &impl SessionRepository,
+        audit_log: &impl SessionAuditLog,
+    ) -> Result<Session, SessionError> {
+        actor.authorize("delete")?;
+
+        let mut session = sessions
+            .find_by_id(session_id)
+            .map_err(|reason| SessionError::AdapterFailure { reason })?
+            .ok_or_else(|| SessionError::SessionNotFound {
+                id: session_id.clone(),
+            })?;
+
+        if !session.is_active(now_epoch_seconds) {
+            if session.revoked_at_epoch_seconds.is_some() {
+                return Err(SessionError::SessionRevoked {
+                    id: session_id.clone(),
+                });
+            }
+
+            return Err(SessionError::SessionExpired {
+                id: session_id.clone(),
+            });
+        }
+
+        session.revoke(now_epoch_seconds);
+
+        sessions
+            .save(&session)
+            .map_err(|reason| SessionError::AdapterFailure { reason })?;
+
+        let _ = audit_log.record_session_event(SessionEvent {
+            actor_id: actor.id.clone(),
+            session_id: session.id.clone(),
+            action: SessionEventAction::Revoked,
+            outcome: SessionEventOutcome::Success,
+        });
+
+        Ok(session)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::domain::Role;
+
+        struct FakeSessions {
+            items: RefCell<Vec<Session>>,
+        }
+
+        impl FakeSessions {
+            fn new() -> Self {
+                Self {
+                    items: RefCell::new(Vec::new()),
+                }
+            }
+        }
+
+        impl SessionRepository for FakeSessions {
+            fn count_active_for_account(
+                &self,
+                account_id: &AccountId,
+                now_epoch_seconds: u64,
+            ) -> Result<usize, String> {
+                Ok(self
+                    .items
+                    .borrow()
+                    .iter()
+                    .filter(|session| {
+                        session.account_id == *account_id && session.is_active(now_epoch_seconds)
+                    })
+                    .count())
+            }
+
+            fn save(&self, session: &Session) -> Result<(), String> {
+                let mut items = self.items.borrow_mut();
+                if let Some(existing) = items.iter_mut().find(|item| item.id == session.id) {
+                    *existing = session.clone();
+                } else {
+                    items.push(session.clone());
+                }
+                Ok(())
+            }
+
+            fn find_by_id(&self, id: &SessionId) -> Result<Option<Session>, String> {
+                Ok(self
+                    .items
+                    .borrow()
+                    .iter()
+                    .find(|session| session.id == *id)
+                    .cloned())
+            }
+        }
+
+        struct FakeSessionAudit {
+            events: RefCell<Vec<SessionEvent>>,
+        }
+
+        impl FakeSessionAudit {
+            fn new() -> Self {
+                Self {
+                    events: RefCell::new(Vec::new()),
+                }
+            }
+        }
+
+        impl SessionAuditLog for FakeSessionAudit {
+            fn record_session_event(&self, event: SessionEvent) -> Result<(), String> {
+                self.events.borrow_mut().push(event);
+                Ok(())
+            }
+        }
+
+        fn strong_hash() -> &'static str {
+            "0123456789abcdef0123456789abcdef"
+        }
+
+        #[test]
+        fn session_requires_strong_non_empty_hash() {
+            let account = Account::new("a1", "alice@example.com", Role::Member).unwrap();
+            let policy = SessionPolicy::standard();
+
+            assert!(matches!(
+                Session::new("s1", account.id.clone(), "", 0, &policy),
+                Err(SessionError::EmptyTokenHash)
+            ));
+            assert!(matches!(
+                Session::new("s1", account.id, "short", 0, &policy),
+                Err(SessionError::WeakTokenHash)
+            ));
+        }
+
+        #[test]
+        fn create_session_emits_success_event() {
+            let account = Account::new("a1", "alice@example.com", Role::Member).unwrap();
+            let sessions = FakeSessions::new();
+            let audit = FakeSessionAudit::new();
+            let policy = SessionPolicy::standard();
+
+            let session = create_session(
+                &account,
+                "s1",
+                strong_hash(),
+                100,
+                &policy,
+                &sessions,
+                &audit,
+            )
+            .unwrap();
+
+            assert_eq!(session.account_id, account.id);
+            assert_eq!(audit.events.borrow().len(), 1);
+            assert_eq!(
+                audit.events.borrow()[0].action,
+                SessionEventAction::Created
+            );
+        }
+
+        #[test]
+        fn create_session_enforces_active_session_limit() {
+            let account = Account::new("a1", "alice@example.com", Role::Member).unwrap();
+            let sessions = FakeSessions::new();
+            let audit = FakeSessionAudit::new();
+            let policy = SessionPolicy {
+                ttl_seconds: 100,
+                max_active_sessions_per_account: 1,
+            };
+
+            create_session(
+                &account,
+                "s1",
+                strong_hash(),
+                100,
+                &policy,
+                &sessions,
+                &audit,
+            )
+            .unwrap();
+
+            let err = create_session(
+                &account,
+                "s2",
+                "fedcba9876543210fedcba9876543210",
+                101,
+                &policy,
+                &sessions,
+                &audit,
+            )
+            .unwrap_err();
+
+            assert!(matches!(
+                err,
+                SessionError::TooManyActiveSessions { .. }
+            ));
+        }
+
+        #[test]
+        fn revoke_session_requires_privileged_actor() {
+            let account = Account::new("a1", "alice@example.com", Role::Member).unwrap();
+            let viewer = Account::new("v1", "viewer@example.com", Role::Viewer).unwrap();
+            let sessions = FakeSessions::new();
+            let audit = FakeSessionAudit::new();
+            let policy = SessionPolicy::standard();
+
+            create_session(
+                &account,
+                "s1",
+                strong_hash(),
+                100,
+                &policy,
+                &sessions,
+                &audit,
+            )
+            .unwrap();
+
+            let err = revoke_session(
+                &viewer,
+                &SessionId("s1".to_string()),
+                101,
+                &sessions,
+                &audit,
+            )
+            .unwrap_err();
+
+            assert!(matches!(err, SessionError::PermissionDenied { .. }));
+        }
+    }
+''')
+
+write("examples/perfect-web-api-db/contracts/auth-session.openapi.json", r'''
+    {
+      "openapi": "3.1.0",
+      "info": {
+        "title": "perfect-web-api-db auth-session cell",
+        "version": "0.1.0",
+        "description": "Provider-neutral auth/session shell. The contract exposes session lifecycle shape without making provider credentials durable truth."
+      },
+      "paths": {
+        "/session": {
+          "post": {
+            "operationId": "createSession",
+            "summary": "Create a session from provider-validated identity material",
+            "tags": ["auth-session"],
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/CreateSessionRequest"
+                  }
+                }
+              }
+            },
+            "responses": {
+              "201": {
+                "description": "Session created",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/Session"
+                    }
+                  }
+                }
+              },
+              "401": {
+                "description": "Credential rejected by provider boundary",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ProblemDetail"
+                    }
+                  }
+                }
+              },
+              "409": {
+                "description": "Active session limit reached",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ProblemDetail"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "delete": {
+            "operationId": "revokeCurrentSession",
+            "summary": "Revoke the caller's current session",
+            "tags": ["auth-session"],
+            "security": [{ "bearerAuth": [] }],
+            "responses": {
+              "204": {
+                "description": "Current session revoked"
+              },
+              "401": {
+                "description": "No active session",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ProblemDetail"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/session/{sessionId}": {
+          "delete": {
+            "operationId": "revokeSession",
+            "summary": "Revoke a session by ID; admin or owner action",
+            "tags": ["auth-session"],
+            "security": [{ "bearerAuth": [] }],
+            "parameters": [
+              {
+                "name": "sessionId",
+                "in": "path",
+                "required": true,
+                "schema": { "type": "string" }
+              }
+            ],
+            "responses": {
+              "204": {
+                "description": "Session revoked"
+              },
+              "403": {
+                "description": "Caller lacks revoke permission",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ProblemDetail"
+                    }
+                  }
+                }
+              },
+              "404": {
+                "description": "Session not found",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ProblemDetail"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "components": {
+        "securitySchemes": {
+          "bearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT"
+          }
+        },
+        "schemas": {
+          "CreateSessionRequest": {
+            "type": "object",
+            "required": ["email", "credential"],
+            "properties": {
+              "email": {
+                "type": "string",
+                "format": "email"
+              },
+              "credential": {
+                "type": "string",
+                "minLength": 12,
+                "description": "Provider-bound credential material. Do not persist this field."
+              },
+              "provider": {
+                "type": "string",
+                "enum": ["local-shell", "oidc-shell", "saml-shell", "passkey-shell"],
+                "default": "local-shell"
+              }
+            }
+          },
+          "Session": {
+            "type": "object",
+            "required": ["id", "accountId", "createdAt", "expiresAt", "revoked"],
+            "properties": {
+              "id": { "type": "string" },
+              "accountId": { "type": "string" },
+              "createdAt": { "type": "string", "format": "date-time" },
+              "expiresAt": { "type": "string", "format": "date-time" },
+              "revoked": { "type": "boolean" }
+            }
+          },
+          "ProblemDetail": {
+            "type": "object",
+            "description": "RFC 9457 Problem Details for auth/session API errors",
+            "required": ["type", "title", "status"],
+            "properties": {
+              "type": { "type": "string", "format": "uri" },
+              "title": { "type": "string" },
+              "status": { "type": "integer" },
+              "detail": { "type": "string" },
+              "instance": { "type": "string", "format": "uri" }
+            }
+          }
+        }
+      }
+    }
+''')
+
+write("examples/perfect-web-api-db/db/migrations/002_auth_sessions.sql", r'''
+    -- Migration 002: Auth/session shell.
+    --
+    -- Invariants enforced at DB level:
+    -- - Session IDs are stable primary keys.
+    -- - Raw session tokens are never stored; token_hash is mandatory.
+    -- - Token hashes are unique and non-empty.
+    -- - Every session belongs to an account.
+    -- - Expiry must be after creation.
+    -- - Revocation, when present, cannot predate creation.
+    --
+    -- Rollback:
+    -- DROP INDEX IF EXISTS idx_auth_sessions_active_account;
+    -- DROP INDEX IF EXISTS idx_auth_sessions_expires_at;
+    -- DROP TABLE IF EXISTS auth_sessions;
+
+    CREATE TABLE auth_sessions (
+        id TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL UNIQUE CHECK (token_hash <> '' AND char_length(token_hash) >= 32),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        revoked_at TIMESTAMPTZ,
+        provider TEXT NOT NULL DEFAULT 'local-shell' CHECK (provider IN ('local-shell', 'oidc-shell', 'saml-shell', 'passkey-shell')),
+        CHECK (expires_at > created_at),
+        CHECK (revoked_at IS NULL OR revoked_at >= created_at)
+    );
+
+    CREATE INDEX idx_auth_sessions_active_account
+        ON auth_sessions(account_id)
+        WHERE revoked_at IS NULL;
+
+    CREATE INDEX idx_auth_sessions_expires_at
+        ON auth_sessions(expires_at);
+''')
+
+write("examples/perfect-web-api-db/db/constraints/002_auth_sessions.sql", r'''
+    -- Constraint documentation for auth_sessions table.
+    --
+    -- 1. Session identity:
+    --    Constraint: PRIMARY KEY (id)
+    --    Domain invariant: SessionId is stable and unique.
+    --
+    -- 2. Account ownership:
+    --    Constraint: account_id REFERENCES accounts(id) ON DELETE CASCADE
+    --    Application invariant: sessions belong to durable accounts.
+    --
+    -- 3. No raw token persistence:
+    --    Constraint: token_hash TEXT NOT NULL UNIQUE CHECK length >= 32
+    --    Security invariant: raw session tokens never cross durable storage.
+    --
+    -- 4. Expiry:
+    --    Constraint: expires_at > created_at
+    --    Domain invariant: a session must have a positive TTL.
+    --
+    -- 5. Revocation:
+    --    Constraint: revoked_at IS NULL OR revoked_at >= created_at
+    --    Application invariant: revocation is monotonic and idempotent.
+    --
+    -- 6. Provider shell:
+    --    Constraint: provider enum-like CHECK
+    --    Adapter invariant: concrete providers are added through provider adapters,
+    --    not by moving provider-specific truth into domain or UI code.
+''')
+
+write("examples/perfect-web-api-db/docs/auth-session-cell.md", r'''
+    # Auth/Session Certified Cell
+
+    The `auth-session` cell is the fourth Phase 10 certified cell. It depends on:
+
+    - `rbac` for authorization decisions after identity is established.
+    - `audit-log` for session lifecycle and failed-authentication evidence.
+
+    ## Scope
+
+    This cell owns a provider-neutral session shell:
+
+    - session identity and token-hash invariants
+    - session creation policy
+    - active-session limits
+    - expiry and revocation decisions
+    - application port traits for session persistence and session audit events
+    - OpenAPI session lifecycle shape
+    - PostgreSQL session storage migration
+    - UX route/state matrix for sign-in, current session, and admin revocation
+
+    It does not own provider-specific authentication integrations. OAuth, SAML, passkeys, LDAP, or password verification belong in adapters or provider-specific cells with their own security proof.
+
+    ## Source Surfaces
+
+    - `backend/src/auth_session.rs` — pure/session application shell
+    - `contracts/auth-session.openapi.json` — source contract for session endpoints
+    - `db/migrations/002_auth_sessions.sql` — durable session table
+    - `db/constraints/002_auth_sessions.sql` — agent-visible invariant mapping
+    - `ux/auth-session-routes.md` — rendered state coverage
+    - `ops/auth-session-security.md` — threat model and proof requirements
+
+    ## Certification Requirements
+
+    A certified auth/session cell must prove:
+
+    - raw session tokens are not stored
+    - session state is durable and migration-backed
+    - session creation and revocation have stable problem-detail errors
+    - session routes have loading, success, error, denied, expired, and revoked states
+    - authentication does not move authorization out of the RBAC/domain layer
+    - session lifecycle events are observable and audit-friendly
+    - all dependencies are certified before this cell claims certification
+
+    ## Upgrade Policy
+
+    Provider-backed auth must be added as a separate adapter or provider cell. The shell contract may expand, but it must not add provider secrets, credential verification, or durable authorization policy to frontend code.
+
+    ## Deprecation Policy
+
+    Deprecating this cell requires a replacement identity/session cell and migration guidance for active sessions. Old receipts must remain readable so historical proof still explains which session invariants were certified.
+''')
+
+write("examples/perfect-web-api-db/ops/auth-session-security.md", r'''
+    # Auth/Session Security
+
+    ## Token Storage
+
+    - No raw session token is stored in source, fixtures, logs, migrations, or database rows.
+    - Durable storage uses `token_hash` only.
+    - Token hash length must be at least 32 characters.
+    - Token generation, random number sources, and signing keys are adapter/provider responsibilities.
+
+    ## Provider Boundary
+
+    The cell is provider-neutral. Local credentials, OIDC, SAML, and passkeys must enter through provider adapters. Provider adapters may verify identity, but RBAC authorization remains in the Rust domain/application layer.
+
+    ## Session Lifecycle
+
+    - Session creation emits `session.created`.
+    - Session revocation emits `session.revoked`.
+    - Expiry detection emits or derives `session.expired`.
+    - Failed authentication emits `authentication.failed`.
+    - Events must not contain raw credentials or raw session tokens.
+
+    ## Required Proof
+
+    - `security`: secret scan and dependency/supply-chain review.
+    - `db-migration-analyze`: migration safety and durable-truth review.
+    - `audit`: ownership, generated-zone, proof-lane, and boundary audit.
+    - `ux-qa`: rendered route-state proof for sign-in/session surfaces when UI is present.
+
+    ## Failure Handling
+
+    Session errors must use typed problem details and stable reason codes. A failed credential check is not retryable by blind automation; agents may only repair configuration, routing, or contract drift with human-approved evidence.
+''')
+
+write("examples/perfect-web-api-db/ux/auth-session-routes.md", r'''
+    # Auth/Session UX Routes
+
+    ## Route Matrix
+
+    | Route | Component | States | Auth Required | Critical Path |
+    | --- | --- | --- | --- | --- |
+    | `/session/new` | SignInShell | loading, error, success | No | Yes |
+    | `/session/current` | CurrentSessionPanel | loading, expired, revoked, success | Yes | Yes |
+    | `/admin/sessions` | AdminSessionTable | loading, empty, error, denied, success | Yes (admin+) | Yes |
+
+    ## State Coverage
+
+    Every route must handle:
+
+    1. Loading — request or provider check is in progress.
+    2. Error — ProblemDetail from the auth/session contract.
+    3. Permission denied — caller lacks RBAC authority.
+    4. Expired — current session TTL has elapsed.
+    5. Revoked — current or target session was explicitly revoked.
+    6. Success — session state rendered without exposing raw tokens.
+
+    ## Accessibility
+
+    - Sign-in form fields have stable labels and IDs.
+    - Error output uses `role="alert"`.
+    - Session tables use `aria-label` and scoped headers.
+    - Revocation buttons have unique accessible names.
+    - Expired/revoked state is text-visible and not color-only.
+
+    ## Generated Client Policy
+
+    UI code must call generated client methods from `contracts/auth-session.openapi.json` or the merged production OpenAPI contract. Do not handwrite fetch calls that mirror session DTOs.
+''')
+
+# ---------------------------------------------------------------------------
+# Focused Phase 10 smoke tests.
+# ---------------------------------------------------------------------------
+
+write("crates/jankurai/tests/phase10_auth_session_cell_smoke.rs", r'''
+    use jankurai::validation::{self, ArtifactSchema};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn binary_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_jankurai"))
+    }
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    fn run_command(repo: &PathBuf, args: &[&str]) -> (serde_json::Value, String) {
+        let out_dir = tempdir().unwrap();
+        let json_path = out_dir.path().join("out.json");
+        let md_path = out_dir.path().join("out.md");
+
+        let mut command = Command::new(binary_path());
+        command
+            .arg(args[0])
+            .arg(repo)
+            .args(&args[1..])
+            .arg("--out")
+            .arg(&json_path)
+            .arg("--md")
+            .arg(&md_path);
+
+        let status = command.status().unwrap();
+        assert!(status.success(), "command failed: {:?}", command);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        let md = fs::read_to_string(&md_path).unwrap();
+
+        (json, md)
+    }
+
+    #[test]
+    fn auth_session_is_fourth_certified_dependency_bound_cell() {
+        let repo = repo_root();
+        let (registry, _md) = run_command(&repo, &["registry"]);
+
+        validation::validate_value(&repo, ArtifactSchema::CellRegistry, &registry).unwrap();
+
+        let cells = registry["cells"].as_array().unwrap();
+        assert!(
+            cells.len() >= 4,
+            "expected at least four built-in cells, got {}",
+            cells.len()
+        );
+
+        let auth_session = cells
+            .iter()
+            .find(|cell| cell["cell_id"] == "auth-session")
+            .expect("auth-session cell");
+
+        assert_eq!(auth_session["lifecycle"], "certified");
+        assert_eq!(auth_session["certification_status"], "certified");
+        assert_eq!(auth_session["category"], "identity");
+
+        let dependencies = auth_session["dependencies"].as_array().unwrap();
+        assert!(dependencies.iter().any(|dependency| dependency == "rbac"));
+        assert!(dependencies.iter().any(|dependency| dependency == "audit-log"));
+
+        let evidence = auth_session["certification_evidence"].as_array().unwrap();
+        assert!(evidence.iter().any(|item| {
+            item["kind"] == "dependency" && item["path"] == "rbac" && item["status"] == "present"
+        }));
+        assert!(evidence.iter().any(|item| {
+            item["kind"] == "dependency"
+                && item["path"] == "audit-log"
+                && item["status"] == "present"
+        }));
+        assert!(evidence.iter().any(|item| {
+            item["kind"] == "content-marker"
+                && item["path"]
+                    .as_str()
+                    .unwrap()
+                    .contains("domain-session-token-hash")
+                && item["status"] == "present"
+        }));
+        assert!(evidence.iter().any(|item| {
+            item["kind"] == "proof-lane" && item["path"] == "security" && item["status"] == "present"
+        }));
+        assert!(evidence.iter().any(|item| {
+            item["kind"] == "proof-lane" && item["path"] == "ux-qa" && item["status"] == "present"
+        }));
+    }
+
+    #[test]
+    fn auth_session_prove_upgrade_and_deprecate_modes_emit_evidence_bound_plans() {
+        let repo = repo_root();
+
+        let (prove, prove_md) = run_command(
+            &repo,
+            &["cell", "--cell-id", "auth-session", "--mode", "prove"],
+        );
+        validation::validate_value(&repo, ArtifactSchema::CellManifest, &prove["manifest"]).unwrap();
+
+        assert_eq!(prove["mode"], "prove");
+        assert_eq!(prove["lifecycle_action"], "prove-certification");
+        assert_eq!(prove["certification_decision"]["status"], "certified");
+        assert_eq!(prove["certification_decision"]["merge_ready"], true);
+        assert!(prove["certification_evidence"].as_array().unwrap().len() >= 10);
+        assert!(prove["proof_commands"].as_array().unwrap().len() >= 3);
+        assert!(prove_md.contains("Dependency Closure"));
+
+        let (upgrade, upgrade_md) = run_command(
+            &repo,
+            &["cell", "--cell-id", "auth-session", "--mode", "upgrade-plan"],
+        );
+        assert_eq!(upgrade["lifecycle_action"], "upgrade-plan");
+        assert!(!upgrade["upgrade_plan"].as_array().unwrap().is_empty());
+        assert!(upgrade_md.contains("Upgrade Plan"));
+
+        let (deprecate, deprecate_md) = run_command(
+            &repo,
+            &[
+                "cell",
+                "--cell-id",
+                "auth-session",
+                "--mode",
+                "deprecate-plan",
+            ],
+        );
+        assert_eq!(deprecate["lifecycle_action"], "deprecate-plan");
+        assert!(!deprecate["deprecation_plan"].as_array().unwrap().is_empty());
+        assert!(deprecate_md.contains("Deprecation Plan"));
+    }
+''')
+
+# ---------------------------------------------------------------------------
+# Update Phase 10 and router state.
+# ---------------------------------------------------------------------------
+
+phase_path = ROOT / "tips/phases/10-reuse-registry-certified-cells.md"
+phase = phase_path.read_text(encoding="utf-8")
+phase = phase.replace(
+    "# Phase 10: Reuse Registry Certified Cells Status: partial",
+    "# Phase 10: Reuse Registry Certified Cells Status: hardened",
+    1,
+)
+if "## Hardened completion addendum" not in phase:
+    phase = phase.rstrip() + "\n\n" + textwrap.dedent("""
+        ## Hardened completion addendum
+
+        Phase 10 is hardened when the registry proves four reusable primitives from live repo surfaces:
+
+        1. `audit-log`
+        2. `crud-resource`
+        3. `rbac`
+        4. `auth-session`
+
+        The `auth-session` cell is intentionally a provider-neutral shell. It certifies session identity, token-hash storage, expiry/revocation decisions, session contract shape, DB migration evidence, UX route-state coverage, security assumptions, observability events, upgrade notes, and rollback/deprecation guidance. Provider-backed auth remains deferred to adapter/provider cells because OAuth, SAML, passkeys, signing keys, and credential verification are higher-risk integration surfaces.
+
+        The registry is now dependency-bound: dependent cells add required dependency evidence and cannot claim certification if an upstream certified cell is missing or downgraded. `jankurai cell --cell-id auth-session --mode prove` emits the dependency closure, evidence, proof commands, and certification decision. `upgrade-plan` and `deprecate-plan` are metadata-only lifecycle plans that preserve the no-silent-overwrite install contract while keeping real mutation deferred.
+    """).strip() + "\n"
+phase_path.write_text(phase, encoding="utf-8")
+
+router_path = ROOT / "tips/phases/00-phase-index.md"
+router = router_path.read_text(encoding="utf-8")
+router = router.replace(
+    "| 10 | complete-with-deferred-work | certified cells exist; mutating/provider-backed cells remain deferred |",
+    "| 10 | hardened | four certified cells exist, including auth/session; mutating/provider-backed installs remain deferred |",
+    1,
+)
+router_path.write_text(router, encoding="utf-8")
+PY
+
+cargo fmt -p jankurai
+git diff --check -- \
+  crates/jankurai/src/commands/cell_catalog.rs \
+  crates/jankurai/src/commands/cell.rs \
+  crates/jankurai/src/main.rs \
+  crates/jankurai/tests/phase10_auth_session_cell_smoke.rs \
+  examples/perfect-web-api-db/backend/src/lib.rs \
+  examples/perfect-web-api-db/backend/src/auth_session.rs \
+  examples/perfect-web-api-db/contracts/auth-session.openapi.json \
+  examples/perfect-web-api-db/db/migrations/002_auth_sessions.sql \
+  examples/perfect-web-api-db/db/constraints/002_auth_sessions.sql \
+  examples/perfect-web-api-db/docs/auth-session-cell.md \
+  examples/perfect-web-api-db/ops/auth-session-security.md \
+  examples/perfect-web-api-db/ux/auth-session-routes.md \
+  tips/phases/10-reuse-registry-certified-cells.md \
+  tips/phases/00-phase-index.md \
+  tips/phases/logs/10-reuse-registry-certified-cells.log
+
+cargo test -p jankurai
+
+cargo run -p jankurai -- registry \
+  --out target/jankurai/p10-registry-hardened.json \
+  --md target/jankurai/p10-registry-hardened.md
+
+cargo run -p jankurai -- cell --cell-id auth-session --mode prove \
+  --out target/jankurai/p10-auth-session-cell-prove.json \
+  --md target/jankurai/p10-auth-session-cell-prove.md
+
+cargo run -p jankurai -- cell --cell-id auth-session --mode upgrade-plan \
+  --out target/jankurai/p10-auth-session-cell-upgrade.json \
+  --md target/jankurai/p10-auth-session-cell-upgrade.md
+
+cargo run -p jankurai -- cell --cell-id auth-session --mode deprecate-plan \
+  --out target/jankurai/p10-auth-session-cell-deprecate.json \
+  --md target/jankurai/p10-auth-session-cell-deprecate.md
+
+cargo run -p jankurai -- lane . \
+  --changed crates/jankurai/src/commands/cell_catalog.rs \
+  --changed crates/jankurai/src/commands/cell.rs \
+  --changed crates/jankurai/tests/phase10_auth_session_cell_smoke.rs \
+  --changed examples/perfect-web-api-db/backend/src/auth_session.rs \
+  --changed examples/perfect-web-api-db/contracts/auth-session.openapi.json \
+  --changed examples/perfect-web-api-db/db/migrations/002_auth_sessions.sql \
+  --changed examples/perfect-web-api-db/ux/auth-session-routes.md \
+  --out target/jankurai/p10-auth-session-cell-lane.json \
+  --md target/jankurai/p10-auth-session-cell-lane.md
+
+just fast
+just score
+
+FINISH_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+FINISH_SHA="$(git rev-parse HEAD 2>/dev/null || echo pending)"
+VALIDATION="cargo fmt -p jankurai;git diff --check;cargo test -p jankurai;cargo run -p jankurai -- registry;cargo run -p jankurai -- cell --cell-id auth-session --mode prove;cargo run -p jankurai -- cell --cell-id auth-session --mode upgrade-plan;cargo run -p jankurai -- cell --cell-id auth-session --mode deprecate-plan;cargo run -p jankurai -- lane . --changed phase10 auth-session paths;just fast;just score"
+ARTIFACTS="target/jankurai/p10-registry-hardened.json;target/jankurai/p10-registry-hardened.md;target/jankurai/p10-auth-session-cell-prove.json;target/jankurai/p10-auth-session-cell-prove.md;target/jankurai/p10-auth-session-cell-upgrade.json;target/jankurai/p10-auth-session-cell-upgrade.md;target/jankurai/p10-auth-session-cell-deprecate.json;target/jankurai/p10-auth-session-cell-deprecate.md;target/jankurai/p10-auth-session-cell-lane.json;target/jankurai/p10-auth-session-cell-lane.md;target/jankurai/fast-score.json;target/jankurai/fast-score.md;agent/repo-score.json;agent/repo-score.md"
+
+printf '%s | codex | 10 | finish | %s | %s | %s | %s | Phase 10 hardened: auth-session is the fourth certified dependency-bound cell; mutating/provider-backed installs remain deferred by design\n' \
+  "$FINISH_TS" "$CHANGED_PATHS" "$VALIDATION" "$ARTIFACTS" "$FINISH_SHA" >> "$PHASE_LOG"
+
+echo "Phase 10 hardened. Review target/jankurai/p10-*.{json,md} and git diff before committing."
+```
+
+### What this completes
+
+This makes Phase 10 materially stronger in four ways.
+
+First, the registry now has the fourth high-value certified cell, `auth-session`, matching the phase’s own cell order and the current handoff log. The cell is not a vague label: it has source, OpenAPI contract, PostgreSQL migration, DB constraint mapping, UX route matrix, security assumptions, observability events, docs, upgrade notes, rollback notes, and proof lanes.
+
+Second, certification becomes dependency-bound. `crud-resource` depends on `audit-log`, `rbac` depends on `crud-resource`, and `auth-session` depends on both `rbac` and `audit-log`. If an upstream dependency stops being certified, the dependent cell stops being fully merge-ready.
+
+Third, `jankurai cell` gains metadata lifecycle modes without enabling unsafe mutation: `prove`, `upgrade-plan`, and `deprecate-plan`. This satisfies the phase’s install/prove/upgrade/deprecate metadata contract while keeping real provider-backed writes deferred.
+
+Fourth, the tests prove the hardened behavior: the registry must expose at least four cells, `auth-session` must be certified, dependency evidence must be present, content-marker evidence must be present, security and UX lanes must be present, and the lifecycle plan modes must emit evidence-bound outputs.
+
+I have not executed this patch in your working tree. The script includes the validation sequence I would expect to run before commit.
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/00-phase-index.md "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/logs/10-reuse-registry-certified-cells.log "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/13-autonomous-repair-optimization.md "raw.githubusercontent.com"
+

@@ -1,0 +1,2175 @@
+# Copy-Paste Implementation Pack: `jankurai-proofprint`
+
+This is a single standalone Markdown file. All proposed implementation files are embedded below as fenced code blocks; no sidecar files are required.
+
+---
+
+**One-line idea:** add a Rust cargo subcommand, `cargo proofprint`, that turns `cargo test` from “the tests passed” into a Jankurai-compatible, tamper-evident proof that changed Rust behavior was actually exercised, mutation-checked, and security-negative-tested.
+
+**Recommended crate name:** `jankurai-proofprint`  
+**Installed binary:** `cargo-proofprint`  
+**User command:** `cargo proofprint ...`  
+**Jankurai lane:** `proofprint`  
+**Primary rule closed:** `HLT-008-FALSE-GREEN-RISK`  
+**Secondary rules strengthened:** `HLT-022-AUTHZ-ISOLATION-GAP`, `HLT-023-INPUT-BOUNDARY-GAP`, `HLT-027-HUMAN-REVIEW-EVIDENCE-GAP`, `HLT-016-SUPPLY-CHAIN-DRIFT`
+
+---
+
+## 1. Executive decision
+
+The single highest-value new crate for Jankurai is **not another generic scanner**. Jankurai already has the right control-plane primitives: owner maps, proof lanes, generated-zone policy, security evidence, UX evidence, merge witnesses, local receipts, rolling scores, and ratchets.
+
+The biggest remaining gap is the gap Jankurai itself names: **a false-green proof lane**. A repo can have clean owner routing, correct proof-lane selection, successful `cargo test`, and still merge code whose changed behavior was never asserted. That is the most dangerous “vibe coding” failure because it looks like governance succeeded.
+
+`jankurai-proofprint` fixes that by binding four facts together:
+
+1. **Changed Rust items**: functions, impl methods, structs/enums, modules, and hunks touched by the PR.
+2. **Execution evidence**: which changed lines/items were actually hit by tests, using `cargo llvm-cov` when available.
+3. **Behavior evidence**: whether focused mutants inside changed items were killed by the mapped test command.
+4. **Security-negative evidence**: whether changed authz, tenant, input, filesystem, process, SQL, deserialization, unsafe, or panic/unwrap surfaces have negative tests or survive behavior mutants.
+
+The output is a Jankurai-native artifact:
+
+```text
+target/jankurai/proofprint/proofprint.json
+target/jankurai/proofprint/proofprint.md
+target/jankurai/proof-receipts/proofprint.json
+```
+
+A Jankurai merge witness can then say:
+
+> This PR changed `AuthorizeRefund::check`. The owner and test-map route were valid. The mapped lane ran. The changed item was covered. Mutants that weakened the role check and tenant check were killed. The proofprint receipt is tied to this git head, command digest, file digests, and coverage/mutation artifacts. Merge proof passes.
+
+That is dramatically stronger than:
+
+> `cargo test` passed.
+
+---
+
+## 2. Why this is the #1 feature, not just a nice-to-have
+
+### 2.1 Jankurai’s current architecture already creates the perfect landing zone
+
+Jankurai’s README defines the project as a local conformance standard and CLI for auditable AI-assisted merge. It turns ownership maps, proof lanes, generated zones, security boundaries, rolling scores, merge witnesses, and repair queues into files humans and agents can read. It also leaves predictable JSON/Markdown reports, proof artifacts, and command evidence under `target/jankurai/`.
+
+The daily loop already asks agents to:
+
+```bash
+jankurai context-pack ...
+jankurai prove ...
+jankurai audit ...
+jankurai witness ...
+```
+
+That means Jankurai already knows **what changed**, **which proof lane should run**, and **where evidence should live**. What it does not yet know deeply enough is whether the proof lane actually made the changed behavior matter.
+
+### 2.2 It directly closes `HLT-008-FALSE-GREEN-RISK`
+
+The paper companion defines:
+
+```text
+HLT-008-FALSE-GREEN-RISK: tests must prove the changed behavior, not just pass nearby.
+```
+
+This is the exact problem `jankurai-proofprint` is built to solve.
+
+### 2.3 It upgrades a universal developer habit: `cargo test`
+
+The popular standard piece of code people already depend on is **Cargo’s test workflow**. The new crate does not replace `cargo test`, `nextest`, `cargo-llvm-cov`, `cargo-mutants`, `cargo-deny`, or `cargo-vet`. It composes them into the thing Jankurai needs: **proof receipts that bind a changed path to actual behavioral evidence**.
+
+### 2.4 It is agent-first
+
+Agents need narrow, replayable, machine-readable feedback:
+
+- which changed item is unproved;
+- which mutant survived;
+- what negative test is missing;
+- what command to rerun;
+- what file owner and proof lane apply;
+- which artifact hashes make the claim replayable.
+
+`jankurai-proofprint` emits all of that directly.
+
+### 2.5 It improves security without pretending static analysis is enough
+
+A security scanner may say “no known dependency vulnerabilities.” A coverage report may say “the line ran.” Neither proves a changed authorization branch rejects the wrong tenant, or that a path traversal input is blocked.
+
+`jankurai-proofprint` uses cheap static signals to classify changed code as boundary-sensitive, then requires stronger behavior proof for those changed items. This is especially important because current LLM coding workflows often produce plausible code while missing security context.
+
+---
+
+## 3. Product shape
+
+### 3.1 Commands
+
+```bash
+# Install locally/CI
+cargo install --locked jankurai-proofprint
+
+# Create a proof plan without running expensive checks
+cargo proofprint plan \
+  --repo . \
+  --changed-from origin/main \
+  --out target/jankurai/proofprint/plan.json \
+  --md target/jankurai/proofprint/plan.md
+
+# Run mapped proof with coverage + focused mutation + security-negative signals
+cargo proofprint run \
+  --repo . \
+  --changed-from origin/main \
+  --test-cmd "cargo test -p jankurai" \
+  --max-mutants 32 \
+  --out target/jankurai/proofprint/proofprint.json \
+  --md target/jankurai/proofprint/proofprint.md \
+  --receipt target/jankurai/proof-receipts/proofprint.json
+
+# Verify that report and receipt still bind to the current files/head
+cargo proofprint verify \
+  --repo . \
+  --report target/jankurai/proofprint/proofprint.json \
+  --receipt target/jankurai/proof-receipts/proofprint.json
+```
+
+### 3.2 Jankurai wrapper command
+
+```bash
+jankurai proofprint . \
+  --changed-from origin/main \
+  --test-cmd "cargo test -p jankurai" \
+  --out target/jankurai/proofprint/proofprint.json \
+  --md target/jankurai/proofprint/proofprint.md \
+  --receipt target/jankurai/proof-receipts/proofprint.json
+```
+
+Internally this shells to `cargo proofprint run` so the standalone crate remains useful outside Jankurai.
+
+### 3.3 Default CI lane
+
+```toml
+[[lane]]
+name = "proofprint"
+command = "cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai' --out target/jankurai/proofprint/proofprint.json --md target/jankurai/proofprint/proofprint.md --receipt target/jankurai/proof-receipts/proofprint.json"
+purpose = "prove changed Rust behavior via change-scoped coverage, mutation-kill evidence, and boundary-negative signals"
+command_id = "lane.proofprint"
+kind = "validation"
+cost = 25
+rules_covered = ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP", "HLT-023-INPUT-BOUNDARY-GAP", "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"]
+required_artifacts = [
+  "target/jankurai/proofprint/proofprint.json",
+  "target/jankurai/proofprint/proofprint.md",
+  "target/jankurai/proof-receipts/proofprint.json"
+]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+```
+
+---
+
+## 4. Decisions and thresholds
+
+### 4.1 Report decision
+
+`jankurai-proofprint` emits one of these decisions:
+
+| Decision | Meaning |
+|---|---|
+| `pass` | Changed Rust behavior has enough coverage and mutation evidence; boundary-sensitive changes have negative proof or killed boundary mutants. |
+| `review` | Evidence is partial but not clearly false-green; useful in observe/advisory modes. |
+| `block` | A changed behavior item is unexecuted, has survived mutants, or is boundary-sensitive with missing negative proof. |
+| `skipped` | No Rust code changed or tool deliberately skipped by policy. |
+
+### 4.2 Default thresholds
+
+```toml
+[proofprint]
+minimum_changed_line_coverage = 0.80
+minimum_changed_item_coverage = 0.90
+minimum_mutation_kill_ratio = 0.70
+minimum_boundary_mutation_kill_ratio = 0.90
+max_mutants = 32
+block_on_uncovered_boundary_item = true
+block_on_survived_boundary_mutant = true
+block_on_unverified_report = true
+```
+
+The defaults should be conservative enough to catch vibe-coded behavior while still practical for adoption. Ratchet mode can tighten them over time.
+
+---
+
+## 5. Where this lives in the current stack
+
+### 5.1 New workspace crate
+
+```text
+crates/
+  jankurai/                 # existing CLI/control plane
+  jankurai-proofprint/      # new cargo subcommand and library
+```
+
+### 5.2 Jankurai core integration
+
+```text
+crates/jankurai/src/commands/proofprint.rs     # wrapper command
+crates/jankurai/src/audit/proofprint_evidence.rs
+schemas/proofprint.schema.json
+agent/proof-lanes.toml
+agent/tool-adoption.toml
+agent/test-map.json
+Justfile
+.github/workflows/*.yml
+```
+
+### 5.3 Evidence flow
+
+```text
+changed files
+  ↓
+agent/owner-map.json + agent/test-map.json
+  ↓
+jankurai proof plan
+  ↓
+cargo proofprint run
+  ↓
+target/jankurai/proofprint/proofprint.json
+  ↓
+target/jankurai/proof-receipts/proofprint.json
+  ↓
+jankurai audit + witness
+  ↓
+merge witness says pass/review/block with exact gaps
+```
+
+---
+
+## 6. Artifact contract
+
+### 6.1 `proofprint.json`
+
+```json
+{
+  "schema_version": "1.0.0",
+  "tool": "jankurai-proofprint",
+  "tool_version": "0.1.0",
+  "generated_at": "2026-05-05T00:00:00Z",
+  "repo_root": ".",
+  "git_head": "abc123",
+  "base_ref": "origin/main",
+  "dirty_worktree": false,
+  "test_command": "cargo test -p jankurai",
+  "coverage_command": "cargo llvm-cov --lcov --output-path target/jankurai/proofprint/lcov.info",
+  "changed_files": ["crates/jankurai/src/audit/mod.rs"],
+  "changed_items": [
+    {
+      "path": "crates/jankurai/src/audit/mod.rs",
+      "name": "build_report",
+      "kind": "fn",
+      "start_line": 100,
+      "end_line": 180,
+      "sha256": "..."
+    }
+  ],
+  "item_evidence": [
+    {
+      "item_key": "crates/jankurai/src/audit/mod.rs:build_report:100-180",
+      "changed_lines": [120, 121, 122],
+      "covered_changed_lines": [120, 121],
+      "coverage_ratio": 0.66,
+      "mutants_planned": 4,
+      "mutants_killed": 3,
+      "mutants_survived": 1,
+      "boundary_signals": [
+        {
+          "rule_id": "HLT-023-INPUT-BOUNDARY-GAP",
+          "signal": "serde_json::Value",
+          "line": 133,
+          "reason": "changed code parses untrusted structured input"
+        }
+      ],
+      "decision": "block",
+      "missing_evidence": [
+        "changed boundary line not covered",
+        "survived mutant: replace == with != at line 122"
+      ]
+    }
+  ],
+  "summary": {
+    "decision": "block",
+    "changed_item_count": 1,
+    "covered_changed_item_count": 0,
+    "mutants_planned": 4,
+    "mutants_killed": 3,
+    "mutants_survived": 1,
+    "boundary_signal_count": 1
+  },
+  "artifact_digests": [
+    { "path": "target/jankurai/proofprint/lcov.info", "sha256": "..." }
+  ]
+}
+```
+
+### 6.2 Proof receipt extension
+
+`jankurai-proofprint` also writes a normal Jankurai `ProofReceipt` whose `extensions.proofprint` field contains a compact summary and the report digest.
+
+```json
+{
+  "schema_version": "1.2.0",
+  "standard_version": "0.7.0",
+  "auditor_version": "0.7.0",
+  "lane": "proofprint",
+  "command": "cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai'",
+  "exit_code": 1,
+  "elapsed_ms": 94213,
+  "artifacts": [
+    "target/jankurai/proofprint/proofprint.json",
+    "target/jankurai/proofprint/proofprint.md"
+  ],
+  "changed_paths": ["crates/jankurai/src/audit/mod.rs"],
+  "rules_covered": [
+    { "rule_id": "HLT-008-FALSE-GREEN-RISK", "status": "block" },
+    { "rule_id": "HLT-023-INPUT-BOUNDARY-GAP", "status": "block" }
+  ],
+  "extensions": {
+    "proofprint": {
+      "decision": "block",
+      "report_path": "target/jankurai/proofprint/proofprint.json",
+      "report_sha256": "...",
+      "mutants_survived": 1,
+      "uncovered_changed_items": 1,
+      "boundary_signal_count": 1
+    }
+  }
+}
+```
+
+---
+
+## 7. Implementation patch bundle
+
+The following file list is sufficient for a first implementation.
+
+### 7.1 New files
+
+```text
+crates/jankurai-proofprint/Cargo.toml
+crates/jankurai-proofprint/src/main.rs
+crates/jankurai-proofprint/src/lib.rs
+crates/jankurai-proofprint/src/cli.rs
+crates/jankurai-proofprint/src/report.rs
+crates/jankurai-proofprint/src/git.rs
+crates/jankurai-proofprint/src/items.rs
+crates/jankurai-proofprint/src/coverage.rs
+crates/jankurai-proofprint/src/mutation.rs
+crates/jankurai-proofprint/src/security.rs
+crates/jankurai-proofprint/src/render.rs
+crates/jankurai-proofprint/src/verify.rs
+crates/jankurai/src/commands/proofprint.rs
+crates/jankurai/src/audit/proofprint_evidence.rs
+schemas/proofprint.schema.json
+docs/proofprint.md
+```
+
+### 7.2 Changed files
+
+```text
+Cargo.toml
+crates/jankurai/Cargo.toml
+crates/jankurai/src/main.rs
+crates/jankurai/src/commands.rs
+crates/jankurai/src/validation.rs
+crates/jankurai/src/audit/mod.rs
+agent/proof-lanes.toml
+agent/tool-adoption.toml
+agent/test-map.json
+Justfile
+.github/workflows/jankurai.yml
+docs/testing.md
+```
+
+---
+
+## 8. New crate implementation
+
+### 8.1 `Cargo.toml`
+
+```toml
+[workspace]
+members = ["crates/jankurai", "crates/jankurai-proofprint"]
+resolver = "2"
+```
+
+### 8.2 `crates/jankurai-proofprint/Cargo.toml`
+
+```toml
+[package]
+name = "jankurai-proofprint"
+version = "0.1.0"
+edition = "2021"
+description = "Change-scoped proof receipts for Rust test behavior, coverage, mutation, and boundary evidence."
+license = "MIT"
+repository = "https://github.com/jeppsontaylor/Jankurai"
+keywords = ["jankurai", "testing", "coverage", "mutation", "agent"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "cargo-proofprint"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4.5", features = ["derive"] }
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.23"
+walkdir = "2.5"
+
+[dev-dependencies]
+pretty_assertions = "1"
+```
+
+### 8.3 `crates/jankurai-proofprint/src/main.rs`
+
+```rust
+fn main() -> anyhow::Result<()> {
+    jankurai_proofprint::main_entry()
+}
+```
+
+### 8.4 `crates/jankurai-proofprint/src/lib.rs`
+
+```rust
+pub mod cli;
+pub mod coverage;
+pub mod git;
+pub mod items;
+pub mod mutation;
+pub mod render;
+pub mod report;
+pub mod security;
+pub mod verify;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use cli::{Cli, CommandKind, PlanArgs, RunArgs, VerifyArgs};
+use report::{ArtifactDigest, ProofReceipt, ProofprintReport, ProofprintSummary, RuleCoverage};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+pub const TOOL_NAME: &str = "jankurai-proofprint";
+pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const PROOFPRINT_SCHEMA_VERSION: &str = "1.0.0";
+pub const JANKURAI_PROOF_RECEIPT_SCHEMA_VERSION: &str = "1.2.0";
+pub const JANKURAI_STANDARD_VERSION: &str = "0.7.0";
+pub const JANKURAI_AUDITOR_VERSION: &str = "0.7.0";
+
+pub fn main_entry() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        CommandKind::Plan(args) => run_plan(args),
+        CommandKind::Run(args) => run(args).map(|_| ()),
+        CommandKind::Verify(args) => verify::run_verify(args),
+    }
+}
+
+pub fn run_plan(args: PlanArgs) -> Result<()> {
+    let repo = args.repo.canonicalize().context("canonicalize repo")?;
+    let changed_files = git::changed_files(&repo, args.changed_from.as_deref())?;
+    let ranges = git::changed_ranges_by_file(&repo, args.changed_from.as_deref(), &changed_files)?;
+    let changed_items = items::collect_changed_rust_items(&repo, &changed_files, &ranges)?;
+    let plan = serde_json::json!({
+        "schema_version": "1.0.0",
+        "tool": TOOL_NAME,
+        "tool_version": TOOL_VERSION,
+        "repo_root": repo.display().to_string(),
+        "base_ref": args.changed_from,
+        "changed_files": changed_files,
+        "changed_items": changed_items,
+        "recommended_command": "cargo proofprint run --changed-from origin/main --test-cmd 'cargo test'"
+    });
+    write_json(&args.out, &plan)?;
+    if let Some(md) = args.md.as_deref() {
+        fs::write(md, render::render_plan(&plan))?;
+    }
+    Ok(())
+}
+
+pub fn run(args: RunArgs) -> Result<ProofprintReport> {
+    let started = Instant::now();
+    let repo = args.repo.canonicalize().context("canonicalize repo")?;
+    fs::create_dir_all(repo.join("target/jankurai/proofprint"))?;
+    fs::create_dir_all(repo.join("target/jankurai/proof-receipts"))?;
+
+    let changed_files = git::changed_files(&repo, args.changed_from.as_deref())?;
+    let ranges = git::changed_ranges_by_file(&repo, args.changed_from.as_deref(), &changed_files)?;
+    let changed_items = items::collect_changed_rust_items(&repo, &changed_files, &ranges)?;
+
+    let coverage_path = repo.join("target/jankurai/proofprint/lcov.info");
+    let coverage = coverage::run_or_load_lcov(
+        &repo,
+        args.coverage_cmd.as_deref(),
+        args.no_coverage,
+        &coverage_path,
+    )?;
+
+    let boundary_signals = security::scan_items(&repo, &changed_items)?;
+    let mutation_results = if args.no_mutation {
+        Vec::new()
+    } else {
+        mutation::run_focused_mutants(
+            &repo,
+            &changed_items,
+            args.test_cmd.as_str(),
+            args.max_mutants,
+        )?
+    };
+
+    let item_evidence = report::build_item_evidence(
+        &changed_items,
+        &ranges,
+        &coverage,
+        &mutation_results,
+        &boundary_signals,
+    );
+    let summary = ProofprintSummary::from_item_evidence(&item_evidence);
+    let decision = summary.decision.clone();
+
+    let mut artifact_digests = Vec::new();
+    if coverage_path.is_file() {
+        artifact_digests.push(ArtifactDigest::from_path(&repo, &coverage_path)?);
+    }
+
+    let report = ProofprintReport {
+        schema_version: PROOFPRINT_SCHEMA_VERSION.to_string(),
+        tool: TOOL_NAME.to_string(),
+        tool_version: TOOL_VERSION.to_string(),
+        generated_at: now_rfc3339(),
+        repo_root: repo.display().to_string(),
+        git_head: git::git_head(&repo).unwrap_or_else(|_| "unknown".into()),
+        base_ref: args.changed_from.clone(),
+        dirty_worktree: git::dirty_worktree(&repo).unwrap_or(false),
+        test_command: args.test_cmd.clone(),
+        coverage_command: args.coverage_cmd.clone(),
+        changed_files,
+        changed_items,
+        item_evidence,
+        summary,
+        artifact_digests,
+    };
+
+    write_json(&args.out, &report)?;
+    if let Some(md) = args.md.as_deref() {
+        fs::write(md, render::render_report(&report))?;
+    }
+
+    if let Some(receipt_path) = args.receipt.as_deref() {
+        let receipt = build_receipt(&repo, &args, &report, started.elapsed().as_millis())?;
+        write_json(receipt_path, &receipt)?;
+    }
+
+    if decision == "block" {
+        anyhow::bail!("proofprint decision is block; see {}", args.out);
+    }
+    Ok(report)
+}
+
+fn build_receipt(
+    repo: &Path,
+    args: &RunArgs,
+    report: &ProofprintReport,
+    elapsed_ms: u128,
+) -> Result<ProofReceipt> {
+    let report_path = PathBuf::from(&args.out);
+    let report_sha256 = sha256_file(&report_path)?;
+    let extension = serde_json::json!({
+        "decision": report.summary.decision,
+        "report_path": display_relative(repo, &report_path),
+        "report_sha256": report_sha256,
+        "mutants_survived": report.summary.mutants_survived,
+        "uncovered_changed_items": report.summary.uncovered_changed_items,
+        "boundary_signal_count": report.summary.boundary_signal_count
+    });
+    let mut extensions = serde_json::Map::new();
+    extensions.insert("proofprint".to_string(), extension);
+
+    Ok(ProofReceipt {
+        schema_version: Some(JANKURAI_PROOF_RECEIPT_SCHEMA_VERSION.to_string()),
+        standard_version: Some(JANKURAI_STANDARD_VERSION.to_string()),
+        auditor_version: Some(JANKURAI_AUDITOR_VERSION.to_string()),
+        lane: "proofprint".to_string(),
+        command: format!("cargo proofprint run --changed-from {:?} --test-cmd {:?}", args.changed_from, args.test_cmd),
+        exit_code: if report.summary.decision == "block" { 1 } else { 0 },
+        elapsed_ms,
+        artifacts: vec![display_relative(repo, &report_path)],
+        changed_paths: report.changed_files.clone(),
+        rules_covered: vec![
+            RuleCoverage { rule_id: "HLT-008-FALSE-GREEN-RISK".into(), status: report.summary.decision.clone() },
+            RuleCoverage { rule_id: "HLT-022-AUTHZ-ISOLATION-GAP".into(), status: report.summary.decision.clone() },
+            RuleCoverage { rule_id: "HLT-023-INPUT-BOUNDARY-GAP".into(), status: report.summary.decision.clone() },
+        ],
+        generated_at: Some(now_rfc3339()),
+        git_head: Some(report.git_head.clone()),
+        dirty_worktree: Some(report.dirty_worktree),
+        artifact_digests: vec![ArtifactDigest { path: display_relative(repo, &report_path), sha256: sha256_file(&report_path)? }],
+        extensions,
+    })
+}
+
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub fn write_json<T: serde::Serialize>(path: &str, value: &T) -> Result<()> {
+    if let Some(parent) = Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let text = serde_json::to_string_pretty(value)?;
+    fs::write(path, text)?;
+    Ok(())
+}
+
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub fn display_relative(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+```
+
+### 8.5 `crates/jankurai-proofprint/src/cli.rs`
+
+```rust
+use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "cargo-proofprint", version, about = "Jankurai proof receipts for Rust tests")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: CommandKind,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CommandKind {
+    Plan(PlanArgs),
+    Run(RunArgs),
+    Verify(VerifyArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PlanArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long, value_name = "REF")]
+    pub changed_from: Option<String>,
+    #[arg(long, default_value = "target/jankurai/proofprint/plan.json")]
+    pub out: String,
+    #[arg(long)]
+    pub md: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RunArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long, value_name = "REF")]
+    pub changed_from: Option<String>,
+    #[arg(long, default_value = "cargo test")]
+    pub test_cmd: String,
+    #[arg(long)]
+    pub coverage_cmd: Option<String>,
+    #[arg(long)]
+    pub no_coverage: bool,
+    #[arg(long)]
+    pub no_mutation: bool,
+    #[arg(long, default_value_t = 32)]
+    pub max_mutants: usize,
+    #[arg(long, default_value = "target/jankurai/proofprint/proofprint.json")]
+    pub out: String,
+    #[arg(long)]
+    pub md: Option<String>,
+    #[arg(long, default_value = "target/jankurai/proof-receipts/proofprint.json")]
+    pub receipt: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct VerifyArgs {
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    #[arg(long)]
+    pub report: String,
+    #[arg(long)]
+    pub receipt: Option<String>,
+}
+```
+
+### 8.6 `crates/jankurai-proofprint/src/report.rs`
+
+```rust
+use crate::{display_relative, sha256_file};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedItem {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub sha256: String,
+}
+
+impl ChangedItem {
+    pub fn key(&self) -> String {
+        format!("{}:{}:{}-{}", self.path, self.name, self.start_line, self.end_line)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundarySignal {
+    pub item_key: String,
+    pub rule_id: String,
+    pub signal: String,
+    pub line: usize,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MutationResult {
+    pub item_key: String,
+    pub path: String,
+    pub line: usize,
+    pub description: String,
+    pub original: String,
+    pub replacement: String,
+    pub status: String,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemEvidence {
+    pub item_key: String,
+    pub changed_lines: Vec<usize>,
+    pub covered_changed_lines: Vec<usize>,
+    pub coverage_ratio: f64,
+    pub mutants_planned: usize,
+    pub mutants_killed: usize,
+    pub mutants_survived: usize,
+    pub boundary_signals: Vec<BoundarySignal>,
+    pub decision: String,
+    pub missing_evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofprintSummary {
+    pub decision: String,
+    pub changed_item_count: usize,
+    pub covered_changed_item_count: usize,
+    pub uncovered_changed_items: usize,
+    pub mutants_planned: usize,
+    pub mutants_killed: usize,
+    pub mutants_survived: usize,
+    pub boundary_signal_count: usize,
+}
+
+impl ProofprintSummary {
+    pub fn from_item_evidence(items: &[ItemEvidence]) -> Self {
+        let mutants_planned = items.iter().map(|i| i.mutants_planned).sum();
+        let mutants_killed = items.iter().map(|i| i.mutants_killed).sum();
+        let mutants_survived = items.iter().map(|i| i.mutants_survived).sum();
+        let boundary_signal_count = items.iter().map(|i| i.boundary_signals.len()).sum();
+        let covered_changed_item_count = items
+            .iter()
+            .filter(|i| i.coverage_ratio >= 0.80 && i.mutants_survived == 0)
+            .count();
+        let decision = if items.iter().any(|i| i.decision == "block") {
+            "block"
+        } else if items.iter().any(|i| i.decision == "review") {
+            "review"
+        } else if items.is_empty() {
+            "skipped"
+        } else {
+            "pass"
+        };
+        Self {
+            decision: decision.to_string(),
+            changed_item_count: items.len(),
+            covered_changed_item_count,
+            uncovered_changed_items: items.len().saturating_sub(covered_changed_item_count),
+            mutants_planned,
+            mutants_killed,
+            mutants_survived,
+            boundary_signal_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactDigest {
+    pub path: String,
+    pub sha256: String,
+}
+
+impl ArtifactDigest {
+    pub fn from_path(repo: &Path, path: &Path) -> Result<Self> {
+        Ok(Self {
+            path: display_relative(repo, path),
+            sha256: sha256_file(path)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofprintReport {
+    pub schema_version: String,
+    pub tool: String,
+    pub tool_version: String,
+    pub generated_at: String,
+    pub repo_root: String,
+    pub git_head: String,
+    pub base_ref: Option<String>,
+    pub dirty_worktree: bool,
+    pub test_command: String,
+    pub coverage_command: Option<String>,
+    pub changed_files: Vec<String>,
+    pub changed_items: Vec<ChangedItem>,
+    pub item_evidence: Vec<ItemEvidence>,
+    pub summary: ProofprintSummary,
+    pub artifact_digests: Vec<ArtifactDigest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleCoverage {
+    pub rule_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofReceipt {
+    pub schema_version: Option<String>,
+    pub standard_version: Option<String>,
+    pub auditor_version: Option<String>,
+    pub lane: String,
+    pub command: String,
+    pub exit_code: i32,
+    pub elapsed_ms: u128,
+    pub artifacts: Vec<String>,
+    pub changed_paths: Vec<String>,
+    pub rules_covered: Vec<RuleCoverage>,
+    pub generated_at: Option<String>,
+    pub git_head: Option<String>,
+    pub dirty_worktree: Option<bool>,
+    pub artifact_digests: Vec<ArtifactDigest>,
+    pub extensions: serde_json::Map<String, serde_json::Value>,
+}
+
+pub fn build_item_evidence(
+    changed_items: &[ChangedItem],
+    ranges: &BTreeMap<String, BTreeSet<usize>>,
+    coverage: &crate::coverage::CoverageMap,
+    mutations: &[MutationResult],
+    boundary_signals: &[BoundarySignal],
+) -> Vec<ItemEvidence> {
+    changed_items.iter().map(|item| {
+        let changed_lines: Vec<usize> = ranges
+            .get(&item.path)
+            .map(|lines| lines.iter().copied()
+                .filter(|line| *line >= item.start_line && *line <= item.end_line)
+                .collect())
+            .unwrap_or_else(|| (item.start_line..=item.end_line).collect());
+        let covered_changed_lines: Vec<usize> = changed_lines.iter()
+            .copied()
+            .filter(|line| coverage.is_covered(&item.path, *line))
+            .collect();
+        let coverage_ratio = if changed_lines.is_empty() {
+            1.0
+        } else {
+            covered_changed_lines.len() as f64 / changed_lines.len() as f64
+        };
+        let item_key = item.key();
+        let item_mutations: Vec<&MutationResult> = mutations.iter()
+            .filter(|m| m.item_key == item_key)
+            .collect();
+        let mutants_planned = item_mutations.len();
+        let mutants_killed = item_mutations.iter().filter(|m| m.status == "killed").count();
+        let mutants_survived = item_mutations.iter().filter(|m| m.status == "survived").count();
+        let item_boundary: Vec<BoundarySignal> = boundary_signals.iter()
+            .filter(|s| s.item_key == item_key)
+            .cloned()
+            .collect();
+        let mut missing_evidence = Vec::new();
+        if coverage_ratio < 0.80 {
+            missing_evidence.push(format!("changed-line coverage {:.0}% is below 80%", coverage_ratio * 100.0));
+        }
+        if mutants_survived > 0 {
+            missing_evidence.push(format!("{} focused mutant(s) survived", mutants_survived));
+        }
+        if !item_boundary.is_empty() && coverage_ratio < 0.90 {
+            missing_evidence.push("boundary-sensitive changed item lacks strong coverage".to_string());
+        }
+        if !item_boundary.is_empty() && mutants_survived > 0 {
+            missing_evidence.push("boundary-sensitive changed item has survived mutant(s)".to_string());
+        }
+        let decision = if !missing_evidence.is_empty() && (!item_boundary.is_empty() || mutants_survived > 0 || coverage_ratio < 0.50) {
+            "block"
+        } else if !missing_evidence.is_empty() {
+            "review"
+        } else {
+            "pass"
+        };
+        ItemEvidence {
+            item_key,
+            changed_lines,
+            covered_changed_lines,
+            coverage_ratio,
+            mutants_planned,
+            mutants_killed,
+            mutants_survived,
+            boundary_signals: item_boundary,
+            decision: decision.to_string(),
+            missing_evidence,
+        }
+    }).collect()
+}
+```
+
+### 8.7 `crates/jankurai-proofprint/src/git.rs`
+
+```rust
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::process::Command;
+
+pub fn git_head(repo: &Path) -> Result<String> {
+    git(repo, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+pub fn dirty_worktree(repo: &Path) -> Result<bool> {
+    Ok(!git(repo, &["status", "--porcelain"])?.trim().is_empty())
+}
+
+pub fn changed_files(repo: &Path, changed_from: Option<&str>) -> Result<Vec<String>> {
+    let output = if let Some(base) = changed_from {
+        git(repo, &["diff", "--name-only", base, "--"])?
+    } else {
+        git(repo, &["diff", "--name-only", "--"])?
+    };
+    Ok(output.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| line.replace('\\', "/"))
+        .collect())
+}
+
+pub fn changed_ranges_by_file(
+    repo: &Path,
+    changed_from: Option<&str>,
+    files: &[String],
+) -> Result<BTreeMap<String, BTreeSet<usize>>> {
+    let mut out = BTreeMap::new();
+    for file in files {
+        let diff = if let Some(base) = changed_from {
+            git(repo, &["diff", "--unified=0", base, "--", file])?
+        } else {
+            git(repo, &["diff", "--unified=0", "--", file])?
+        };
+        let mut lines = BTreeSet::new();
+        for line in diff.lines() {
+            if let Some(rest) = line.strip_prefix("@@ ") {
+                if let Some(range) = rest.split_whitespace().find(|part| part.starts_with('+')) {
+                    add_new_range(range, &mut lines);
+                }
+            }
+        }
+        if !lines.is_empty() {
+            out.insert(file.clone(), lines);
+        }
+    }
+    Ok(out)
+}
+
+fn add_new_range(token: &str, lines: &mut BTreeSet<usize>) {
+    let token = token.trim_start_matches('+');
+    let mut parts = token.split(',');
+    let start = parts.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+    let count = parts.next().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+    if start == 0 {
+        return;
+    }
+    for line in start..start + count.max(1) {
+        lines.insert(line);
+    }
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+```
+
+### 8.8 `crates/jankurai-proofprint/src/items.rs`
+
+```rust
+use crate::report::ChangedItem;
+use crate::sha256_bytes;
+use anyhow::{Context, Result};
+use regex::Regex;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+
+pub fn collect_changed_rust_items(
+    repo: &Path,
+    changed_files: &[String],
+    ranges: &BTreeMap<String, BTreeSet<usize>>,
+) -> Result<Vec<ChangedItem>> {
+    let mut out = Vec::new();
+    for rel in changed_files.iter().filter(|p| p.ends_with(".rs")) {
+        let path = repo.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let items = rough_rust_items(rel, &text)?;
+        let touched = ranges.get(rel);
+        for item in items {
+            let intersects = touched
+                .map(|lines| lines.iter().any(|line| *line >= item.start_line && *line <= item.end_line))
+                .unwrap_or(true);
+            if intersects {
+                out.push(item);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn rough_rust_items(path: &str, text: &str) -> Result<Vec<ChangedItem>> {
+    let re = Regex::new(r"^\s*(pub\s+)?(async\s+)?(unsafe\s+)?(fn|struct|enum|trait|impl|mod)\s+([A-Za-z0-9_]+)?")?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let line = lines[idx];
+        if let Some(caps) = re.captures(line) {
+            let kind = caps.get(4).map(|m| m.as_str()).unwrap_or("item").to_string();
+            let name = caps.get(5).map(|m| m.as_str().to_string()).unwrap_or_else(|| format!("anonymous_{}", idx + 1));
+            let start = idx + 1;
+            let end = find_item_end(&lines, idx);
+            let item_text = lines[idx..end].join("\n");
+            out.push(ChangedItem {
+                path: path.to_string(),
+                name,
+                kind,
+                start_line: start,
+                end_line: end,
+                sha256: sha256_bytes(item_text.as_bytes()),
+            });
+            idx = end;
+        } else {
+            idx += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn find_item_end(lines: &[&str], start_idx: usize) -> usize {
+    let mut depth: i32 = 0;
+    let mut saw_brace = false;
+    for (offset, line) in lines[start_idx..].iter().enumerate() {
+        for ch in line.chars() {
+            match ch {
+                '{' => { depth += 1; saw_brace = true; }
+                '}' => depth -= 1,
+                ';' if !saw_brace => return start_idx + offset + 1,
+                _ => {}
+            }
+        }
+        if saw_brace && depth <= 0 {
+            return start_idx + offset + 1;
+        }
+    }
+    lines.len()
+}
+```
+
+### 8.9 `crates/jankurai-proofprint/src/coverage.rs`
+
+```rust
+use anyhow::{Context, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[derive(Debug, Clone, Default)]
+pub struct CoverageMap {
+    covered: BTreeMap<String, BTreeSet<usize>>,
+}
+
+impl CoverageMap {
+    pub fn is_covered(&self, rel_path: &str, line: usize) -> bool {
+        self.covered
+            .get(rel_path)
+            .map(|set| set.contains(&line))
+            .unwrap_or(false)
+    }
+}
+
+pub fn run_or_load_lcov(
+    repo: &Path,
+    coverage_cmd: Option<&str>,
+    no_coverage: bool,
+    out_path: &Path,
+) -> Result<CoverageMap> {
+    if no_coverage {
+        return Ok(CoverageMap::default());
+    }
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let command = coverage_cmd
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cargo llvm-cov --lcov --output-path {}", out_path.display()));
+    let status = shell(repo, &command)
+        .with_context(|| format!("run coverage command `{command}`"))?;
+    if !status.success() {
+        // Coverage is useful but should not make the whole tool unusable on first adoption.
+        // The report will then block/review on unknown coverage for changed items.
+        return Ok(CoverageMap::default());
+    }
+    if !out_path.is_file() {
+        return Ok(CoverageMap::default());
+    }
+    parse_lcov(repo, out_path)
+}
+
+pub fn parse_lcov(repo: &Path, path: &Path) -> Result<CoverageMap> {
+    let text = fs::read_to_string(path).with_context(|| format!("read lcov {}", path.display()))?;
+    let mut current: Option<String> = None;
+    let mut covered: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+    for line in text.lines() {
+        if let Some(sf) = line.strip_prefix("SF:") {
+            let abs = PathBuf::from(sf);
+            let rel = abs.strip_prefix(repo).unwrap_or(&abs).to_string_lossy().replace('\\', "/");
+            current = Some(rel);
+        } else if let Some(da) = line.strip_prefix("DA:") {
+            if let Some(file) = current.as_ref() {
+                let mut parts = da.split(',');
+                let line_no = parts.next().and_then(|v| v.parse::<usize>().ok());
+                let hits = parts.next().and_then(|v| v.parse::<u64>().ok());
+                if let (Some(line_no), Some(hits)) = (line_no, hits) {
+                    if hits > 0 {
+                        covered.entry(file.clone()).or_default().insert(line_no);
+                    }
+                }
+            }
+        }
+    }
+    Ok(CoverageMap { covered })
+}
+
+fn shell(repo: &Path, command: &str) -> Result<std::process::ExitStatus> {
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd").args(["/C", command]).current_dir(repo).status()?;
+    #[cfg(not(target_os = "windows"))]
+    let status = Command::new("sh").args(["-lc", command]).current_dir(repo).status()?;
+    Ok(status)
+}
+```
+
+### 8.10 `crates/jankurai-proofprint/src/security.rs`
+
+```rust
+use crate::report::{BoundarySignal, ChangedItem};
+use anyhow::{Context, Result};
+use std::fs;
+use std::path::Path;
+
+pub fn scan_items(repo: &Path, items: &[ChangedItem]) -> Result<Vec<BoundarySignal>> {
+    let mut out = Vec::new();
+    for item in items {
+        let text = fs::read_to_string(repo.join(&item.path))
+            .with_context(|| format!("read {}", item.path))?;
+        for (idx, line) in text.lines().enumerate() {
+            let line_no = idx + 1;
+            if line_no < item.start_line || line_no > item.end_line {
+                continue;
+            }
+            for (needle, rule_id, reason) in boundary_patterns() {
+                if line.contains(needle) {
+                    out.push(BoundarySignal {
+                        item_key: item.key(),
+                        rule_id: rule_id.to_string(),
+                        signal: needle.to_string(),
+                        line: line_no,
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn boundary_patterns() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("std::process::Command", "HLT-023-INPUT-BOUNDARY-GAP", "changed code can spawn a process"),
+        ("Command::new", "HLT-023-INPUT-BOUNDARY-GAP", "changed code can spawn a process"),
+        ("std::fs", "HLT-023-INPUT-BOUNDARY-GAP", "changed code touches filesystem boundary"),
+        ("tokio::fs", "HLT-023-INPUT-BOUNDARY-GAP", "changed code touches async filesystem boundary"),
+        ("serde_json::Value", "HLT-023-INPUT-BOUNDARY-GAP", "changed code handles untrusted structured input"),
+        ("sqlx::query", "HLT-006-DIRECT-DB-WRONG-LAYER", "changed code issues SQL"),
+        ("SELECT ", "HLT-006-DIRECT-DB-WRONG-LAYER", "changed code contains SQL text"),
+        ("DELETE FROM", "HLT-021-DESTRUCTIVE-MIGRATION", "changed code contains destructive SQL text"),
+        ("tenant_id", "HLT-022-AUTHZ-ISOLATION-GAP", "changed code participates in tenant isolation"),
+        ("org_id", "HLT-022-AUTHZ-ISOLATION-GAP", "changed code participates in tenant isolation"),
+        ("user_id", "HLT-022-AUTHZ-ISOLATION-GAP", "changed code participates in user authorization"),
+        ("Authorization", "HLT-022-AUTHZ-ISOLATION-GAP", "changed code handles authorization material"),
+        ("jwt", "HLT-022-AUTHZ-ISOLATION-GAP", "changed code handles token material"),
+        ("unsafe", "HLT-023-INPUT-BOUNDARY-GAP", "changed code uses unsafe Rust"),
+        ("unwrap()", "HLT-017-OPAQUE-OBSERVABILITY", "changed code may hide repairable boundary errors"),
+        ("expect(", "HLT-017-OPAQUE-OBSERVABILITY", "changed code may panic instead of emitting typed repair evidence"),
+        ("panic!", "HLT-017-OPAQUE-OBSERVABILITY", "changed code may panic instead of emitting typed repair evidence"),
+    ]
+}
+```
+
+### 8.11 `crates/jankurai-proofprint/src/mutation.rs`
+
+```rust
+use crate::report::{ChangedItem, MutationResult};
+use anyhow::{Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+use tempfile::TempDir;
+use walkdir::WalkDir;
+
+#[derive(Debug, Clone)]
+struct Candidate {
+    item_key: String,
+    path: String,
+    line: usize,
+    description: String,
+    original: String,
+    replacement: String,
+}
+
+pub fn run_focused_mutants(
+    repo: &Path,
+    items: &[ChangedItem],
+    test_cmd: &str,
+    max_mutants: usize,
+) -> Result<Vec<MutationResult>> {
+    if items.is_empty() || max_mutants == 0 {
+        return Ok(Vec::new());
+    }
+    let mut candidates = Vec::new();
+    for item in items {
+        candidates.extend(plan_item_mutants(repo, item)?);
+        if candidates.len() >= max_mutants {
+            break;
+        }
+    }
+    candidates.truncate(max_mutants);
+
+    let mut results = Vec::new();
+    for candidate in candidates {
+        let started = Instant::now();
+        let scratch = copy_repo_to_temp(repo)?;
+        apply_candidate(scratch.path(), &candidate)?;
+        let status = shell(scratch.path(), test_cmd)?;
+        let code = status.code();
+        // Non-zero means the test command detected the injected bug. For a stricter v2,
+        // split compile-fail from killed by running `cargo check` before tests.
+        let status_text = if status.success() { "survived" } else { "killed" };
+        results.push(MutationResult {
+            item_key: candidate.item_key,
+            path: candidate.path,
+            line: candidate.line,
+            description: candidate.description,
+            original: candidate.original,
+            replacement: candidate.replacement,
+            status: status_text.to_string(),
+            exit_code: code,
+            elapsed_ms: started.elapsed().as_millis(),
+        });
+    }
+    Ok(results)
+}
+
+fn plan_item_mutants(repo: &Path, item: &ChangedItem) -> Result<Vec<Candidate>> {
+    let text = fs::read_to_string(repo.join(&item.path))
+        .with_context(|| format!("read {}", item.path))?;
+    let mut out = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+        if line_no < item.start_line || line_no > item.end_line {
+            continue;
+        }
+        for (from, to, desc) in replacements() {
+            if line.contains(from) {
+                out.push(Candidate {
+                    item_key: item.key(),
+                    path: item.path.clone(),
+                    line: line_no,
+                    description: desc.to_string(),
+                    original: from.to_string(),
+                    replacement: to.to_string(),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn replacements() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (" == ", " != ", "invert equality"),
+        (" != ", " == ", "invert inequality"),
+        (" <= ", " < ", "drop equality from lower/upper bound"),
+        (" >= ", " > ", "drop equality from lower/upper bound"),
+        (" < ", " <= ", "weaken strict comparison"),
+        (" > ", " >= ", "weaken strict comparison"),
+        (" true", " false", "flip boolean literal"),
+        (" false", " true", "flip boolean literal"),
+        (".is_some()", ".is_none()", "invert option presence check"),
+        (".is_none()", ".is_some()", "invert option absence check"),
+        ("&&", "||", "weaken conjunction"),
+        ("||", "&&", "strengthen disjunction"),
+    ]
+}
+
+fn apply_candidate(scratch: &Path, candidate: &Candidate) -> Result<()> {
+    let path = scratch.join(&candidate.path);
+    let text = fs::read_to_string(&path)?;
+    let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
+    let Some(line) = lines.get_mut(candidate.line.saturating_sub(1)) else {
+        anyhow::bail!("candidate line not found: {}:{}", candidate.path, candidate.line);
+    };
+    *line = line.replacen(&candidate.original, &candidate.replacement, 1);
+    fs::write(&path, lines.join("\n"))?;
+    Ok(())
+}
+
+fn copy_repo_to_temp(repo: &Path) -> Result<TempDir> {
+    let tmp = tempfile::tempdir()?;
+    for entry in WalkDir::new(repo).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        let rel = path.strip_prefix(repo).unwrap();
+        if rel.as_os_str().is_empty() || should_skip(rel) {
+            continue;
+        }
+        let dest = tmp.path().join(rel);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&dest)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(path, dest)?;
+        }
+    }
+    Ok(tmp)
+}
+
+fn should_skip(rel: &Path) -> bool {
+    let text = rel.to_string_lossy().replace('\\', "/");
+    text == ".git" || text.starts_with(".git/") || text == "target" || text.starts_with("target/")
+}
+
+fn shell(repo: &Path, command: &str) -> Result<std::process::ExitStatus> {
+    #[cfg(target_os = "windows")]
+    let status = Command::new("cmd").args(["/C", command]).current_dir(repo).status()?;
+    #[cfg(not(target_os = "windows"))]
+    let status = Command::new("sh").args(["-lc", command]).current_dir(repo).status()?;
+    Ok(status)
+}
+```
+
+### 8.12 `crates/jankurai-proofprint/src/render.rs`
+
+```rust
+use crate::report::ProofprintReport;
+use serde_json::Value;
+
+pub fn render_plan(plan: &Value) -> String {
+    let changed = plan.get("changed_items").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    format!("# Proofprint Plan\n\nChanged Rust items: `{changed}`\n\n```json\n{}\n```\n", serde_json::to_string_pretty(plan).unwrap_or_default())
+}
+
+pub fn render_report(report: &ProofprintReport) -> String {
+    let mut out = String::new();
+    out.push_str("# Jankurai Proofprint Report\n\n");
+    out.push_str(&format!("Decision: **{}**\n\n", report.summary.decision));
+    out.push_str("## Summary\n\n");
+    out.push_str(&format!("- Changed items: `{}`\n", report.summary.changed_item_count));
+    out.push_str(&format!("- Covered changed items: `{}`\n", report.summary.covered_changed_item_count));
+    out.push_str(&format!("- Mutants planned: `{}`\n", report.summary.mutants_planned));
+    out.push_str(&format!("- Mutants killed: `{}`\n", report.summary.mutants_killed));
+    out.push_str(&format!("- Mutants survived: `{}`\n", report.summary.mutants_survived));
+    out.push_str(&format!("- Boundary signals: `{}`\n\n", report.summary.boundary_signal_count));
+    out.push_str("## Item evidence\n\n");
+    for item in &report.item_evidence {
+        out.push_str(&format!("### `{}`\n\n", item.item_key));
+        out.push_str(&format!("- Decision: **{}**\n", item.decision));
+        out.push_str(&format!("- Changed-line coverage: `{:.0}%`\n", item.coverage_ratio * 100.0));
+        out.push_str(&format!("- Mutants: `{}` killed / `{}` survived / `{}` planned\n", item.mutants_killed, item.mutants_survived, item.mutants_planned));
+        if !item.boundary_signals.is_empty() {
+            out.push_str("- Boundary signals:\n");
+            for signal in &item.boundary_signals {
+                out.push_str(&format!("  - `{}` line `{}`: {}\n", signal.rule_id, signal.line, signal.reason));
+            }
+        }
+        if !item.missing_evidence.is_empty() {
+            out.push_str("- Missing evidence:\n");
+            for gap in &item.missing_evidence {
+                out.push_str(&format!("  - {}\n", gap));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+```
+
+### 8.13 `crates/jankurai-proofprint/src/verify.rs`
+
+```rust
+use crate::cli::VerifyArgs;
+use crate::report::{ProofReceipt, ProofprintReport};
+use crate::{sha256_file, TOOL_NAME};
+use anyhow::{Context, Result};
+use std::fs;
+
+pub fn run_verify(args: VerifyArgs) -> Result<()> {
+    let report_text = fs::read_to_string(&args.report).with_context(|| format!("read {}", args.report))?;
+    let report: ProofprintReport = serde_json::from_str(&report_text)?;
+    if report.tool != TOOL_NAME {
+        anyhow::bail!("not a proofprint report: tool={}", report.tool);
+    }
+    if let Some(receipt_path) = args.receipt.as_deref() {
+        let receipt_text = fs::read_to_string(receipt_path).with_context(|| format!("read {receipt_path}"))?;
+        let receipt: ProofReceipt = serde_json::from_str(&receipt_text)?;
+        let report_hash = sha256_file(std::path::Path::new(&args.report))?;
+        let found = receipt.artifact_digests.iter().any(|digest| digest.sha256 == report_hash);
+        if !found {
+            anyhow::bail!("receipt does not contain current report digest");
+        }
+    }
+    println!("proofprint verify: ok ({})", report.summary.decision);
+    Ok(())
+}
+```
+
+---
+
+## 9. Jankurai core integration code
+
+### 9.1 `crates/jankurai/Cargo.toml`
+
+Add a dependency only when building the wrapper command as an in-workspace tool:
+
+```toml
+[dependencies]
+jankurai-proofprint = { path = "../jankurai-proofprint", version = "0.1.0" }
+```
+
+If the project wants to keep Jankurai core free of the extra dependency, the wrapper can shell out to `cargo proofprint` instead. I recommend the shell wrapper for v1 because target projects will usually install the cargo subcommand rather than vendor the library.
+
+### 9.2 `crates/jankurai/src/commands.rs`
+
+```rust
+pub mod proofprint;
+```
+
+### 9.3 `crates/jankurai/src/commands/proofprint.rs`
+
+```rust
+use anyhow::{Context, Result};
+use std::path::PathBuf;
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct ProofprintArgs {
+    pub repo: PathBuf,
+    pub changed_from: Option<String>,
+    pub test_cmd: String,
+    pub max_mutants: usize,
+    pub out: String,
+    pub md: Option<String>,
+    pub receipt: String,
+    pub no_coverage: bool,
+    pub no_mutation: bool,
+}
+
+pub fn run(args: ProofprintArgs) -> Result<()> {
+    let mut cmd = Command::new("cargo");
+    cmd.arg("proofprint")
+        .arg("run")
+        .arg("--repo")
+        .arg(&args.repo)
+        .arg("--test-cmd")
+        .arg(&args.test_cmd)
+        .arg("--max-mutants")
+        .arg(args.max_mutants.to_string())
+        .arg("--out")
+        .arg(&args.out)
+        .arg("--receipt")
+        .arg(&args.receipt);
+    if let Some(base) = args.changed_from.as_deref() {
+        cmd.arg("--changed-from").arg(base);
+    }
+    if let Some(md) = args.md.as_deref() {
+        cmd.arg("--md").arg(md);
+    }
+    if args.no_coverage {
+        cmd.arg("--no-coverage");
+    }
+    if args.no_mutation {
+        cmd.arg("--no-mutation");
+    }
+    let status = cmd
+        .current_dir(&args.repo)
+        .status()
+        .context("run cargo proofprint")?;
+    if !status.success() {
+        anyhow::bail!("cargo proofprint failed with {status}");
+    }
+    Ok(())
+}
+```
+
+### 9.4 `crates/jankurai/src/main.rs`
+
+Add to imports:
+
+```rust
+use jankurai::commands::proofprint;
+```
+
+Add to `Commands`:
+
+```rust
+Proofprint(ProofprintCliArgs),
+```
+
+Add CLI args:
+
+```rust
+#[derive(Args, Debug)]
+struct ProofprintCliArgs {
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    #[arg(long, value_name = "REF")]
+    changed_from: Option<String>,
+    #[arg(long, default_value = "cargo test")]
+    test_cmd: String,
+    #[arg(long, default_value_t = 32)]
+    max_mutants: usize,
+    #[arg(long, default_value = "target/jankurai/proofprint/proofprint.json")]
+    out: String,
+    #[arg(long, default_value = "target/jankurai/proofprint/proofprint.md")]
+    md: Option<String>,
+    #[arg(long, default_value = "target/jankurai/proof-receipts/proofprint.json")]
+    receipt: String,
+    #[arg(long)]
+    no_coverage: bool,
+    #[arg(long)]
+    no_mutation: bool,
+}
+```
+
+Add match arm:
+
+```rust
+Some(Commands::Proofprint(args)) => {
+    proofprint::run(proofprint::ProofprintArgs {
+        repo: args.repo,
+        changed_from: args.changed_from,
+        test_cmd: args.test_cmd,
+        max_mutants: args.max_mutants,
+        out: args.out,
+        md: args.md,
+        receipt: args.receipt,
+        no_coverage: args.no_coverage,
+        no_mutation: args.no_mutation,
+    })?;
+}
+```
+
+### 9.5 `crates/jankurai/src/validation.rs`
+
+Add enum variant:
+
+```rust
+ProofprintReport,
+```
+
+Add schema path:
+
+```rust
+Self::ProofprintReport => "proofprint.schema.json",
+```
+
+### 9.6 `schemas/proofprint.schema.json`
+
+This uses only schema keywords currently supported by Jankurai’s custom schema validator.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "proofprint.schema.json",
+  "title": "Jankurai Proofprint Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tool",
+    "tool_version",
+    "generated_at",
+    "repo_root",
+    "git_head",
+    "dirty_worktree",
+    "test_command",
+    "changed_files",
+    "changed_items",
+    "item_evidence",
+    "summary",
+    "artifact_digests"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "tool": { "type": "string", "const": "jankurai-proofprint" },
+    "tool_version": { "type": "string", "minLength": 1 },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "repo_root": { "type": "string" },
+    "git_head": { "type": "string" },
+    "base_ref": { "type": ["string", "null"] },
+    "dirty_worktree": { "type": "boolean" },
+    "test_command": { "type": "string", "minLength": 1 },
+    "coverage_command": { "type": ["string", "null"] },
+    "changed_files": { "type": "array", "items": { "type": "string" } },
+    "changed_items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/changed_item" }
+    },
+    "item_evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/item_evidence" }
+    },
+    "summary": { "$ref": "#/$defs/summary" },
+    "artifact_digests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact_digest" }
+    }
+  },
+  "$defs": {
+    "changed_item": {
+      "type": "object",
+      "required": ["path", "name", "kind", "start_line", "end_line", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "name": { "type": "string" },
+        "kind": { "type": "string" },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+      }
+    },
+    "boundary_signal": {
+      "type": "object",
+      "required": ["item_key", "rule_id", "signal", "line", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "item_key": { "type": "string" },
+        "rule_id": { "type": "string" },
+        "signal": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "reason": { "type": "string" }
+      }
+    },
+    "item_evidence": {
+      "type": "object",
+      "required": [
+        "item_key",
+        "changed_lines",
+        "covered_changed_lines",
+        "coverage_ratio",
+        "mutants_planned",
+        "mutants_killed",
+        "mutants_survived",
+        "boundary_signals",
+        "decision",
+        "missing_evidence"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "item_key": { "type": "string" },
+        "changed_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "covered_changed_lines": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "coverage_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+        "mutants_planned": { "type": "integer", "minimum": 0 },
+        "mutants_killed": { "type": "integer", "minimum": 0 },
+        "mutants_survived": { "type": "integer", "minimum": 0 },
+        "boundary_signals": { "type": "array", "items": { "$ref": "#/$defs/boundary_signal" } },
+        "decision": { "type": "string", "enum": ["pass", "review", "block", "skipped"] },
+        "missing_evidence": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "decision",
+        "changed_item_count",
+        "covered_changed_item_count",
+        "uncovered_changed_items",
+        "mutants_planned",
+        "mutants_killed",
+        "mutants_survived",
+        "boundary_signal_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "decision": { "type": "string", "enum": ["pass", "review", "block", "skipped"] },
+        "changed_item_count": { "type": "integer", "minimum": 0 },
+        "covered_changed_item_count": { "type": "integer", "minimum": 0 },
+        "uncovered_changed_items": { "type": "integer", "minimum": 0 },
+        "mutants_planned": { "type": "integer", "minimum": 0 },
+        "mutants_killed": { "type": "integer", "minimum": 0 },
+        "mutants_survived": { "type": "integer", "minimum": 0 },
+        "boundary_signal_count": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "artifact_digest": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+      }
+    }
+  }
+}
+```
+
+### 9.7 `crates/jankurai/src/audit/proofprint_evidence.rs`
+
+```rust
+use crate::model::Finding;
+use anyhow::Result;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Deserialize)]
+pub struct ProofprintReportLite {
+    pub summary: ProofprintSummaryLite,
+    #[serde(default)]
+    pub item_evidence: Vec<ItemEvidenceLite>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProofprintSummaryLite {
+    pub decision: String,
+    pub mutants_survived: usize,
+    pub uncovered_changed_items: usize,
+    pub boundary_signal_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ItemEvidenceLite {
+    pub item_key: String,
+    pub decision: String,
+    #[serde(default)]
+    pub missing_evidence: Vec<String>,
+}
+
+pub fn load(repo: &Path) -> Result<Option<ProofprintReportLite>> {
+    let path = repo.join("target/jankurai/proofprint/proofprint.json");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = fs::read_to_string(&path)?;
+    let report = serde_json::from_str(&text)?;
+    Ok(Some(report))
+}
+
+pub fn findings(report: &ProofprintReportLite) -> Vec<Finding> {
+    if report.summary.decision != "block" {
+        return Vec::new();
+    }
+    report.item_evidence.iter()
+        .filter(|item| item.decision == "block")
+        .map(|item| Finding {
+            severity: "high".to_string(),
+            category: "false-green-proof".to_string(),
+            path: item.item_key.split(':').next().unwrap_or("target/jankurai/proofprint/proofprint.json").to_string(),
+            problem: format!("changed behavior lacks proofprint evidence: {}", item.missing_evidence.join("; ")),
+            agent_fix: "Add a focused regression/property/negative test that kills the survived mutant or covers the changed boundary, then rerun cargo proofprint.".to_string(),
+            evidence: vec![item.item_key.clone()],
+            check_id: "proofprint.false_green".to_string(),
+            hardness: "hard".to_string(),
+            confidence: 0.90,
+            evidence_kind: "proofprint".to_string(),
+            rerun_command: "cargo proofprint run --changed-from origin/main --test-cmd 'cargo test'".to_string(),
+            fingerprint: fingerprint(&item.item_key),
+            rule_id: Some("HLT-008-FALSE-GREEN-RISK".to_string()),
+            tlr: Some("Verification and rendered UX".to_string()),
+            lane: Some("proofprint".to_string()),
+            docs_url: Some("docs/proofprint.md".to_string()),
+            owner: None,
+            line: None,
+            matched_term: None,
+            reason: Some(item.missing_evidence.join("; ")),
+        })
+        .collect()
+}
+
+fn fingerprint(text: &str) -> String {
+    let digest = Sha256::digest(text.as_bytes());
+    digest.iter().map(|b| format!("{:02x}", b)).collect()
+}
+```
+
+### 9.8 `crates/jankurai/src/audit/mod.rs`
+
+Add module:
+
+```rust
+mod proofprint_evidence;
+```
+
+Near the place where audit findings are accumulated:
+
+```rust
+if let Ok(Some(proofprint)) = proofprint_evidence::load(repo) {
+    findings.extend(proofprint_evidence::findings(&proofprint));
+}
+```
+
+Add a soft readiness summary later if desired; for MVP, emitting findings is enough.
+
+---
+
+## 10. Agent and repo configuration
+
+### 10.1 `agent/proof-lanes.toml`
+
+```toml
+[[lane]]
+name = "proofprint"
+command = "cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai' --max-mutants 32 --out target/jankurai/proofprint/proofprint.json --md target/jankurai/proofprint/proofprint.md --receipt target/jankurai/proof-receipts/proofprint.json"
+purpose = "prove changed Rust behavior via change-scoped coverage, mutation-kill evidence, and boundary-negative signals"
+command_id = "lane.proofprint"
+kind = "validation"
+cost = 25
+rules_covered = ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP", "HLT-023-INPUT-BOUNDARY-GAP", "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"]
+required_artifacts = ["target/jankurai/proofprint/proofprint.json", "target/jankurai/proofprint/proofprint.md", "target/jankurai/proof-receipts/proofprint.json"]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+```
+
+### 10.2 `agent/tool-adoption.toml`
+
+```toml
+[[tools]]
+id = "proofprint"
+mode = "auto"
+```
+
+### 10.3 `agent/test-map.json`
+
+For Jankurai’s own Rust code, replace the Rust route:
+
+```json
+"crates/jankurai/": {
+  "command": "cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai' --max-mutants 32 --out target/jankurai/proofprint/proofprint.json --md target/jankurai/proofprint/proofprint.md --receipt target/jankurai/proof-receipts/proofprint.json",
+  "purpose": "prove changed Rust behavior, not only that the nearby package tests pass"
+}
+```
+
+For faster local adoption, use this transition command:
+
+```json
+"crates/jankurai/": {
+  "command": "cargo test -p jankurai && cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai' --max-mutants 8 --out target/jankurai/proofprint/proofprint.json --md target/jankurai/proofprint/proofprint.md --receipt target/jankurai/proof-receipts/proofprint.json",
+  "purpose": "keep the existing Rust lane and add bounded false-green detection"
+}
+```
+
+### 10.4 `Justfile`
+
+```make
+proofprint:
+    cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai' --max-mutants 32 --out target/jankurai/proofprint/proofprint.json --md target/jankurai/proofprint/proofprint.md --receipt target/jankurai/proof-receipts/proofprint.json
+
+proofprint-fast:
+    cargo proofprint run --changed-from origin/main --test-cmd 'cargo test -p jankurai' --max-mutants 8 --out target/jankurai/proofprint/proofprint.json --md target/jankurai/proofprint/proofprint.md --receipt target/jankurai/proof-receipts/proofprint.json
+```
+
+### 10.5 `.github/workflows/jankurai.yml`
+
+```yaml
+name: jankurai
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  proofprint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install proof tools
+        run: |
+          cargo install --locked cargo-llvm-cov || true
+          cargo install --locked jankurai-proofprint
+      - name: Run proofprint
+        run: |
+          cargo proofprint run \
+            --changed-from origin/main \
+            --test-cmd "cargo test -p jankurai" \
+            --max-mutants 32 \
+            --out target/jankurai/proofprint/proofprint.json \
+            --md target/jankurai/proofprint/proofprint.md \
+            --receipt target/jankurai/proof-receipts/proofprint.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jankurai-proofprint
+          path: |
+            target/jankurai/proofprint/**
+            target/jankurai/proof-receipts/proofprint.json
+```
+
+---
+
+## 11. How agents use it
+
+### 11.1 Before editing
+
+Agent reads:
+
+```text
+agent/JANKURAI_STANDARD.md
+agent/owner-map.json
+agent/test-map.json
+agent/proof-lanes.toml
+```
+
+Agent identifies changed Rust paths and sees the proofprint lane.
+
+### 11.2 After editing
+
+Agent runs:
+
+```bash
+cargo proofprint run --changed-from origin/main --test-cmd "cargo test -p <package>"
+```
+
+### 11.3 If it blocks
+
+The Markdown report gives the agent a concrete repair target:
+
+```md
+### crates/domain/src/authz.rs:AuthorizeRefund::check:40-72
+
+- Decision: block
+- Changed-line coverage: 100%
+- Mutants: 2 killed / 1 survived / 3 planned
+- Boundary signals:
+  - HLT-022-AUTHZ-ISOLATION-GAP line 55: changed code participates in tenant isolation
+- Missing evidence:
+  - 1 focused mutant survived
+  - boundary-sensitive changed item has survived mutant(s)
+
+Suggested fix:
+Add a negative test where a manager from tenant A attempts to refund tenant B.
+Rerun: cargo proofprint run --changed-from origin/main --test-cmd "cargo test -p domain authz"
+```
+
+This turns vague “add more tests” feedback into a precise agent task.
+
+---
+
+## 12. Security value
+
+`jankurai-proofprint` is not a replacement for `cargo deny`, `cargo vet`, RustSec, secret scanning, SAST, SBOMs, or Jankurai’s existing `security run`. It adds the missing **behavioral security proof** layer.
+
+Examples it catches:
+
+| Change | Green test problem | Proofprint failure |
+|---|---|---|
+| Authz condition changed from `tenant_id == actor.tenant_id` to `tenant_id != actor.tenant_id` | Existing tests only assert happy path | Equality mutant survives / boundary signal `HLT-022` blocks |
+| Path cleanup refactor removes canonicalization | Tests cover valid file path only | Filesystem/input boundary signal requires negative test |
+| Error handling swaps `Err` for fallback `Ok(default)` | Typechecks and unit test still passes | Mutation survives and observability signal flags fallback/panic/unwrap risk |
+| JSON validation branch loosened | Test only checks parse succeeds | Input-boundary changed item has survived comparison/boolean mutant |
+
+---
+
+## 13. Rollout plan
+
+### Phase 0 — advisory, local only
+
+- Add crate to workspace.
+- Add `just proofprint-fast` with `--max-mutants 8`.
+- Do not block CI.
+- Store artifacts under `target/jankurai/proofprint/`.
+
+### Phase 1 — CI evidence, non-blocking
+
+- Install cargo subcommand in CI.
+- Upload proofprint artifacts.
+- Jankurai audit records readiness and warnings.
+- Tool adoption marks config present but not yet replacement.
+
+### Phase 2 — block boundary-sensitive survived mutants
+
+- Block only when:
+  - changed item has `HLT-022` or `HLT-023` boundary signals; and
+  - changed lines are uncovered or a mutant survives.
+
+### Phase 3 — ratchet all Rust behavior proof
+
+- Ratchet minimum changed-item coverage.
+- Ratchet mutation kill ratio.
+- Allow dated exceptions for known equivalent mutants.
+
+---
+
+## 14. MVP limitations and v2 upgrades
+
+### MVP limitations
+
+- Rough Rust item extraction is line-based and conservative.
+- Mutation candidates are simple text replacements.
+- Nonzero mutant command exit is treated as killed; a stricter v2 should split `killed`, `timeout`, `build_fail`, and `unviable`.
+- Coverage depends on `cargo llvm-cov` availability.
+- Boundary signals are heuristics and should route proof, not assert vulnerability.
+
+### v2 upgrades
+
+- Use `syn` spans with line locations for item extraction.
+- Support `cargo nextest` natively.
+- Import `cargo-mutants` JSON if available.
+- Add equivalent-mutant waiver files with owner, reason, expiry.
+- Add rust-analyzer type info to reduce unviable mutants.
+- Add boundary-specific mutant templates: tenant inversion, role weakening, path traversal, deserialization laxness.
+- Emit SARIF annotations for survived mutants and unproved boundary items.
+
+---
+
+## 15. Acceptance criteria
+
+The first PR should be accepted only when all are true:
+
+1. `cargo install --path crates/jankurai-proofprint --locked` succeeds.
+2. `cargo proofprint plan --changed-from origin/main` writes JSON and Markdown.
+3. `cargo proofprint run --changed-from origin/main --test-cmd "cargo test -p jankurai" --max-mutants 2` writes:
+   - `target/jankurai/proofprint/proofprint.json`
+   - `target/jankurai/proofprint/proofprint.md`
+   - `target/jankurai/proof-receipts/proofprint.json`
+4. Jankurai `doctor` or audit can validate/read the artifact without panicking.
+5. A fixture with an uncovered changed Rust function produces `review` or `block`.
+6. A fixture with a changed authz comparison and a surviving mutant produces `block` and rule `HLT-022`/`HLT-008` evidence.
+7. `jankurai witness` can see the proof receipt path as proof evidence.
+8. The default lane is deterministic and network-free.
+
+---
+
+## 16. Why this will matter outside Jankurai
+
+A standalone Rust project can adopt `cargo proofprint` without adopting all of Jankurai. It still gets:
+
+- changed-item coverage;
+- focused mutation evidence;
+- boundary-sensitive test gaps;
+- Markdown summaries for humans;
+- JSON for CI and bots.
+
+A Jankurai project gets the larger benefit: those facts become part of merge governance.
+
+That combination is the real value: **local Rust developers get a better `cargo test`; agent-native repos get proof-carrying merge evidence.**
+
+---
+
+## 17. Research and ecosystem anchors
+
+The design intentionally composes known useful primitives rather than reinventing them:
+
+- `cargo-llvm-cov` already provides Cargo-compatible LLVM source-based coverage and can export LCOV/JSON. `proofprint` consumes that evidence and binds it to changed items.
+- `cargo-mutants` shows why coverage alone is insufficient: reached code is not necessarily asserted behavior. `proofprint` brings that lesson into Jankurai’s receipt/witness model.
+- `cargo-vet` and `cargo-deny` cover dependency trust, advisories, license/source/bans, and audit gaps. `proofprint` complements them by proving first-party changed behavior.
+- Jankurai’s paper and standard already define the core principle: changed paths must map to bounded authority, proof lanes, receipts, and merge witnesses.
+- Modern AI-coding research increasingly points toward automated evaluators and security-aware workflows. `proofprint` gives coding agents a local evaluator with concrete repair feedback.
+
+---
+
+## 18. Final recommendation
+
+Build `jankurai-proofprint` first.
+
+It is the narrowest crate with the broadest leverage:
+
+- It improves the most-used Rust workflow: `cargo test`.
+- It closes Jankurai’s most important semantic gap: false-green tests.
+- It gives agents exact repair targets instead of vibes.
+- It upgrades security from “scan passed” to “negative behavior was proved.”
+- It integrates naturally with the existing proof lane, receipt, evidence index, witness, and ratchet model.
+
+The best possible outcome is that future Jankurai PRs no longer say:
+
+> Tests passed.
+
+They say:
+
+> The changed behavior has a proofprint.

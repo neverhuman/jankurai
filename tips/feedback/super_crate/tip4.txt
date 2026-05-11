@@ -1,0 +1,2637 @@
+# Copy-ready single-file implementation: `jankurai-proofcell`
+
+This is one self-contained Markdown file. All proposed implementation files are embedded below as fenced code blocks, including Rust source, schemas, Jankurai integration snippets, docs, CI, fixtures, and acceptance tests.
+
+---
+
+# Jankurai ProofCell: the one crate I would add
+
+**Proposed crate:** `jankurai-proofcell`  
+**Import name:** `jankurai_proofcell`  
+**Cargo subcommand:** `cargo jankurai-proofcell`  
+**Jankurai command:** `jankurai proofcell verify`  
+**Primary output:** `target/jankurai/proof-cells/index.json` plus a Jankurai-compatible proof receipt  
+**Core value:** turn `cargo test` from an unstructured green/red signal into behavior-linked, owner-routed, security-aware, tamper-evident proof that Jankurai can use in the merge witness.
+
+---
+
+## 1. Executive decision
+
+The best single new crate is **`jankurai-proofcell`**, a small Rust dev-tooling crate that makes tests carry machine-readable proof metadata.
+
+Jankurai already has the right control-plane: owner maps, test maps, proof lanes, proof receipts, security and UX evidence, merge witnesses, score history, and repair queues. The biggest remaining gap is that a passing proof lane can still be a **false green**: tests might be shallow, over-mocked, snapshot-only, missing assertions, missing negative authorization/input cases, unrelated to the changed behavior, or impossible for an agent to map back to the product invariant being claimed.
+
+`jankurai-proofcell` upgrades the most common Rust proof primitive, `cargo test`, into a Jankurai-native evidence source. It gives each important test a **ProofCell**:
+
+```rust
+use jankurai_proofcell::{proof_cell, jk_assert, jk_negative};
+
+proof_cell! {
+    id: "orders.cancel.rejects_cross_tenant_user",
+    owner: "crates/application",
+    lane: "fast",
+    rules: ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP"],
+    changed: ["crates/application/src/orders/**", "crates/domain/src/orders/**"],
+    test: cancel_rejects_cross_tenant_user {
+        let result = cancel_order_as_other_tenant();
+
+        jk_negative!("cross_tenant_user_is_denied", result.is_err());
+        jk_assert!("error_has_stable_reason", result.unwrap_err().reason_code() == "ORDER_FORBIDDEN");
+    }
+}
+```
+
+When the lane runs:
+
+```bash
+cargo jankurai-proofcell run \
+  --changed-from origin/main \
+  --nextest \
+  --out target/jankurai/proof-cells/index.json \
+  --receipt target/jankurai/proof-receipts/proofcell.json
+
+cargo run -p jankurai -- witness . \
+  --changed-from origin/main \
+  --proof-receipts target/jankurai/proof-receipts \
+  --out target/jankurai/merge-witness.json \
+  --md target/jankurai/merge-witness.md
+```
+
+Jankurai can now answer the question agents usually blur:
+
+> “Which behavior, invariant, security rule, owner, and changed path did this passing test actually prove?”
+
+---
+
+## 2. Why this is the best idea for Jankurai
+
+### 2.1 It closes the most dangerous gap in the standard
+
+Jankurai’s thesis is not “run more checks.” It is “changed paths must bind to owners, proof lanes, evidence receipts, and a merge witness.” The current repo already has `jankurai prove`, `proof-verify`, `witness`, `security run`, `ux-qa`, `rust witness`, route maps, schema validation, and repair queues.
+
+That leaves one extremely high-leverage missing primitive: **semantic proof quality**.
+
+A proof receipt can say a command ran. It cannot always prove that the tests were relevant, had real assertions, covered the changed behavior, included negative cases for authz/input boundaries, avoided fake mocks, or were tied to stable rule IDs.
+
+`jankurai-proofcell` gives Jankurai a first-class way to detect and repair:
+
+- `HLT-008-FALSE-GREEN-RISK`
+- `HLT-022-AUTHZ-ISOLATION-GAP`
+- `HLT-023-INPUT-BOUNDARY-GAP`
+- `HLT-018-PERF-CONCURRENCY-DRIFT`
+- `HLT-027-HUMAN-REVIEW-EVIDENCE-GAP`
+- parts of `HLT-016-SUPPLY-CHAIN-DRIFT` when dependency changes require extra proof
+
+### 2.2 It improves a standard piece of code everyone depends on
+
+Almost every Rust repository already depends on `cargo test` as the default local proof gate. `cargo test` is useful, but its output is not agent-native. It is mostly a boolean: pass/fail.
+
+`jankurai-proofcell` makes `cargo test`, `cargo nextest`, `miri`, and `kani` emit durable proof receipts without requiring product runtime dependencies. It is a dev dependency and CI tool.
+
+### 2.3 It reduces vibe coding at the point agents fake confidence
+
+Agents often produce plausible tests that validate implementation details instead of product invariants. ProofCell makes the proof shape explicit:
+
+- What behavior does this prove?
+- Which owner owns it?
+- Which Jankurai rules does it cover?
+- Which changed paths does it route to?
+- How many real assertions ran?
+- Did a required negative case run?
+- Did the test use mocks, snapshots, or generated contracts?
+- Which command, commit, and artifact digests produced the receipt?
+
+### 2.4 It is low-friction enough to auto-include
+
+The crate can be added automatically by `jankurai init` as a dev-dependency and proof lane. A repository can adopt it in three steps:
+
+1. Add the crate.
+2. Wrap high-value tests with `proof_cell!` and `jk_assert!`/`jk_negative!`.
+3. Add one proof lane command.
+
+No product runtime architecture needs to change.
+
+---
+
+## 3. Research and ecosystem grounding
+
+This proposal is intentionally not another generic linter.
+
+It is a bridge between Jankurai’s proof-carrying merge model and the Rust testing/security ecosystem.
+
+Relevant ecosystem signals:
+
+- AI-generated code and AI-assisted programming can produce vulnerable code and high-confidence wrong answers, so proof receipts should not trust model confidence or shallow tests.
+- Recent research on coding-agent commits has specifically examined over-mocked tests in AI-generated changes, which matches Jankurai’s `false-green` concern.
+- `cargo-nextest` is already a widely used richer test runner with JUnit, per-test execution, retries, and better CI ergonomics.
+- `kani` can prove Rust properties with model checking when a behavior deserves stronger proof than examples.
+- `miri` can catch undefined behavior and unsafe-code issues by interpreting Rust tests.
+- `cargo-vet`, OpenSSF Scorecard, and SLSA address supply-chain trust; ProofCell should not replace them, but it should route dependency/security-sensitive changes to the right receipt.
+
+References used while designing this:
+
+- Jankurai repository: <https://github.com/jeppsontaylor/Jankurai>
+- Jankurai paper companion: <https://github.com/jeppsontaylor/Jankurai/blob/main/paper/jankurai.md>
+- Jankurai standard: <https://github.com/jeppsontaylor/Jankurai/blob/main/docs/agent-native-standard.md>
+- Jankurai testing doctrine: <https://github.com/jeppsontaylor/Jankurai/blob/main/docs/testing.md>
+- Jankurai merge witness docs: <https://github.com/jeppsontaylor/Jankurai/blob/main/docs/merge-witness.md>
+- Cargo Nextest: <https://nexte.st/>
+- Kani Rust Verifier: <https://github.com/model-checking/kani>
+- Miri: <https://github.com/rust-lang/miri>
+- cargo-vet: <https://mozilla.github.io/cargo-vet/>
+- OpenSSF Scorecard: <https://github.com/ossf/scorecard>
+- SLSA: <https://slsa.dev/>
+
+---
+
+## 4. Where it lives in the current Jankurai stack
+
+ProofCell is not a replacement for Jankurai. It is a **proof-source crate** that feeds Jankurai.
+
+```text
+repo/
+  Cargo.toml
+  crates/
+    jankurai/                         # existing CLI/auditor
+    jankurai-proofcell/               # new crate: runtime + cargo subcommand
+  schemas/
+    proof-cell.schema.json            # new
+    proof-cell-index.schema.json      # new
+  docs/
+    proofcell.md                      # new
+  agent/
+    proof-lanes.toml                  # add proofcell lane
+    test-map.json                     # route Rust paths to proofcell lane where adopted
+    tool-adoption.toml                # add proofcell tool entry
+  target/jankurai/
+    proof-cells/
+      events.ndjson                   # volatile test events
+      index.json                      # durable aggregate proof evidence
+    proof-receipts/
+      proofcell.json                  # Jankurai-compatible receipt
+```
+
+### Stack position
+
+```text
+changed paths
+   │
+   ▼
+agent/owner-map.json + agent/test-map.json
+   │
+   ▼
+jankurai prove / proof lanes
+   │
+   ├── cargo test / cargo nextest             # existing green/red test execution
+   │       ▲
+   │       │
+   │   jankurai-proofcell                     # new: semantic proof events + index
+   │
+   ├── jankurai security run                  # existing
+   ├── jankurai ux audit                      # existing
+   └── jankurai migrate --analyze             # existing
+   │
+   ▼
+target/jankurai/proof-receipts/*.json
+   │
+   ▼
+jankurai witness
+```
+
+ProofCell’s job is to enrich the proof layer, not to decide the merge alone.
+
+---
+
+## 5. What the crate proves
+
+A ProofCell is a declared test/proof unit.
+
+It can represent:
+
+- unit test
+- integration test
+- doctest wrapper
+- property test
+- regression test
+- negative authorization test
+- input-boundary test
+- unsafe-code Miri test
+- Kani proof harness
+- public API/semver proof
+- concurrency/performance-sensitive proof
+
+Each ProofCell emits this contract:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "cell_id": "orders.cancel.rejects_cross_tenant_user",
+  "owner": "crates/application",
+  "lane": "fast",
+  "rules_covered": [
+    "HLT-008-FALSE-GREEN-RISK",
+    "HLT-022-AUTHZ-ISOLATION-GAP"
+  ],
+  "changed_path_globs": [
+    "crates/application/src/orders/**",
+    "crates/domain/src/orders/**"
+  ],
+  "assertions": 2,
+  "negative_cases": 1,
+  "mocks": [],
+  "snapshots": [],
+  "status": "pass",
+  "decision": "pass",
+  "risk_notes": [],
+  "artifacts": [],
+  "started_at": "2026-05-05T00:00:00Z",
+  "finished_at": "2026-05-05T00:00:01Z"
+}
+```
+
+The aggregate index ties cells to git, command, manifests, path routing, and artifact digests.
+
+---
+
+## 6. Merge decisions introduced by ProofCell
+
+ProofCell uses Jankurai’s existing decision vocabulary.
+
+| Condition | ProofCell decision | Typical Jankurai effect |
+|---|---|---|
+| Required cell ran, passed, has assertion evidence, route matches owner/test map | `pass` | receipt can satisfy mapped lane |
+| Cell passed but uses snapshots only, too many mocks, missing optional stronger proof | `review` | human review or repair queue |
+| Cell missing, failed, has zero assertions, or required negative cases absent | `block` | merge witness blocks |
+| Score/proof regression from baseline | delegated to Jankurai | `ratchet_fail` handled by witness |
+| Release contract lacks required proof category | delegated to Jankurai | `release_fail` handled by release gate |
+
+---
+
+## 7. How it is used by developers and agents
+
+### 7.1 After `jankurai init`
+
+`jankurai init --apply --level full` adds:
+
+```toml
+[dev-dependencies]
+jankurai-proofcell = "0.1"
+```
+
+and adds a proof lane:
+
+```toml
+[[lane]]
+name = "proofcell"
+command = "cargo jankurai-proofcell run --changed-from origin/main --nextest --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json"
+purpose = "run behavior-linked Rust proof cells and emit Jankurai proof receipts"
+command_id = "lane.proofcell"
+kind = "validation"
+cost = 12
+rules_covered = ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP", "HLT-023-INPUT-BOUNDARY-GAP", "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"]
+required_artifacts = ["target/jankurai/proof-cells/index.json", "target/jankurai/proof-receipts/proofcell.json"]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+```
+
+### 7.2 In a high-value Rust test
+
+```rust
+use jankurai_proofcell::{proof_cell, jk_assert, jk_negative};
+
+proof_cell! {
+    id: "invoices.post.prevents_duplicate_idempotency_key",
+    owner: "crates/application",
+    lane: "fast",
+    rules: ["HLT-008-FALSE-GREEN-RISK", "HLT-018-PERF-CONCURRENCY-DRIFT"],
+    changed: ["crates/application/src/invoices/**", "crates/domain/src/invoices/**"],
+    test: prevents_duplicate_idempotency_key {
+        let first = post_invoice("same-key");
+        let second = post_invoice("same-key");
+
+        jk_assert!("first_post_succeeds", first.is_ok());
+        jk_negative!("second_post_is_rejected", second.is_err());
+        jk_assert!("error_is_stable", second.unwrap_err().reason_code() == "INVOICE_DUPLICATE_IDEMPOTENCY_KEY");
+    }
+}
+```
+
+### 7.3 In CI
+
+```yaml
+- name: Jankurai proof cells
+  run: |
+    cargo jankurai-proofcell run \
+      --changed-from origin/main \
+      --nextest \
+      --out target/jankurai/proof-cells/index.json \
+      --receipt target/jankurai/proof-receipts/proofcell.json
+
+- name: Jankurai witness
+  run: |
+    cargo run -p jankurai -- witness . \
+      --changed-from origin/main \
+      --proof-receipts target/jankurai/proof-receipts \
+      --baseline agent/repo-score.json \
+      --out target/jankurai/merge-witness.json \
+      --md target/jankurai/merge-witness.md
+```
+
+---
+
+## 8. Adoption policy
+
+ProofCell should be required only where it creates real value.
+
+### Required in HL4/HL5 for
+
+- authorization and tenant/data isolation logic
+- input validation boundaries
+- durable product invariants
+- idempotency and transaction behavior
+- unsafe Rust
+- public API compatibility
+- security-sensitive generated code
+- concurrency-sensitive business flows
+
+### Advisory in HL2/HL3 for
+
+- normal leaf functions
+- internal refactors
+- low-risk pure transformations
+
+### Not required for
+
+- generated files that are already covered by generation receipts
+- docs-only changes unless docs claim proof
+- purely visual UX proof already covered by UX QA
+
+---
+
+## 9. Implementation file tree
+
+This is the minimal implementation tree.
+
+```text
+crates/jankurai-proofcell/
+  Cargo.toml
+  src/
+    lib.rs
+    model.rs
+    event.rs
+    assertions.rs
+    runner.rs
+    git.rs
+    digest.rs
+    verdict.rs
+    bin/
+      cargo-jankurai-proofcell.rs
+
+crates/jankurai/src/commands/
+  proofcell.rs                      # new integration command
+
+crates/jankurai/src/audit/
+  proofcell_artifact.rs             # new audit ingestion
+
+schemas/
+  proof-cell.schema.json
+  proof-cell-index.schema.json
+
+docs/
+  proofcell.md
+```
+
+The crate deliberately avoids a proc-macro companion for the MVP. A declarative macro is enough, keeps the “one crate” promise, and is much easier to publish/adopt.
+
+---
+
+## 10. Workspace changes
+
+### `Cargo.toml` diff
+
+```toml
+[workspace]
+members = [
+  "crates/jankurai",
+  "crates/jankurai-proofcell",
+]
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+walkdir = "2"
+```
+
+---
+
+## 11. New crate files
+
+### `crates/jankurai-proofcell/Cargo.toml`
+
+```toml
+[package]
+name = "jankurai-proofcell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Behavior-linked Rust proof receipts for Jankurai"
+repository = "https://github.com/jeppsontaylor/Jankurai"
+readme = "README.md"
+keywords = ["testing", "proof", "ci", "jankurai", "agents"]
+categories = ["development-tools::testing", "development-tools::cargo-plugins"]
+
+[lib]
+name = "jankurai_proofcell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cargo-jankurai-proofcell"
+path = "src/bin/cargo-jankurai-proofcell.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+```
+
+### `crates/jankurai-proofcell/src/lib.rs`
+
+```rust
+//! Jankurai ProofCell.
+//!
+//! This crate lets Rust tests emit behavior-linked proof evidence that can be
+//! consumed by Jankurai proof lanes and merge witnesses.
+//!
+//! MVP design goals:
+//! - dev-dependency only
+//! - no network access
+//! - one public crate
+//! - works with `cargo test` and `cargo nextest`
+//! - emits JSON/NDJSON under `target/jankurai/proof-cells/`
+
+mod assertions;
+mod digest;
+mod event;
+mod git;
+pub mod model;
+pub mod runner;
+pub mod verdict;
+
+pub use assertions::{record_assertion, record_mock, record_negative_case};
+pub use model::{AssertionKind, MockKind, ProofCellSpec};
+
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+/// Guard around one test/proof body.
+///
+/// The guard emits start/finish events and lets assertion macros attach
+/// semantic evidence to the active cell.
+pub struct ProofGuard {
+    spec: ProofCellSpec,
+    finished: bool,
+}
+
+impl ProofGuard {
+    pub fn start(spec: ProofCellSpec) -> Self {
+        assertions::enter_cell(spec.cell_id.clone());
+        let _ = event::emit_event(model::ProofEvent::CellStarted {
+            at: chrono::Utc::now().to_rfc3339(),
+            spec: spec.clone(),
+        });
+        Self {
+            spec,
+            finished: false,
+        }
+    }
+
+    pub fn pass(mut self) {
+        self.finished = true;
+        assertions::leave_cell();
+        let _ = event::emit_event(model::ProofEvent::CellFinished {
+            at: chrono::Utc::now().to_rfc3339(),
+            cell_id: self.spec.cell_id.clone(),
+            status: "pass".to_string(),
+            panic_message: None,
+        });
+    }
+
+    pub fn fail(mut self, message: String) {
+        self.finished = true;
+        assertions::leave_cell();
+        let _ = event::emit_event(model::ProofEvent::CellFinished {
+            at: chrono::Utc::now().to_rfc3339(),
+            cell_id: self.spec.cell_id.clone(),
+            status: "fail".to_string(),
+            panic_message: Some(message),
+        });
+    }
+}
+
+impl Drop for ProofGuard {
+    fn drop(&mut self) {
+        if !self.finished && !std::thread::panicking() {
+            assertions::leave_cell();
+            let _ = event::emit_event(model::ProofEvent::CellFinished {
+                at: chrono::Utc::now().to_rfc3339(),
+                cell_id: self.spec.cell_id.clone(),
+                status: "unknown".to_string(),
+                panic_message: Some("proof guard dropped without explicit finish".to_string()),
+            });
+        }
+    }
+}
+
+/// Execute one proof body and preserve panic behavior for the Rust test runner.
+pub fn run_proof_body<F>(spec: ProofCellSpec, body: F)
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    let guard = ProofGuard::start(spec);
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(()) => guard.pass(),
+        Err(payload) => {
+            guard.fail("test panicked".to_string());
+            resume_unwind(payload);
+        }
+    }
+}
+
+/// Define a `#[test]` function with Jankurai proof metadata.
+///
+/// This macro intentionally stays declarative. That keeps the MVP as a single
+/// crate instead of requiring a proc-macro crate.
+#[macro_export]
+macro_rules! proof_cell {
+    (
+        id: $id:literal,
+        owner: $owner:literal,
+        lane: $lane:literal,
+        rules: [$($rule:literal),* $(,)?],
+        changed: [$($changed:literal),* $(,)?],
+        test: $name:ident $body:block
+    ) => {
+        #[test]
+        fn $name() {
+            let __spec = $crate::ProofCellSpec {
+                cell_id: $id.to_string(),
+                owner: $owner.to_string(),
+                lane: $lane.to_string(),
+                rules_covered: vec![$($rule.to_string()),*],
+                changed_path_globs: vec![$($changed.to_string()),*],
+                proof_kind: "test".to_string(),
+                source_file: file!().to_string(),
+                source_line: line!(),
+                requires_negative_case: false,
+                max_mock_count: None,
+                tags: Vec::new(),
+            };
+            $crate::run_proof_body(__spec, || $body);
+        }
+    };
+    (
+        id: $id:literal,
+        owner: $owner:literal,
+        lane: $lane:literal,
+        rules: [$($rule:literal),* $(,)?],
+        changed: [$($changed:literal),* $(,)?],
+        requires_negative_case: $requires_negative_case:expr,
+        test: $name:ident $body:block
+    ) => {
+        #[test]
+        fn $name() {
+            let __spec = $crate::ProofCellSpec {
+                cell_id: $id.to_string(),
+                owner: $owner.to_string(),
+                lane: $lane.to_string(),
+                rules_covered: vec![$($rule.to_string()),*],
+                changed_path_globs: vec![$($changed.to_string()),*],
+                proof_kind: "test".to_string(),
+                source_file: file!().to_string(),
+                source_line: line!(),
+                requires_negative_case: $requires_negative_case,
+                max_mock_count: None,
+                tags: Vec::new(),
+            };
+            $crate::run_proof_body(__spec, || $body);
+        }
+    };
+}
+
+/// Assert a positive invariant and emit assertion evidence.
+#[macro_export]
+macro_rules! jk_assert {
+    ($assertion_id:literal, $condition:expr $(,)?) => {{
+        let __passed = $condition;
+        $crate::record_assertion(
+            $assertion_id,
+            stringify!($condition),
+            $crate::AssertionKind::Positive,
+            __passed,
+            file!(),
+            line!(),
+        );
+        assert!(__passed, "jankurai assertion failed: {}", $assertion_id);
+    }};
+}
+
+/// Assert a required negative case and emit negative-case evidence.
+#[macro_export]
+macro_rules! jk_negative {
+    ($assertion_id:literal, $condition:expr $(,)?) => {{
+        let __passed = $condition;
+        $crate::record_assertion(
+            $assertion_id,
+            stringify!($condition),
+            $crate::AssertionKind::Negative,
+            __passed,
+            file!(),
+            line!(),
+        );
+        $crate::record_negative_case($assertion_id, __passed, file!(), line!());
+        assert!(__passed, "jankurai negative-case assertion failed: {}", $assertion_id);
+    }};
+}
+
+/// Record a mock/stub usage in a proof cell.
+///
+/// Agents are allowed to use mocks, but the receipt must make mocking visible.
+#[macro_export]
+macro_rules! jk_mock {
+    ($mock_id:literal, $kind:expr $(,)?) => {{
+        $crate::record_mock($mock_id, $kind, file!(), line!());
+    }};
+}
+```
+
+### `crates/jankurai-proofcell/src/model.rs`
+
+```rust
+use serde::{Deserialize, Serialize};
+
+pub const PROOF_CELL_SCHEMA_VERSION: &str = "1.0.0";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCellSpec {
+    pub cell_id: String,
+    pub owner: String,
+    pub lane: String,
+    pub rules_covered: Vec<String>,
+    pub changed_path_globs: Vec<String>,
+    pub proof_kind: String,
+    pub source_file: String,
+    pub source_line: u32,
+    pub requires_negative_case: bool,
+    pub max_mock_count: Option<usize>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssertionKind {
+    Positive,
+    Negative,
+    Invariant,
+    Boundary,
+    Regression,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MockKind {
+    None,
+    ContractStub,
+    FakeAdapter,
+    NetworkMock,
+    DatabaseMock,
+    Clock,
+    Randomness,
+    Snapshot,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ProofEvent {
+    CellStarted {
+        at: String,
+        spec: ProofCellSpec,
+    },
+    CellFinished {
+        at: String,
+        cell_id: String,
+        status: String,
+        panic_message: Option<String>,
+    },
+    Assertion {
+        at: String,
+        cell_id: String,
+        assertion_id: String,
+        expression: String,
+        kind: AssertionKind,
+        passed: bool,
+        file: String,
+        line: u32,
+    },
+    NegativeCase {
+        at: String,
+        cell_id: String,
+        case_id: String,
+        passed: bool,
+        file: String,
+        line: u32,
+    },
+    MockUsed {
+        at: String,
+        cell_id: String,
+        mock_id: String,
+        kind: MockKind,
+        file: String,
+        line: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ArtifactDigest {
+    pub path: String,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCellReport {
+    pub schema_version: String,
+    pub cell_id: String,
+    pub owner: String,
+    pub lane: String,
+    pub rules_covered: Vec<String>,
+    pub changed_path_globs: Vec<String>,
+    pub proof_kind: String,
+    pub source_file: String,
+    pub source_line: u32,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub status: String,
+    pub decision: String,
+    pub assertions: usize,
+    pub positive_assertions: usize,
+    pub negative_assertions: usize,
+    pub negative_cases: usize,
+    pub mocks: Vec<MockObservation>,
+    pub snapshots: Vec<String>,
+    pub risk_notes: Vec<String>,
+    pub repair_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MockObservation {
+    pub mock_id: String,
+    pub kind: MockKind,
+    pub file: String,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCellIndex {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub repo_root: String,
+    pub git_head: String,
+    pub dirty_worktree: bool,
+    pub command: String,
+    pub command_exit_code: i32,
+    pub changed_from: Option<String>,
+    pub changed_paths: Vec<String>,
+    pub event_log: String,
+    pub event_log_sha256: String,
+    pub cells: Vec<ProofCellReport>,
+    pub required_cells_missing: Vec<String>,
+    pub decisions: ProofCellDecisionSummary,
+    pub artifact_digests: Vec<ArtifactDigest>,
+    pub jankurai_rules_covered: Vec<String>,
+    pub overall_decision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProofCellDecisionSummary {
+    pub pass: usize,
+    pub review: usize,
+    pub block: usize,
+}
+```
+
+### `crates/jankurai-proofcell/src/assertions.rs`
+
+```rust
+use crate::event::emit_event;
+use crate::model::{AssertionKind, MockKind, ProofEvent};
+use std::cell::RefCell;
+
+thread_local! {
+    static ACTIVE_CELL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn enter_cell(cell_id: String) {
+    ACTIVE_CELL.with(|slot| *slot.borrow_mut() = Some(cell_id));
+}
+
+pub(crate) fn leave_cell() {
+    ACTIVE_CELL.with(|slot| *slot.borrow_mut() = None);
+}
+
+fn active_cell_id() -> Option<String> {
+    ACTIVE_CELL.with(|slot| slot.borrow().clone())
+}
+
+pub fn record_assertion(
+    assertion_id: &str,
+    expression: &str,
+    kind: AssertionKind,
+    passed: bool,
+    file: &str,
+    line: u32,
+) {
+    let Some(cell_id) = active_cell_id() else {
+        return;
+    };
+    let _ = emit_event(ProofEvent::Assertion {
+        at: chrono::Utc::now().to_rfc3339(),
+        cell_id,
+        assertion_id: assertion_id.to_string(),
+        expression: expression.to_string(),
+        kind,
+        passed,
+        file: file.to_string(),
+        line,
+    });
+}
+
+pub fn record_negative_case(case_id: &str, passed: bool, file: &str, line: u32) {
+    let Some(cell_id) = active_cell_id() else {
+        return;
+    };
+    let _ = emit_event(ProofEvent::NegativeCase {
+        at: chrono::Utc::now().to_rfc3339(),
+        cell_id,
+        case_id: case_id.to_string(),
+        passed,
+        file: file.to_string(),
+        line,
+    });
+}
+
+pub fn record_mock(mock_id: &str, kind: MockKind, file: &str, line: u32) {
+    let Some(cell_id) = active_cell_id() else {
+        return;
+    };
+    let _ = emit_event(ProofEvent::MockUsed {
+        at: chrono::Utc::now().to_rfc3339(),
+        cell_id,
+        mock_id: mock_id.to_string(),
+        kind,
+        file: file.to_string(),
+        line,
+    });
+}
+```
+
+### `crates/jankurai-proofcell/src/event.rs`
+
+```rust
+use crate::model::ProofEvent;
+use anyhow::{Context, Result};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
+
+pub const EVENTS_ENV: &str = "JANKURAI_PROOFCELL_EVENTS";
+
+pub fn emit_event(event: ProofEvent) -> Result<()> {
+    let Some(path) = std::env::var_os(EVENTS_ENV).map(PathBuf::from) else {
+        // Running outside the proofcell runner should never fail tests.
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create proofcell event dir {}", parent.display()))?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open proofcell event log {}", path.display()))?;
+    let line = serde_json::to_string(&event)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+```
+
+### `crates/jankurai-proofcell/src/digest.rs`
+
+```rust
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
+
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn sha256_string(value: &str) -> String {
+    sha256_bytes(value.as_bytes())
+}
+```
+
+### `crates/jankurai-proofcell/src/git.rs`
+
+```rust
+use std::path::Path;
+use std::process::Command;
+
+pub fn git_head(repo: &Path) -> String {
+    git_output(repo, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string())
+}
+
+pub fn dirty_worktree(repo: &Path) -> bool {
+    git_output(repo, &["status", "--porcelain"])
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false)
+}
+
+pub fn changed_paths(repo: &Path, base: Option<&str>) -> Vec<String> {
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    git_output(repo, &["diff", "--name-only", base, "--"])
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+```
+
+### `crates/jankurai-proofcell/src/verdict.rs`
+
+```rust
+use crate::model::{MockKind, ProofCellReport};
+
+pub fn decide_cell(report: &mut ProofCellReport) {
+    let mut block = false;
+    let mut review = false;
+
+    if report.status != "pass" {
+        block = true;
+        report
+            .risk_notes
+            .push(format!("proof cell status is `{}`", report.status));
+        report
+            .repair_hints
+            .push("fix the failing proof cell before relying on this lane".to_string());
+    }
+
+    if report.assertions == 0 {
+        block = true;
+        report
+            .risk_notes
+            .push("proof cell executed with zero Jankurai assertions".to_string());
+        report.repair_hints.push(
+            "replace smoke-only execution with jk_assert! or jk_negative! tied to a behavior".to_string(),
+        );
+    }
+
+    if report
+        .rules_covered
+        .iter()
+        .any(|r| r.contains("AUTHZ") || r.contains("INPUT-BOUNDARY"))
+        && report.negative_cases == 0
+    {
+        block = true;
+        report
+            .risk_notes
+            .push("authz/input-boundary proof has no negative case".to_string());
+        report
+            .repair_hints
+            .push("add jk_negative! for denied role, tenant, malformed input, or unsafe sink".to_string());
+    }
+
+    let non_contract_mocks = report
+        .mocks
+        .iter()
+        .filter(|mock| !matches!(mock.kind, MockKind::ContractStub | MockKind::Clock))
+        .count();
+    if non_contract_mocks > 2 {
+        review = true;
+        report
+            .risk_notes
+            .push(format!("proof cell used {non_contract_mocks} non-contract mocks"));
+        report.repair_hints.push(
+            "prefer generated contract stubs, fake adapters, or integration containers over broad mocks"
+                .to_string(),
+        );
+    }
+
+    if !report.snapshots.is_empty() && report.assertions == report.snapshots.len() {
+        review = true;
+        report
+            .risk_notes
+            .push("snapshot-heavy proof needs semantic assertions".to_string());
+        report
+            .repair_hints
+            .push("add semantic jk_assert! checks next to snapshot updates".to_string());
+    }
+
+    report.decision = if block {
+        "block".to_string()
+    } else if review {
+        "review".to_string()
+    } else {
+        "pass".to_string()
+    };
+}
+```
+
+### `crates/jankurai-proofcell/src/runner.rs`
+
+```rust
+use crate::digest::{sha256_file, sha256_string};
+use crate::event::EVENTS_ENV;
+use crate::git;
+use crate::model::{
+    ArtifactDigest, AssertionKind, MockObservation, ProofCellDecisionSummary, ProofCellIndex,
+    ProofCellReport, ProofEvent, PROOF_CELL_SCHEMA_VERSION,
+};
+use crate::verdict::decide_cell;
+use anyhow::{bail, Context, Result};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    pub repo: PathBuf,
+    pub changed_from: Option<String>,
+    pub out: PathBuf,
+    pub receipt: Option<PathBuf>,
+    pub use_nextest: bool,
+    pub package: Option<String>,
+    pub extra_args: Vec<String>,
+    pub continue_on_error: bool,
+}
+
+pub fn run(options: RunOptions) -> Result<ProofCellIndex> {
+    let event_log = options.repo.join("target/jankurai/proof-cells/events.ndjson");
+    if let Some(parent) = event_log.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&event_log, "")?;
+
+    let command_string = command_string(&options);
+    let status = run_test_command(&options, &event_log)?;
+    let command_exit_code = status.code().unwrap_or(1);
+
+    if command_exit_code != 0 && !options.continue_on_error {
+        // Still write the index below, then return an error after persistence.
+    }
+
+    let events = read_events(&event_log)?;
+    let mut cells = aggregate_cells(events);
+    for cell in &mut cells {
+        decide_cell(cell);
+    }
+
+    let mut decisions = ProofCellDecisionSummary::default();
+    let mut rules = BTreeSet::new();
+    for cell in &cells {
+        match cell.decision.as_str() {
+            "pass" => decisions.pass += 1,
+            "review" => decisions.review += 1,
+            "block" => decisions.block += 1,
+            _ => decisions.block += 1,
+        }
+        for rule in &cell.rules_covered {
+            rules.insert(rule.clone());
+        }
+    }
+
+    let changed_paths = git::changed_paths(&options.repo, options.changed_from.as_deref());
+    let required_cells_missing = required_cells_missing_for_changed_paths(&changed_paths, &cells);
+    let overall_decision = if command_exit_code != 0
+        || decisions.block > 0
+        || !required_cells_missing.is_empty()
+    {
+        "block"
+    } else if decisions.review > 0 {
+        "review"
+    } else {
+        "pass"
+    }
+    .to_string();
+
+    let event_rel = rel(&options.repo, &event_log);
+    let event_hash = sha256_file(&event_log)?;
+    let mut artifact_digests = vec![ArtifactDigest {
+        path: event_rel.clone(),
+        sha256: event_hash.clone(),
+    }];
+
+    let index = ProofCellIndex {
+        schema_version: PROOF_CELL_SCHEMA_VERSION.to_string(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        repo_root: options.repo.display().to_string(),
+        git_head: git::git_head(&options.repo),
+        dirty_worktree: git::dirty_worktree(&options.repo),
+        command: command_string,
+        command_exit_code,
+        changed_from: options.changed_from.clone(),
+        changed_paths,
+        event_log: event_rel,
+        event_log_sha256: event_hash,
+        cells,
+        required_cells_missing,
+        decisions,
+        artifact_digests: artifact_digests.clone(),
+        jankurai_rules_covered: rules.into_iter().collect(),
+        overall_decision,
+    };
+
+    write_json(&options.out, &index)?;
+    artifact_digests.push(ArtifactDigest {
+        path: rel(&options.repo, &options.out),
+        sha256: sha256_file(&options.out)?,
+    });
+
+    if let Some(receipt_path) = &options.receipt {
+        write_jankurai_receipt(&options.repo, receipt_path, &index, &artifact_digests)?;
+    }
+
+    if index.overall_decision == "block" && !options.continue_on_error {
+        bail!("proofcell decision is block; see {}", options.out.display());
+    }
+
+    Ok(index)
+}
+
+fn run_test_command(options: &RunOptions, event_log: &Path) -> Result<std::process::ExitStatus> {
+    let mut cmd = if options.use_nextest {
+        let mut cmd = Command::new("cargo");
+        cmd.args(["nextest", "run"]);
+        cmd
+    } else {
+        let mut cmd = Command::new("cargo");
+        cmd.arg("test");
+        cmd
+    };
+
+    if let Some(package) = &options.package {
+        cmd.args(["-p", package]);
+    }
+    cmd.args(&options.extra_args);
+    cmd.env(EVENTS_ENV, event_log);
+    cmd.current_dir(&options.repo);
+    cmd.status().context("run proofcell test command")
+}
+
+fn command_string(options: &RunOptions) -> String {
+    let mut parts = if options.use_nextest {
+        vec!["cargo".to_string(), "nextest".to_string(), "run".to_string()]
+    } else {
+        vec!["cargo".to_string(), "test".to_string()]
+    };
+    if let Some(package) = &options.package {
+        parts.extend(["-p".to_string(), package.clone()]);
+    }
+    parts.extend(options.extra_args.clone());
+    parts.join(" ")
+}
+
+fn read_events(path: &Path) -> Result<Vec<ProofEvent>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut events = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: ProofEvent = serde_json::from_str(line)
+            .with_context(|| format!("parse proofcell event {} line {}", path.display(), idx + 1))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn aggregate_cells(events: Vec<ProofEvent>) -> Vec<ProofCellReport> {
+    let mut cells: BTreeMap<String, ProofCellReport> = BTreeMap::new();
+
+    for event in events {
+        match event {
+            ProofEvent::CellStarted { at, spec } => {
+                cells.entry(spec.cell_id.clone()).or_insert(ProofCellReport {
+                    schema_version: PROOF_CELL_SCHEMA_VERSION.to_string(),
+                    cell_id: spec.cell_id,
+                    owner: spec.owner,
+                    lane: spec.lane,
+                    rules_covered: spec.rules_covered,
+                    changed_path_globs: spec.changed_path_globs,
+                    proof_kind: spec.proof_kind,
+                    source_file: spec.source_file,
+                    source_line: spec.source_line,
+                    started_at: Some(at),
+                    finished_at: None,
+                    status: "started".to_string(),
+                    decision: "block".to_string(),
+                    assertions: 0,
+                    positive_assertions: 0,
+                    negative_assertions: 0,
+                    negative_cases: 0,
+                    mocks: Vec::new(),
+                    snapshots: Vec::new(),
+                    risk_notes: Vec::new(),
+                    repair_hints: Vec::new(),
+                });
+            }
+            ProofEvent::CellFinished {
+                at,
+                cell_id,
+                status,
+                panic_message,
+            } => {
+                if let Some(cell) = cells.get_mut(&cell_id) {
+                    cell.finished_at = Some(at);
+                    cell.status = status;
+                    if let Some(message) = panic_message {
+                        cell.risk_notes.push(message);
+                    }
+                }
+            }
+            ProofEvent::Assertion {
+                cell_id,
+                kind,
+                passed,
+                assertion_id,
+                ..
+            } => {
+                if let Some(cell) = cells.get_mut(&cell_id) {
+                    cell.assertions += 1;
+                    match kind {
+                        AssertionKind::Negative => cell.negative_assertions += 1,
+                        _ => cell.positive_assertions += 1,
+                    }
+                    if !passed {
+                        cell.risk_notes
+                            .push(format!("assertion `{assertion_id}` failed"));
+                    }
+                }
+            }
+            ProofEvent::NegativeCase { cell_id, passed, case_id, .. } => {
+                if let Some(cell) = cells.get_mut(&cell_id) {
+                    cell.negative_cases += 1;
+                    if !passed {
+                        cell.risk_notes
+                            .push(format!("negative case `{case_id}` failed"));
+                    }
+                }
+            }
+            ProofEvent::MockUsed {
+                cell_id,
+                mock_id,
+                kind,
+                file,
+                line,
+                ..
+            } => {
+                if let Some(cell) = cells.get_mut(&cell_id) {
+                    if matches!(kind, crate::model::MockKind::Snapshot) {
+                        cell.snapshots.push(mock_id.clone());
+                    }
+                    cell.mocks.push(MockObservation {
+                        mock_id,
+                        kind,
+                        file,
+                        line,
+                    });
+                }
+            }
+        }
+    }
+
+    cells.into_values().collect()
+}
+
+fn required_cells_missing_for_changed_paths(
+    changed_paths: &[String],
+    cells: &[ProofCellReport],
+) -> Vec<String> {
+    // MVP heuristic: if a changed Rust path is under crates/ and no proof cell
+    // declares a glob prefix that covers it, report the path as missing.
+    // Jankurai audit integration should replace this with owner/test-map routing.
+    let mut missing = Vec::new();
+    for path in changed_paths {
+        if !path.ends_with(".rs") || !path.starts_with("crates/") {
+            continue;
+        }
+        let covered = cells.iter().any(|cell| {
+            cell.changed_path_globs.iter().any(|glob| prefix_glob_matches(glob, path))
+        });
+        if !covered {
+            missing.push(path.clone());
+        }
+    }
+    missing
+}
+
+fn prefix_glob_matches(glob: &str, path: &str) -> bool {
+    if let Some(prefix) = glob.strip_suffix("/**") {
+        path.starts_with(prefix)
+    } else if let Some(prefix) = glob.strip_suffix("*") {
+        path.starts_with(prefix)
+    } else {
+        glob == path
+    }
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(value)?;
+    fs::write(path, text).with_context(|| format!("write {}", path.display()))
+}
+
+fn write_jankurai_receipt(
+    repo: &Path,
+    path: &Path,
+    index: &ProofCellIndex,
+    artifact_digests: &[ArtifactDigest],
+) -> Result<()> {
+    let receipt = serde_json::json!({
+        "schema_version": "1.2.0",
+        "standard_version": "0.7.0",
+        "auditor_version": "0.7.0",
+        "receipt_id": format!("proofcell:{}", sha256_string(&index.command)),
+        "lane": "proofcell",
+        "command": index.command,
+        "exit_code": index.command_exit_code,
+        "elapsed_ms": 0,
+        "artifacts": [rel(repo, path), index.event_log.clone(), "target/jankurai/proof-cells/index.json"],
+        "changed_paths": index.changed_paths,
+        "git_head": index.git_head,
+        "dirty_worktree": index.dirty_worktree,
+        "rules_covered": index.jankurai_rules_covered.iter().map(|rule| {
+            serde_json::json!({ "rule_id": rule, "status": index.overall_decision })
+        }).collect::<Vec<Value>>(),
+        "artifact_digests": artifact_digests,
+        "extensions": {
+            "jankurai.proofcell.index": "target/jankurai/proof-cells/index.json",
+            "jankurai.proofcell.decision": index.overall_decision,
+            "jankurai.proofcell.pass": index.decisions.pass,
+            "jankurai.proofcell.review": index.decisions.review,
+            "jankurai.proofcell.block": index.decisions.block,
+            "jankurai.proofcell.required_cells_missing": index.required_cells_missing
+        }
+    });
+    write_json(path, &receipt)
+}
+
+fn rel(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+```
+
+### `crates/jankurai-proofcell/src/bin/cargo-jankurai-proofcell.rs`
+
+```rust
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use jankurai_proofcell::runner::{self, RunOptions};
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(name = "cargo-jankurai-proofcell")]
+#[command(bin_name = "cargo jankurai-proofcell")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run Rust tests and emit Jankurai ProofCell evidence.
+    Run(RunArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RunArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+
+    #[arg(long, value_name = "REF")]
+    changed_from: Option<String>,
+
+    #[arg(long, default_value = "target/jankurai/proof-cells/index.json")]
+    out: PathBuf,
+
+    #[arg(long, default_value = "target/jankurai/proof-receipts/proofcell.json")]
+    receipt: PathBuf,
+
+    #[arg(long)]
+    nextest: bool,
+
+    #[arg(short = 'p', long)]
+    package: Option<String>,
+
+    #[arg(long)]
+    continue_on_error: bool,
+
+    /// Extra cargo test / nextest args after `--`.
+    #[arg(last = true)]
+    extra_args: Vec<OsString>,
+}
+
+fn main() -> Result<()> {
+    // Cargo subcommands receive `jankurai-proofcell` as argv[1] in some shells.
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    if args.get(1).and_then(|s| s.to_str()) == Some("jankurai-proofcell") {
+        args.remove(1);
+    }
+
+    let cli = Cli::parse_from(args);
+    match cli.command {
+        Command::Run(args) => {
+            let index = runner::run(RunOptions {
+                repo: args.repo,
+                changed_from: args.changed_from,
+                out: args.out,
+                receipt: Some(args.receipt),
+                use_nextest: args.nextest,
+                package: args.package,
+                extra_args: args
+                    .extra_args
+                    .into_iter()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .collect(),
+                continue_on_error: args.continue_on_error,
+            })?;
+            println!(
+                "proofcell: {} pass, {} review, {} block; decision={}",
+                index.decisions.pass,
+                index.decisions.review,
+                index.decisions.block,
+                index.overall_decision
+            );
+        }
+    }
+    Ok(())
+}
+```
+
+---
+
+## 12. New schemas
+
+### `schemas/proof-cell.schema.json`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/proof-cell.schema.json",
+  "title": "Jankurai ProofCell Report",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "cell_id",
+    "owner",
+    "lane",
+    "rules_covered",
+    "changed_path_globs",
+    "proof_kind",
+    "source_file",
+    "source_line",
+    "status",
+    "decision",
+    "assertions",
+    "negative_cases",
+    "mocks",
+    "risk_notes",
+    "repair_hints"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "cell_id": { "type": "string", "minLength": 1 },
+    "owner": { "type": "string", "minLength": 1 },
+    "lane": { "type": "string", "minLength": 1 },
+    "rules_covered": { "type": "array", "items": { "type": "string" } },
+    "changed_path_globs": { "type": "array", "items": { "type": "string" } },
+    "proof_kind": { "type": "string" },
+    "source_file": { "type": "string" },
+    "source_line": { "type": "integer", "minimum": 1 },
+    "started_at": { "type": ["string", "null"] },
+    "finished_at": { "type": ["string", "null"] },
+    "status": { "type": "string", "enum": ["started", "pass", "fail", "unknown"] },
+    "decision": { "type": "string", "enum": ["pass", "review", "block"] },
+    "assertions": { "type": "integer", "minimum": 0 },
+    "positive_assertions": { "type": "integer", "minimum": 0 },
+    "negative_assertions": { "type": "integer", "minimum": 0 },
+    "negative_cases": { "type": "integer", "minimum": 0 },
+    "mocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["mock_id", "kind", "file", "line"],
+        "properties": {
+          "mock_id": { "type": "string" },
+          "kind": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer", "minimum": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "snapshots": { "type": "array", "items": { "type": "string" } },
+    "risk_notes": { "type": "array", "items": { "type": "string" } },
+    "repair_hints": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}
+```
+
+### `schemas/proof-cell-index.schema.json`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/proof-cell-index.schema.json",
+  "title": "Jankurai ProofCell Index",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "repo_root",
+    "git_head",
+    "dirty_worktree",
+    "command",
+    "command_exit_code",
+    "changed_paths",
+    "event_log",
+    "event_log_sha256",
+    "cells",
+    "required_cells_missing",
+    "decisions",
+    "artifact_digests",
+    "jankurai_rules_covered",
+    "overall_decision"
+  ],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "generated_at": { "type": "string" },
+    "repo_root": { "type": "string" },
+    "git_head": { "type": "string" },
+    "dirty_worktree": { "type": "boolean" },
+    "command": { "type": "string" },
+    "command_exit_code": { "type": "integer" },
+    "changed_from": { "type": ["string", "null"] },
+    "changed_paths": { "type": "array", "items": { "type": "string" } },
+    "event_log": { "type": "string" },
+    "event_log_sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "cells": { "type": "array", "items": { "$ref": "proof-cell.schema.json" } },
+    "required_cells_missing": { "type": "array", "items": { "type": "string" } },
+    "decisions": {
+      "type": "object",
+      "required": ["pass", "review", "block"],
+      "properties": {
+        "pass": { "type": "integer", "minimum": 0 },
+        "review": { "type": "integer", "minimum": 0 },
+        "block": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "artifact_digests": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string", "minLength": 64, "maxLength": 64 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "jankurai_rules_covered": { "type": "array", "items": { "type": "string" } },
+    "overall_decision": { "type": "string", "enum": ["pass", "review", "block"] }
+  },
+  "additionalProperties": false
+}
+```
+
+---
+
+## 13. Jankurai integration files
+
+### `crates/jankurai/src/commands.rs` diff
+
+```rust
+pub mod proofcell;
+```
+
+### `crates/jankurai/src/main.rs` diff
+
+Add to `use jankurai::commands::{ ... }`:
+
+```rust
+proofcell,
+```
+
+Add command enum:
+
+```rust
+Proofcell {
+    #[command(subcommand)]
+    command: ProofcellCommand,
+},
+```
+
+Add subcommand enum:
+
+```rust
+#[derive(Subcommand, Debug)]
+enum ProofcellCommand {
+    Verify(ProofcellVerifyArgs),
+}
+```
+
+Add args:
+
+```rust
+#[derive(Args, Debug)]
+struct ProofcellVerifyArgs {
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    #[arg(long, default_value = "target/jankurai/proof-cells/index.json")]
+    index: String,
+    #[arg(long, default_value = "target/jankurai/proof-cells/verify.json")]
+    out: String,
+    #[arg(long, default_value = "target/jankurai/proof-cells/verify.md")]
+    md: String,
+    #[arg(long)]
+    strict: bool,
+}
+```
+
+Add match arm:
+
+```rust
+Some(Commands::Proofcell { command }) => match command {
+    ProofcellCommand::Verify(args) => proofcell::run_verify(proofcell::ProofcellVerifyArgs {
+        repo: args.repo,
+        index: args.index,
+        out: args.out,
+        md: args.md,
+        strict: args.strict,
+    })?,
+},
+```
+
+### `crates/jankurai/src/commands/proofcell.rs`
+
+```rust
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use crate::render::{write_json, write_markdown};
+use crate::validation::{self, ArtifactSchema};
+
+#[derive(Debug, Clone)]
+pub struct ProofcellVerifyArgs {
+    pub repo: PathBuf,
+    pub index: String,
+    pub out: String,
+    pub md: String,
+    pub strict: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCellIndexLite {
+    pub schema_version: String,
+    pub git_head: String,
+    pub command: String,
+    pub command_exit_code: i32,
+    pub cells: Vec<ProofCellLite>,
+    pub required_cells_missing: Vec<String>,
+    pub overall_decision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCellLite {
+    pub cell_id: String,
+    pub owner: String,
+    pub lane: String,
+    pub rules_covered: Vec<String>,
+    pub changed_path_globs: Vec<String>,
+    pub status: String,
+    pub decision: String,
+    pub assertions: usize,
+    pub negative_cases: usize,
+    pub risk_notes: Vec<String>,
+    pub repair_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofCellVerification {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub index_path: String,
+    pub verdict: String,
+    pub issues: Vec<String>,
+    pub cells_total: usize,
+    pub cells_pass: usize,
+    pub cells_review: usize,
+    pub cells_block: usize,
+    pub rules_covered: Vec<String>,
+}
+
+pub fn run_verify(args: ProofcellVerifyArgs) -> Result<()> {
+    let index_path = resolve(&args.repo, &args.index);
+    let text = fs::read_to_string(&index_path)
+        .with_context(|| format!("read proofcell index {}", index_path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse proofcell index {}", index_path.display()))?;
+
+    // Add ArtifactSchema::ProofCellIndex in validation.rs before enabling this.
+    validation::validate_value(&args.repo, ArtifactSchema::ProofCellIndex, &value)?;
+
+    let index: ProofCellIndexLite = serde_json::from_value(value)?;
+    let verification = verify_index(&args.index, &index);
+
+    write_json(&args.out, &serde_json::to_string_pretty(&verification)?)?;
+    write_markdown(&args.md, &render_md(&verification))?;
+
+    if args.strict && verification.verdict == "block" {
+        anyhow::bail!("proofcell verification blocked; see {}", args.md);
+    }
+    Ok(())
+}
+
+fn verify_index(index_path: &str, index: &ProofCellIndexLite) -> ProofCellVerification {
+    let mut issues = Vec::new();
+    let mut pass = 0;
+    let mut review = 0;
+    let mut block = 0;
+    let mut rules = std::collections::BTreeSet::new();
+
+    if index.command_exit_code != 0 {
+        issues.push(format!(
+            "proofcell command exited {}",
+            index.command_exit_code
+        ));
+    }
+
+    for missing in &index.required_cells_missing {
+        issues.push(format!("changed path lacks proof cell: {missing}"));
+    }
+
+    for cell in &index.cells {
+        match cell.decision.as_str() {
+            "pass" => pass += 1,
+            "review" => review += 1,
+            "block" => block += 1,
+            _ => block += 1,
+        }
+        if cell.assertions == 0 {
+            issues.push(format!("cell `{}` has zero assertions", cell.cell_id));
+        }
+        for rule in &cell.rules_covered {
+            rules.insert(rule.clone());
+        }
+    }
+
+    let verdict = if index.overall_decision == "block" || block > 0 || !issues.is_empty() {
+        "block"
+    } else if index.overall_decision == "review" || review > 0 {
+        "review"
+    } else {
+        "pass"
+    };
+
+    ProofCellVerification {
+        schema_version: "1.0.0".to_string(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        index_path: index_path.to_string(),
+        verdict: verdict.to_string(),
+        issues,
+        cells_total: index.cells.len(),
+        cells_pass: pass,
+        cells_review: review,
+        cells_block: block,
+        rules_covered: rules.into_iter().collect(),
+    }
+}
+
+fn render_md(report: &ProofCellVerification) -> String {
+    let mut out = String::new();
+    out.push_str("# Jankurai ProofCell Verification\n\n");
+    out.push_str(&format!("- Verdict: `{}`\n", report.verdict));
+    out.push_str(&format!("- Cells: `{}` pass, `{}` review, `{}` block, `{}` total\n", report.cells_pass, report.cells_review, report.cells_block, report.cells_total));
+    out.push_str("\n## Rules covered\n\n");
+    for rule in &report.rules_covered {
+        out.push_str(&format!("- `{rule}`\n"));
+    }
+    if !report.issues.is_empty() {
+        out.push_str("\n## Issues\n\n");
+        for issue in &report.issues {
+            out.push_str(&format!("- {issue}\n"));
+        }
+    }
+    out
+}
+
+fn resolve(repo: &Path, path: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    }
+}
+```
+
+### `crates/jankurai/src/validation.rs` diff
+
+```rust
+pub enum ArtifactSchema {
+    // existing variants...
+    ProofCell,
+    ProofCellIndex,
+}
+
+impl ArtifactSchema {
+    pub fn rel_path(self) -> &'static str {
+        match self {
+            // existing mappings...
+            Self::ProofCell => "proof-cell.schema.json",
+            Self::ProofCellIndex => "proof-cell-index.schema.json",
+        }
+    }
+}
+```
+
+### `crates/jankurai/src/audit/proofcell_artifact.rs`
+
+```rust
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ProofCellAuditSummary {
+    pub path: String,
+    pub present: bool,
+    pub overall_decision: String,
+    pub cells_total: usize,
+    pub cells_pass: usize,
+    pub cells_review: usize,
+    pub cells_block: usize,
+    pub required_cells_missing: Vec<String>,
+    pub rules_covered: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Index {
+    overall_decision: String,
+    cells: Vec<Cell>,
+    required_cells_missing: Vec<String>,
+    jankurai_rules_covered: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Cell {
+    decision: String,
+}
+
+pub fn read_summary(repo: &Path) -> Result<ProofCellAuditSummary> {
+    let rel = "target/jankurai/proof-cells/index.json";
+    let path = repo.join(rel);
+    if !path.is_file() {
+        return Ok(ProofCellAuditSummary {
+            path: rel.to_string(),
+            present: false,
+            overall_decision: "missing".to_string(),
+            ..Default::default()
+        });
+    }
+
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let index: Index = serde_json::from_str(&text).context("parse proofcell index")?;
+
+    let mut pass = 0;
+    let mut review = 0;
+    let mut block = 0;
+    for cell in &index.cells {
+        match cell.decision.as_str() {
+            "pass" => pass += 1,
+            "review" => review += 1,
+            "block" => block += 1,
+            _ => block += 1,
+        }
+    }
+
+    Ok(ProofCellAuditSummary {
+        path: rel.to_string(),
+        present: true,
+        overall_decision: index.overall_decision,
+        cells_total: index.cells.len(),
+        cells_pass: pass,
+        cells_review: review,
+        cells_block: block,
+        required_cells_missing: index.required_cells_missing,
+        rules_covered: index.jankurai_rules_covered,
+    })
+}
+```
+
+### `crates/jankurai/src/model.rs` diff
+
+```rust
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ProofCellReadiness {
+    pub present: bool,
+    pub path: String,
+    pub overall_decision: String,
+    pub cells_total: usize,
+    pub cells_pass: usize,
+    pub cells_review: usize,
+    pub cells_block: usize,
+    pub required_cells_missing: Vec<String>,
+    pub rules_covered: Vec<String>,
+}
+
+pub struct Report {
+    // existing fields...
+    pub proof_cell: ProofCellReadiness,
+}
+```
+
+### Audit finding behavior
+
+Add audit findings when:
+
+| ProofCell artifact condition | Finding |
+|---|---|
+| missing but Rust paths changed and tool marked required | `HLT-008-FALSE-GREEN-RISK` |
+| `overall_decision == block` | `HLT-008-FALSE-GREEN-RISK` |
+| missing negative case for authz/input rule | `HLT-022-AUTHZ-ISOLATION-GAP` or `HLT-023-INPUT-BOUNDARY-GAP` |
+| non-contract mock count above policy | `HLT-008-FALSE-GREEN-RISK` review finding |
+| proof cell index digest not referenced by proof receipt | `HLT-027-HUMAN-REVIEW-EVIDENCE-GAP` |
+
+---
+
+## 14. Agent configuration changes
+
+### `agent/proof-lanes.toml` addition
+
+```toml
+[[lane]]
+name = "proofcell"
+command = "cargo jankurai-proofcell run --changed-from origin/main --nextest --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json"
+purpose = "run behavior-linked Rust proof cells and emit Jankurai proof receipts"
+command_id = "lane.proofcell"
+kind = "validation"
+cost = 12
+rules_covered = [
+  "HLT-008-FALSE-GREEN-RISK",
+  "HLT-018-PERF-CONCURRENCY-DRIFT",
+  "HLT-022-AUTHZ-ISOLATION-GAP",
+  "HLT-023-INPUT-BOUNDARY-GAP",
+  "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"
+]
+required_artifacts = [
+  "target/jankurai/proof-cells/index.json",
+  "target/jankurai/proof-receipts/proofcell.json"
+]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+```
+
+### `agent/test-map.json` examples
+
+For Jankurai itself:
+
+```json
+{
+  "tests": {
+    "crates/jankurai/": {
+      "command": "cargo jankurai-proofcell run --changed-from origin/main --nextest --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json",
+      "purpose": "verify Rust behavior proof cells before accepting audit or witness changes"
+    },
+    "crates/jankurai-proofcell/": {
+      "command": "cargo test -p jankurai-proofcell && cargo jankurai-proofcell run --changed-from origin/main --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json",
+      "purpose": "verify the proofcell crate and its self-hosted proof evidence"
+    }
+  }
+}
+```
+
+For an adopted product repo:
+
+```json
+{
+  "tests": {
+    "crates/domain/": {
+      "command": "cargo jankurai-proofcell run -p domain --changed-from origin/main --nextest --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json",
+      "purpose": "prove domain invariants with behavior-linked proof cells"
+    },
+    "crates/application/": {
+      "command": "cargo jankurai-proofcell run -p application --changed-from origin/main --nextest --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json",
+      "purpose": "prove application authz, idempotency, transaction, and failure behavior"
+    }
+  }
+}
+```
+
+### `agent/tool-adoption.toml` addition
+
+```toml
+[tools.proofcell]
+mode = "advisory"
+category = "proof"
+replaces = ["unstructured-cargo-test-claim", "manual-test-summary"]
+local_command = "cargo jankurai-proofcell run --changed-from origin/main --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json"
+ci_command = "cargo jankurai-proofcell run --changed-from origin/main --nextest --out target/jankurai/proof-cells/index.json --receipt target/jankurai/proof-receipts/proofcell.json"
+artifacts = ["target/jankurai/proof-cells/index.json", "target/jankurai/proof-receipts/proofcell.json"]
+rules = ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP", "HLT-023-INPUT-BOUNDARY-GAP", "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"]
+```
+
+---
+
+## 15. `jankurai init` behavior
+
+`jankurai init` should add ProofCell only for Rust workspaces or mixed Rust repos.
+
+### Detection
+
+Enable ProofCell when:
+
+- root `Cargo.toml` exists, or
+- `cargo metadata` succeeds, or
+- init profile contains Rust.
+
+### Generated modifications
+
+1. Add dev-dependency if absent.
+2. Add lane to `agent/proof-lanes.toml`.
+3. Add tool entry to `agent/tool-adoption.toml`.
+4. Add docs pointer to `agent/JANKURAI_STANDARD.md`.
+5. Add a starter example under `examples/proofcell-basic/` only in the Jankurai repo, not every adopted repo.
+
+### `crates/jankurai/src/commands/init.rs` pseudo-diff
+
+```rust
+fn rust_tooling_plan(repo: &Path, plan: &mut InitPlan) {
+    if repo.join("Cargo.toml").is_file() {
+        plan.add_toml_dependency(
+            "Cargo.toml",
+            "dev-dependencies",
+            "jankurai-proofcell",
+            "0.1",
+        );
+        plan.append_toml_block(
+            "agent/proof-lanes.toml",
+            include_str!("templates/proofcell-lane.toml"),
+        );
+        plan.append_toml_block(
+            "agent/tool-adoption.toml",
+            include_str!("templates/proofcell-tool.toml"),
+        );
+    }
+}
+```
+
+---
+
+## 16. Example proofcell test package
+
+### `examples/proofcell-basic/Cargo.toml`
+
+```toml
+[package]
+name = "proofcell-basic"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+jankurai-proofcell = { path = "../../crates/jankurai-proofcell" }
+
+[lib]
+path = "src/lib.rs"
+```
+
+### `examples/proofcell-basic/src/lib.rs`
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Role {
+    Owner,
+    Admin,
+    OtherTenant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderError {
+    Forbidden,
+    AlreadyCancelled,
+}
+
+impl OrderError {
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::Forbidden => "ORDER_FORBIDDEN",
+            Self::AlreadyCancelled => "ORDER_ALREADY_CANCELLED",
+        }
+    }
+}
+
+pub fn cancel_order(role: Role, already_cancelled: bool) -> Result<(), OrderError> {
+    if already_cancelled {
+        return Err(OrderError::AlreadyCancelled);
+    }
+    match role {
+        Role::Owner | Role::Admin => Ok(()),
+        Role::OtherTenant => Err(OrderError::Forbidden),
+    }
+}
+```
+
+### `examples/proofcell-basic/tests/order_cancel.rs`
+
+```rust
+use jankurai_proofcell::{jk_assert, jk_negative, proof_cell};
+use proofcell_basic::{cancel_order, Role};
+
+proof_cell! {
+    id: "orders.cancel.rejects_cross_tenant_user",
+    owner: "crates/application",
+    lane: "fast",
+    rules: ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP"],
+    changed: ["examples/proofcell-basic/src/**"],
+    requires_negative_case: true,
+    test: cancel_rejects_cross_tenant_user {
+        let result = cancel_order(Role::OtherTenant, false);
+        jk_negative!("cross_tenant_user_is_denied", result.is_err());
+        jk_assert!("reason_code_is_stable", result.unwrap_err().reason_code() == "ORDER_FORBIDDEN");
+    }
+}
+
+proof_cell! {
+    id: "orders.cancel.allows_owner",
+    owner: "crates/application",
+    lane: "fast",
+    rules: ["HLT-008-FALSE-GREEN-RISK"],
+    changed: ["examples/proofcell-basic/src/**"],
+    test: cancel_allows_owner {
+        let result = cancel_order(Role::Owner, false);
+        jk_assert!("owner_can_cancel", result.is_ok());
+    }
+}
+```
+
+---
+
+## 17. CI workflow snippet
+
+### `.github/workflows/jankurai.yml` addition
+
+```yaml
+- name: Install cargo-nextest
+  uses: taiki-e/install-action@nextest
+
+- name: Jankurai ProofCell
+  run: |
+    cargo jankurai-proofcell run \
+      --changed-from origin/main \
+      --nextest \
+      --out target/jankurai/proof-cells/index.json \
+      --receipt target/jankurai/proof-receipts/proofcell.json
+
+- name: Verify ProofCell artifact
+  run: |
+    cargo run -p jankurai -- proofcell verify . \
+      --index target/jankurai/proof-cells/index.json \
+      --out target/jankurai/proof-cells/verify.json \
+      --md target/jankurai/proof-cells/verify.md \
+      --strict
+
+- name: Upload Jankurai proof artifacts
+  uses: actions/upload-artifact@v4
+  with:
+    name: jankurai-proofcell
+    path: |
+      target/jankurai/proof-cells/index.json
+      target/jankurai/proof-cells/verify.json
+      target/jankurai/proof-cells/verify.md
+      target/jankurai/proof-receipts/proofcell.json
+```
+
+Security note: the repository’s CI-hardening policy may require action pinning by SHA. The snippet uses readable tags for documentation; production templates should apply the repo’s action-pinning policy.
+
+---
+
+## 18. Docs file
+
+### `docs/proofcell.md`
+
+````md
+# Jankurai ProofCell
+
+ProofCell turns Rust tests into behavior-linked proof receipts.
+
+Use it when a Rust test is proving durable product truth, authorization, input validation, unsafe-code safety, idempotency, transaction behavior, or a regression that should be visible to agents.
+
+## Minimal example
+
+```rust
+use jankurai_proofcell::{proof_cell, jk_assert, jk_negative};
+
+proof_cell! {
+    id: "orders.cancel.rejects_cross_tenant_user",
+    owner: "crates/application",
+    lane: "fast",
+    rules: ["HLT-008-FALSE-GREEN-RISK", "HLT-022-AUTHZ-ISOLATION-GAP"],
+    changed: ["crates/application/src/orders/**"],
+    requires_negative_case: true,
+    test: cancel_rejects_cross_tenant_user {
+        let result = cancel_order_as_other_tenant();
+        jk_negative!("cross_tenant_user_is_denied", result.is_err());
+        jk_assert!("stable_reason_code", result.unwrap_err().reason_code() == "ORDER_FORBIDDEN");
+    }
+}
+```
+
+## Run
+
+```bash
+cargo jankurai-proofcell run \
+  --changed-from origin/main \
+  --nextest \
+  --out target/jankurai/proof-cells/index.json \
+  --receipt target/jankurai/proof-receipts/proofcell.json
+```
+
+## Decisions
+
+- `pass`: test passed and emitted meaningful proof evidence.
+- `review`: proof exists but has over-mocking, snapshots, or other residual risk.
+- `block`: command failed, cell failed, zero assertions, missing negative case, or changed path lacks required proof.
+
+## Rules covered
+
+ProofCell primarily supports:
+
+- `HLT-008-FALSE-GREEN-RISK`
+- `HLT-018-PERF-CONCURRENCY-DRIFT`
+- `HLT-022-AUTHZ-ISOLATION-GAP`
+- `HLT-023-INPUT-BOUNDARY-GAP`
+- `HLT-027-HUMAN-REVIEW-EVIDENCE-GAP`
+````
+
+---
+
+## 19. Conformance fixtures
+
+Add fixtures under `conformance/` after MVP.
+
+### `conformance/hl3-pass-proofcell/expected.json`
+
+```json
+{
+  "decision": "pass",
+  "required_rules": ["HLT-008-FALSE-GREEN-RISK"],
+  "required_artifacts": ["target/jankurai/proof-cells/index.json"]
+}
+```
+
+### `conformance/hl3-fail-proofcell-zero-assertion/expected.json`
+
+```json
+{
+  "decision": "block",
+  "required_rule": "HLT-008-FALSE-GREEN-RISK",
+  "problem_contains": "zero assertions"
+}
+```
+
+### `conformance/hl3-fail-proofcell-authz-no-negative/expected.json`
+
+```json
+{
+  "decision": "block",
+  "required_rule": "HLT-022-AUTHZ-ISOLATION-GAP",
+  "problem_contains": "negative case"
+}
+```
+
+---
+
+## 20. How ProofCell should influence Jankurai scoring
+
+ProofCell should not become a magic score booster. It should mostly remove uncertainty and expose blockers.
+
+### Suggested scoring behavior
+
+| Artifact state | Score behavior |
+|---|---|
+| No Rust workspace | not applicable |
+| Rust workspace, ProofCell disabled/advisory | no hard cap, tool adoption warning only |
+| ProofCell required and artifact missing | high finding, cap `false-green-risk` |
+| ProofCell present and `overall_decision=block` | high finding, cap `false-green-risk` |
+| Authz/input rule has no negative cases | high finding, cap corresponding rule |
+| ProofCell present and `review` only | medium finding, no hard cap unless policy says required |
+| ProofCell pass with receipt digest in merge witness | improves witness completeness and proof coverage ratio |
+
+### Suggested report section
+
+```md
+## ProofCell
+
+- Artifact: `target/jankurai/proof-cells/index.json`
+- Decision: `pass`
+- Cells: 18 pass, 1 review, 0 block
+- Rules covered: HLT-008, HLT-022, HLT-023
+- Missing cells for changed paths: none
+```
+
+---
+
+## 21. Security design
+
+ProofCell itself must be boring and least-privilege.
+
+### Safety properties
+
+- **No network access** by default.
+- **No mutation outside `target/jankurai/proof-cells/` and requested receipt path.**
+- **No product runtime dependency.** It is a dev-dependency.
+- **No secret capture.** Assertion expressions are stored, not runtime values.
+- **No model judgment.** Decisions are deterministic.
+- **No bypass of Jankurai allowlists.** It emits receipts, but `jankurai prove` still enforces proof command allowlists.
+- **No auto-pass on malformed events.** Malformed events should block or review.
+
+### Threats and mitigations
+
+| Threat | Mitigation |
+|---|---|
+| Agent deletes weak test and claims lane passed | changed path missing cell appears in `required_cells_missing`; witness sees missing proof |
+| Agent writes smoke test with no assertions | zero assertions block |
+| Agent over-mocks external boundary | non-contract mock count routes review/block by policy |
+| Agent changes authz and tests only success path | authz rule with no negative case blocks |
+| Agent edits JSON artifact by hand | index and receipt digests mismatch under proof verification |
+| Agent hides failure with `continue_on_error` | index records command exit code and overall decision remains block |
+| Agent leaks secrets in assertion values | macros store expression text only, not debug values |
+
+---
+
+## 22. Optional phase-2 extensions
+
+These are deliberately not MVP requirements.
+
+### 22.1 Miri adapter
+
+```bash
+cargo jankurai-proofcell run --miri --package core-safety
+```
+
+Rules:
+
+- unsafe code changes require Miri or documented exception
+- any `unsafe` proof cell should include `rules: ["HLT-023-INPUT-BOUNDARY-GAP"]` or a future unsafe-specific rule
+
+### 22.2 Kani adapter
+
+```rust
+#[cfg(kani)]
+#[kani::proof]
+fn cancel_order_never_allows_cross_tenant() {
+    // proof harness
+}
+```
+
+The ProofCell index should include a Kani report digest and classify the cell as `proof_kind = "kani"`.
+
+### 22.3 cargo-semver-checks adapter
+
+Public API cells can require:
+
+```bash
+cargo semver-checks check-release
+```
+
+ProofCell records this as `proof_kind = "semver"` and maps it to contract/API rules.
+
+### 22.4 cargo-vet adapter
+
+Dependency-sensitive changes should require `cargo vet` or `cargo deny` artifacts, but ProofCell should only point to those receipts. It should not duplicate supply-chain scanners.
+
+---
+
+## 23. Implementation plan
+
+### Phase 1: standalone crate MVP
+
+- Add `crates/jankurai-proofcell`.
+- Implement `proof_cell!`, `jk_assert!`, `jk_negative!`, `jk_mock!`.
+- Emit NDJSON test events.
+- Aggregate into `proof-cell-index.json`.
+- Emit Jankurai-compatible proof receipt.
+- Add schema tests for both new schemas.
+- Add `examples/proofcell-basic`.
+
+Definition of done:
+
+```bash
+cargo test -p jankurai-proofcell
+cargo jankurai-proofcell run --out target/jankurai/proof-cells/index.json
+```
+
+### Phase 2: Jankurai CLI integration
+
+- Add `jankurai proofcell verify`.
+- Add schema enum variants.
+- Add audit ingestion summary.
+- Add report field and Markdown section.
+- Add findings for block/review states.
+
+Definition of done:
+
+```bash
+cargo run -p jankurai -- proofcell verify . --strict
+cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+```
+
+### Phase 3: proof lane integration
+
+- Add proof lane template.
+- Add tool adoption entry.
+- Let `jankurai init` add the dev-dependency and lane for Rust workspaces.
+- Let `jankurai witness` recognize ProofCell receipt extension.
+
+Definition of done:
+
+```bash
+cargo run -p jankurai -- prove . --changed-from origin/main
+cargo run -p jankurai -- witness . --changed-from origin/main
+```
+
+### Phase 4: hardening and ecosystem adapters
+
+- Add nextest JUnit parsing for per-test metadata.
+- Add Miri adapter.
+- Add Kani adapter.
+- Add cargo-semver-checks adapter.
+- Add mock-budget policy fields in `agent/audit-policy.toml`.
+
+---
+
+## 24. Acceptance tests
+
+### Required test cases for the new crate
+
+| Test | Expected |
+|---|---|
+| passing proof cell with `jk_assert!` | index decision `pass` |
+| passing proof cell with zero assertions | index decision `block` |
+| authz proof with no negative case | index decision `block` |
+| proof cell panic | command fails and index decision `block` |
+| broad mocks above budget | cell decision `review` |
+| changed Rust path not covered by any cell glob | `required_cells_missing` includes path |
+| receipt emitted | `proofcell.json` has artifact digests and extension keys |
+| no `JANKURAI_PROOFCELL_EVENTS` env | tests run normally without failing |
+
+### Example Rust unit test for aggregator
+
+```rust
+#[test]
+fn zero_assertion_cell_blocks() {
+    let mut report = ProofCellReport {
+        schema_version: "1.0.0".into(),
+        cell_id: "example".into(),
+        owner: "crates/domain".into(),
+        lane: "fast".into(),
+        rules_covered: vec!["HLT-008-FALSE-GREEN-RISK".into()],
+        changed_path_globs: vec!["crates/domain/**".into()],
+        proof_kind: "test".into(),
+        source_file: "tests/example.rs".into(),
+        source_line: 1,
+        started_at: Some("now".into()),
+        finished_at: Some("now".into()),
+        status: "pass".into(),
+        decision: "pass".into(),
+        assertions: 0,
+        positive_assertions: 0,
+        negative_assertions: 0,
+        negative_cases: 0,
+        mocks: vec![],
+        snapshots: vec![],
+        risk_notes: vec![],
+        repair_hints: vec![],
+    };
+    jankurai_proofcell::verdict::decide_cell(&mut report);
+    assert_eq!(report.decision, "block");
+}
+```
+
+---
+
+## 25. Why not a different crate?
+
+### Not chosen: a replacement test runner
+
+Too large and duplicates `cargo-nextest`.
+
+ProofCell should wrap or enrich existing runners, not compete with them.
+
+### Not chosen: a secret scanner
+
+Jankurai already has a security lane and should orchestrate tools like `gitleaks`, `cargo audit`, `cargo deny`, `zizmor`, SBOM, and provenance. Another scanner is lower leverage.
+
+### Not chosen: a boundary runtime library
+
+A runtime boundary crate could be valuable, but it would force product code changes and compete with frameworks. ProofCell is easier to auto-include and immediately valuable.
+
+### Not chosen: a general AI code reviewer
+
+Jankurai’s standard explicitly favors deterministic, artifact-backed proof over model opinions. ProofCell keeps that philosophy.
+
+---
+
+## 26. Expected value
+
+### For Jankurai itself
+
+- Makes `HLT-008-FALSE-GREEN-RISK` substantially more enforceable.
+- Strengthens merge witness completeness.
+- Creates a concrete artifact that bridges tests, owners, rules, and changed paths.
+- Adds a showcase crate demonstrating Jankurai’s philosophy in Rust.
+- Gives `jankurai init` a high-value automatic Rust dev-tool.
+
+### For any Rust project using Jankurai
+
+- Agents stop saying “tests pass” without naming what behavior was proven.
+- Security-sensitive changes require negative proof, not only happy paths.
+- Over-mocked tests become visible in CI.
+- Proof can be reviewed as JSON/Markdown, not chat history.
+- Test metadata survives across agents, commits, and pull requests.
+
+### For open-source maintainers
+
+- Reviews get a compact proof matrix.
+- Contributors have a clear way to label regression tests.
+- Security fixes can prove denied cases and input boundaries.
+- CI artifacts are easier to audit after the fact.
+
+---
+
+## 27. The single-sentence pitch
+
+**`jankurai-proofcell` is the crate that makes Rust tests prove what they claim: every important green test becomes a behavior-owned, rule-linked, negative-case-aware, artifact-digested receipt that Jankurai can bind into the merge witness.**

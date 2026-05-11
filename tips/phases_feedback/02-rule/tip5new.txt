@@ -1,0 +1,1356 @@
+I could not complete a normal `git clone` in the container because DNS resolution to GitHub failed, so I inspected the repository through GitHub’s rendered/raw files and downloaded key raw source files for local formatting/review. My read: **Phase 02 is already useful and partially complete, but it is not yet hardened to “100% done.”** The path to finish it is to convert the current centralized heuristic scanner into a registry-driven semantic rule pipeline with fixture-backed proof for every rule, every cap, and every emitted finding.
+
+## Phase 02 verdict
+
+**Current status:** the phase router calls Phase 02 complete, and the feedback ledger says the current architecture satisfies the initial feedback because the repo already has `audit/rules.rs`, finding builders, boundary checks, and registry tests. However, the Phase 02 receipt itself still says the analyzer split remains partial and AST/import support is a pilot. That means this phase should be treated as **complete enough to proceed**, but **not hardened enough to freeze**. ([GitHub][1])
+
+**What “done” should mean:** Phase 02’s objective is not to build a compiler-grade static analyzer. The stated target is a versioned rule engine with semantic understanding, where inventory flows through analyzers into a rule registry, findings, caps, score, and reports. The acceptance criteria explicitly call for stable HLT rules, semantic boundary checks, generated-zone checks, an AST/import pilot, richer finding metadata, tests, and docs/rule index coverage. ([GitHub][2])
+
+So the goal should be:
+
+> **Finish Phase 02 by making every rule, finding, cap, boundary decision, generated-zone decision, and semantic import decision traceable, fixture-tested, registry-backed, and schema-compatible.**
+
+---
+
+# 1. What exists now
+
+The repo already has the right broad shape. The README describes Jankurai as an agent-native repo audit tool, with canonical validation through `jankurai`, `just fast`, `just compat`, and related commands. ([GitHub][3]) The standard is the single contract for hard blocks, rule IDs, proof lanes, audit output, and repair receipts, with `agent/JANKURAI_STANDARD.md` pointing to the full standard and validation flow. ([GitHub][4])
+
+The current Phase 02 assets are meaningful:
+
+| Area                | Current implementation                                                                                                                                                                                                                                                                           | Hardening read                                                                                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rule registry       | `audit/rules.rs` defines stable `HLT-*` rules with metadata including category, TLR, lane, docs URL, evidence kind, severity, repairability, repair eligibility, risk, and repair reason. ([GitHub][5])                                                                                          | Good foundation. Needs cap linkage, rule docs/index export, status/versioning, and exhaustive fixture coverage.                                                                     |
+| Finding builder     | `FindingBuilder` enriches findings from registry metadata and assigns lane, evidence kind, TLR, docs URL, owner, confidence, rerun command, and fingerprint. ([GitHub][6])                                                                                                                       | Good centralization. Needs to preserve matched term/reason/source span and use a stronger typed `FindingDraft` contract.                                                            |
+| Audit pipeline      | `run_audit_with_options` inventories the repo, scopes changed paths, runs analyzers, computes score/caps/policy, builds findings, produces repair queue, proof receipts, artifacts, and report output. ([GitHub][7])                                                                             | Good pipeline. Needs rule analyzers to become first-class, not mostly wired by central `build_findings`.                                                                            |
+| Scanner             | `audit/scan.rs` contains many pattern/heuristic checks: TODO/fallback/prompt/agency/false-green/streaming/future-hostile, secret-like content, destructive migration markers, generated zone issues, wrong-layer DB hits, CI hardening, contract source checks, and related scans. ([GitHub][8]) | Useful but too centralized. Needs deterministic analyzer modules and fixture tests per rule.                                                                                        |
+| AST/import pilot    | `audit/analyzers/ast.rs` currently parses Rust and TypeScript imports with regexes and detects some forbidden domain/web imports. ([GitHub][9])                                                                                                                                                  | Correct as a pilot. Not hardened enough for “semantic oracle.”                                                                                                                      |
+| Dimension analyzers | Analyzer modules cover ownership, contracts, proof, security, shape, data, observability, context, Python, and speed. ([GitHub][10])                                                                                                                                                             | Solid dimension layer. Needs cleaner separation between score dimensions and rule findings.                                                                                         |
+| Boundary manifest   | `BoundaryManifest` parses stack, queues, DB, and streaming exception fields. ([GitHub][11])                                                                                                                                                                                                      | Incomplete: the repo’s `agent/boundaries.toml` also has Rust, TypeScript, and Python policy sections that are not fully represented in the parsed manifest contract. ([GitHub][12]) |
+| Tests               | Existing tests check rule ID uniqueness, specific rule metadata, repair metadata, audit schema serialization, high/critical finding metadata, proof receipts, AST pilot detections, boundary manifest validation, contract-source checks, and report/SARIF/JUnit exports. ([GitHub][13])         | Strong smoke coverage. Needs exhaustive fixture matrix and negative/allowlist tests for each stable rule.                                                                           |
+
+---
+
+# 2. The hardening gaps to close
+
+These are the concrete blockers preventing Phase 02 from being “100% done.”
+
+## Gap A — The rule registry does not fully own caps
+
+Right now the rule registry owns HLT rule metadata, while caps and score effects are still substantially separate. The Phase 02 target architecture says rules should feed findings, findings should feed caps/score, and the report should flow from that. ([GitHub][2])
+
+**Problem:** a cap can still exist as a scoring/report concept without being first-class registry metadata.
+
+**Finish condition:** every hard cap has a stable rule/cap mapping, and no high-impact report decision can happen without a registry-backed explanation.
+
+Add to `RuleSpec` or a sibling `CapSpec`:
+
+```rust
+pub struct RuleSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub category: &'static str,
+    pub tlr: &'static str,
+    pub lane: &'static str,
+    pub docs_url: &'static str,
+    pub owner_hint: &'static str,
+    pub evidence_kind: EvidenceKind,
+    pub severity: Severity,
+    pub repairable: bool,
+    pub repair_eligibility: RepairEligibility,
+    pub repair_risk: RepairRisk,
+    pub repair_reason: &'static str,
+
+    // Add these:
+    pub status: RuleStatus,              // Stable, Experimental, Deprecated
+    pub standard_section: &'static str,  // e.g. "Test Lanes", "Boundaries"
+    pub cap: Option<CapSpec>,
+    pub confidence_policy: ConfidencePolicy,
+    pub analyzer: &'static str,
+}
+```
+
+And:
+
+```rust
+pub struct CapSpec {
+    pub id: &'static str,
+    pub max_score: Option<u16>,
+    pub hardness: Hardness,
+    pub reason: &'static str,
+}
+```
+
+Acceptance criteria:
+
+* Every emitted `Finding.rule_id` exists in `RULES`.
+* Every hard cap in report output maps to either a `RuleSpec.cap` or an explicit legacy compatibility exception.
+* Every `RuleSpec` has a docs target.
+* Every rule has a fixture.
+* Every cap has a fixture.
+* Deprecated rules remain resolvable for old reports but are not emitted by new analyzers.
+
+---
+
+## Gap B — Finding evidence is being normalized too aggressively
+
+The standard requires findings to carry rule ID, category, severity, owner, path, line, matched term, reason, problem, repair guidance, and proof lane context. ([GitHub][14]) The current `FindingBuilder` enriches many metadata fields, but the builder path loses some raw evidence fields such as matched term and reason by default. ([GitHub][6])
+
+**Problem:** the report is good for routing, but not yet strong enough for forensic-quality repair because some analyzer evidence is flattened.
+
+**Finish condition:** every finding is created from a typed draft that preserves evidence, source span, matched term, reason, and semantic context.
+
+Introduce:
+
+```rust
+pub struct FindingDraft {
+    pub rule_id: &'static str,
+    pub check_id: &'static str,
+    pub severity_override: Option<Severity>,
+    pub path: Option<PathBuf>,
+    pub line: Option<u32>,
+    pub evidence: Vec<FindingEvidence>,
+    pub problem: String,
+    pub repair: String,
+    pub analyzer: &'static str,
+}
+
+pub struct FindingEvidence {
+    pub kind: EvidenceKind,
+    pub matched_term: Option<String>,
+    pub reason: Option<String>,
+    pub source_span: Option<SourceSpan>,
+    pub snippet_hash: Option<String>,
+    pub semantic_context: Option<String>,
+}
+```
+
+Then make `FindingBuilder` materialize a `Finding` from `FindingDraft + RuleSpec`.
+
+Acceptance criteria:
+
+* High/critical findings always include owner, lane, rerun command, docs URL, evidence kind, repair eligibility, repair risk, and agent fix metadata.
+* Pattern findings preserve matched term and reason.
+* Semantic findings preserve import edge, boundary edge, generated-zone edge, or migration edge.
+* Fingerprints are stable across irrelevant line shifts when possible.
+* Fingerprints do not depend on volatile prose ordering.
+
+---
+
+## Gap C — Analyzer architecture is still too centralized
+
+The Phase 02 target architecture names a clean flow: inventory → analyzers → rule registry → findings → caps → score → reports. ([GitHub][2]) Current code has that shape at a high level, but `audit/mod.rs` still centrally wires many checks in `build_findings`, while `scan.rs` holds many unrelated detectors. ([GitHub][7])
+
+**Problem:** central wiring makes it harder to prove coverage, test individual rules, add analyzers, or reason about false positives.
+
+**Finish condition:** each analyzer owns its rules and emits `FindingDraft`s; the central audit pipeline only orchestrates.
+
+Add a trait like:
+
+```rust
+pub trait RuleAnalyzer {
+    fn name(&self) -> &'static str;
+    fn rules(&self) -> &'static [&'static str];
+    fn analyze(&self, ctx: &AuditContext, inventory: &Inventory) -> Vec<FindingDraft>;
+}
+```
+
+Create analyzer modules:
+
+```text
+crates/jankurai/src/audit/analyzers/
+  rule.rs
+  boundary_oracle.rs
+  generated_zone_oracle.rs
+  import_graph.rs
+  contract_oracle.rs
+  migration_oracle.rs
+  ci_oracle.rs
+  proof_oracle.rs
+  prompt_oracle.rs
+  security_oracle.rs
+  shape_oracle.rs
+  python_oracle.rs
+```
+
+Refactor in this order:
+
+1. Add `FindingDraft` without changing output.
+2. Wrap existing `scan.rs` functions in analyzer modules.
+3. Move one rule family at a time out of `build_findings`.
+4. Keep old report shape stable.
+5. Delete or shrink central `build_findings` only after parity tests pass.
+
+Acceptance criteria:
+
+* `run_audit_with_options` no longer knows individual rule checks.
+* It only runs registered analyzers, materializes findings, applies caps, scores, and reports.
+* Each analyzer declares the rule IDs it can emit.
+* A test asserts that every stable rule has at least one analyzer or an explicit non-emitted/manual status.
+* A test asserts that no analyzer emits undeclared rules.
+
+---
+
+## Gap D — Boundary oracle is not manifest-driven enough
+
+The boundary oracle doc says violations should map to owner, proof lane, rerun command, evidence kind, and repair queue item. ([GitHub][15]) The code has boundary modules for Rust, TypeScript, Python, SQL, and streaming, with static forbidden markers and import policies. ([GitHub][16])
+
+The repo also has a richer `agent/boundaries.toml` with Rust, TypeScript, Python, queues, DB, and streaming policy. ([GitHub][12])
+
+**Problem:** some boundary policy exists in TOML, but parts of the analyzer still rely on hard-coded constants and partial manifest parsing.
+
+**Finish condition:** `agent/boundaries.toml` becomes the source of truth for boundary rules, with static code defaults only used as fallback.
+
+Extend `BoundaryManifest`:
+
+```rust
+pub struct BoundaryManifest {
+    pub stack: StackBoundary,
+    pub rust: Option<RustBoundary>,
+    pub typescript: Option<TypeScriptBoundary>,
+    pub python: Option<PythonBoundary>,
+    pub queues: QueueBoundary,
+    pub db: DbBoundary,
+    pub streaming_exception: Option<StreamingException>,
+}
+```
+
+Add typed subcontracts:
+
+```rust
+pub struct RustBoundary {
+    pub domain_roots: Vec<String>,
+    pub forbidden_domain_imports: Vec<String>,
+    pub allowed_adapter_roots: Vec<String>,
+}
+
+pub struct TypeScriptBoundary {
+    pub web_roots: Vec<String>,
+    pub forbidden_web_imports: Vec<String>,
+    pub generated_contract_roots: Vec<String>,
+    pub handwritten_contract_roots: Vec<String>,
+}
+
+pub struct PythonBoundary {
+    pub allowed_roots: Vec<String>,
+    pub forbidden_truth_markers: Vec<String>,
+}
+```
+
+Boundary checks to harden:
+
+| Check                  | Required behavior                                                                             |
+| ---------------------- | --------------------------------------------------------------------------------------------- |
+| Rust domain IO         | Domain paths cannot import DB/network/filesystem/HTTP adapters unless manifest allows it.     |
+| TypeScript web imports | Web code cannot import DB/backend/adapters directly.                                          |
+| Contract source        | Handwritten public API DTOs must be rejected unless generated-zone relationship is declared.  |
+| Python truth leakage   | Python cannot own product truth unless path is allowlisted.                                   |
+| DB wrong layer         | DB access must route through declared DB roots or adapters.                                   |
+| Streaming exception    | Runtime drift is allowed only with owner, reason, classification, expiry, and migration path. |
+| Queue/event contracts  | Queue clients must map to event contract paths.                                               |
+| Expired exceptions     | Expired exceptions become hard findings.                                                      |
+
+Acceptance criteria:
+
+* Boundary manifest schema covers all parsed fields.
+* Unknown fields fail in strict validation mode.
+* Expired exceptions fail deterministically.
+* All boundary findings preserve boundary edge evidence.
+* All boundary findings include owner, lane, rerun command, and repair queue metadata.
+* Fixture tests cover positive, negative, allowlisted, generated, vendor/reference, and expired-exception cases.
+
+---
+
+## Gap E — Generated-zone oracle needs source/output semantics
+
+The standard and artifact contracts treat generated surfaces as durable repo contracts, with generated artifacts, schemas, owner maps, test maps, proof receipts, and audit outputs all expected to stay compatible. ([GitHub][17]) Existing scans detect generated-zone metadata issues, missing headers, missing files, orphan contract sources, and related contract problems. ([GitHub][8])
+
+**Problem:** the oracle checks symptoms, but not a complete source → command → output relationship.
+
+**Finish condition:** every generated zone has a declared source, generator command, output set, edit policy, and reproducibility proof.
+
+Add a generated-zone graph:
+
+```rust
+pub struct GeneratedZone {
+    pub id: String,
+    pub owner: String,
+    pub source_paths: Vec<PathBuf>,
+    pub output_paths: Vec<PathBuf>,
+    pub generator_command: String,
+    pub proof_lane: String,
+    pub edit_policy: EditPolicy,
+}
+```
+
+Generated-zone checks:
+
+1. Declared outputs exist.
+2. Declared outputs contain required generated header.
+3. Generated files are not manually modified in changed-scope mode.
+4. Source changes route to generator/proof lane.
+5. Public API contract changes require generated output proof.
+6. Orphan generated outputs are flagged.
+7. Orphan handwritten public contract sources are flagged.
+8. Generator command is present and maps to test lane.
+9. Optional: output content hash is stored or reproducibility proof is attached.
+
+Acceptance criteria:
+
+* A change to a contract source without regenerated output creates a finding.
+* A generated file edited by hand creates a finding.
+* A missing generated header creates a finding.
+* A generated output with no declared source creates a finding.
+* A declared output missing from disk creates a finding.
+* A declared generated zone with an invalid command creates a finding.
+* All findings route to the smallest credible lane.
+
+---
+
+## Gap F — AST/import graph is still a pilot
+
+The AST pilot currently uses regexes to parse Rust and TypeScript imports and checks a small set of forbidden import relationships. ([GitHub][9]) That is enough for a pilot, but not enough to call the semantic oracle hardened.
+
+**Problem:** regex-only import parsing will miss common forms and can overflag or underflag.
+
+**Finish condition:** the import graph is parser-light, deterministic, cached, and good enough to support boundary decisions without pretending to be a full compiler.
+
+Phase the AST/import hardening carefully.
+
+### F1. First pass: robust parser-light graph
+
+Support:
+
+**Rust**
+
+* `use foo::bar`
+* `use foo::{bar, baz}`
+* `use crate::...`
+* `use super::...`
+* `mod x`
+* `pub mod x`
+* package names from `Cargo.toml`
+
+**TypeScript**
+
+* `import x from "..."`
+* `import { x } from "..."`
+* `export { x } from "..."`
+* `export * from "..."`
+* `require("...")`
+* `import("...")`
+* tsconfig path aliases
+* relative path normalization
+
+**Python**
+
+* `import x`
+* `from x import y`
+* DB/HTTP/product-truth marker linkage
+* allowlisted roots from boundary manifest
+
+**SQL**
+
+* destructive operation markers
+* migration transaction/rollback hints
+* tenant/RLS/constraint hints where applicable
+
+### F2. Cache the semantic graph
+
+Create:
+
+```rust
+pub struct SemanticGraph {
+    pub imports: Vec<ImportEdge>,
+    pub db_edges: Vec<DbEdge>,
+    pub generated_edges: Vec<GeneratedEdge>,
+    pub boundary_edges: Vec<BoundaryEdge>,
+    pub parse_errors: Vec<ParseError>,
+}
+```
+
+Run it once per audit, then pass it to analyzers.
+
+This also fixes the current inefficiency where the AST pilot path can be called more than once in the central finding build.
+
+### F3. Parser failures must not crash the audit
+
+Rules:
+
+* Parse failure in one file becomes advisory evidence.
+* Parse failure does not hide simpler pattern checks.
+* Analyzer confidence drops when semantic parse is partial.
+* Report includes parse coverage summary.
+
+Acceptance criteria:
+
+* Import graph tests cover Rust nested imports, TypeScript re-exports, dynamic import, require, path aliases, Python imports, and malformed files.
+* Boundary oracle consumes graph edges, not raw regex hits.
+* Semantic parse coverage appears in audit diagnostics.
+* No new dependency is added until timing impact is measured.
+* If a parser crate is added later, it must be behind measured performance and compatibility tests.
+
+---
+
+# 3. Exact implementation sequence
+
+## Slice 0 — Baseline and guardrails
+
+**Goal:** lock today’s behavior before refactor.
+
+Files:
+
+```text
+tips/phases/02-rule-engine-semantic-oracle.md
+crates/jankurai/tests/*
+target/jankurai/*
+```
+
+Actions:
+
+1. Add a Phase 02 hardening start log.
+2. Run current focused tests.
+3. Generate current audit output.
+4. Save baseline output under `target/jankurai/phase02-baseline.*`.
+5. Record current rule IDs and cap IDs.
+6. Record current emitted finding shape.
+7. Do not touch generated/read-only outputs by hand.
+
+Validation:
+
+```bash
+cargo test -p jankurai --test rule_registry_smoke
+cargo test -p jankurai --test audit_smoke
+cargo test -p jankurai --test boundaries_manifest_smoke
+cargo test -p jankurai --test contract_source_smoke
+cargo test -p jankurai --test schema_contracts
+cargo test -p jankurai --test report_compatibility_guard
+cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+just compat
+just fast
+```
+
+Exit:
+
+* Baseline passes.
+* Any existing failure is documented before code changes.
+* No schema-breaking change has occurred.
+
+---
+
+## Slice 1 — Registry and cap contract
+
+**Goal:** make rule metadata complete enough to drive caps, docs, repair, and proof routing.
+
+Files:
+
+```text
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/caps.rs
+crates/jankurai/tests/rule_registry_smoke.rs
+docs/rules/hlt-index.md             # or generated equivalent
+schemas/rule-registry.schema.json    # only if JSON export is added
+```
+
+Actions:
+
+1. Add typed enums for rule status, severity, evidence kind, TLR, lane, and confidence policy.
+2. Add `CapSpec`.
+3. Map every current hard cap to a rule or explicit legacy compatibility entry.
+4. Add `RuleStatus::{Stable, Experimental, Deprecated}`.
+5. Add `standard_section`.
+6. Add `analyzer`.
+7. Add a registry export command or generated docs index.
+8. Update registry tests.
+
+Tests to add:
+
+* `all_rule_ids_are_unique`
+* `all_rule_ids_match_hlt_format`
+* `all_stable_rules_have_docs`
+* `all_stable_rules_have_analyzer`
+* `all_hard_caps_have_rule_mapping`
+* `all_rules_have_repair_metadata`
+* `deprecated_rules_are_not_emitted`
+* `docs_index_contains_every_stable_rule`
+
+Exit:
+
+* Existing report shape still passes.
+* No current HLT rule disappears.
+* Every stable rule can be explained from registry alone.
+
+---
+
+## Slice 2 — FindingDraft and evidence preservation
+
+**Goal:** stop losing analyzer evidence.
+
+Files:
+
+```text
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/src/model.rs
+crates/jankurai/src/audit/evidence.rs
+crates/jankurai/tests/audit_smoke.rs
+crates/jankurai/tests/schema_contracts.rs
+```
+
+Actions:
+
+1. Introduce `FindingDraft`.
+2. Introduce `FindingEvidence`.
+3. Add builder methods:
+
+   * `from_draft`
+   * `from_hit`
+   * `from_boundary_edge`
+   * `from_import_edge`
+   * `from_generated_edge`
+4. Preserve matched term and reason.
+5. Preserve source span when available.
+6. Improve fingerprint inputs.
+7. Keep old fields backward-compatible.
+8. Add optional fields rather than breaking schema.
+
+Tests to add:
+
+* Pattern finding preserves matched term.
+* Pattern finding preserves reason.
+* Boundary finding preserves boundary edge.
+* Import finding preserves import edge.
+* Generated-zone finding preserves source/output edge.
+* Fingerprint stays stable across irrelevant evidence ordering.
+* High/critical findings always include lane/rerun/owner/docs/agent fix.
+
+Exit:
+
+* Every emitted high/critical finding is repairable or explicitly human-required/never-auto.
+* Findings are explainable without reading scanner internals.
+
+---
+
+## Slice 3 — Analyzer trait and non-behavioral split
+
+**Goal:** make analyzer ownership explicit while preserving output.
+
+Files:
+
+```text
+crates/jankurai/src/audit/analyzers/rule.rs
+crates/jankurai/src/audit/analyzers/*
+crates/jankurai/src/audit/mod.rs
+crates/jankurai/src/audit/scan.rs
+crates/jankurai/tests/audit_smoke.rs
+```
+
+Actions:
+
+1. Add `RuleAnalyzer` trait.
+2. Add analyzer registry.
+3. Wrap existing scanner checks without changing behavior.
+4. Move checks gradually:
+
+   * prompt/agency oracle
+   * security oracle
+   * shape oracle
+   * CI oracle
+   * migration oracle
+   * contract oracle
+   * boundary oracle
+   * generated-zone oracle
+5. Make central audit pipeline orchestrate analyzers.
+6. Keep dimension analyzers separate from rule analyzers.
+
+Tests to add:
+
+* Every analyzer declares emitted rules.
+* No analyzer emits undeclared rule ID.
+* Every stable rule has analyzer coverage or explicit manual status.
+* Analyzer order is deterministic.
+* Same fixture produces same finding set before/after split.
+
+Exit:
+
+* `audit/mod.rs` no longer manually wires individual rule checks.
+* `scan.rs` becomes helper-only or significantly reduced.
+* Output parity holds for existing tests.
+
+---
+
+## Slice 4 — Boundary oracle hardening
+
+**Goal:** make `agent/boundaries.toml` the authoritative boundary policy.
+
+Files:
+
+```text
+crates/jankurai/src/boundaries/manifest.rs
+crates/jankurai/src/boundaries/rust.rs
+crates/jankurai/src/boundaries/typescript.rs
+crates/jankurai/src/boundaries/python.rs
+crates/jankurai/src/boundaries/sql.rs
+crates/jankurai/src/boundaries/streaming.rs
+crates/jankurai/src/audit/analyzers/boundary_oracle.rs
+crates/jankurai/tests/boundaries_manifest_smoke.rs
+docs/boundary-oracle.md
+agent/boundaries.toml
+schemas/audit-boundaries.schema.json
+```
+
+Actions:
+
+1. Parse all manifest sections:
+
+   * stack
+   * rust
+   * typescript
+   * python
+   * queues
+   * db
+   * streaming exception
+2. Add strict unknown-field checks.
+3. Replace static forbidden lists with manifest-driven lists.
+4. Keep static defaults only for missing optional fields.
+5. Add boundary edge evidence.
+6. Validate exception expiry.
+7. Validate queue/event contract linkage.
+8. Validate DB root ownership.
+9. Validate Python allowed roots.
+10. Validate generated contract roots.
+
+Tests to add:
+
+* Valid full manifest passes.
+* Minimal valid manifest passes if intentionally supported.
+* Unknown section fails strict mode.
+* Missing queue contract path fails.
+* Expired streaming exception fails.
+* Rust domain forbidden import fails.
+* Rust adapter allowed import passes.
+* TypeScript web DB import fails.
+* Generated contract import passes.
+* Python product truth outside allowed root fails.
+* Python tool path passes.
+* DB access in wrong layer fails.
+* DB access in declared adapter/root passes.
+
+Exit:
+
+* Boundary oracle findings are semantic, not just string hits.
+* Boundary checks are reproducible from manifest + inventory.
+
+---
+
+## Slice 5 — Generated-zone oracle hardening
+
+**Goal:** make generated surfaces provable.
+
+Files:
+
+```text
+crates/jankurai/src/audit/analyzers/generated_zone_oracle.rs
+crates/jankurai/src/audit/scan.rs
+crates/jankurai/tests/generated_zones_manifest_smoke.rs
+crates/jankurai/tests/contract_source_smoke.rs
+agent/generated-zones.toml
+schemas/generated-zones.schema.json
+docs/artifact-contracts.md
+```
+
+Actions:
+
+1. Build generated-zone DAG.
+2. Validate source paths.
+3. Validate output paths.
+4. Validate headers.
+5. Validate generator command.
+6. Validate owner.
+7. Validate proof lane.
+8. Validate changed-source → regenerated-output relationship.
+9. Validate no manual edits to generated files.
+10. Validate public contract surfaces have generated backing.
+
+Tests to add:
+
+* Missing generated output fails.
+* Missing generated header fails.
+* Hand-edited generated file fails.
+* Source changed but output missing from changed set fails.
+* Output exists with declared source passes.
+* Orphan handwritten API contract fails.
+* Declared generated zone with invalid command fails.
+* Generated vendor/reference docs are excluded as intended.
+
+Exit:
+
+* Generated-zone findings include source/output/generator evidence.
+* Contract drift cannot silently pass.
+
+---
+
+## Slice 6 — Import graph and AST pilot upgrade
+
+**Goal:** turn AST pilot into a dependable semantic graph without overbuilding.
+
+Files:
+
+```text
+crates/jankurai/src/audit/analyzers/ast.rs
+crates/jankurai/src/audit/analyzers/import_graph.rs
+crates/jankurai/src/audit/analyzers/boundary_oracle.rs
+crates/jankurai/tests/audit_smoke.rs
+crates/jankurai/tests/fixtures/phase02/import_graph/*
+```
+
+Actions:
+
+1. Introduce `SemanticGraph`.
+2. Parse Rust imports beyond simple regex.
+3. Parse TypeScript imports/re-exports/require/dynamic imports.
+4. Parse Python import markers.
+5. Normalize relative paths.
+6. Support tsconfig aliases if present.
+7. Cache graph once per audit.
+8. Pass graph to boundary oracle.
+9. Record parse coverage and parse errors.
+10. Make parse failure advisory, not fatal.
+
+Tests to add:
+
+* Rust nested import detected.
+* Rust domain forbidden adapter import fails.
+* Rust allowed adapter import passes.
+* TypeScript re-export from forbidden backend path fails.
+* TypeScript dynamic import from allowed generated contract path passes.
+* TypeScript path alias resolves correctly.
+* Python forbidden truth marker outside allowed root fails.
+* Malformed file does not crash audit.
+* Semantic graph is cached once.
+* AST pilot duplicate-call regression test.
+
+Exit:
+
+* Boundary findings can cite import edges.
+* Regex-only behavior is no longer the only semantic basis.
+* Performance remains acceptable.
+
+---
+
+## Slice 7 — Cap/score integration
+
+**Goal:** make scoring consequences derive from registry-backed findings.
+
+Files:
+
+```text
+crates/jankurai/src/audit/caps.rs
+crates/jankurai/src/audit/policy.rs
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/mod.rs
+crates/jankurai/tests/audit_smoke.rs
+crates/jankurai/tests/report_compatibility_guard.rs
+```
+
+Actions:
+
+1. Convert cap application to consume materialized findings.
+2. Keep legacy cap IDs stable.
+3. Ensure caps include rule IDs where possible.
+4. Ensure report remains backward compatible.
+5. Ensure soft dimension findings stay separate from hard caps.
+6. Add cap provenance to diagnostics.
+7. Add compatibility tests for old report consumers.
+
+Tests to add:
+
+* Cap triggered by finding includes rule provenance.
+* Cap not triggered when finding is absent.
+* Multiple findings for same cap dedupe deterministically.
+* Cap ordering is stable.
+* Legacy report compatibility passes.
+* Schema compatibility passes.
+
+Exit:
+
+* No hard cap can be mysterious.
+* Every score drop can be traced to rule evidence.
+
+---
+
+## Slice 8 — Exhaustive fixture matrix
+
+**Goal:** prove every rule and cap.
+
+Files:
+
+```text
+crates/jankurai/tests/fixtures/phase02/
+crates/jankurai/tests/phase02_rule_matrix.rs
+crates/jankurai/tests/phase02_boundary_matrix.rs
+crates/jankurai/tests/phase02_generated_zone_matrix.rs
+crates/jankurai/tests/phase02_import_graph_matrix.rs
+```
+
+Create fixtures like:
+
+```text
+fixtures/phase02/
+  HLT-001/
+    positive/
+    negative/
+    allowlisted/
+  HLT-002/
+    positive/
+    negative/
+    allowlisted/
+  ...
+  HLT-021/
+    positive/
+    negative/
+    allowlisted/
+```
+
+Each stable rule needs:
+
+1. Positive fixture: violation is detected.
+2. Negative fixture: clean case passes.
+3. Allowlist fixture: acceptable exception does not false-positive.
+4. Changed-scope fixture where relevant.
+5. Generated/vendor/reference exclusion fixture where relevant.
+6. Repair metadata assertion.
+7. Proof lane assertion.
+8. Owner assertion.
+
+Exit:
+
+* Every stable HLT rule has fixture coverage.
+* Every hard cap has fixture coverage.
+* Every analyzer has false-positive and false-negative tests.
+* Fixtures are small, readable, and deterministic.
+
+---
+
+## Slice 9 — Docs, generated index, and final receipt
+
+**Goal:** make the hardened contract visible.
+
+Files:
+
+```text
+docs/rules/hlt-index.md
+docs/boundary-oracle.md
+docs/artifact-contracts.md
+docs/audit-rubric.md
+tips/phases/02-rule-engine-semantic-oracle.md
+agent/JANKURAI_STANDARD.md
+agent/repo-score.json
+agent/repo-score.md
+```
+
+Actions:
+
+1. Generate or update HLT rule index.
+2. Document rule statuses.
+3. Document analyzer ownership.
+4. Document boundary manifest semantics.
+5. Document generated-zone semantics.
+6. Document AST/import graph limits.
+7. Record final Phase 02 receipt.
+8. Update phase status from “complete but partial receipt” to “hardened.”
+9. Regenerate audit outputs only through the canonical command.
+
+Final validation:
+
+```bash
+cargo test -p jankurai
+cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+cargo run -p jankurai -- versions
+just compat
+just fast
+just check
+```
+
+Exit:
+
+* Phase 02 receipt says hardened.
+* The receipt lists files changed, commands run, and any residual explicit non-goals.
+* No manual edits to generated artifacts.
+* Report/schema compatibility passes.
+
+---
+
+# 4. Parallel work plan
+
+Use parallel agents only where ownership does not overlap. Merge in this order.
+
+## Agent A — Registry + finding contract
+
+Owns:
+
+```text
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/src/audit/evidence.rs
+crates/jankurai/tests/rule_registry_smoke.rs
+crates/jankurai/tests/audit_smoke.rs
+```
+
+Tasks:
+
+* Add rule status/cap metadata.
+* Add `FindingDraft`.
+* Preserve matched term/reason/source span.
+* Strengthen high/critical finding tests.
+* Generate or update rule docs/index.
+
+Must not touch:
+
+```text
+crates/jankurai/src/boundaries/**
+generated outputs
+```
+
+---
+
+## Agent B — Boundary oracle
+
+Owns:
+
+```text
+crates/jankurai/src/boundaries/**
+crates/jankurai/src/audit/analyzers/boundary_oracle.rs
+crates/jankurai/tests/boundaries_manifest_smoke.rs
+docs/boundary-oracle.md
+schemas/audit-boundaries.schema.json
+```
+
+Tasks:
+
+* Extend manifest parser.
+* Make policy manifest-driven.
+* Add strict validation.
+* Add semantic boundary evidence.
+* Add positive/negative/allowlist fixtures.
+
+Depends on:
+
+* Agent A’s `FindingDraft` shape.
+
+---
+
+## Agent C — Generated-zone oracle
+
+Owns:
+
+```text
+crates/jankurai/src/audit/analyzers/generated_zone_oracle.rs
+crates/jankurai/tests/generated_zones_manifest_smoke.rs
+crates/jankurai/tests/contract_source_smoke.rs
+agent/generated-zones.toml
+schemas/generated-zones.schema.json
+docs/artifact-contracts.md
+```
+
+Tasks:
+
+* Build source/output/generator graph.
+* Detect manual edits.
+* Detect source/output drift.
+* Preserve generated-zone edge evidence.
+* Harden contract-source tests.
+
+Depends on:
+
+* Agent A’s evidence model.
+
+---
+
+## Agent D — Import graph / AST pilot
+
+Owns:
+
+```text
+crates/jankurai/src/audit/analyzers/ast.rs
+crates/jankurai/src/audit/analyzers/import_graph.rs
+crates/jankurai/tests/fixtures/phase02/import_graph/**
+```
+
+Tasks:
+
+* Add semantic graph.
+* Parse Rust/TS/Python import forms.
+* Normalize path aliases.
+* Cache graph once.
+* Feed boundary oracle.
+* Add parse coverage diagnostics.
+
+Depends on:
+
+* Agent B’s boundary edge model.
+* Agent A’s evidence model.
+
+---
+
+## Agent E — Compatibility, docs, receipts
+
+Owns:
+
+```text
+crates/jankurai/tests/schema_contracts.rs
+crates/jankurai/tests/report_compatibility_guard.rs
+docs/rules/hlt-index.md
+tips/phases/02-rule-engine-semantic-oracle.md
+agent/repo-score.json
+agent/repo-score.md
+```
+
+Tasks:
+
+* Keep schema/report compatibility green.
+* Update rule index.
+* Run final validation.
+* Write final hardened receipt.
+* Ensure generated outputs are produced only by canonical commands.
+
+Depends on:
+
+* All other agents.
+
+---
+
+# 5. Merge order
+
+Do not merge the semantic pieces before the contract pieces. The safest order is:
+
+1. **Baseline + tests only**
+2. **Registry metadata expansion**
+3. **FindingDraft/evidence preservation**
+4. **Analyzer trait with no behavior change**
+5. **Boundary manifest parser**
+6. **Boundary oracle behavior**
+7. **Generated-zone oracle**
+8. **Import graph upgrade**
+9. **Cap/score provenance**
+10. **Fixture matrix completion**
+11. **Docs/rule index/final receipt**
+
+This avoids the dangerous failure mode where analyzers start emitting new semantic findings before the report, registry, schema, and repair contracts can explain them.
+
+---
+
+# 6. Hard acceptance checklist
+
+Phase 02 is hardened only when all of this is true:
+
+## Registry
+
+* All stable HLT rules are in `RULES`.
+* All rule IDs are unique.
+* All stable rules have docs.
+* All stable rules declare analyzer ownership.
+* All stable rules declare evidence kind.
+* All stable rules declare proof lane.
+* All stable rules declare repair policy.
+* All hard caps map to registry metadata or explicit legacy compatibility metadata.
+* Deprecated rules are resolvable but not emitted.
+
+## Findings
+
+* Every emitted finding has a valid `rule_id`.
+* Every high/critical finding has owner, lane, rerun command, docs URL, repair guidance, repair eligibility, repair risk, and agent fix metadata.
+* Pattern findings preserve matched term and reason.
+* Boundary findings preserve boundary edge.
+* Import findings preserve import edge.
+* Generated-zone findings preserve source/output/generator edge.
+* Fingerprints are deterministic.
+* Findings are stable under analyzer ordering.
+
+## Boundary oracle
+
+* `agent/boundaries.toml` fully drives Rust, TypeScript, Python, queue, DB, and streaming policy.
+* Static forbidden lists are defaults, not hidden policy.
+* Unknown manifest fields fail strict validation.
+* Expired exceptions fail.
+* Allowlisted paths are respected.
+* Generated/vendor/reference exclusions are respected.
+* Every violation maps to owner, proof lane, rerun command, evidence kind, and repair queue item.
+
+## Generated-zone oracle
+
+* Declared generated outputs exist.
+* Generated headers are present.
+* Source/output relationships are known.
+* Generator command is declared.
+* Manual edits are detected.
+* Source changes without regenerated outputs are detected.
+* Public contract drift is detected.
+* Generated-zone findings include source/output evidence.
+
+## Import graph
+
+* Rust nested imports are handled.
+* TypeScript imports, re-exports, require, dynamic imports, and path aliases are handled.
+* Python imports are handled for boundary purposes.
+* Parse failures do not crash audit.
+* Parse coverage is reported.
+* Semantic graph is computed once per audit.
+* Boundary oracle consumes graph evidence.
+
+## Tests
+
+* Every stable rule has positive, negative, and allowlist fixtures.
+* Every hard cap has positive and negative fixtures.
+* Every analyzer has fixture coverage.
+* Report compatibility guard passes.
+* Schema contract tests pass.
+* Existing smoke tests still pass.
+* Changed-scope tests still pass.
+* SARIF/JUnit/issues export tests still pass.
+
+## Docs and receipts
+
+* Rule index is complete.
+* Boundary oracle docs match implementation.
+* Generated-zone docs match implementation.
+* Phase 02 receipt lists changed files and validation commands.
+* Phase status can honestly say “hardened,” not merely “complete.”
+
+---
+
+# 7. Specific tests I would add
+
+These are the highest-value new tests.
+
+```text
+crates/jankurai/tests/phase02_rule_matrix.rs
+```
+
+Assertions:
+
+* Every stable HLT rule has at least one fixture.
+* Fixture positive emits the expected rule.
+* Fixture negative does not emit the rule.
+* Fixture allowlist does not emit the rule.
+* Every emitted rule is declared by the analyzer.
+
+```text
+crates/jankurai/tests/phase02_cap_matrix.rs
+```
+
+Assertions:
+
+* Every hard cap has rule provenance.
+* Cap ordering is deterministic.
+* Duplicate findings dedupe into one cap.
+* Legacy cap IDs remain stable.
+
+```text
+crates/jankurai/tests/phase02_finding_contract.rs
+```
+
+Assertions:
+
+* Pattern evidence preserves matched term.
+* Pattern evidence preserves reason.
+* Boundary evidence preserves edge.
+* Import evidence preserves edge.
+* Generated evidence preserves source/output/generator.
+* High/critical findings have complete repair/proof metadata.
+
+```text
+crates/jankurai/tests/phase02_boundary_oracle.rs
+```
+
+Assertions:
+
+* Rust domain forbidden import fails.
+* Rust adapter import passes.
+* TypeScript web → DB import fails.
+* Generated contract import passes.
+* Python truth outside allowed root fails.
+* Python allowed tool path passes.
+* DB wrong layer fails.
+* Streaming exception expired fails.
+* Streaming exception valid passes.
+
+```text
+crates/jankurai/tests/phase02_generated_zone_oracle.rs
+```
+
+Assertions:
+
+* Missing generated output fails.
+* Missing header fails.
+* Manual generated edit fails.
+* Contract source without generated output fails.
+* Valid generated zone passes.
+* Invalid generator command fails.
+
+```text
+crates/jankurai/tests/phase02_import_graph.rs
+```
+
+Assertions:
+
+* Rust grouped imports are expanded.
+* Rust `mod` edges are included.
+* TypeScript re-export edges are included.
+* TypeScript `require` is included.
+* TypeScript dynamic import is included.
+* tsconfig alias is resolved.
+* Malformed source does not crash.
+* Parse coverage is recorded.
+
+---
+
+# 8. Validation command set
+
+The existing standard says path changes should route through `agent/test-map.toml`, and the repo already maps crate, schema, DB, generated-zone, docs, and agent changes to relevant commands. ([GitHub][18]) For Phase 02 hardening, I would use this command set.
+
+## Focused Phase 02 tests
+
+```bash
+cargo test -p jankurai --test rule_registry_smoke
+cargo test -p jankurai --test audit_smoke
+cargo test -p jankurai --test boundaries_manifest_smoke
+cargo test -p jankurai --test contract_source_smoke
+cargo test -p jankurai --test generated_zones_manifest_smoke
+cargo test -p jankurai --test schema_contracts
+cargo test -p jankurai --test report_compatibility_guard
+```
+
+## New Phase 02 tests
+
+```bash
+cargo test -p jankurai --test phase02_rule_matrix
+cargo test -p jankurai --test phase02_cap_matrix
+cargo test -p jankurai --test phase02_finding_contract
+cargo test -p jankurai --test phase02_boundary_oracle
+cargo test -p jankurai --test phase02_generated_zone_oracle
+cargo test -p jankurai --test phase02_import_graph
+```
+
+## Full crate validation
+
+```bash
+cargo test -p jankurai
+cargo run -p jankurai -- versions
+cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+```
+
+## Repo lanes
+
+```bash
+just compat
+just fast
+just check
+```
+
+## Final proof
+
+```bash
+cargo run -p jankurai -- lane . \
+  --changed crates/jankurai/src/audit \
+  --out target/jankurai/phase02-lane.json \
+  --md target/jankurai/phase02-lane.md
+```
+
+Then repeat with boundary paths if those changed:
+
+```bash
+cargo run -p jankurai -- lane . \
+  --changed crates/jankurai/src/boundaries \
+  --out target/jankurai/phase02-boundaries-lane.json \
+  --md target/jankurai/phase02-boundaries-lane.md
+```
+
+---
+
+# 9. The main risks
+
+## Risk 1 — Breaking report compatibility
+
+The audit report is a durable artifact. The repo already has artifact contracts and compatibility guards for reports, schemas, proof receipts, standard status, audit boundaries, security, UX, and related outputs. ([GitHub][17])
+
+Mitigation:
+
+* Add new fields as optional first.
+* Preserve existing field names.
+* Keep legacy cap IDs.
+* Run `report_compatibility_guard`.
+* Run `schema_contracts`.
+* Only tighten schema after compatibility tests prove consumers are safe.
+
+## Risk 2 — Overbuilding AST
+
+The Phase 02 doc explicitly says the target is not compiler-grade static analysis. ([GitHub][2])
+
+Mitigation:
+
+* Build a parser-light semantic graph first.
+* Add real parser dependencies only if false positives/negatives justify them.
+* Measure audit time before and after.
+* Treat parse failures as advisory.
+
+## Risk 3 — Too many false positives
+
+Boundary and generated-zone checks can become noisy if docs/reference/vendor/generated paths are not excluded correctly.
+
+Mitigation:
+
+* Add allowlist fixtures.
+* Add generated/vendor/reference fixtures.
+* Sort findings deterministically.
+* Emit top-N findings per rule with summary counts rather than flooding.
+
+## Risk 4 — Central scan code remains forever
+
+If the analyzer split is not completed, Phase 02 will continue to look done but behave like a pile of checks.
+
+Mitigation:
+
+* Require every stable rule to name an analyzer.
+* Require every analyzer to declare emitted rules.
+* Add a test that fails if new direct rule emission appears outside analyzer modules or the builder.
+
+## Risk 5 — Proof routing drift
+
+Phase 02 findings must route to the smallest credible proof lane. That depends on the Phase 03 proof router and the standard’s lane contract. The standard requires path changes to route through the test map and agents to run the smallest mapped lane. ([GitHub][18])
+
+Mitigation:
+
+* Do not invent lanes inside analyzers.
+* Lanes come from `RuleSpec`.
+* Rerun commands come from lane mapping.
+* Tests assert lane/rerun on every high/critical finding.
+
+---
+
+# 10. Final “100% done” definition
+
+I would not mark Phase 02 hardened until this exact statement is true:
+
+> For every stable HLT rule, Jankurai has registry metadata, analyzer ownership, fixture coverage, docs coverage, finding evidence preservation, repair metadata, proof-lane routing, cap/score provenance where applicable, and compatibility-tested report output. Boundary decisions are manifest-driven. Generated-zone decisions are source/output/generator-driven. Import decisions come from a cached semantic graph. All of it passes focused, crate-wide, compatibility, and lane validation.
+
+That is the finish line. Current Phase 02 is a solid base; the hardening work is primarily about **making the rule engine provable, not merely functional**.
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/00-phase-index.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/02-rule-engine-semantic-oracle.md "raw.githubusercontent.com"
+[3]: https://github.com/jeppsontaylor/Jankurai "GitHub - jeppsontaylor/Jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[4]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/agent/JANKURAI_STANDARD.md "raw.githubusercontent.com"
+[5]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/rules.rs "raw.githubusercontent.com"
+[6]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/finding_builder.rs "raw.githubusercontent.com"
+[7]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/mod.rs "raw.githubusercontent.com"
+[8]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/scan.rs "raw.githubusercontent.com"
+[9]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/analyzers/ast.rs "raw.githubusercontent.com"
+[10]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/analyzers/mod.rs "raw.githubusercontent.com"
+[11]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/boundaries/manifest.rs "raw.githubusercontent.com"
+[12]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/agent/boundaries.toml "raw.githubusercontent.com"
+[13]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/tests/rule_registry_smoke.rs "raw.githubusercontent.com"
+[14]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/audit-rubric.md "raw.githubusercontent.com"
+[15]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/boundary-oracle.md "raw.githubusercontent.com"
+[16]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/boundaries/rust.rs "raw.githubusercontent.com"
+[17]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/artifact-contracts.md "raw.githubusercontent.com"
+[18]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/agent-native-standard.md "raw.githubusercontent.com"
+

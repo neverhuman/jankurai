@@ -1,0 +1,582 @@
+Here’s the Rust “never justified” bad-behavior list, framed for **vibe coding**: AI-assisted, fast, improvisational Rust where people are tempted to “make the compiler shut up” instead of proving the code is correct.
+
+I’m using **never justified** narrowly. I am **not** saying “never use `unsafe`,” “never use `unwrap`,” or “never clone.” Those all have legitimate uses. The non-excusable behavior is **using them to hide uncertainty, bypass contracts, erase failure modes, or ship unreviewed risk**. Rust’s own Reference says Rust code is incorrect if it exhibits undefined behavior, including inside `unsafe`; `unsafe` only moves responsibility to the programmer, and safe code interacting with unsafe code must not be able to trigger UB. ([Rust Documentation][1])
+
+## The highest-priority “never justified” Rust behaviors
+
+1. **Creating undefined behavior and calling it acceptable.** This includes data races, dangling or misaligned pointer access, invalid values, broken aliasing, mutating immutable bytes, invalid lifetimes, and wrong assumptions inside `unsafe`. The Rust Reference’s UB list is explicitly serious and also warns it is not exhaustive. ([Rust Documentation][1])
+
+2. **Publishing a safe API that safe callers can use to trigger UB.** That is unsound Rust. This is worse than merely “using unsafe,” because it leaks unsafety into code that appears safe. Real ecosystem bugs include safe Rust triggering UB through incorrect `Send`/`Sync` bounds in `futures-rs`, and GitLab advisories for crates with invalid bit patterns, out-of-bounds iterator advances, and uninitialized `MaybeUninit::assume_init` usage. ([GitHub][2])
+
+3. **Writing `unsafe` without a real safety proof.** “Seems fine,” “the AI said so,” “copied from StackOverflow,” “Miri passed once,” or “the tests pass” is not a proof. The Rust Book recommends keeping unsafe blocks small, wrapping unsafe code in safe abstractions, and using Miri to check unsafe code. ([Rust Documentation][3])
+
+4. **Suppressing lints, warnings, tests, or audits just to get green CI.** Rust and Clippy expose mechanisms to `allow`, `warn`, `deny`, and `forbid` lints; using `allow` to hide a real problem without a reason is a review smell. Clippy also warns that restriction lints should be enabled case-by-case, not blindly. ([Rust Documentation][4])
+
+5. **Treating “it compiles” as “it is correct.”** Rust prevents many memory-safety bugs in safe code, but it does not prove business logic, cancellation safety, panic policy, input validation, resource limits, cryptography, SQL safety, authorization, protocol compatibility, or operational resilience.
+
+---
+
+# A. Vibe-coding-specific Rust behavior that is never excusable
+
+These are the big ones when someone is moving fast with AI or “compiler-driven” edits.
+
+1. **Accepting generated Rust without understanding every invariant it relies on.**
+2. **Letting an AI introduce `unsafe`, FFI, `Send`, `Sync`, `Pin`, `transmute`, atomics, `static mut`, `no_mangle`, `export_name`, or lifetime tricks without human review.**
+3. **Using the compiler as a random patch oracle: adding `clone`, `Arc`, `Mutex`, `'static`, `Box::leak`, `unsafe`, `RefCell`, `Rc`, or `unwrap` until errors disappear.**
+4. **Satisfying the borrow checker by changing the program’s ownership model without checking semantics.**
+5. **Adding `Arc<Mutex<T>>` everywhere to avoid thinking about ownership.**
+6. **Adding `.clone()` everywhere to avoid thinking about borrowing, especially on large data, secret data, locked data, or hot paths.**
+7. **Adding `'static` bounds until async code compiles, without proving the data really can live that long.**
+8. **Using `Box::leak`, `mem::forget`, global singletons, or lazy statics to silence lifetime errors.**
+9. **Replacing precise error types with `anyhow::Error` or strings everywhere in a library API because the generated code was easier.**
+10. **Turning recoverable errors into panics because the AI could not thread `Result` through the call graph.**
+11. **Turning panics into `Result` while silently losing the invariant violation that the panic was meant to expose.**
+12. **Deleting failing tests because generated code changed behavior.**
+13. **Weakening tests to match generated output.**
+14. **Accepting generated benchmarks that do not measure release builds, realistic data, or optimized-away work.**
+15. **Accepting generated documentation that overclaims safety, complexity, performance, or security.**
+16. **Shipping generated code that uses crates the team has not reviewed.**
+17. **Letting an AI choose dependencies by popularity/name alone.**
+18. **Copying code from Reddit, X, StackOverflow, GitHub issues, or an LLM into `unsafe` without going back to primary docs.**
+19. **Inventing a `SAFETY:` comment after the fact to appease Clippy.**
+20. **Saying “the compiler would catch it” for code involving `unsafe`, FFI, logic, concurrency, IO, or external inputs.**
+21. **Trusting AI-generated FFI signatures.**
+22. **Trusting AI-generated `repr(C)` structs without checking C headers, padding, alignment, ABI, ownership, and platform differences.**
+23. **Trusting AI-generated atomic orderings.**
+24. **Trusting AI-generated `Pin` projections.**
+25. **Trusting AI-generated parsers for untrusted input without fuzz/property tests.**
+
+---
+
+# B. `unsafe` and soundness behavior that is never excusable
+
+Rust does not forbid `unsafe`; it demands discipline. The Rust Book says `unsafe` gives access to five special operations but does not turn off all safety checks, and incorrect unsafe code can cause memory unsafety. ([Rust Documentation][3])
+
+## Unsafe blocks and functions
+
+1. **Using `unsafe` as a way to bypass the borrow checker rather than encode the real invariant.**
+2. **Writing an unsafe block without a nearby `SAFETY:` explanation.** Clippy’s `undocumented_unsafe_blocks` lint exists because undocumented unsafe blocks and impls are harder to maintain and can hide unsoundness. ([rust-lang.github.io][5])
+3. **Writing a `SAFETY:` comment that restates the code instead of proving the preconditions.**
+4. **Writing a false or unverifiable `SAFETY:` comment.**
+5. **Putting many unrelated unsafe operations into one block so reviewers cannot audit each obligation separately.** Clippy has a `multiple_unsafe_ops_per_block` restriction lint for this exact auditability reason. ([rust-lang.github.io][5])
+6. **Assuming `unsafe fn` means the whole body should be implicitly unsafe.** Rust 2024 warns by default for unsafe operations inside unsafe functions without explicit unsafe blocks, because conflating “caller has obligations” with “body may perform unsafe operations” was considered too risky. ([Rust Documentation][6])
+7. **Making a function safe when the caller must uphold memory-safety preconditions.**
+8. **Making a trait safe when implementors must uphold safety invariants that unsafe code relies on.**
+9. **Hiding unsafe behavior inside a macro so the callsite looks safe.** Clippy explicitly calls out macros that hide unsafe blocks and allow unsafe operations in seemingly safe code. ([rust-lang.github.io][5])
+10. **Adding `#![allow(unsafe_code)]` or `#[allow(...)]` around unsafe merely to suppress review.**
+11. **Using `unsafe` in generated code without marking generated files as such and without a review process.**
+12. **Relying on a private invariant from another crate unless that invariant is part of its public, documented contract.**
+13. **Depending on debug-only checks to justify release-mode unsafe code.**
+
+## Pointers, references, aliasing, and validity
+
+14. **Dereferencing null, dangling, misaligned, or invalid raw pointers.**
+15. **Creating a Rust reference from a raw pointer before proving validity, alignment, provenance, aliasing, and lifetime.**
+16. **Creating `&mut T` when any other live reference or pointer can read or write the same memory in violation of aliasing rules.**
+17. **Creating multiple mutable references to the same object through raw pointers.**
+18. **Mutating through `&T` except through valid interior mutability such as `UnsafeCell`.**
+19. **Producing invalid values for Rust types: invalid `bool`, invalid `char`, invalid enum discriminants, invalid `NonZero*`, invalid `NonNull`, invalid references, invalid `String`, invalid `Vec`, or invalid niche-optimized types.**
+20. **Assuming all bit patterns are valid for a type.**
+21. **Reading uninitialized memory as a typed value.** The Rustonomicon is blunt: interpreting uninitialized memory as a value causes UB. ([Rust Documentation][7])
+22. **Calling `MaybeUninit::assume_init` before every byte that matters is initialized to a valid value.**
+23. **Dropping uninitialized memory.**
+24. **Double-dropping through `ptr::read`, `ManuallyDrop`, `MaybeUninit`, `mem::forget`, or custom drop glue.**
+25. **Using `mem::zeroed` on types where the all-zero bit pattern is invalid.**
+26. **Using `transmute` as a normal conversion tool.** The standard library says both source and destination must be valid at their types, violating that is UB, and `transmute` should be an absolute last resort. ([Rust Documentation][8])
+27. **Transmuting lifetimes to `'static` unless the value truly lives for `'static`.**
+28. **Transmuting between pointer and integer types without understanding the memory model and provenance.**
+29. **Transmuting containers like `Vec<T>` to `Vec<U>` by assuming internal layout.**
+30. **Relying on `repr(Rust)` layout for FFI, disk formats, network formats, or cross-version compatibility.**
+31. **Using `slice::from_raw_parts` or `from_raw_parts_mut` without proving pointer validity, alignment, length, initialized memory, and aliasing.**
+32. **Using `get_unchecked` when the index can be influenced by input, races, or stale validation.**
+33. **Using `unreachable_unchecked` for a branch that is merely “unlikely.”**
+34. **Using `assume`, unchecked math, unchecked indexing, or unchecked UTF-8 as performance tricks without proof.**
+
+## Unsafe traits and marker traits
+
+35. **Incorrectly implementing `Send` or `Sync`.** The Rustonomicon says these are unsafe traits, unsafe code can rely on them being correct, and incorrect implementations can cause UB. ([Rust Documentation][9])
+36. **Marking a type `Send` because “it compiles except for this raw pointer.”**
+37. **Marking a type `Sync` while it contains unsynchronized interior mutability.**
+38. **Treating `Rc`, `RefCell`, `Cell`, raw pointers, or non-thread-safe C handles as thread-safe by wrapping them in newtypes with unsafe impls.**
+39. **Implementing unsafe traits like `TrustedLen`, allocator traits, or FFI-related traits without satisfying every invariant.**
+40. **Deriving or implementing `Copy`, `Clone`, `Default`, `Deref`, `Drop`, `Send`, or `Sync` in a way that violates ownership or safety invariants.**
+
+## `Pin` and self-referential behavior
+
+41. **Moving a pinned value after promising it will not move.**
+42. **Using `Pin::new_unchecked` without proving the pointee will remain pinned.**
+43. **Writing manual pin projections without understanding structural pinning.**
+44. **Creating self-referential structs with raw pointers and hoping normal moves will not happen.**
+45. **Implementing `Unpin` for a type that relies on pinning for soundness.**
+46. **Assuming async futures can be moved after pinning just because the code compiles.**
+
+---
+
+# C. FFI, ABI, and linking behavior that is never excusable
+
+Rust 2024 requires unsafe extern blocks to make clear that the author must ensure signatures are correct; wrong extern signatures can cause UB. ([Rust Documentation][10])
+
+1. **Declaring an `extern` function with the wrong ABI.**
+2. **Declaring wrong parameter types, return types, mutability, ownership, or nullability.**
+3. **Marking an extern function `safe` when the caller must satisfy pointer, lifetime, thread, initialization, or ownership preconditions.**
+4. **Assuming C `int`, `long`, `size_t`, enum layout, struct padding, or calling convention is the same on all targets.**
+5. **Using `repr(C)` incorrectly or forgetting it for FFI structs.**
+6. **Assuming `repr(C)` fixes Rust enum layouts that C cannot represent.**
+7. **Passing Rust references to C that may store them beyond the call.**
+8. **Passing pointers to stack values into callbacks that may outlive the stack frame.**
+9. **Letting C mutate through a pointer while Rust has live immutable references.**
+10. **Letting C read/write Rust-owned memory after Rust has freed or moved it.**
+11. **Freeing C-allocated memory with Rust’s allocator or Rust-allocated memory with C’s allocator unless explicitly designed that way.**
+12. **Ignoring null returns from C.**
+13. **Ignoring error returns, `errno`, or library-specific error-state conventions.**
+14. **Converting C strings to Rust strings without checking NUL termination and UTF-8 assumptions.**
+15. **Creating `&str` from bytes that are not valid UTF-8.**
+16. **Assuming C libraries are thread-safe without checking their docs.**
+17. **Calling non-thread-safe C APIs from multiple Rust threads just because Rust types are `Send`.**
+18. **Allowing unwinding across an FFI boundary that is not allowed to unwind.**
+19. **Not defining ownership of callback userdata.**
+20. **Generating bindings with bindgen and treating them as reviewed safe wrappers.**
+21. **Putting `unsafe` wrappers around C APIs but failing to encode ownership, lifetime, and thread-safety rules in Rust types.**
+22. **Using `no_mangle`, `export_name`, or `link_section` without checking symbol collisions and linker behavior.** Rust 2024 marks these as unsafe attributes because they have soundness requirements the compiler cannot verify. ([Rust Documentation][11])
+
+---
+
+# D. Error handling and panic behavior that is never excusable
+
+Blanket “never use `unwrap`” is too crude. The Rust Book explicitly says `unwrap`/`expect` can be appropriate in examples, prototypes, tests, and cases where a human can prove failure is impossible, especially with an explanatory `expect` message. ([Rust Documentation][12])
+
+The non-excusable behavior is **unjustified panicking where failure is expected or externally triggerable**.
+
+1. **Using `.unwrap()` on user input, network input, files, config, database output, environment variables, CLI args, or service responses in production paths.**
+2. **Using `.expect()` with a vague message like `"should work"` or `"impossible"` when the condition is not actually impossible.**
+3. **Using `panic!`, `assert!`, indexing `[]`, `.unwrap()`, `.expect()`, `.next().unwrap()`, `.parse().unwrap()`, or `.lock().unwrap()` as ordinary error handling.**
+4. **Panicking inside a function that returns `Result` for the same failure mode.** Clippy’s `panic_in_result_fn` lint exists because some codebases require `Result` functions to return errors rather than crash. ([rust-lang.github.io][5])
+5. **Using `todo!()` or `unimplemented!()` in reachable production code.**
+6. **Using `unreachable!()` for states that can be reached through malformed input, version skew, corrupted data, concurrency, or future enum variants.**
+7. **Using `assert!` to validate attacker-controlled or user-controlled input.**
+8. **Ignoring `Result` or `Option` values with `_ =` when failure matters.**
+9. **Calling `.ok()` or `.err()` just to throw away useful error information.**
+10. **Using `map_err(|_| ...)` to erase the context needed to debug or handle the failure.**
+11. **Returning `Ok(())` after a partial failure.**
+12. **Logging an error and continuing as if the operation succeeded.**
+13. **Retrying forever without backoff, cap, cancellation, or observability.**
+14. **Converting every error into a string in library APIs, preventing callers from matching error kinds.**
+15. **Leaking secrets or PII in error messages, panic messages, `Debug`, `Display`, or logs.**
+16. **Swallowing task panics in async code by dropping `JoinHandle`s whose results matter.**
+17. **Using panics for expected parser failures, HTTP errors, permission errors, missing files, invalid config, rate limits, or unavailable services.** The Rust Book says expected failures are better represented with `Result`. ([Rust Documentation][12])
+18. **Panicking in `Drop` for normal cleanup failure.**
+19. **Doing blocking or fallible work in destructors without an explicit alternative API.** The Rust API Guidelines say dependable crates should have destructors that never fail and alternatives for destructors that may block. ([rust-lang.github.io][13])
+20. **Documenting a function as infallible when it can panic.**
+21. **Failing to document panic conditions in public APIs.** Rust API Guidelines call for a `Panics` section for panic conditions. ([rust-lang.github.io][14])
+
+Clippy’s `unwrap_used` and `expect_used` lints are good policy tools, but they are `allow` by default because quick-and-dirty code and tests may intentionally use them. For production paths, every panic should be treated like an explicit design decision. ([rust-lang.github.io][5])
+
+---
+
+# E. Type and API design behavior that is never excusable
+
+1. **Allowing invalid states when the type system could prevent them.**
+2. **Using primitive types where a newtype is needed to encode units, ownership, trust level, identity, or validation state.**
+3. **Accepting `String` for “validated email,” “SQL identifier,” “path inside base dir,” “secret token,” or “already escaped HTML.”**
+4. **Using `bool` parameters that allow meaningless or dangerous combinations in public APIs.**
+5. **Using `Option<T>` to mean multiple different things without documenting the distinction.**
+6. **Making constructors that can create invalid objects.**
+7. **Providing public fields that let callers violate invariants.**
+8. **Making fields private but then exposing unsafe mutation through getters or `DerefMut`.**
+9. **Relying on documentation alone for an invariant that could be encoded in a type.** Rust API Guidelines recommend leveraging types and validating arguments when practical. ([rust-lang.github.io][15])
+10. **Public unsafe functions without a `# Safety` section.** Clippy’s `missing_safety_doc` warns on this, and the API Guidelines require safety sections explaining caller invariants. ([rust-lang.github.io][5])
+11. **Public functions that can panic without a `# Panics` section.**
+12. **Public functions returning `Result` without documenting meaningful error cases.**
+13. **Public traits whose implementors must uphold hidden invariants but that are not sealed or unsafe.**
+14. **Unsafe code relying on trait method behavior that implementors are not required to provide.**
+15. **Using `Default` to create an invalid sentinel value.**
+16. **Deriving `Deserialize` in a way that bypasses constructor validation.**
+17. **Deriving `Clone` or `Copy` for types that represent unique ownership, locks, handles, or capabilities.**
+18. **Implementing `PartialEq`, `Eq`, `Ord`, or `Hash` inconsistently.**
+19. **Implementing `Ord` for a relation that is not total.**
+20. **Implementing `Hash` inconsistently with `Eq`.**
+21. **Implementing `Deref` to pretend a domain type is a collection or primitive when that exposes invalid operations.**
+22. **Changing public API behavior without documenting migration.**
+23. **Shipping breaking changes as patch/minor releases without a clear semver rationale.** Cargo’s SemVer chapter describes which public API changes are conventionally breaking and require major bumps. ([Rust Documentation][16])
+24. **Silently changing feature flags so downstream crates compile different APIs or invariants.**
+25. **Re-exporting public dependency types without treating that dependency as part of your semver surface.**
+26. **Exposing `unsafe` details through type aliases, public fields, or trait bounds that downstream users cannot reason about.**
+
+---
+
+# F. Concurrency and async behavior that is never excusable
+
+The Rustonomicon distinguishes data races, which are UB and prevented in safe Rust, from general race conditions, which Rust cannot eliminate. ([Rust Documentation][17])
+
+1. **Creating a data race through unsafe code.**
+2. **Using `unsafe impl Send` or `unsafe impl Sync` to move non-thread-safe state across threads.**
+3. **Sharing `Rc`, `RefCell`, raw pointers, or C handles across threads through an unsafe wrapper without synchronization.**
+4. **Using `static mut` or global mutable state without synchronization.**
+5. **Using atomics with `Relaxed` because it “seemed faster” without a memory-ordering proof.**
+6. **Using atomics as a replacement for locks without proving the full protocol.**
+7. **Checking a condition, then using unchecked access after another thread can change the condition.**
+8. **Holding a blocking mutex guard across `.await` in code that can run concurrently.**
+9. **Holding any lock while awaiting network IO, disk IO, user callbacks, or unbounded work unless the lock is explicitly designed for that and the deadlock/cancellation story is proven.**
+10. **Blocking the async runtime with CPU-heavy loops, `std::thread::sleep`, synchronous IO, or blocking locks.** Tokio’s `spawn_blocking` docs say blocking or doing lots of compute in a future without yielding is problematic because it can prevent the executor from driving other futures. ([Docs.rs][18])
+11. **Using `spawn_blocking` as an unbounded CPU work queue.** Tokio notes that many CPU-bound computations should be limited with a semaphore or moved to a specialized executor. ([Docs.rs][18])
+12. **Using `spawn_blocking` for long-lived workers instead of dedicated threads.** Tokio recommends dedicated threads for long-lived blocking workloads. ([Docs.rs][18])
+13. **Calling blocking Tokio APIs inside async contexts that are documented to panic.** Tokio’s `Mutex::blocking_lock` panics inside async execution contexts and recommends `spawn_blocking` or `block_in_place`. ([Docs.rs][19])
+14. **Using `tokio::select!` in a loop with cancellation-unsafe operations while assuming progress is preserved.** Tokio documents methods that are not cancellation safe and explains that dropping and recreating a future must be a no-op for cancellation safety. ([Docs.rs][20])
+15. **Dropping futures that perform partial writes, partial reads, or state transitions without a cancellation-safety design.**
+16. **Using unbounded channels for untrusted or high-volume input.**
+17. **Spawning one task/thread per request without limits.**
+18. **Ignoring backpressure.**
+19. **Ignoring timeouts.**
+20. **Ignoring shutdown and cancellation paths.**
+21. **Creating lock-order cycles.**
+22. **Using `Mutex` where message passing or ownership transfer would make the invariant clearer.**
+23. **Using `Arc<Mutex<T>>` as a default architecture instead of a deliberate synchronization boundary.**
+24. **Ignoring poisoned mutexes when the protected data may be inconsistent.**
+25. **Detaching tasks that own important work and never observing whether they failed.**
+
+---
+
+# G. Security behavior that is never excusable
+
+1. **Trusting external input because Rust is memory-safe.**
+2. **Treating config, database rows, environment variables, CLI args, HTTP headers, JSON, protobufs, file contents, or feature flags as infallible.**
+3. **Using `unwrap`/`expect` on external input in request paths.**
+4. **Deserializing untrusted bytes directly into trusted domain types without validation.**
+5. **Using `unsafe` or `transmute` to parse network, disk, or IPC bytes.**
+6. **Assuming `serde` validation is the same as domain validation.**
+7. **Accepting unbounded input into `String`, `Vec`, `read_to_end`, `collect`, or recursive structures.**
+8. **Building paths by string concatenation with user input.**
+9. **Allowing `..`, symlinks, absolute paths, or platform-specific path tricks to escape a base directory.**
+10. **Using `Command::new("sh").arg("-c").arg(user_input)` or equivalent shell injection patterns.**
+11. **Building SQL, LDAP, HTML, shell, regex, or path expressions by concatenating unsanitized strings.**
+12. **Disabling TLS certificate or hostname validation.**
+13. **Rolling your own cryptography.**
+14. **Using non-cryptographic RNG for secrets, tokens, session IDs, keys, or nonces.**
+15. **Comparing secrets with normal equality when timing side channels matter.**
+16. **Logging secrets, tokens, passwords, session cookies, Authorization headers, private keys, PII, or raw request bodies.**
+17. **Deriving `Debug` for secret-bearing types without redaction.**
+18. **Using `Debug` output as a stable or user-facing format.**
+19. **Returning internal errors, paths, SQL, stack traces, or panic payloads to users.**
+20. **Ignoring authentication or authorization errors by converting them to default values.**
+21. **Treating “parse failed” as “use default allow.”**
+22. **Failing open on security checks.**
+23. **Caching authorization decisions without invalidation strategy.**
+24. **Using world-writable temp paths unsafely.**
+25. **Ignoring TOCTOU races around files, symlinks, and permissions.**
+26. **Storing passwords without a password hashing scheme designed for passwords.**
+27. **Not rotating or revoking secrets after exposure.**
+28. **Using unsafe FFI crypto bindings without checking initialization, thread safety, return codes, and zeroization requirements.**
+29. **Assuming dependency code is safe because it is Rust.**
+30. **Ignoring RustSec/GitHub/GitLab advisories.** RustSec exists specifically as a vulnerability database for Rust crates and provides `cargo-audit`; GitLab’s advisory database also tracks Cargo advisories. ([RustSec][21])
+
+---
+
+# H. Dependency and supply-chain behavior that is never excusable
+
+1. **Adding a crate without checking maintenance, license, repository, recent releases, unsafe usage, downloads only in context, issue history, and transitive dependencies.**
+2. **Adding a crate because the name looks right without checking typosquatting risk.**
+3. **Ignoring `build.rs` and proc-macro risk. Build scripts and proc macros execute code during build.**
+4. **Using unreviewed Git dependencies in production.**
+5. **Depending on a moving Git branch without a pinned revision.** Cargo’s own guide explains how relying on the latest default branch can produce different builds later, and how `Cargo.lock` records exact revisions. ([Rust Documentation][22])
+6. **Not committing `Cargo.lock` for applications, services, CLIs, or deployable binaries.** Cargo says when in doubt, check `Cargo.lock` into version control. ([Rust Documentation][22])
+7. **Manually editing `Cargo.lock` instead of using Cargo.**
+8. **Using wildcard dependencies or overly broad ranges without a reason.**
+9. **Ignoring yanked, unmaintained, deprecated, or vulnerable crates.**
+10. **Letting Dependabot/Renovate/cargo-audit findings rot without triage.**
+11. **Using `cargo update` blindly right before release.**
+12. **Using old transitive versions because “it still builds.”**
+13. **Enabling default features without knowing what they pull in.**
+14. **Enabling optional features that change security, networking, TLS, serialization, or FFI behavior without review.**
+15. **Vendoring C/C++ libraries through `-sys` crates and forgetting they need security updates too.**
+16. **Depending on a crate’s undocumented behavior.**
+17. **Depending on private modules, layout, error strings, or debug output from another crate.**
+18. **Publishing a crate with path/git dependencies that cannot resolve for users.** Cargo documents that crates.io does not allow packages to be published with dependencies outside crates.io except dev-dependencies. ([Rust Documentation][23])
+19. **Failing to document MSRV when your users need it.**
+20. **Changing MSRV unexpectedly in a patch release for a library used by others.**
+21. **Ignoring license incompatibilities.**
+22. **Copying code into a crate without attribution or license compliance.**
+23. **Publishing AI-generated code with invented provenance or license assumptions.**
+
+---
+
+# I. Testing, verification, and CI behavior that is never excusable
+
+Cargo’s `cargo test` compiles and executes unit, integration, and documentation tests; doctests are also run by default for library documentation examples. ([Rust Documentation][24])
+
+1. **Merging code with failing tests.**
+2. **Deleting tests instead of fixing the regression.**
+3. **Weakening assertions until generated code passes.**
+4. **Only testing happy paths for parsers, network protocols, storage formats, auth logic, or unsafe abstractions.**
+5. **No regression test for a fixed bug.**
+6. **No tests for documented panic/error behavior.**
+7. **No tests for boundary values: empty, one, max, overflow, invalid UTF-8, invalid enum, large input, duplicate input, partial input, interrupted IO.**
+8. **No tests for feature-flag combinations that users can enable.**
+9. **No tests for no-default-features if you claim to support it.**
+10. **No tests for MSRV if you claim an MSRV.**
+11. **No tests for documented examples.**
+12. **No property tests or fuzzing for untrusted parsers or complex state machines.**
+13. **No Miri run for crates with nontrivial unsafe code.** Miri is an official UB detection tool for Rust that can run binaries and tests and catch unsafe code that violates safety requirements. ([GitHub][25])
+14. **No sanitizer strategy for FFI-heavy or unsafe-heavy code.** Rust’s sanitizer docs describe AddressSanitizer catching out-of-bounds access, use-after-free, double free, invalid free, and leaks. ([Rust Documentation][26])
+15. **Treating Miri, fuzzing, or sanitizers as proof of correctness. They find bugs; they do not prove all invariants.**
+16. **Ignoring flaky tests.**
+17. **Hiding nondeterminism with sleeps instead of synchronization.**
+18. **Using CI that does not run workspace tests.**
+19. **Only running default features when non-default features are released.**
+20. **Not running Clippy or rustfmt in CI for a maintained codebase.**
+21. **Using `#[allow]` without a reason.**
+22. **Using `#[cfg(test)]` to change production invariants.**
+23. **Testing with mocks that remove the failure modes production code must handle.**
+24. **Shipping generated code that was never formatted, linted, or reviewed.**
+25. **Treating coverage percentage as a substitute for invariant testing.**
+
+A practical CI baseline for strict projects often includes targeted lints, not every Clippy restriction lint:
+
+```rust
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(unused_must_use)]
+#![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::missing_safety_doc)]
+#![deny(clippy::panic_in_result_fn)]
+// Consider per project:
+// #![deny(clippy::unwrap_used)]
+// #![deny(clippy::expect_used)]
+```
+
+---
+
+# J. Performance and resource behavior that is never excusable
+
+1. **Unbounded allocation from untrusted input.**
+2. **Reading entire request bodies, files, or streams into memory without a size limit.**
+3. **Recursive parsing without depth limits.**
+4. **Using unbounded queues/channels for untrusted traffic.**
+5. **Spawning unbounded tasks, threads, or blocking jobs.**
+6. **Ignoring backpressure.**
+7. **Ignoring timeouts.**
+8. **Holding locks while doing slow IO, logging, formatting, allocation-heavy work, or user callbacks.**
+9. **Using `clone` to quiet borrow errors in hot paths without measuring cost.**
+10. **Using `String` concatenation in loops where it creates avoidable quadratic behavior.**
+11. **Calling `.collect::<Vec<_>>()` just to iterate once.**
+12. **Allocating in a hot path while claiming zero-copy or low latency.**
+13. **Using `Debug` formatting in hot paths accidentally.**
+14. **Using `println!`/`eprintln!` in libraries or hot production paths instead of structured logging or returning errors.**
+15. **Leaking memory intentionally to solve ownership without documenting process lifetime and bounds.**
+16. **Using `Box::leak` or global caches with unbounded cardinality.**
+17. **Assuming async makes blocking work cheap.**
+18. **Using `spawn_blocking` for unbounded CPU work.**
+19. **Using a single global mutex around high-volume state.**
+20. **Claiming performance wins without benchmarks.**
+21. **Benchmarking debug builds.**
+22. **Benchmarking toy inputs and extrapolating to production.**
+23. **Benchmarking code that the optimizer removed.**
+24. **Ignoring allocator behavior when performance depends on allocation.**
+25. **Optimizing by adding unsafe before measuring safe alternatives.**
+
+---
+
+# K. Observability and operational behavior that is never excusable
+
+1. **No logs, metrics, or traces for important error paths.**
+2. **Logging too much sensitive data instead of structured, redacted context.**
+3. **Panicking in a service without supervision, restart policy, alerting, and rate limits.**
+4. **Restart loops with no circuit breaker.**
+5. **Assuming generated config is valid because the generator “should” be correct.**
+6. **Failing to validate config before rollout.**
+7. **Failing to stage config/schema/permission changes.**
+8. **No kill switch for risky features.**
+9. **No rollback path for migrations.**
+10. **Deploying Rust services as if memory safety replaces operational safety.**
+11. **Ignoring partial rollout signals.**
+12. **Treating panics as invisible if the process restarts.**
+13. **Dropping async task errors so production failures vanish.**
+14. **Hiding error context from operators.**
+15. **Letting debug-only logs be the only way to diagnose production failure.**
+
+A good recent cautionary pattern: social media reduced the November 18, 2025 Cloudflare outage to a Rust `unwrap` story, but Cloudflare’s official postmortem describes a chain involving a database permissions change, an unexpectedly doubled feature file, propagation across the network, and software failing on that file. The Rust lesson is not “unwrap is always evil”; it is that **hidden assumptions at config/data boundaries must be validated and operationally contained**. ([The Cloudflare Blog][27])
+
+---
+
+# L. Documentation behavior that is never excusable
+
+1. **Documenting unsafe code incompletely.**
+2. **Documenting unsafe code incorrectly.**
+3. **Saying “safe” when safety depends on undocumented caller behavior.**
+4. **Omitting `# Safety` from public unsafe functions.**
+5. **Omitting `# Panics` from public functions with known panic conditions.**
+6. **Omitting error conditions from public fallible APIs.**
+7. **Documenting examples that do not compile.**
+8. **Documenting examples that use `unwrap` in ways users will copy into production without a warning.**
+9. **Claiming constant time, lock-free, wait-free, zero-copy, allocation-free, thread-safe, or panic-free behavior without tests or proof.**
+10. **Claiming semver compatibility while changing public behavior.**
+11. **Leaving stale docs after changing invariants.**
+12. **Using comments to contradict code.**
+13. **Using comments to justify behavior the code does not actually enforce.**
+14. **Hiding safety-critical assumptions in PR comments instead of source docs.**
+15. **Failing to document feature flags that affect behavior, dependencies, or API.**
+
+---
+
+# M. Macro, proc-macro, and codegen behavior that is never excusable
+
+1. **Generating unsafe code without making that obvious to reviewers.**
+2. **Generating unsafe code from untrusted input.**
+3. **Hiding unsafe operations inside macros so callsites appear safe.**
+4. **Generating public APIs that differ by feature flag without documentation.**
+5. **Generating code that bypasses validation constructors.**
+6. **Generating `Send`/`Sync` impls automatically without checking fields and invariants.**
+7. **Generating FFI bindings and treating them as safe wrappers.**
+8. **Generating `Deserialize` impls that allow invalid domain values.**
+9. **Using proc macros from unreviewed crates in security-sensitive builds.**
+10. **Letting `build.rs` download or execute unpinned external code during builds.**
+11. **Committing generated code without recording generator version and inputs.**
+12. **Not reviewing generated diffs.**
+13. **Making generated code non-reproducible.**
+14. **Hand-editing generated files without feeding changes back to the generator.**
+15. **Using macros to create clever APIs that hide lifetimes, ownership, panics, or allocation.**
+
+---
+
+# N. Serialization, parsing, and data-format behavior that is never excusable
+
+1. **Parsing untrusted data with `unwrap`.**
+2. **Parsing untrusted data with unchecked indexing.**
+3. **Parsing untrusted data with `unsafe` layout casts.**
+4. **Assuming network byte order equals native byte order.**
+5. **Assuming struct layout equals wire layout.**
+6. **Assuming enum discriminants are valid.**
+7. **Ignoring duplicate fields when duplicates are security-relevant.**
+8. **Ignoring unknown fields when unknown fields should reject the message.**
+9. **Accepting partial parses as full success.**
+10. **Not bounding recursion depth.**
+11. **Not bounding list/map/string sizes.**
+12. **Not handling invalid UTF-8 explicitly.**
+13. **Using lossy conversion where exactness matters.**
+14. **Using floats for money, counters, authorization thresholds, or exact protocol fields.**
+15. **Not canonicalizing before signing or verifying.**
+16. **Signing one representation and verifying another.**
+17. **Using `Debug` or `Display` as a serialization format.**
+18. **Changing serialized format without versioning.**
+19. **Not testing backward/forward compatibility.**
+20. **Deserializing directly into privileged internal types instead of validating into them.**
+
+---
+
+# O. Build, release, and semver behavior that is never excusable
+
+1. **Releasing without knowing what code and dependencies are in the artifact.**
+2. **Publishing a crate with known unsoundness and no warning.**
+3. **Publishing a security fix without disclosing enough for users to act.**
+4. **Silently breaking semver.**
+5. **Changing public types, trait bounds, feature defaults, MSRV, panic behavior, or error behavior without release notes when users rely on them.**
+6. **Yanking or replacing releases to hide mistakes without documenting impact.**
+7. **Tagging a release that does not match the published crate.**
+8. **Publishing from a dirty working tree.**
+9. **Publishing generated artifacts that cannot be reproduced.**
+10. **Using local path patches accidentally in release builds.**
+11. **Relying on environment-specific build behavior.**
+12. **Letting `build.rs` depend on undeclared system state.**
+13. **Not checking license files and included sources before publishing.**
+14. **Not running tests on the exact feature set being released.**
+15. **Not running docs for public APIs.**
+16. **Not checking package contents with `cargo package --list` or equivalent review.**
+17. **Shipping debug assertions as the only enforcement of release invariants.**
+18. **Shipping release builds that depend on debug-only behavior.**
+
+---
+
+# P. Maintainer and ecosystem behavior that is never excusable
+
+1. **Hiding a soundness bug.**
+2. **Hiding a vulnerability report.**
+3. **Knowingly leaving users on a vulnerable version without advisory, yank, patch, or migration guidance.**
+4. **Marking a vulnerability as “not security” because it is “only a panic” when it is remotely triggerable denial of service.**
+5. **Marking UB as harmless because “it works on my machine.”**
+6. **Dismissing Miri, sanitizer, or fuzz findings without root-cause analysis.**
+7. **Closing soundness issues because they require a breaking API fix.**
+8. **Refusing a semver break when the current API is unsound.**
+9. **Adding a malicious or surprising `build.rs`.**
+10. **Adding telemetry, network calls, or data collection in build scripts or proc macros without disclosure.**
+11. **Namesquatting, typosquatting, or publishing lookalike crates.**
+12. **Copying code without license compliance.**
+13. **Claiming “memory safe” for a crate with unaudited unsafe code exposed through safe APIs.**
+14. **Claiming “production ready” for generated or prototype code with no maintenance plan.**
+15. **Leaving abandoned crates with known breakage and no deprecation notice if users are actively affected.**
+
+---
+
+# Q. “Looks bad, but not automatically never justified”
+
+These are not automatically non-excusable. They become bad when they hide uncertainty or violate a contract.
+
+1. **`unsafe`** — acceptable when necessary, minimal, documented, reviewed, and tested.
+2. **`unwrap` / `expect`** — acceptable in tests, examples, prototypes, or proven invariants; bad when used on expected/external failures. ([Rust Documentation][12])
+3. **`clone`** — acceptable when cheap or semantically needed; bad when used to avoid ownership reasoning.
+4. **`Arc<Mutex<T>>`** — acceptable for shared mutable state; bad as a default architecture.
+5. **`RefCell` / `Cell`** — acceptable for interior mutability; bad when used to dodge design.
+6. **`Box<dyn Trait>`** — acceptable for dynamic dispatch; bad when used to hide type confusion or object-safety issues.
+7. **Macros** — acceptable for reducing boilerplate; bad when they hide control flow, panics, allocations, or unsafe.
+8. **Nightly Rust** — acceptable for deliberate reasons; bad when used because generated code wanted an unstable shortcut.
+9. **Panics** — acceptable for broken invariants; bad for expected runtime failure.
+10. **Broad error types** — acceptable at application boundaries; bad in library APIs where callers need structured handling.
+
+---
+
+## The compact “ban list” for Rust vibe coding
+
+For a team policy, I’d ban or require explicit review for:
+
+```text
+unsafe without SAFETY proof
+unsafe fn without # Safety docs
+unsafe impl Send/Sync
+transmute
+MaybeUninit::assume_init
+mem::zeroed
+unreachable_unchecked
+get_unchecked
+Pin::new_unchecked
+from_raw_parts / from_raw_parts_mut
+FFI signatures and extern blocks
+no_mangle / export_name / link_section
+static mut
+Box::leak / mem::forget outside narrow audited cases
+unwrap/expect in production paths
+panic/assert in Result-returning functions
+todo!/unimplemented! in reachable code
+ignored Result values
+blocking calls inside async
+unbounded queues/tasks/input reads
+unreviewed dependencies, build.rs, proc macros
+lint/test/audit suppressions without reason
+```
+
+The north star is simple: **Rust lets you move risk into types, contracts, and compiler checks. Non-excusable Rust behavior is anything that moves that risk back into hidden assumptions.**
+
+[1]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html "Behavior considered undefined - The Rust Reference"
+[2]: https://github.com/rust-lang/futures-rs/issues/2239 "MappedMutexGuard Send/Sync bound is unsound · Issue #2239 · rust-lang/futures-rs · GitHub"
+[3]: https://doc.rust-lang.org/book/ch20-01-unsafe-rust.html "Unsafe Rust - The Rust Programming Language"
+[4]: https://doc.rust-lang.org/reference/attributes/diagnostics.html "Diagnostics - The Rust Reference"
+[5]: https://rust-lang.github.io/rust-clippy/master/index.html "Clippy Lints"
+[6]: https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html "unsafe_op_in_unsafe_fn warning - The Rust Edition Guide"
+[7]: https://doc.rust-lang.org/nomicon/uninitialized.html "Uninitialized Memory - The Rustonomicon"
+[8]: https://doc.rust-lang.org/std/mem/fn.transmute.html "transmute in std::mem - Rust"
+[9]: https://doc.rust-lang.org/nomicon/send-and-sync.html "Send and Sync - The Rustonomicon"
+[10]: https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-extern.html "Unsafe extern blocks - The Rust Edition Guide"
+[11]: https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-attributes.html "Unsafe attributes - The Rust Edition Guide"
+[12]: https://doc.rust-lang.org/book/ch09-03-to-panic-or-not-to-panic.html "To panic! or Not to panic! - The Rust Programming Language"
+[13]: https://rust-lang.github.io/api-guidelines/checklist.html "Checklist - Rust API Guidelines"
+[14]: https://rust-lang.github.io/api-guidelines/documentation.html "Documentation - Rust API Guidelines"
+[15]: https://rust-lang.github.io/api-guidelines/dependability.html "Dependability - Rust API Guidelines"
+[16]: https://doc.rust-lang.org/cargo/reference/semver.html "SemVer Compatibility - The Cargo Book"
+[17]: https://doc.rust-lang.org/nomicon/races.html "Races - The Rustonomicon"
+[18]: https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html "spawn_blocking in tokio::task - Rust"
+[19]: https://docs.rs/tokio/latest/tokio/sync/struct.Mutex.html "Mutex in tokio::sync - Rust"
+[20]: https://docs.rs/tokio/latest/tokio/macro.select.html "select in tokio - Rust"
+[21]: https://rustsec.org/ "About RustSec › RustSec Advisory Database"
+[22]: https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html "Cargo.toml vs Cargo.lock - The Cargo Book"
+[23]: https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html "Specifying Dependencies - The Cargo Book"
+[24]: https://doc.rust-lang.org/cargo/commands/cargo-test.html "cargo test - The Cargo Book"
+[25]: https://github.com/rust-lang/miri/?utm_source=chatgpt.com "rust-lang/miri"
+[26]: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/sanitizer.html?utm_source=chatgpt.com "sanitizer - The Rust Unstable Book"
+[27]: https://blog.cloudflare.com/18-november-2025-outage/?utm_source=chatgpt.com "Cloudflare outage on November 18, 2025"
+

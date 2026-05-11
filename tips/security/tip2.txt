@@ -1,0 +1,951 @@
+## Executive verdict
+
+Jankurai is already pointed in the right direction: it treats agent behavior as repository policy, uses owner/test/generated-zone files, produces audit receipts, and explicitly frames the project around “no proof, no merge; no receipt, no trust.” ([GitHub][1]) It also already names many of the right agent-era risk categories: secret sprawl, prompt injection, overbroad agency, supply-chain drift, CI hardening gaps, unsafe input boundaries, agent-tool supply gaps, and human-review evidence gaps. ([GitHub][2])
+
+The biggest missing piece is **not awareness**. The biggest missing piece is **hard enforcement**. The repo has excellent concepts and several security hooks, but many of the strongest controls are still advisory, non-strict, not present as GitHub config, not mirrored into audit evidence, or not connected to blocking score caps.
+
+My strongest recommendation: make Jankurai’s security posture **two-layered**:
+
+1. **GitHub/Git enforcement layer:** branch/ruleset protection, CODEOWNERS, least-privilege Actions tokens, pinned Actions, Dependabot, CodeQL, dependency review, secret scanning, signed releases, provenance.
+2. **Jankurai audit layer:** machine-readable evidence that these controls exist, ran, passed, produced artifacts, and cannot be bypassed by an agent, maintainer, skipped tool, moved tag, missing scanner, or fake receipt.
+
+---
+
+## What is already good in Jankurai
+
+Jankurai already has an unusually strong foundation for an agent-first project.
+
+It has a root agent instruction surface and a fuller standard that tells agents what owns behavior, which files are generated, what commands prove changes, and which failures are actionable. ([GitHub][2]) It has stable security-relevant rule IDs for secrets, prompt injection, overbroad agency, supply-chain drift, CI hardening gaps, authz/data isolation, unsafe input boundaries, agent-tool supply chain, release readiness, cost budgets, and human-review evidence. ([GitHub][2])
+
+It has a security policy with private vulnerability reporting, redaction guidance, narrow proof lanes, and a rule that trusted agent policy should not be rewritten by untrusted context, generated outputs, repair plans, or model responses. ([GitHub][3])
+
+It also has CI running a Jankurai audit on pull requests and default-branch pushes, plus a security lane that emits `target/jankurai/security/evidence.json`. ([GitHub][4]) The standard correctly says the security lane should cover secrets, dependency checks, SAST, unsafe code, licenses, SCA, Cargo/npm audit policy, and SBOM. ([GitHub][2])
+
+That is a great start. Now the hardening work is to close the gap between **declared philosophy** and **non-bypassable controls**.
+
+---
+
+## Highest-priority gaps I found
+
+### 1. The CI security lane is not strict
+
+The current workflow runs:
+
+```yaml
+cargo run -p jankurai -- security run . --out target/jankurai/security/evidence.json
+```
+
+It does **not** pass `--strict`. ([GitHub][4]) That matters because the repo’s own `SECURITY.md` says `just security-strict` should be used when changing secret scanning, dependency checks, prompt-injection policy, generated zones, file writes, shell execution, CI permissions, or advisory behavior. ([GitHub][3])
+
+The security policy currently requires only `gitleaks`; `cargo audit` and `npm audit` are advisory.  The documented security matrix says CI should require `gitleaks`, `cargo audit`, `npm audit`, and `zizmor`, and release should require SBOM, vulnerability scanning, OpenSSF Scorecard, SLSA, and Cosign-style signing. 
+
+**Fix:** CI should run strict security by default.
+
+```yaml
+- name: Security lane
+  run: cargo run -p jankurai -- security run . --strict --out target/jankurai/security/evidence.json
+```
+
+**Audit rule:** `HLT-028-SECURITY-LANE-NON-STRICT-IN-CI`
+
+**Scoring:** cap final score at `70` if CI runs security non-strict; cap at `60` if a required tool is skipped; block merge on high/critical.
+
+---
+
+### 2. GitHub Actions workflow permissions are not explicitly least-privilege
+
+The current workflow is 86 lines and shows `name`, triggers, jobs, runners, and steps, but no explicit top-level or job-level `permissions:` block. ([GitHub][4]) GitHub recommends granting `GITHUB_TOKEN` the minimum required permissions and setting the default to read-only, increasing permissions per job only when required. ([GitHub Docs][5])
+
+**Fix:**
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    permissions:
+      contents: read
+      actions: read
+      security-events: write # only if uploading SARIF to code scanning
+```
+
+**Audit rule:** `HLT-029-ACTIONS-TOKEN-OVERPRIVILEGED`
+
+**Scoring:** cap at `74` if no explicit `permissions:` exists; cap at `60` if write permissions are available to pull-request code without a documented reason; critical if an untrusted PR can obtain secrets or write tokens.
+
+---
+
+### 3. Actions are pinned to tags, not immutable SHAs
+
+The workflow uses refs such as `actions/checkout@v4`, `dtolnay/rust-toolchain@stable`, `actions/setup-node@v4`, and `actions/upload-artifact@v4`. ([GitHub][4]) GitHub says pinning an action to a full-length commit SHA is currently the only way to use an action as an immutable release; tags can move or be deleted. ([GitHub Docs][5])
+
+**Fix:**
+
+```yaml
+- uses: actions/checkout@<full-length-commit-sha>
+- uses: actions/setup-node@<full-length-commit-sha>
+- uses: actions/upload-artifact@<full-length-commit-sha>
+```
+
+Keep Dependabot enabled for GitHub Actions so pinned SHAs still receive update PRs.
+
+**Audit rule:** `HLT-030-UNPINNED-ACTION-REF`
+
+**Scoring:** cap at `76` for any third-party action pinned by tag; cap at `68` if action runs before security checks or has token/secrets access; critical for untrusted action plus write token or secrets.
+
+---
+
+### 4. No visible CODEOWNERS for security-critical paths
+
+The `.github` directory listing shows issue templates, instructions, workflows, the PR template, and Copilot instructions; I did not see a `CODEOWNERS` file there. ([GitHub][6]) GitHub specifically recommends using CODEOWNERS to control workflow-file changes, because workflow changes should require designated reviewer approval. ([GitHub Docs][5])
+
+**Fix:** add `.github/CODEOWNERS`.
+
+```text
+# Security-critical control plane
+.github/workflows/**        @jeppsontaylor/security @jeppsontaylor/maintainers
+.github/dependabot.yml      @jeppsontaylor/security
+.github/CODEOWNERS          @jeppsontaylor/security
+.github/instructions/**     @jeppsontaylor/security @jeppsontaylor/maintainers
+.github/copilot-instructions.md @jeppsontaylor/security
+
+# Agent policy
+AGENTS.md                   @jeppsontaylor/security @jeppsontaylor/maintainers
+agent/**                    @jeppsontaylor/security @jeppsontaylor/maintainers
+docs/security*.md           @jeppsontaylor/security
+
+# Build/release/dependency surfaces
+Cargo.toml                  @jeppsontaylor/security
+Cargo.lock                  @jeppsontaylor/security
+package.json                @jeppsontaylor/security
+package-lock.json           @jeppsontaylor/security
+Justfile                    @jeppsontaylor/security
+tools/security-lane.sh      @jeppsontaylor/security
+```
+
+**Audit rule:** `HLT-031-MISSING-CODEOWNERS-FOR-CONTROL-PLANE`
+
+**Scoring:** cap at `78` if missing; cap at `65` if workflows, agent policy, release, dependency, or security config can change without code-owner review.
+
+---
+
+### 5. Branch protection/ruleset evidence is not file-backed
+
+I cannot verify UI-only settings from the repo files alone. That is itself the audit gap: branch protection, rulesets, signed commits, required checks, stale-review dismissal, force-push protection, deletion protection, merge queue, admin bypass, and required CODEOWNER review should be mirrored into a Jankurai evidence artifact.
+
+GitHub branch protection can require PR reviews, status checks, conversation resolution, signed commits, linear history, merge queue, deployments, no bypass, push restrictions, and force-push/deletion controls. ([GitHub Docs][7])
+
+**Fix:** add `agent/repository-controls.toml` plus generated evidence from GitHub API.
+
+```toml
+schema_version = "1.0.0"
+
+[branch_protection.main]
+require_pull_request = true
+required_approving_reviews = 1
+require_code_owner_reviews = true
+dismiss_stale_reviews = true
+require_last_push_approval = true
+require_status_checks = true
+strict_status_checks = true
+required_checks = [
+  "audit",
+  "ux-qa",
+  "paper",
+  "codeql",
+  "dependency-review",
+  "scorecard",
+  "security-strict"
+]
+require_signed_commits = true
+require_linear_history = true
+require_conversation_resolution = true
+allow_force_pushes = false
+allow_deletions = false
+allow_bypass = false
+```
+
+CI should write:
+
+```text
+target/jankurai/security/repo-settings-evidence.json
+```
+
+**Audit rule:** `HLT-032-BRANCH-PROTECTION-NOT-EVIDENCED`
+
+**Scoring:** cap at `72` if branch protection is not evidenced; cap at `60` if direct pushes to `main` are allowed; critical if force pushes/deletions are allowed on protected branches.
+
+---
+
+### 6. No visible Dependabot configuration
+
+The `.github` listing did not show `dependabot.yml`. ([GitHub][6]) GitHub recommends Dependabot for keeping Actions and reusable workflows up to date, and dependency review to understand dependency changes and security impact in pull requests. ([GitHub Docs][5])
+
+**Fix:** add `.github/dependabot.yml`.
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+```
+
+Add dependency-review on PRs:
+
+```yaml
+- name: Dependency review
+  uses: actions/dependency-review-action@<full-length-commit-sha>
+```
+
+**Audit rule:** `HLT-033-MISSING-DEPENDENCY-UPDATE-AND-REVIEW`
+
+**Scoring:** cap at `80` if no dependency update tool; cap at `74` if dependency changes do not run review/SCA; block on high/critical reachable vulnerability unless an approved expiring exception exists.
+
+---
+
+### 7. No visible CodeQL/SAST workflow
+
+The workflows directory contains only `jankurai.yml`. ([GitHub][8]) The current workflow emits a SARIF path as an artifact, but I did not see a CodeQL workflow or a SARIF upload step to GitHub code scanning. ([GitHub][4]) GitHub recommends code scanning and provides CodeQL workflow templates for finding vulnerabilities before production. ([GitHub Docs][5])
+
+**Fix:** add CodeQL and SARIF upload.
+
+```yaml
+name: codeql
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@<full-length-commit-sha>
+      - uses: github/codeql-action/init@<full-length-commit-sha>
+        with:
+          languages: rust,javascript-typescript
+      - uses: github/codeql-action/analyze@<full-length-commit-sha>
+```
+
+Then upload Jankurai/Semgrep/zizmor SARIF too:
+
+```yaml
+- name: Upload Jankurai SARIF
+  uses: github/codeql-action/upload-sarif@<full-length-commit-sha>
+  with:
+    sarif_file: target/jankurai/jankurai.sarif
+```
+
+**Audit rule:** `HLT-034-SAST-NOT-ENFORCED`
+
+**Scoring:** cap at `82` if no SAST; cap at `74` for runtime/product code without SAST; cap at `68` if SAST output is generated but not uploaded or enforced.
+
+---
+
+### 8. Secret scanning exists locally, but GitHub push protection is not evidenced
+
+The repo has `.gitleaksignore` and a `gitleaks` lane, which is good. However, GitHub secret scanning and push protection should also be enabled and evidenced. GitHub’s secret scanning can detect secrets already visible in a repository, and push protection blocks contributors from pushing secrets and creates an alert on bypass. ([GitHub Docs][9])
+
+**Fix:** enforce both:
+
+```toml
+[github_security_features]
+secret_scanning = "required"
+push_protection = "required"
+validity_checks = "required"
+generic_secret_detection = "required"
+```
+
+CI evidence should record whether features are enabled through GitHub API or a manually attested settings export.
+
+**Audit rule:** `HLT-035-SECRET-PROTECTION-NOT-EVIDENCED`
+
+**Scoring:** cap at `78` if no push-protection evidence; cap at `60` if a secret-like value is detected in committed files; critical if a live secret appears in code, logs, artifacts, prompts, fixtures, transcripts, or agent context.
+
+---
+
+### 9. SBOM generation is advisory; release vulnerability scanning/provenance/signing is not enforced
+
+The security tool matrix says release should require Syft, Grype/Trivy, OpenSSF Scorecard, SLSA, and Cosign-style signing.  The current workflow uploads security evidence, but there is no visible release workflow that signs artifacts, publishes provenance, verifies provenance, or fails release on SBOM vulnerability results. ([GitHub][4])
+
+SLSA is the current supply-chain specification for incrementally improving supply-chain security; version 1.2 defines levels/tracks and recommended attestation formats, including provenance. ([SLSA][10]) SLSA’s build track is about giving confidence that artifacts were not tampered with and can be traced back to source. ([SLSA][11])
+
+**Fix:** release must produce and verify:
+
+```text
+target/jankurai/release/jankurai-linux-amd64.tar.gz
+target/jankurai/release/sbom.spdx.json
+target/jankurai/release/vuln-scan.grype.json
+target/jankurai/release/provenance.intoto.jsonl
+target/jankurai/release/cosign.bundle
+target/jankurai/release/checksums.txt
+target/jankurai/release/checksums.txt.sig
+```
+
+**Audit rule:** `HLT-036-RELEASE-PROVENANCE-GAP`
+
+**Scoring:** cap at `78` if SBOM missing; cap at `72` if artifact vulnerability scan missing; cap at `70` if release is unsigned; cap at `60` if release artifacts are built outside CI or not tied to a protected tag.
+
+---
+
+### 10. OpenSSF Scorecard is not visibly run
+
+OpenSSF Scorecard assesses open-source projects through automated checks and covers vulnerabilities, dependency update tooling, security policy, CI tests, fuzzing, SAST, branch protection, dangerous workflows, code review, pinned dependencies, token permissions, packaging, and signed releases. ([undefined][12]) GitHub also recommends Scorecards for workflow dependency security and notes it checks script injection, token permissions, and pinned actions. ([GitHub Docs][5])
+
+**Fix:**
+
+```yaml
+name: scorecard
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "23 5 * * 1"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write
+
+jobs:
+  scorecard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@<full-length-commit-sha>
+      - uses: ossf/scorecard-action@<full-length-commit-sha>
+        with:
+          results_file: target/jankurai/security/scorecard.sarif
+          results_format: sarif
+          publish_results: true
+```
+
+**Audit rule:** `HLT-037-SCORECARD-NOT-RUN`
+
+**Scoring:** cap at `82` if Scorecard absent; cap by individual Scorecard findings when imported.
+
+---
+
+### 11. Agent/MCP/tool supply chain needs a stronger allowlist
+
+Jankurai already has `HLT-024-AGENT-TOOL-SUPPLY-GAP`, but the repo should make agent tools, MCP servers, hooks, plugins, prompts, and IDE adapters first-class security assets. OWASP’s agentic security work highlights risks such as agent behavior hijacking, tool misuse/exploitation, and identity/privilege abuse. ([OWASP Gen AI Security Project][13]) OWASP’s earlier agentic threat guide frames agentic AI as increasingly autonomous and risky because LLM integration expands scale and capability. ([OWASP Gen AI Security Project][14])
+
+**Fix:** add `agent/tool-policy.toml`.
+
+```toml
+schema_version = "1.0.0"
+
+[defaults]
+network = "deny"
+filesystem_write = "deny"
+shell = "deny"
+secrets = "deny"
+mcp_servers = "deny"
+max_cost_usd = 0
+require_receipt = true
+
+[[tool]]
+id = "git.diff"
+kind = "local"
+allowed_lanes = ["fast", "audit", "security"]
+permissions = ["read_repo"]
+network = "deny"
+
+[[tool]]
+id = "cargo.test"
+kind = "shell"
+allowed_commands = ["cargo test -p jankurai", "cargo check -p jankurai"]
+allowed_lanes = ["fast", "audit"]
+filesystem_write = ["target/**"]
+network = "deny"
+
+[[tool]]
+id = "release.sign"
+kind = "oidc"
+allowed_lanes = ["release"]
+requires_human_approval = true
+requires_protected_tag = true
+secrets = "oidc-only"
+```
+
+**Audit rule:** `HLT-038-AGENT-TOOL-POLICY-GAP`
+
+**Scoring:** cap at `65` if tools are not allowlisted; cap at `55` if agents can edit their own policy without CODEOWNER approval; critical if an agent has shell/network/secrets/write access outside the requested proof lane.
+
+---
+
+### 12. PR template lacks a security-specific gate
+
+The PR template asks for summary, changed paths, validation, receipts, and risk, which is good, but it does not force dependency/security/tooling/threat-model answers. 
+
+**Fix:** add a security section.
+
+```markdown
+## Security Impact
+
+- [ ] No secrets, credentials, customer data, prompt transcripts, or private logs added.
+- [ ] Dependency changes reviewed with dependency-review/SCA evidence.
+- [ ] New or changed GitHub Actions are SHA-pinned and least-privilege.
+- [ ] Agent/MCP/tool permission changes are listed and scoped to a proof lane.
+- [ ] Auth/authz/input/file/shell/network/crypto behavior has negative tests.
+- [ ] Generated security-sensitive code was regenerated from source and not hand-edited.
+- [ ] Security lane run: `just security-strict`
+- [ ] Residual risk and exception expiry documented.
+```
+
+**Audit rule:** `HLT-039-PR-SECURITY-EVIDENCE-GAP`
+
+**Scoring:** advisory for missing checklist; high when security-sensitive paths changed without answers and receipts.
+
+---
+
+### 13. The “full” lane metadata and actual `just check` command are not aligned
+
+`agent/proof-lanes.toml` says the full lane supersedes fast, audit, and security, but the `Justfile` `check` command runs versions, score, and paper build; it does not run the strict security lane, Rust tests, UX QA, dependency review, CodeQL, or release provenance.  
+
+**Fix:** make the release/full lane literal.
+
+```make
+check:
+    cargo run -p jankurai -- versions
+    cargo test -p jankurai
+    npm ci
+    npm --workspace @jankurai/ux-qa run build
+    npm --workspace @jankurai/ux-qa run test
+    cargo run -p jankurai -- security run . --strict --out target/jankurai/security/evidence.json
+    cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md --score-history agent/score-history.jsonl --score-history-csv agent/score-history.csv
+    latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=paper paper/jankurai.tex
+```
+
+**Audit rule:** `HLT-040-FULL-LANE-DOES-NOT-RUN-CLAIMED-GATES`
+
+**Scoring:** cap at `75` if lane claims security/release coverage but omits it; cap at `65` if `release` can pass without security evidence.
+
+---
+
+## Exhaustive security baseline for every agent-first coding project
+
+Use this as the master checklist. Jankurai already covers several conceptually; the missing work is to make each one explicit, enforced, evidenced, and scored.
+
+| Area                 | Required practice                                     | Implementation                                      | Enforcement                       | Evidence                |
+| -------------------- | ----------------------------------------------------- | --------------------------------------------------- | --------------------------------- | ----------------------- |
+| Repo governance      | Root agent instructions                               | `AGENTS.md`, provider adapters                      | Audit required file               | `agent/repo-score.json` |
+| Trusted policy       | Agent policy cannot be changed by untrusted context   | CODEOWNERS on `AGENTS.md`, `agent/**`, IDE adapters | Required review + audit           | PR review receipt       |
+| Ownership            | Every path has owner and allowed dependency direction | `agent/owner-map.json`                              | Audit blocks ownerless paths      | owner-map finding       |
+| Proof routing        | Every path maps to proof lanes                        | `agent/test-map.json`                               | Audit blocks unmapped proof       | proof-plan JSON         |
+| Generated zones      | No hand edits in generated output                     | `agent/generated-zones.toml`                        | CI diff check                     | generated-zone finding  |
+| Branch protection    | PR-only changes to main                               | GitHub ruleset/branch protection                    | Required checks/reviews           | repo-settings evidence  |
+| Reviews              | Code-owner and stale-review dismissal                 | CODEOWNERS + branch rule                            | GitHub required review            | review evidence         |
+| Signed source        | Signed commits/tags for protected branches/releases   | branch rule, tag rule                               | GitHub ruleset                    | ruleset evidence        |
+| Workflow permissions | Least-privilege `GITHUB_TOKEN`                        | `permissions: contents: read`                       | zizmor/audit                      | workflow finding        |
+| Action integrity     | Pin actions to full SHA                               | workflow `uses: owner/action@sha`                   | zizmor/audit                      | workflow finding        |
+| Dependency updates   | Automated updates                                     | Dependabot/Renovate                                 | scheduled PRs                     | dependabot config       |
+| Dependency review    | PR dependency risk review                             | dependency-review action                            | required check                    | dependency-review JSON  |
+| SCA                  | Vulnerability scanning                                | cargo audit, npm audit, OSV, Grype/Trivy            | strict CI                         | SCA JSON                |
+| License policy       | Approved/denied licenses                              | cargo-deny, license checker                         | strict CI                         | license report          |
+| SBOM                 | Build and release SBOMs                               | Syft SPDX/CycloneDX                                 | required on release               | SBOM artifact           |
+| Provenance           | SLSA/in-toto attestations                             | CI release provenance                               | release gate                      | provenance file         |
+| Signing              | Sign release artifacts                                | Sigstore/Cosign/OIDC                                | release gate                      | signature/bundle        |
+| SAST                 | Static analysis                                       | CodeQL + Semgrep                                    | required check                    | SARIF uploaded          |
+| Secrets              | Local and platform secret scanning                    | gitleaks + GitHub secret scanning                   | pre-commit + CI + push protection | secret evidence         |
+| Prompt secrecy       | No private prompts/transcripts in repo/artifacts      | context redaction policy                            | audit scanner                     | redaction receipt       |
+| Agent tools          | Tool allowlist and lane-scoped permissions            | `agent/tool-policy.toml`                            | audit + runtime wrapper           | tool receipt            |
+| MCP/plugin supply    | Pin and verify tools/plugins/MCP servers              | lockfile/hash/provenance                            | audit before use                  | tool inventory          |
+| Shell execution      | Command allowlist, no untrusted interpolation         | tool wrapper                                        | audit and tests                   | shell-policy receipt    |
+| Network egress       | Default-deny or allowlisted egress                    | tool/runtime policy                                 | sandbox/firewall                  | egress log              |
+| Filesystem writes    | Repo-root confinement and generated-zone checks       | wrapper + path canonicalization                     | tests/audit                       | write receipt           |
+| Secrets in CI        | OIDC instead of long-lived secrets                    | cloud OIDC, env protection                          | environment reviewers             | OIDC evidence           |
+| Logs/artifacts       | Redaction, retention, no secret dumps                 | log policy                                          | CI artifact scanner               | artifact scan           |
+| Authn/authz          | Negative authorization tests                          | integration tests                                   | required for auth paths           | auth test receipt       |
+| Tenant isolation     | Cross-tenant denial tests                             | DB/app tests                                        | required for data paths           | isolation report        |
+| Input boundaries     | Validation and dangerous-sink tests                   | fuzz/property/unit tests                            | required for sinks                | negative test receipt   |
+| File/path safety     | No traversal/symlink escape                           | canonicalization tests                              | required for FS paths             | path-safety report      |
+| Command safety       | No injection into shell                               | no shell or allowlisted args                        | SAST + tests                      | command-safety report   |
+| Crypto               | Use vetted libraries and policies                     | crypto wrapper, no homegrown crypto                 | SAST/review                       | crypto review           |
+| Unsafe code          | deny or tightly review `unsafe`                       | Rust lint/audit                                     | required owner review             | unsafe inventory        |
+| DB migrations        | Apply/revert, lock/backfill/rollback                  | migration analyzer                                  | DB lane                           | migration report        |
+| Runtime config       | secure defaults, no silent fallback                   | typed config schema                                 | tests/audit                       | config report           |
+| Error handling       | No secret/error leakage                               | structured errors                                   | tests                             | error contract          |
+| Observability        | Security-relevant telemetry                           | request IDs/audit logs                              | observability lane                | trace/log schema        |
+| Fuzzing              | Fuzz parsers/protocol/input boundaries                | cargo-fuzz/proptest/etc.                            | scheduled CI                      | fuzz corpus/report      |
+| Agent evals          | Prompt-injection and tool-misuse regression corpus    | malicious fixtures                                  | security lane                     | eval report             |
+| Cost limits          | Agent budget/quotas/stop conditions                   | tool policy                                         | audit                             | budget receipt          |
+| Incident response    | Vulnerability handling and SLA                        | `SECURITY.md`, advisory process                     | audit                             | advisory receipt        |
+| Exceptions           | Expiring exceptions only                              | `docs/exceptions/*.md`                              | expiry check                      | exception report        |
+| Release readiness    | All gates pass before shipping                        | release lane                                        | protected tags/envs               | release evidence        |
+
+This aligns with NIST SSDF’s core idea: secure software practices must be integrated into the SDLC to reduce vulnerabilities, mitigate exploitation impact, and prevent recurrence. ([NIST Computer Security Resource Center][15]) For agent-first projects, the SDLC also includes prompts, tool policies, IDE adapters, context packs, model outputs, repair plans, receipts, and generated artifacts as security-relevant code.
+
+---
+
+## Concrete implementation plan
+
+### Phase 1 — Make current security controls non-bypassable
+
+Implement these immediately:
+
+1. Add `.github/CODEOWNERS`.
+2. Add `.github/dependabot.yml`.
+3. Add explicit `permissions:` to every workflow.
+4. Replace tag-based Actions refs with full SHAs.
+5. Run `security run --strict` in CI.
+6. Add `timeout-minutes` to every job.
+7. Add `concurrency` to cancel stale runs.
+8. Add dependency-review for PRs.
+9. Add branch protection/ruleset evidence export.
+10. Add PR security checklist.
+
+Workflow skeleton:
+
+```yaml
+name: jankurai
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@<full-length-commit-sha>
+
+      - name: Check audit versions
+        run: cargo run -p jankurai -- versions
+
+      - name: Jankurai audit
+        run: cargo run -p jankurai -- audit . --mode ratchet --json agent/repo-score.json --md agent/repo-score.md --sarif target/jankurai/jankurai.sarif --github-step-summary target/jankurai/summary.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+
+      - name: Security lane strict
+        run: cargo run -p jankurai -- security run . --strict --out target/jankurai/security/evidence.json
+
+      - name: Upload Jankurai SARIF
+        uses: github/codeql-action/upload-sarif@<full-length-commit-sha>
+        with:
+          sarif_file: target/jankurai/jankurai.sarif
+```
+
+### Phase 2 — Expand the security lane
+
+Upgrade `agent/security-policy.toml` from a small list into a real policy contract.
+
+```toml
+schema_version = "2.0.0"
+
+[mode]
+local_default = "advisory"
+ci_default = "strict"
+release_default = "strict"
+
+[thresholds]
+fail_lane_on = "high"
+fail_release_on = "medium"
+max_cvss = 7.0
+max_open_critical = 0
+max_open_high = 0
+max_secret_findings = 0
+max_unpinned_actions = 0
+
+[required.ci]
+tools = [
+  "gitleaks",
+  "cargo-audit",
+  "npm-audit",
+  "cargo-deny",
+  "osv-scanner",
+  "zizmor",
+  "semgrep",
+  "codeql",
+  "dependency-review"
+]
+
+[required.release]
+tools = [
+  "syft",
+  "grype",
+  "scorecard",
+  "slsa-provenance",
+  "cosign"
+]
+
+[artifacts]
+secret_scan = "target/jankurai/security/gitleaks.json"
+rust_advisories = "target/jankurai/security/cargo-audit.json"
+npm_advisories = "target/jankurai/security/npm-audit.json"
+licenses = "target/jankurai/security/cargo-deny.json"
+workflow_hardening = "target/jankurai/security/zizmor.sarif"
+sast = "target/jankurai/security/semgrep.sarif"
+sbom = "target/jankurai/security/sbom.spdx.json"
+vuln_scan = "target/jankurai/security/grype.json"
+scorecard = "target/jankurai/security/scorecard.json"
+```
+
+The security evidence JSON should include, for every tool:
+
+```json
+{
+  "tool": "zizmor",
+  "version": "x.y.z",
+  "status": "ran",
+  "required": true,
+  "blocking": true,
+  "finding_count": 0,
+  "highest_severity": "none",
+  "normalized_decision": "pass",
+  "artifact": "target/jankurai/security/zizmor.sarif",
+  "command": "zizmor --format sarif .github/workflows",
+  "git_head": "<sha>"
+}
+```
+
+A skipped required tool in CI should be a **high finding**, not an advisory note.
+
+### Phase 3 — Add GitHub settings evidence
+
+Add a command like:
+
+```bash
+cargo run -p jankurai -- github evidence \
+  --repo jeppsontaylor/Jankurai \
+  --out target/jankurai/security/repo-settings-evidence.json
+```
+
+It should check:
+
+```json
+{
+  "branch_protection": {
+    "main": {
+      "requires_pr": true,
+      "requires_code_owner_review": true,
+      "dismisses_stale_reviews": true,
+      "requires_status_checks": true,
+      "required_checks": ["audit", "security-strict", "codeql", "dependency-review"],
+      "requires_signed_commits": true,
+      "allows_force_pushes": false,
+      "allows_deletions": false,
+      "allows_admin_bypass": false
+    }
+  },
+  "security_features": {
+    "secret_scanning": true,
+    "push_protection": true,
+    "dependabot_alerts": true,
+    "dependabot_security_updates": true,
+    "private_vulnerability_reporting": true
+  },
+  "actions": {
+    "default_workflow_permissions": "read",
+    "can_approve_pull_requests": false,
+    "allowed_actions_policy": "selected-or-sha-pinned"
+  }
+}
+```
+
+Offline mode can read a committed attestation, but release mode should prefer live API evidence.
+
+### Phase 4 — Add agent-specific hardening
+
+Create these files:
+
+```text
+agent/tool-policy.toml
+agent/context-policy.toml
+agent/prompt-injection-corpus.toml
+agent/data-classification.toml
+agent/release-policy.toml
+agent/repository-controls.toml
+docs/security/threat-model.md
+docs/security/agent-threat-model.md
+docs/security/secure-coding.md
+docs/security/incident-response.md
+```
+
+Key requirements:
+
+```toml
+# agent/context-policy.toml
+schema_version = "1.0.0"
+
+[redaction]
+deny_paths = [
+  ".env",
+  ".env.*",
+  "**/*.pem",
+  "**/*.key",
+  "**/*secret*",
+  "**/*token*",
+  "target/**/logs/**",
+  "private/**",
+  "transcripts/**"
+]
+deny_patterns = [
+  "AWS_ACCESS_KEY_ID",
+  "OPENAI_API_KEY",
+  "GITHUB_TOKEN",
+  "PRIVATE KEY",
+  "BEGIN RSA PRIVATE KEY"
+]
+
+[trusted_policy]
+paths = [
+  "AGENTS.md",
+  "agent/**",
+  ".github/instructions/**",
+  ".github/copilot-instructions.md",
+  ".cursor/rules/**",
+  "CLAUDE.md",
+  "GEMINI.md"
+]
+requires_codeowner_review = true
+agent_may_modify_without_human = false
+```
+
+Agent tool invocations should leave receipts:
+
+```json
+{
+  "agent_id": "unknown-or-tool-name",
+  "lane": "security",
+  "tool": "cargo.test",
+  "allowed_by": "agent/tool-policy.toml",
+  "command": "cargo test -p jankurai",
+  "network": "deny",
+  "filesystem_write": ["target/**"],
+  "secrets_available": false,
+  "exit_code": 0,
+  "git_head": "<sha>"
+}
+```
+
+### Phase 5 — Add negative security tests
+
+Every agent-first project should include malicious regression fixtures for:
+
+```text
+prompt injection in docs/issues/comments
+malicious generated-code edits
+agent instruction override attempts
+MCP config privilege escalation
+path traversal
+symlink escape
+shell injection
+unsafe file writes
+secret exfiltration through logs
+dependency confusion
+typosquatting package names
+malicious postinstall scripts
+workflow script injection
+untrusted PR title/body interpolation
+authz bypass
+tenant data leakage
+destructive migration without rollback
+release from unprotected branch/tag
+```
+
+For Jankurai specifically, add tests that prove:
+
+```text
+untrusted context cannot modify trusted policy
+security lane fails if required tools are skipped in CI
+workflow audit detects unpinned actions
+workflow audit detects missing permissions
+audit detects missing CODEOWNERS
+audit detects no Dependabot config
+audit detects no branch-protection evidence
+audit detects release lane mismatch
+audit detects SARIF produced but not uploaded
+audit detects agent tool policy overreach
+```
+
+---
+
+## Recommended audit and scoring model
+
+Do not rely on averaging alone. Security scoring should use both:
+
+1. **Weighted score:** useful for trends.
+2. **Hard caps:** prevents a repo with one catastrophic issue from still scoring “good.”
+
+Suggested security score dimensions:
+
+| Dimension                                 | Weight |
+| ----------------------------------------- | -----: |
+| GitHub/repo governance                    |     15 |
+| CI workflow hardening                     |     15 |
+| Secrets and sensitive data                |     12 |
+| Dependencies, SBOM, SCA, licenses         |     15 |
+| SAST, fuzzing, secure-code tests          |     14 |
+| Agent/tool/prompt/MCP safety              |     14 |
+| Release provenance and artifact integrity |     10 |
+| Vulnerability response and exceptions     |      5 |
+
+Minimums:
+
+```toml
+[security_score]
+minimum_for_hl3 = 85
+minimum_for_hl4 = 90
+minimum_for_hl5 = 95
+fail_on = ["critical", "high"]
+ratchet = true
+```
+
+Hard caps to add:
+
+```toml
+[caps.security]
+live_secret_detected = 40
+agent_can_modify_trusted_policy_without_review = 55
+untrusted_pr_has_write_token_or_secrets = 45
+security_lane_non_strict_in_ci = 70
+required_security_tool_skipped_in_ci = 60
+no_branch_protection_evidence = 72
+direct_push_to_main_allowed = 60
+force_push_or_deletion_allowed_on_main = 55
+missing_codeowners_for_control_plane = 78
+workflow_token_permissions_not_explicit = 74
+workflow_default_write_token = 68
+third_party_actions_unpinned = 76
+pull_request_target_checks_out_untrusted_code = 45
+missing_dependabot_or_renovate = 80
+dependency_change_without_review = 74
+missing_sast_for_runtime_code = 82
+sarif_generated_but_not_uploaded = 78
+missing_secret_push_protection_evidence = 78
+missing_sbom_for_release = 78
+release_without_vulnerability_scan = 72
+release_without_signed_artifact = 70
+release_without_slsa_provenance = 70
+full_lane_omits_claimed_security_gate = 75
+no_agent_tool_allowlist = 65
+mcp_or_agent_plugin_unpinned = 65
+prompt_injection_corpus_missing_for_agent_tooling = 78
+security_exception_without_expiry = 70
+```
+
+Every finding should include:
+
+```json
+{
+  "rule_id": "HLT-030-UNPINNED-ACTION-REF",
+  "severity": "high",
+  "path": ".github/workflows/jankurai.yml",
+  "evidence": "actions/checkout@v4",
+  "expected": "full-length commit SHA",
+  "actual": "tag ref",
+  "blocking": true,
+  "score_cap": 76,
+  "remediation": "Pin action to full SHA and enable Dependabot action updates.",
+  "exception_allowed": true,
+  "exception_requires_expiry": true
+}
+```
+
+---
+
+## New Jankurai rule IDs I would add
+
+Jankurai already has `HLT-001` through `HLT-027`. I would add these:
+
+```text
+HLT-028-SECURITY-LANE-NON-STRICT-IN-CI
+HLT-029-ACTIONS-TOKEN-OVERPRIVILEGED
+HLT-030-UNPINNED-ACTION-REF
+HLT-031-MISSING-CODEOWNERS-FOR-CONTROL-PLANE
+HLT-032-BRANCH-PROTECTION-NOT-EVIDENCED
+HLT-033-MISSING-DEPENDENCY-UPDATE-AND-REVIEW
+HLT-034-SAST-NOT-ENFORCED
+HLT-035-SECRET-PROTECTION-NOT-EVIDENCED
+HLT-036-RELEASE-PROVENANCE-GAP
+HLT-037-SCORECARD-NOT-RUN
+HLT-038-AGENT-TOOL-POLICY-GAP
+HLT-039-PR-SECURITY-EVIDENCE-GAP
+HLT-040-FULL-LANE-DOES-NOT-RUN-CLAIMED-GATES
+HLT-041-SARIF-NOT-UPLOADED
+HLT-042-REQUIRED-TOOL-SKIPPED
+HLT-043-SECURITY-EXCEPTION-NO-EXPIRY
+HLT-044-MCP-OR-PLUGIN-UNPINNED
+HLT-045-AGENT-CONTEXT-REDACTION-GAP
+HLT-046-WORKFLOW-SCRIPT-INJECTION-RISK
+HLT-047-RELEASE-FROM-UNPROTECTED-REF
+HLT-048-SIGNED-COMMIT-OR-TAG-GAP
+HLT-049-FUZZING-GAP-FOR-PARSER-OR-BOUNDARY
+HLT-050-DEPENDENCY-CONFUSION-GAP
+```
+
+---
+
+## The “best possible” security posture for Jankurai
+
+For Jankurai to become a top-tier security reference for agent-first coding, I would define the target as:
+
+```text
+No proof, no merge.
+No strict security lane, no merge.
+No CODEOWNER review for control-plane changes, no merge.
+No pinned Actions, no merge.
+No least-privilege token permissions, no merge.
+No dependency review for dependency changes, no merge.
+No SAST/SCA/secret evidence, no merge.
+No SBOM/provenance/signature, no release.
+No agent tool receipt, no trust.
+No expiring exception, no exception.
+```
+
+That fits Jankurai’s core philosophy beautifully. The repo already has the language, the rule system, the evidence mindset, and the agent-native structure. The next security leap is to make every one of those controls **observable, strict, scored, and impossible to fake with a green-but-weak CI run**.
+
+[1]: https://github.com/jeppsontaylor/Jankurai "GitHub - jeppsontaylor/Jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[2]: https://github.com/jeppsontaylor/Jankurai/blob/main/docs/agent-native-standard.md "Jankurai/docs/agent-native-standard.md at main · jeppsontaylor/Jankurai · GitHub"
+[3]: https://github.com/jeppsontaylor/Jankurai/blob/main/SECURITY.md "Jankurai/SECURITY.md at main · jeppsontaylor/Jankurai · GitHub"
+[4]: https://github.com/jeppsontaylor/Jankurai/blob/main/.github/workflows/jankurai.yml "Jankurai/.github/workflows/jankurai.yml at main · jeppsontaylor/Jankurai · GitHub"
+[5]: https://docs.github.com/en/actions/reference/security/secure-use?ref=marcinhoppe.com "Secure use reference - GitHub Docs"
+[6]: https://github.com/jeppsontaylor/Jankurai/tree/main/.github "Jankurai/.github at main · jeppsontaylor/Jankurai · GitHub"
+[7]: https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/defining-the-mergeability-of-pull-requests/about-protected-branches "About protected branches - GitHub Docs"
+[8]: https://github.com/jeppsontaylor/Jankurai/tree/main/.github/workflows "Jankurai/.github/workflows at main · jeppsontaylor/Jankurai · GitHub"
+[9]: https://docs.github.com/code-security/secret-scanning/configuring-secret-scanning-for-your-repositories?learn=secret_scanning "Enabling secret scanning features - GitHub Docs"
+[10]: https://slsa.dev/spec/ "SLSA • SLSA specification"
+[11]: https://slsa.dev/spec/v1.0/levels "SLSA • Security levels"
+[12]: https://scorecard.dev/ "OpenSSF Scorecard"
+[13]: https://genai.owasp.org/2025/12/09/owasp-genai-security-project-releases-top-10-risks-and-mitigations-for-agentic-ai-security/ "OWASP GenAI Security Project Releases Top 10 Risks and Mitigations for Agentic AI Security - OWASP Gen AI Security Project"
+[14]: https://genai.owasp.org/resource/agentic-ai-threats-and-mitigations/ "Agentic AI - OWASP Lists Threats and Mitigations"
+[15]: https://csrc.nist.gov/publications/detail/sp/800-218/final "SP 800-218, Secure Software Development Framework (SSDF) Version 1.1: Recommendations for Mitigating the Risk of Software Vulnerabilities | CSRC"
+

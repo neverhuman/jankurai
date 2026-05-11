@@ -1,0 +1,1180 @@
+This is exactly the right direction. Jankurai already has the bones of a serious agent-first control plane, but the database/security side needs to move from **detective policy** to **rehearsed, artifact-backed production proof**.
+
+I reviewed the public repository structure, the README, DB docs, testing docs, security docs, proof lanes, test map, scanner rules, caps, and migration analyzer. I did **not** execute the Rust CLI or CI; this is a design/code audit from the repository content available through GitHub and the connector.
+
+## My read of Jankurai today
+
+Jankurai’s core idea is strong: it defines a repository standard and local audit CLI for AI-assisted work, with the operating principle “no proof, no merge; no receipt, no trust.” It turns owner maps, proof lanes, generated zones, security boundaries, rolling scores, merge witnesses, and repair queues into files that agents can follow. ([GitHub][1])
+
+The repo already has agent routing, proof lanes, security lanes, UX QA, migration analysis, witness generation, repair planning, and a database root. Its README shows a daily workflow around context packing, proof selection, fast/full audit, and merge witness generation. ([GitHub][1]) The repo also has a dedicated `db/` folder reserved for PostgreSQL migrations, constraints, and durable-truth policy, with guidance to keep rollback, backfill, lock, and transaction proof documented. ([GitHub][2])
+
+The key gap: **Jankurai knows database safety matters, but the current implementation mostly detects risky SQL and routes migrations to analysis. It does not yet require real database rehearsals.**
+
+Evidence:
+
+* `agent/boundaries.toml` declares `db/`, `db/migrations`, and `db/constraints` as database boundaries, and forbids DB access in the Rust domain and TypeScript web layers. 
+* `agent/proof-lanes.toml` includes `db-migration-analyze`, which runs `cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json` and covers direct DB wrong-layer and destructive migration rules. 
+* `agent/test-map.json` routes `db/` to `just fast` and `db/migrations/` to migration analysis only; it does **not** require migration replay, apply, rollback, drift, RLS, restore, or performance proof. 
+* The audit rubric already says PostgreSQL minimum proof should include “migration apply/rollback where possible, constraint tests, seed validation,” but the active proof map does not enforce those lanes yet. 
+* The destructive migration detector is line/pattern based: it looks for destructive SQL like `DROP`, `TRUNCATE`, `DROP COLUMN`, `DELETE FROM` without `WHERE`, and skips the finding when it sees markers like rollback, down migration, backfill, lock timeout, advisory lock, staged deploy, expand-contract, or `jankurai:migration-safe`. That is a useful detector, but not a substitute for executing migrations against a real database. 
+
+## Highest-priority missing items
+
+The biggest missing items are these:
+
+1. **No mandatory ephemeral database migration replay from zero.**
+2. **No mandatory migration apply test against the previous schema.**
+3. **No mandatory rollback or roll-forward rehearsal.**
+4. **No schema drift check between migration history and actual schema.**
+5. **No required database role/privilege audit.**
+6. **No enforced row-level security or tenant-isolation proof.**
+7. **No backup and restore proof, including point-in-time recovery where relevant.**
+8. **No data-classification manifest for PII, secrets, regulated data, retention, redaction, and model/agent exposure.**
+9. **No required migration lock/performance proof for large tables or production-impacting DDL/DML.**
+10. **No policy-to-implementation alignment for security tooling: the docs describe a richer matrix than `agent/security-policy.toml` currently requires.** The policy currently enables `gitleaks`, `cargo audit`, and `npm audit`, but only requires `gitleaks`; `cargo audit` and `npm audit` are advisory.  The security-tool matrix calls for a broader CI/release set including `gitleaks`, `cargo audit`, `npm audit`, `zizmor`, Syft, Grype/Trivy, OpenSSF Scorecard, SLSA, and Cosign. ([GitHub][3])
+
+That last mismatch should itself become an audit finding: **security policy drift**.
+
+---
+
+# The database standard every agent-first project should require
+
+For agent-first projects, the DB layer must be treated as a **durable truth boundary**. Agents can generate code quickly, but they must not be allowed to casually mutate production truth, erase data, widen privileges, bypass tenant boundaries, or fake green migrations.
+
+## 1. Database ownership and inventory
+
+Every repo should have a machine-readable database inventory:
+
+```toml
+# db/inventory.toml
+schema_version = "1.0.0"
+engine = "postgresql"
+minimum_version = "16"
+owner = "platform-data"
+primary_database = "app"
+migration_tool = "sqlx|prisma|liquibase|atlas|flyway|custom"
+
+[environments.dev]
+uses_ephemeral_db = true
+requires_seed_validation = true
+
+[environments.ci]
+uses_ephemeral_db = true
+requires_full_replay = true
+requires_drift_check = true
+
+[environments.production]
+requires_backup_restore_receipt = true
+requires_pitr = true
+requires_change_window_for_destructive = true
+```
+
+The inventory should capture:
+
+* database engine and supported versions;
+* migration tool and migration table;
+* canonical schema dump path;
+* extensions and ownership;
+* environment names;
+* production row-count source;
+* backup/PITR mechanism;
+* owner/team responsible for durable truth;
+* tables that hold user data, money, authorization, audit events, model traces, logs, files, or embeddings.
+
+This needs to be enforced because agents otherwise infer DB truth from nearby SQL files, stale ORM models, or copied examples.
+
+## 2. Data classification
+
+Every project should require a data-classification manifest:
+
+```toml
+# db/data-classification.toml
+schema_version = "1.0.0"
+
+[[table]]
+name = "users"
+classification = "pii"
+retention = "account_lifetime_plus_30_days"
+tenant_scoped = true
+rls_required = true
+backup_encryption_required = true
+agent_prompt_exposure = "forbidden"
+
+[[column]]
+table = "users"
+name = "email"
+classification = "pii"
+log_policy = "redact"
+test_fixture_policy = "synthetic_only"
+
+[[column]]
+table = "api_keys"
+name = "hashed_secret"
+classification = "credential"
+log_policy = "never"
+prompt_policy = "never"
+```
+
+This should drive:
+
+* log redaction;
+* test fixture generation;
+* prompt/transcript redaction;
+* backup encryption;
+* retention/deletion jobs;
+* access review;
+* RLS requirements;
+* export controls;
+* scoring.
+
+OWASP’s Logging guidance explicitly warns against logging secrets, access tokens, session IDs, database connection strings, passwords, encryption keys, and sensitive personal data without proper masking/redaction. ([OWASP Cheat Sheet Series][4]) That applies directly to agent transcripts, screenshots, vector stores, CI artifacts, and migration logs.
+
+## 3. Migration format
+
+Every migration should include metadata, safety intent, and proof expectations. A good SQL header:
+
+```sql
+-- jankurai:migration
+-- id: 202605051230_add_user_status
+-- owner: platform-data
+-- type: additive|destructive|data|backfill|index|constraint|rls|role
+-- tables: users
+-- classification: pii
+-- deploy_phase: expand|contract|single
+-- rollback: db/migrations/202605051230_add_user_status.rollback.sql
+-- backfill: none
+-- lock_timeout: 3s
+-- statement_timeout: 60s
+-- expected_rows_touched: 0
+-- requires_backup_receipt: false
+-- requires_human_approval: false
+```
+
+For destructive/data-bearing migrations:
+
+```sql
+-- requires_backup_receipt: true
+-- requires_restore_rehearsal: true
+-- requires_human_approval: true
+-- backfill: db/backfills/202605051230_backfill_user_status.toml
+-- rollback_strategy: roll-forward-fix|down-migration|restore
+-- blast_radius: users.status, 12_400_000 rows
+```
+
+The key principle: **comments alone should never prove safety**. They should describe the intended proof, and the proof lane should verify the claim.
+
+## 4. Immutable migration history
+
+Applied migration files must be immutable. The repo should fail if:
+
+* an applied migration is edited;
+* a migration is deleted;
+* migrations are reordered;
+* checksums differ from recorded history;
+* a migration exists without metadata;
+* a migration is present but not routed through DB proof lanes.
+
+Prisma Migrate uses a shadow database to replay migration history and detect drift, including edited/deleted migration files by checksum; that general pattern is exactly what an agent-first project needs even if it does not use Prisma. ([Prisma][5]) Prisma also treats the migrations folder plus the migration table as the source for checking whether migrations have run, changed, or been deleted. ([Prisma][6])
+
+## 5. Apply, rollback, and replay proof
+
+Every DB-changing PR should produce these artifacts:
+
+```text
+target/jankurai/db/replay-from-zero.json
+target/jankurai/db/apply-from-previous.json
+target/jankurai/db/rollback-rehearsal.json
+target/jankurai/db/drift-check.json
+target/jankurai/db/constraint-tests.json
+target/jankurai/db/rls-tests.json
+target/jankurai/db/role-audit.json
+target/jankurai/db/backup-restore.json
+```
+
+Minimum required proof:
+
+1. **Replay from zero**: create empty DB, apply all migrations, run schema checks.
+2. **Apply from previous**: create DB at previous migration, apply changed migration.
+3. **Rollback or roll-forward**: apply changed migration, then run rollback or documented forward-fix plan.
+4. **Drift check**: compare canonical schema against expected migration output.
+5. **Constraint tests**: prove DB constraints reject invalid data.
+6. **Seed validation**: load synthetic seeds, verify they satisfy constraints and do not include real PII.
+7. **Privilege/RLS audit**: connect as each runtime role and prove allowed/denied operations.
+8. **Backup/restore proof**: for release-impacting DB changes, restore a backup into an ephemeral DB and run smoke checks.
+
+PostgreSQL’s own documentation identifies regular backups as essential and describes SQL dumps, file-system backups, and continuous archiving; WAL-based continuous archiving is what enables point-in-time recovery. ([PostgreSQL][7])
+
+## 6. Expand/contract migration strategy
+
+Agent-first projects should strongly prefer expand/contract migrations:
+
+**Expand phase**
+
+* add nullable column;
+* add new table;
+* add new index concurrently where supported;
+* add permissive constraint as `NOT VALID` where supported;
+* deploy app writing both old and new shape;
+* backfill in resumable batches.
+
+**Contract phase**
+
+* validate constraint;
+* switch reads to new shape;
+* stop writing old shape;
+* wait through compatibility window;
+* drop old column/table only after proof.
+
+Destructive operations should require human approval and stronger caps.
+
+## 7. Lock, timeout, and performance policy
+
+Every production-impacting migration must prove it cannot lock the database dangerously.
+
+Require:
+
+```sql
+SET lock_timeout = '3s';
+SET statement_timeout = '60s';
+```
+
+For large tables:
+
+* row-count estimate;
+* `EXPLAIN (FORMAT JSON)` for backfill/update queries;
+* batched updates with resume cursor;
+* idempotent backfill;
+* retry limits;
+* deadlock handling;
+* connection pool budget;
+* advisory lock if migration framework allows concurrent runners;
+* index creation strategy;
+* no unbounded `UPDATE`, `DELETE`, or `ALTER` without approval.
+
+The scanner currently flags some destructive SQL, but it does not verify row counts, timeouts, query plans, locks, or runtime rehearsals. 
+
+## 8. Roles and least privilege
+
+Every project needs a role manifest:
+
+```toml
+# db/roles.toml
+schema_version = "1.0.0"
+
+[[role]]
+name = "app_rw"
+superuser = false
+createdb = false
+createrole = false
+bypassrls = false
+allowed_schemas = ["public"]
+allowed_tables = ["app_*"]
+forbidden_tables = ["audit_log", "secrets"]
+
+[[role]]
+name = "migration_owner"
+superuser = false
+createdb = false
+createrole = false
+bypassrls = false
+allowed_actions = ["ddl", "migrate"]
+requires_ci_only = true
+```
+
+PostgreSQL role options default to `NOSUPERUSER`, `NOCREATEDB`, and `NOCREATEROLE`, and PostgreSQL warns that superuser privileges are dangerous and should be used only when truly needed. ([PostgreSQL][8]) PostgreSQL also supports default privilege controls for future objects; a good audit should verify both current grants and default grants. ([PostgreSQL][9])
+
+The audit should fail if:
+
+* app role is superuser;
+* app role can create DBs or roles;
+* app role can bypass RLS;
+* app role owns tables unnecessarily;
+* public schema grants are broad;
+* default privileges grant broad access;
+* migration role is used at runtime;
+* test/prod roles share credentials;
+* CI uses production DB credentials.
+
+## 9. Row-level security and tenant isolation
+
+For multi-tenant or owner-scoped data, RLS should be the default. PostgreSQL RLS restricts rows by user/policy; when enabled and no policy exists, access is denied by default, while superusers and roles with `BYPASSRLS` bypass it. ([PostgreSQL][10])
+
+Every tenant-scoped table should have:
+
+* tenant column;
+* RLS enabled;
+* policy for runtime role;
+* negative tests as wrong tenant;
+* positive tests as correct tenant;
+* admin/break-glass policy if needed;
+* proof that app role does not bypass RLS;
+* tests for joins, search endpoints, exports, background jobs, and reports.
+
+Jankurai has an authz/isolation detector, but it currently detects terms like `owner_id`, `tenant_id`, `org_id`, `rls`, and then looks for negative-test wording. That is valuable, but it should be upgraded to require actual DB-level policy proof. 
+
+## 10. Query safety
+
+Every project must require parameterized queries and forbid string-built SQL with user input. OWASP’s SQL Injection Prevention Cheat Sheet emphasizes prepared/parameterized queries and least privilege for database accounts. ([OWASP Cheat Sheet Series][11])
+
+Audit should detect and/or test:
+
+* string interpolation in SQL;
+* dynamic identifiers without allowlists;
+* `SELECT *` on sensitive data;
+* unbounded queries;
+* raw SQL outside adapter/db boundaries;
+* ORM escape hatches;
+* unsafe search/sort/filter parameters;
+* missing pagination;
+* missing tenant predicate;
+* missing query timeout;
+* query result logging with sensitive fields.
+
+## 11. Backup, restore, and disaster recovery
+
+A DB migration should not be considered safe unless restore has been proven recently.
+
+Require:
+
+```toml
+# db/backup-policy.toml
+schema_version = "1.0.0"
+backup_frequency = "daily"
+pitr_enabled = true
+restore_test_frequency = "weekly"
+release_db_change_requires_restore_receipt = true
+rpo = "15m"
+rto = "60m"
+encryption_required = true
+```
+
+Release-blocking checks:
+
+* backup exists before destructive migration;
+* restore has succeeded within policy window;
+* restored DB passes smoke tests;
+* PITR target time tested;
+* backup encrypted;
+* access to backups is least-privilege;
+* restore runbook exists;
+* rollback plan references restore decision threshold.
+
+## 12. Seeds and fixtures
+
+Every project needs a fixture safety policy:
+
+* no production PII in seeds;
+* synthetic data only;
+* deterministic seeds for CI;
+* seed validation after migrations;
+* tenant-scoped fixtures;
+* edge-case fixtures for nulls, long strings, Unicode, timezone, decimals, money, deleted users, inactive users, and permission boundaries;
+* fixture version tied to schema version;
+* explicit fixture owner.
+
+## 13. Observability for DB changes
+
+Every migration and DB incident needs repair receipts:
+
+* migration ID;
+* git SHA;
+* actor;
+* database/environment;
+* start/end time;
+* lock wait;
+* rows touched;
+* timeout events;
+* retries;
+* advisory lock status;
+* rollback/forward-fix status;
+* trace/correlation ID;
+* schema version before/after.
+
+Jankurai already has observability and repair evidence as a rubric dimension; DB-specific migration receipts should become first-class artifacts. 
+
+---
+
+# Security best practices missing or under-enforced
+
+Jankurai already recognizes many security risks: secret sprawl, prompt injection, overbroad agency, supply-chain drift, CI hardening, input boundaries, authz/data isolation, release readiness, cost budget, and human-review evidence.  The scanner has concrete pattern checks for secrets, prompt injection phrases, overbroad agent authority, false-green tests, unsafe input sinks, release readiness, and destructive SQL. 
+
+What is missing is a **complete, enforceable security program** with required artifacts, not just detectors.
+
+## A. Governance and secure development
+
+Add mandatory evidence for:
+
+* threat model per major feature;
+* data-flow diagram for sensitive systems;
+* abuse-case review;
+* security owner/CODEOWNER;
+* security PR checklist;
+* vulnerability handling policy;
+* dependency change rationale;
+* release risk classification;
+* explicit human approval for high-risk auth, payment, data, infra, and agent-tool changes.
+
+NIST’s Secure Software Development Framework provides a common vocabulary and recommendations for secure software development practices that reduce vulnerabilities. ([NIST Computer Security Resource Center][12]) OWASP ASVS provides a basis for testing technical web application security controls and secure development requirements. ([OWASP][13])
+
+## B. Authentication, authorization, and session security
+
+Require proof for:
+
+* MFA/SSO for admin access;
+* secure session cookies;
+* CSRF protection where applicable;
+* password hashing policy if passwords exist;
+* token expiration and rotation;
+* service-to-service authentication;
+* RBAC/ABAC matrix;
+* owner/non-owner tests;
+* tenant isolation tests;
+* admin action audit logs;
+* break-glass access procedure.
+
+OWASP Top 10 identifies Broken Access Control, Cryptographic Failures, Injection, Insecure Design, Security Misconfiguration, Vulnerable and Outdated Components, Identification and Authentication Failures, Software/Data Integrity Failures, Logging and Monitoring Failures, and SSRF as major application risk categories. ([OWASP][14])
+
+## C. Secrets management
+
+Jankurai already has secret scanning, but it should also require secret lifecycle management:
+
+* no secrets in repo, tests, migrations, prompts, screenshots, logs, or artifacts;
+* secret manager required for runtime secrets;
+* dynamic/short-lived credentials where possible;
+* rotation receipts;
+* emergency revocation runbook;
+* CI secret inventory;
+* environment-specific secrets;
+* no production secrets in local dev;
+* transcript/artifact secret scanning.
+
+OWASP Secrets Management guidance emphasizes centralized storage, provisioning, auditing, rotation, least privilege, and lifecycle management. ([OWASP Cheat Sheet Series][15])
+
+## D. CI/CD hardening
+
+Add hard gates for:
+
+* minimal `GITHUB_TOKEN` permissions;
+* no `pull_request_target` unsafe checkout/build patterns;
+* third-party GitHub Actions pinned to full-length commit SHA;
+* no `curl | sh`;
+* no untrusted PR code with write tokens;
+* protected environments for production;
+* OIDC short-lived cloud credentials instead of long-lived cloud secrets;
+* artifact retention policy;
+* provenance generation;
+* release signing.
+
+GitHub’s own hardening guidance recommends pinning third-party Actions to full-length commit SHAs because tags can move, while SHA pinning is immutable. ([GitHub Docs][16]) GitHub also supports OIDC so workflows can exchange short-lived tokens with cloud providers instead of storing long-lived cloud credentials as GitHub secrets. ([GitHub Docs][17])
+
+## E. Supply chain and provenance
+
+Make these required in CI or release:
+
+* lockfiles;
+* dependency review;
+* vulnerability scanning;
+* license policy;
+* SBOM generation;
+* container scanning;
+* SAST;
+* IaC scanning;
+* workflow linting;
+* OpenSSF Scorecard;
+* artifact signing;
+* SLSA provenance;
+* Cosign/Sigstore verification;
+* release attestation upload.
+
+Sigstore supports signing and verifying artifacts with ephemeral keys, OIDC identity, and transparency logs. ([Sigstore][18]) SLSA provenance is verifiable information about where, when, and how an artifact was produced, allowing consumers to verify that an artifact meets expectations. ([SLSA][19])
+
+## F. Agent and LLM security
+
+Jankurai already has prompt-injection and agency checks, which is great. The missing part is a more complete LLM/agent threat model.
+
+Require:
+
+* untrusted context labeling;
+* external issue/doc/web content isolation;
+* model output treated as untrusted;
+* no model output directly executed as shell/SQL;
+* tool-call allowlists;
+* MCP/tool server pinning;
+* prompt/model/eval versioning;
+* golden evals for agent workflows;
+* transcript redaction;
+* vector-store data classification;
+* prompt injection regression tests;
+* cost budgets;
+* kill switches;
+* human approval for network, filesystem, production DB, secret, deploy, and destructive operations.
+
+OWASP’s LLM security work identifies prompt injection, insecure output handling, sensitive information disclosure, supply-chain vulnerabilities, and excessive agency as central risks for LLM applications. ([OWASP][20])
+
+## G. Input/output boundary security
+
+Add hard gates for:
+
+* parameterized SQL;
+* schema validation on all external input;
+* output encoding;
+* safe HTML rendering;
+* SSRF allowlists;
+* upload extension/type/size validation;
+* file storage outside web root;
+* malware scanning or sandboxing for uploads;
+* command execution sandboxing;
+* no unsafe deserialization;
+* no dynamic `eval`/`exec`;
+* no path traversal;
+* no open redirects.
+
+OWASP File Upload guidance recommends allowlisted extensions, file type validation beyond the `Content-Type` header, generated filenames, size limits, authorization, storage outside web root, and malware/CDR-style safety controls where appropriate. ([OWASP Cheat Sheet Series][21])
+
+## H. Runtime and infrastructure security
+
+Require proof for:
+
+* TLS everywhere;
+* HSTS for web;
+* secure headers;
+* rate limits;
+* abuse controls;
+* WAF or equivalent edge controls where relevant;
+* network segmentation;
+* database not publicly exposed;
+* private connectivity for DB;
+* connection pooling limits;
+* admin interface isolation;
+* structured audit logs;
+* alerting on auth failures, privilege changes, destructive migrations, secret access, backup failures, and tenant-isolation violations.
+
+## I. Privacy and data protection
+
+Require:
+
+* data inventory;
+* PII classification;
+* retention policy;
+* deletion policy;
+* export policy;
+* redaction policy;
+* consent/legal basis where applicable;
+* encryption policy;
+* backup retention;
+* test data policy;
+* prompt/transcript retention policy;
+* vector-store deletion policy;
+* privacy review for new third-party processors.
+
+## J. Security testing
+
+Make these explicit lanes:
+
+* SAST;
+* dependency scan;
+* secret scan;
+* IaC scan;
+* container scan;
+* workflow lint;
+* SQL injection tests;
+* authz negative tests;
+* RLS tests;
+* SSRF tests;
+* file upload tests;
+* XSS tests;
+* CSRF tests;
+* prompt-injection tests;
+* fuzz tests for parsers/input boundaries;
+* mutation tests for critical authorization logic;
+* backup/restore drills;
+* incident response tabletop receipts.
+
+---
+
+# How to implement this in Jankurai
+
+## 1. Add DB proof lanes
+
+Add these to `agent/proof-lanes.toml`:
+
+```toml
+[[lane]]
+name = "db-schema-replay"
+command = "just db-schema-replay"
+purpose = "create an empty PostgreSQL database, apply all migrations from zero, dump schema, and validate checksums"
+command_id = "lane.db.schema-replay"
+kind = "db"
+cost = 20
+rules_covered = ["HLT-028-DB-MIGRATION-APPLY-GAP", "HLT-030-DB-DRIFT-GAP"]
+required_artifacts = [
+  "target/jankurai/db/schema-replay.json",
+  "target/jankurai/db/schema.sql"
+]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+
+[[lane]]
+name = "db-migration-apply"
+command = "just db-migration-apply"
+purpose = "apply changed migrations against the previous schema in an ephemeral PostgreSQL database"
+command_id = "lane.db.migration-apply"
+kind = "db"
+cost = 25
+rules_covered = ["HLT-028-DB-MIGRATION-APPLY-GAP"]
+required_artifacts = ["target/jankurai/db/migration-apply.json"]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+
+[[lane]]
+name = "db-rollback-rehearsal"
+command = "just db-rollback-rehearsal"
+purpose = "prove rollback or approved roll-forward repair for changed DB migrations"
+command_id = "lane.db.rollback"
+kind = "db"
+cost = 30
+rules_covered = ["HLT-029-DB-ROLLBACK-RESTORE-GAP"]
+required_artifacts = ["target/jankurai/db/rollback-rehearsal.json"]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+
+[[lane]]
+name = "db-drift-check"
+command = "just db-drift-check"
+purpose = "compare migration-produced schema against canonical schema and migration history"
+command_id = "lane.db.drift"
+kind = "db"
+cost = 20
+rules_covered = ["HLT-030-DB-DRIFT-GAP"]
+required_artifacts = ["target/jankurai/db/drift-check.json"]
+timeout_seconds = 1200
+requires_network = false
+destructive = false
+
+[[lane]]
+name = "db-security-posture"
+command = "just db-security-posture"
+purpose = "verify database roles, grants, default privileges, extensions, RLS, and app-role least privilege"
+command_id = "lane.db.security-posture"
+kind = "security"
+cost = 25
+rules_covered = [
+  "HLT-031-DB-ROLE-PRIVILEGE-GAP",
+  "HLT-032-RLS-TENANT-GAP",
+  "HLT-033-DATA-CLASSIFICATION-GAP"
+]
+required_artifacts = ["target/jankurai/db/security-posture.json"]
+timeout_seconds = 1200
+requires_network = false
+destructive = false
+
+[[lane]]
+name = "db-backup-restore"
+command = "just db-backup-restore"
+purpose = "restore a backup into an ephemeral DB and run smoke checks for release-impacting DB changes"
+command_id = "lane.db.backup-restore"
+kind = "release"
+cost = 40
+rules_covered = ["HLT-034-BACKUP-PITR-RESTORE-GAP"]
+required_artifacts = ["target/jankurai/db/backup-restore.json"]
+timeout_seconds = 3600
+requires_network = false
+destructive = false
+
+[[lane]]
+name = "db-lock-performance"
+command = "just db-lock-performance"
+purpose = "verify lock_timeout, statement_timeout, row-count, EXPLAIN, and batch strategy for production-impacting migrations"
+command_id = "lane.db.lock-performance"
+kind = "db"
+cost = 25
+rules_covered = ["HLT-035-MIGRATION-LOCK-PERF-GAP"]
+required_artifacts = ["target/jankurai/db/lock-performance.json"]
+timeout_seconds = 1800
+requires_network = false
+destructive = false
+```
+
+The existing `db-migration-analyze` lane can stay, but it should become the **static preflight** lane, not the only DB proof lane. 
+
+## 2. Update `agent/test-map.json`
+
+Change routing from:
+
+```json
+"db/": {
+  "command": "just fast",
+  "purpose": "verify database policy and migration root remains routed"
+},
+"db/migrations/": {
+  "command": "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json",
+  "purpose": "verify migration inventory and liability evidence when SQL migrations change"
+}
+```
+
+to a composite proof plan:
+
+```json
+"db/": {
+  "command": "just db-security-posture && just db-schema-replay && just db-drift-check",
+  "purpose": "verify database policy, role safety, schema replay, and drift evidence"
+},
+"db/migrations/": {
+  "command": "just db-migration-analyze && just db-migration-apply && just db-rollback-rehearsal && just db-drift-check && just db-lock-performance",
+  "purpose": "prove migration static safety, executable apply, rollback or roll-forward, drift, and production lock/performance safety"
+},
+"db/constraints/": {
+  "command": "just db-security-posture && just db-constraints-rls",
+  "purpose": "prove constraints, RLS, grants, and tenant-isolation behavior"
+},
+"db/seeds/": {
+  "command": "just db-schema-replay && just db-seed-validate",
+  "purpose": "prove seeds are synthetic, deterministic, and constraint-valid"
+},
+"db/data-classification.toml": {
+  "command": "just db-security-posture && just security",
+  "purpose": "prove sensitive data handling, redaction, retention, backup, and prompt exposure policy"
+}
+```
+
+## 3. Add DB artifact schemas
+
+Add JSON schemas under `schemas/`:
+
+```text
+schemas/db-schema-replay.schema.json
+schemas/db-migration-apply.schema.json
+schemas/db-rollback-rehearsal.schema.json
+schemas/db-drift-check.schema.json
+schemas/db-security-posture.schema.json
+schemas/db-backup-restore.schema.json
+schemas/db-lock-performance.schema.json
+```
+
+Each artifact should include:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-05-05T00:00:00Z",
+  "repo_sha": "...",
+  "lane": "db-migration-apply",
+  "database_engine": "postgresql",
+  "database_version": "16.x",
+  "migration_tool": "sqlx",
+  "changed_migrations": [],
+  "status": "pass|fail|warning",
+  "checks": [],
+  "evidence": [],
+  "human_approvals": [],
+  "exceptions": [],
+  "repair_queue": []
+}
+```
+
+## 4. Add DB-specific audit rules
+
+Add these rule IDs after HLT-027:
+
+| Rule                                 | Cap | Severity                                   | What it catches                                                                        |
+| ------------------------------------ | --: | ------------------------------------------ | -------------------------------------------------------------------------------------- |
+| `HLT-028-DB-MIGRATION-APPLY-GAP`     |  72 | hard                                       | Migration changed without replay/apply proof                                           |
+| `HLT-029-DB-ROLLBACK-RESTORE-GAP`    |  68 | hard                                       | Destructive/data migration without rollback, roll-forward, or restore proof            |
+| `HLT-030-DB-DRIFT-GAP`               |  78 | hard                                       | Migration history and schema can drift silently                                        |
+| `HLT-031-DB-ROLE-PRIVILEGE-GAP`      |  70 | hard                                       | App/runtime roles have excessive DB privilege                                          |
+| `HLT-032-RLS-TENANT-GAP`             |  74 | hard                                       | Tenant/owner-scoped tables lack RLS or negative proof                                  |
+| `HLT-033-DATA-CLASSIFICATION-GAP`    |  76 | hard                                       | Sensitive data lacks classification, retention, prompt/log/backup policy               |
+| `HLT-034-BACKUP-PITR-RESTORE-GAP`    |  72 | hard                                       | DB release lacks restore/PITR receipt                                                  |
+| `HLT-035-MIGRATION-LOCK-PERF-GAP`    |  82 | hard for large/destructive, soft otherwise | Migration lacks lock timeout, statement timeout, row-count, batch, or query-plan proof |
+| `HLT-036-QUERY-PARAMETERIZATION-GAP` |  70 | hard                                       | String SQL/user input not parameterized                                                |
+| `HLT-037-SEED-FIXTURE-SAFETY-GAP`    |  82 | soft/hard if PII                           | Seeds contain prod-like PII or lack validation                                         |
+| `HLT-038-SCHEMA-COMPATIBILITY-GAP`   |  80 | hard                                       | Schema/API change lacks expand-contract compatibility proof                            |
+| `HLT-039-DB-OBSERVABILITY-GAP`       |  84 | soft                                       | DB migrations/runtime lack receipts, trace IDs, or repair evidence                     |
+
+## 5. Add security-specific audit rules
+
+Add these security rules:
+
+| Rule                                  | Cap | Severity                                    | What it catches                                                             |
+| ------------------------------------- | --: | ------------------------------------------- | --------------------------------------------------------------------------- |
+| `HLT-040-CI-SECRET-OIDC-GAP`          |  72 | hard                                        | Static cloud credentials or broad CI token permissions                      |
+| `HLT-041-ACTION-PINNING-GAP`          |  78 | hard                                        | Third-party Actions not pinned to full commit SHA                           |
+| `HLT-042-PROVENANCE-SIGNING-GAP`      |  80 | hard for release                            | Missing SLSA provenance, Cosign/Sigstore signing, or verification           |
+| `HLT-043-AGENT-UNTRUSTED-CONTEXT-GAP` |  78 | hard                                        | Untrusted issues/docs/tool output can influence trusted policy/commands     |
+| `HLT-044-LLM-DATA-LEAKAGE-GAP`        |  70 | hard                                        | Prompts, transcripts, screenshots, vectors, or logs can expose PII/secrets  |
+| `HLT-045-MCP-TOOL-PINNING-GAP`        |  74 | hard                                        | MCP/tool/hook/rule files are unpinned, unreviewed, or over-privileged       |
+| `HLT-046-SECURITY-TOOL-POLICY-DRIFT`  |  78 | hard                                        | Security docs and `agent/security-policy.toml` disagree                     |
+| `HLT-047-THREAT-MODEL-GAP`            |  82 | soft/hard for auth/data/payment/agent tools | Sensitive feature lacks threat model or abuse-case review                   |
+| `HLT-048-LOG-REDACTION-GAP`           |  76 | hard                                        | Sensitive values can reach logs, traces, CI artifacts, or agent transcripts |
+| `HLT-049-FILE-UPLOAD-GAP`             |  78 | hard                                        | Upload path lacks type/size/auth/storage/malware controls                   |
+| `HLT-050-SSRF-EGRESS-GAP`             |  76 | hard                                        | User-controlled fetch/network path lacks allowlist/egress policy            |
+| `HLT-051-CRYPTO-KEY-MANAGEMENT-GAP`   |  74 | hard                                        | Encryption/key lifecycle is unclear or unsafe                               |
+| `HLT-052-INCIDENT-RESPONSE-GAP`       |  84 | soft/hard for prod                          | No runbook for secret leak, data leak, auth bypass, or DB loss              |
+
+## 6. Align security policy with the richer matrix
+
+Upgrade `agent/security-policy.toml` from “gitleaks required, cargo/npm advisory” to profiles:
+
+```toml
+schema_version = "1.1.0"
+
+[profiles.local]
+required_tools = ["gitleaks"]
+advisory_tools = ["cargo audit", "npm audit", "zizmor", "semgrep"]
+fail_lane_on = "high"
+
+[profiles.ci]
+required_tools = [
+  "gitleaks",
+  "cargo audit",
+  "npm audit",
+  "zizmor",
+  "semgrep",
+  "cargo deny",
+  "codeql"
+]
+fail_lane_on = "high"
+
+[profiles.release]
+required_tools = [
+  "syft",
+  "grype",
+  "trivy",
+  "openssf-scorecard",
+  "cosign",
+  "slsa-provenance"
+]
+fail_lane_on = "medium"
+
+[ci_hardening]
+pin_github_actions_to_sha = true
+default_token_permissions = "read"
+forbid_pull_request_target_untrusted_checkout = true
+prefer_oidc_over_static_cloud_secrets = true
+forbid_curl_pipe_shell = true
+
+[agent_security]
+pin_mcp_servers = true
+require_tool_allowlist = true
+require_untrusted_context_isolation = true
+require_prompt_transcript_redaction = true
+```
+
+This directly fixes the mismatch between the current policy file and the richer security-tool matrix.  ([GitHub][3])
+
+---
+
+# Recommended scoring model
+
+Jankurai currently gives “Data truth and workflow safety” only 8 points, while “Security and supply-chain posture” has 14.  For agent-first projects, DB/data deserves more weight because agent mistakes in durable truth are often irreversible.
+
+Recommended weights:
+
+| Dimension                                    | Weight |
+| -------------------------------------------- | -----: |
+| Ownership and agent navigation               |     10 |
+| Contract and boundary integrity              |     10 |
+| Proof lanes and test routing                 |     12 |
+| Security and supply-chain posture            |     13 |
+| Database and data-truth safety               |     14 |
+| Migration, rollback, and release resilience  |     10 |
+| Authorization, tenant isolation, and privacy |     10 |
+| Observability and repair evidence            |      8 |
+| Context economy and agent instructions       |      5 |
+| Build speed, cost, and deterministic setup   |      4 |
+| UX/e2e where applicable                      |      4 |
+
+Hard caps should override weights. Suggested hard caps:
+
+| Failure                                                      | Max score |
+| ------------------------------------------------------------ | --------: |
+| Secret-like material detected                                |        60 |
+| No security lane on high-risk repo                           |        60 |
+| Direct DB access from wrong layer                            |        66 |
+| Destructive migration without executable proof               |        68 |
+| App DB role has superuser/BYPASSRLS/broad grants             |        70 |
+| No rollback/restore proof for destructive/data migration     |        68 |
+| Tenant/owner data without RLS or negative authz proof        |        74 |
+| No backup/restore receipt for DB release                     |        72 |
+| CI uses broad/static cloud credentials                       |        72 |
+| Third-party Actions unpinned                                 |        78 |
+| Security policy docs and machine policy disagree             |        78 |
+| Missing provenance/signing for release artifacts             |        80 |
+| Missing threat model for auth/payment/data/agent-tool change |        82 |
+
+## Evidence should be scored by artifact strength
+
+Every rule should classify evidence as:
+
+| Evidence level | Meaning                                     | Scoring impact                                           |
+| -------------- | ------------------------------------------- | -------------------------------------------------------- |
+| `none`         | No evidence                                 | hard cap applies                                         |
+| `claim`        | Comment/docs say it is safe                 | cap remains, finding maybe downgraded only with approval |
+| `static`       | Scanner detected safe-looking pattern       | partial credit                                           |
+| `executed`     | CI/lane actually ran proof                  | full credit                                              |
+| `replayed`     | Proof can be re-run from artifacts/commands | strongest                                                |
+| `reviewed`     | Human approval receipt attached             | required for destructive/high-risk                       |
+| `expired`      | Approval or exception expired               | treated as no evidence                                   |
+
+This matters because the current destructive migration detector accepts safety markers/comments as enough to skip findings.  That should become “claim-level evidence,” not full proof.
+
+---
+
+# Pull request requirements for DB changes
+
+Every DB PR should include a machine-readable checklist:
+
+```yaml
+db_change:
+  migration_ids:
+    - 202605051230_add_user_status
+  type: additive
+  tables:
+    - users
+  classification:
+    - pii
+  tenant_scoped: true
+  destructive: false
+  data_backfill: false
+  expected_rows_touched: 0
+  lock_timeout: 3s
+  statement_timeout: 60s
+  rollback_strategy: down_migration
+  backup_required: false
+  proof_artifacts:
+    schema_replay: target/jankurai/db/schema-replay.json
+    migration_apply: target/jankurai/db/migration-apply.json
+    rollback: target/jankurai/db/rollback-rehearsal.json
+    drift: target/jankurai/db/drift-check.json
+    rls: target/jankurai/db/rls-tests.json
+    role_audit: target/jankurai/db/role-audit.json
+```
+
+For destructive migrations, require:
+
+```yaml
+human_approval:
+  required: true
+  approver: platform-data
+  receipt: target/jankurai/approvals/db-destruction-202605051230.json
+backup_restore:
+  required: true
+  artifact: target/jankurai/db/backup-restore.json
+roll_forward_fix:
+  artifact: target/jankurai/db/roll-forward-plan.md
+```
+
+No DB-changing PR should merge with only a comment like “rollback included” or `jankurai:migration-safe`.
+
+---
+
+# Exact “must-have” DB/security audit checklist
+
+Use this as the exhaustive baseline.
+
+## Database management
+
+* Database inventory exists.
+* Data-classification manifest exists.
+* Role manifest exists.
+* Backup policy exists.
+* Restore policy exists.
+* Retention policy exists.
+* Canonical schema dump exists.
+* Migration tool is declared.
+* Migration history table is declared.
+* Applied migration immutability is enforced.
+* Extensions are declared and reviewed.
+* DB ownership is documented.
+* App role, migration role, read-only role, job role, and analytics role are separated.
+* App role is not superuser.
+* App role cannot create DBs.
+* App role cannot create roles.
+* App role cannot bypass RLS.
+* Runtime does not use migration owner.
+* Default privileges are least-privilege.
+* Public grants are reviewed.
+* Sensitive tables are marked.
+* Tenant tables are marked.
+* RLS-required tables are marked.
+* Backups are encrypted.
+* Backup access is least-privilege.
+* Restore is tested.
+* PITR is tested where required.
+* Logs redact sensitive fields.
+* CI artifacts redact sensitive values.
+* Agent transcripts redact sensitive values.
+* Vector stores classify and delete sensitive data.
+
+## Migrations
+
+* Every migration has metadata.
+* Every migration has an owner.
+* Every migration has a type.
+* Every migration has table list.
+* Every migration has classification impact.
+* Every migration declares expand/contract phase.
+* Every migration has rollback or roll-forward strategy.
+* Destructive migrations require approval.
+* Data migrations require row-count estimate.
+* Backfills are resumable.
+* Backfills are idempotent.
+* Backfills have batch size.
+* Backfills have resume cursor.
+* Backfills have retry budget.
+* Migrations set lock timeout.
+* Migrations set statement timeout.
+* Migrations avoid unbounded `UPDATE`.
+* Migrations avoid unbounded `DELETE`.
+* Migrations avoid table rewrites without approval.
+* Index strategy is safe for large tables.
+* Constraints are validated safely.
+* Migration replay from zero passes.
+* Migration apply from previous passes.
+* Rollback/roll-forward rehearsal passes.
+* Drift check passes.
+* Seed validation passes.
+* Constraint tests pass.
+* RLS tests pass.
+* Role audit passes.
+* Query-plan/lock proof exists for large migrations.
+* Backup/restore proof exists for destructive/data migrations.
+
+## Database testing
+
+* Unit tests cover domain invariants.
+* Property tests cover state machines and constraints.
+* Adapter integration tests run against real PostgreSQL.
+* Migration replay tests run in CI.
+* Migration rollback tests run in CI where possible.
+* Schema drift tests run in CI.
+* Constraint negative tests exist.
+* RLS negative tests exist.
+* Wrong-tenant tests exist.
+* Wrong-owner tests exist.
+* Admin/break-glass tests exist.
+* Seed tests exist.
+* Idempotency tests exist.
+* Transaction rollback tests exist.
+* Concurrency/deadlock tests exist.
+* Query timeout tests exist.
+* Backup restore smoke tests exist.
+* Performance budget tests exist for critical queries.
+* E2E tests cover critical user flows with DB state.
+* Contract tests verify API/schema compatibility.
+* CDC/event/outbox tests exist if events exist.
+
+## Application security
+
+* Threat model exists for sensitive features.
+* OWASP Top 10 risks are mapped.
+* ASVS level is declared where applicable.
+* Authentication tests exist.
+* Authorization matrix exists.
+* Owner/non-owner tests exist.
+* Tenant isolation tests exist.
+* Admin action audit exists.
+* Session security is configured.
+* CSRF protections are present where needed.
+* Password hashing policy exists where needed.
+* Token rotation/expiration exists.
+* Service-to-service auth exists.
+* Rate limits exist.
+* Abuse controls exist.
+* Input validation exists at all boundaries.
+* Output encoding exists.
+* SQL is parameterized.
+* SSRF allowlists exist.
+* File upload controls exist.
+* Unsafe command execution is blocked or sandboxed.
+* Unsafe deserialization is blocked.
+* Secrets are centralized.
+* Secrets rotate.
+* Logs redact sensitive values.
+* Security headers exist for web apps.
+* TLS is enforced.
+* DB is not publicly exposed.
+* Production credentials are not available to local dev or untrusted CI.
+
+## Agent/LLM security
+
+* Trusted policy files are separated from untrusted context.
+* Issues/docs/web pages/tool output are labeled untrusted.
+* Model output is never directly executed.
+* Shell commands require allowlist/receipts.
+* SQL generated by agents requires DB proof lanes.
+* Agent tool permissions are least-privilege.
+* MCP/tool servers are pinned.
+* Agent hooks are reviewed.
+* Prompt templates are versioned.
+* Model/provider versions are recorded.
+* Golden evals exist for agent workflows.
+* Prompt-injection tests exist.
+* Sensitive data is redacted from prompts.
+* Transcripts have retention policy.
+* Vector stores have deletion policy.
+* Tool calls have receipts.
+* High-risk operations require human approval.
+* Cost budgets and kill switches exist.
+
+## Supply chain and CI/CD
+
+* Lockfiles exist.
+* Dependency review runs.
+* Vulnerability scans run.
+* Secret scans run.
+* SAST runs.
+* IaC scans run.
+* Container scans run.
+* Workflow lint runs.
+* GitHub Actions are pinned to SHAs.
+* CI token permissions are least-privilege.
+* OIDC is used instead of long-lived cloud secrets.
+* Protected environments gate production.
+* Release artifacts have SBOMs.
+* Release artifacts are signed.
+* SLSA provenance exists.
+* OpenSSF Scorecard runs.
+* License policy exists.
+* Build is reproducible enough for audit.
+* Release witness is generated.
+* Raw CI logs are attached as evidence.
+
+---
+
+# Bottom line
+
+Jankurai is already unusually strong for an agent-first standard: it has proof lanes, audit caps, scanner-backed rules, repair queues, generated-zone discipline, security lanes, and explicit DB boundaries. The missing leap is to make database safety and security **executable**, not just documented.
+
+The next best version of Jankurai should treat DB and security evidence like this:
+
+> A migration is not safe because it says “rollback/backfill/lock timeout.”
+> It is safe only when Jankurai can replay it, apply it, roll it back or prove roll-forward, check drift, test constraints, test RLS, audit roles, restore backup, and attach machine-readable receipts.
+
+That upgrade would make Jankurai much closer to a gold-standard control plane for agent-first coding.
+
+[1]: https://github.com/jeppsontaylor/Jankurai "GitHub - jeppsontaylor/Jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[2]: https://github.com/jeppsontaylor/Jankurai/tree/main/db "Jankurai/db at main · jeppsontaylor/Jankurai · GitHub"
+[3]: https://github.com/jeppsontaylor/Jankurai/raw/refs/heads/main/docs/security-tool-matrix.md "raw.githubusercontent.com"
+[4]: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html?utm_source=chatgpt.com "Logging - OWASP Cheat Sheet Series"
+[5]: https://www.prisma.io/docs/orm/prisma-migrate/understanding-prisma-migrate/shadow-database?utm_source=chatgpt.com "About the shadow database | Prisma Documentation"
+[6]: https://www.prisma.io/docs/orm/prisma-migrate/understanding-prisma-migrate/migration-histories?utm_source=chatgpt.com "About migration histories | Prisma Documentation"
+[7]: https://www.postgresql.org/docs/current/backup.html?utm_source=chatgpt.com "PostgreSQL: Documentation: 18: Chapter 25. Backup and Restore"
+[8]: https://www.postgresql.org/docs/current/sql-createrole.html?utm_source=chatgpt.com "PostgreSQL: Documentation: 18: CREATE ROLE"
+[9]: https://www.postgresql.org/docs/18/sql-alterdefaultprivileges.html?utm_source=chatgpt.com "PostgreSQL: Documentation: 18: ALTER DEFAULT PRIVILEGES"
+[10]: https://www.postgresql.org/docs/17/ddl-rowsecurity.html?utm_source=chatgpt.com "PostgreSQL: Documentation: 17: 5.9. Row Security Policies"
+[11]: https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html?utm_source=chatgpt.com "SQL Injection Prevention - OWASP Cheat Sheet Series"
+[12]: https://csrc.nist.gov/publications/detail/sp/800-218/final?utm_source=chatgpt.com "SP 800-218, Secure Software Development Framework (SSDF) Version 1.1: Recommendations for Mitigating the Risk of Software Vulnerabilities | CSRC"
+[13]: https://owasp.org/www-project-application-security-verification-standard/?utm_source=chatgpt.com "OWASP Application Security Verification Standard (ASVS) | OWASP Foundation"
+[14]: https://owasp.org/Top10/2021/?utm_source=chatgpt.com "OWASP Top 10:2021"
+[15]: https://cheatsheetseries.owasp.org/cheatsheets/Secrets_Management_Cheat_Sheet.html?utm_source=chatgpt.com "Secrets Management - OWASP Cheat Sheet Series"
+[16]: https://docs.github.com/actions/security-guides/security-hardening-for-github-actions?learn=getting_started&utm_source=chatgpt.com "Secure use reference - GitHub Docs"
+[17]: https://docs.github.com/en/actions/concepts/security/openid-connect?ref=21cto&utm_source=chatgpt.com "OpenID Connect - GitHub Docs"
+[18]: https://docs.sigstore.dev/?utm_source=chatgpt.com "Overview - Sigstore"
+[19]: https://slsa.dev/spec/v1.1/provenance?utm_source=chatgpt.com "SLSA • Provenance"
+[20]: https://owasp.org/www-project-top-10-for-large-language-model-applications?utm_source=chatgpt.com "OWASP Top 10 for Large Language Model Applications | OWASP Foundation"
+[21]: https://cheatsheetseries.owasp.org/cheatsheets/File_Upload_Cheat_Sheet.html?utm_source=chatgpt.com "File Upload - OWASP Cheat Sheet Series"
+

@@ -1,0 +1,1641 @@
+## Best approach
+
+Jankurai is already positioned as a local audit CLI that leaves JSON/Markdown reports, score history, proof artifacts, and command evidence under predictable paths, so the badge should also be local, deterministic, and committed with the repo rather than served by a hosted service. That keeps the badge aligned with Jankurai’s “no receipt, no trust” posture. ([GitHub][1])
+
+The right standard is:
+
+```md
+<!-- jankurai-badge:start -->
+[![Jankurai score: 93/100 (pass)](agent/jankurai-badge.svg)](agent/repo-score.md)
+<!-- jankurai-badge:end -->
+```
+
+The badge image lives at `agent/jankurai-badge.svg`, the human-readable report lives at `agent/repo-score.md`, and optional badge metadata lives at `agent/jankurai-badge.json`. GitHub supports relative image paths in README files and automatically transforms relative links based on the current branch, so this works in normal GitHub rendering without any external image host. ([GitHub Docs][2])
+
+Jankurai already has a Phase 12 `publish` path that can emit `--badge-json` and `--badge-svg`, but that badge is tied to public certification evidence. The solution below adds a dedicated repo-score README badge that every Jankurai-adopted project can use immediately. ([GitHub][3])
+
+---
+
+# 1. Add a new command: `jankurai badge`
+
+Create this file:
+
+```rust
+// crates/jankurai/src/commands/badge.rs
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+
+pub const DEFAULT_SCORE_JSON: &str = "agent/repo-score.json";
+pub const DEFAULT_SCORE_MD: &str = "agent/repo-score.md";
+pub const DEFAULT_BADGE_SVG: &str = "agent/jankurai-badge.svg";
+pub const DEFAULT_BADGE_JSON: &str = "agent/jankurai-badge.json";
+pub const DEFAULT_README: &str = "README.md";
+pub const DEFAULT_CONFIG: &str = "agent/badge.toml";
+
+const START_MARKER: &str = "<!-- jankurai-badge:start -->";
+const END_MARKER: &str = "<!-- jankurai-badge:end -->";
+
+#[derive(Debug, Clone)]
+pub struct BadgeArgs {
+    pub repo: PathBuf,
+    pub score: String,
+    pub out: String,
+    pub json_out: Option<String>,
+    pub readme: Option<String>,
+    pub link: String,
+    pub update_readme: bool,
+    pub check: bool,
+    pub print_markdown: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BadgeMetadata {
+    pub schema_version: String,
+    pub standard: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub standard_version: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auditor_version: Option<String>,
+
+    pub source_report: String,
+    pub source_badge_fingerprint: String,
+
+    pub score: i32,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_score: Option<i32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum_score: Option<i32>,
+
+    pub decision: String,
+    pub passed: bool,
+    pub findings: usize,
+    pub hard_findings: usize,
+    pub soft_findings: usize,
+    pub caps: usize,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conformance_level: Option<String>,
+
+    pub badge_svg: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readme: Option<String>,
+
+    pub markdown: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct BadgeConfig {
+    enabled: Option<bool>,
+    score: Option<String>,
+    svg: Option<String>,
+    json: Option<String>,
+    readme: Option<String>,
+    link: Option<String>,
+    update_readme: Option<bool>,
+    label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ScoreInput {
+    source_report: String,
+    source_badge_fingerprint: String,
+    standard_version: Option<String>,
+    auditor_version: Option<String>,
+    score: i32,
+    raw_score: Option<i32>,
+    minimum_score: Option<i32>,
+    decision: String,
+    passed: bool,
+    findings: usize,
+    hard_findings: usize,
+    soft_findings: usize,
+    caps: usize,
+    conformance_level: Option<String>,
+}
+
+/// Called by `jankurai audit` after it has written the score report.
+///
+/// This keeps badge auto-update opt-in by repository policy:
+/// only repos with `agent/badge.toml` get README/badge mutation from audit.
+pub fn run_from_config_after_audit(
+    repo: &Path,
+    just_written_score_json: &str,
+    just_written_score_md: &str,
+) -> Result<()> {
+    let config_path = repo.join(DEFAULT_CONFIG);
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let config_text = fs::read_to_string(&config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let config: BadgeConfig = toml::from_str(&config_text)
+        .with_context(|| format!("parse {}", config_path.display()))?;
+
+    if config.enabled == Some(false) {
+        return Ok(());
+    }
+
+    let score = config
+        .score
+        .unwrap_or_else(|| just_written_score_json.to_string());
+    let svg = config.svg.unwrap_or_else(|| DEFAULT_BADGE_SVG.to_string());
+    let json = config.json.unwrap_or_else(|| DEFAULT_BADGE_JSON.to_string());
+    let readme = config.readme.unwrap_or_else(|| DEFAULT_README.to_string());
+    let link = config
+        .link
+        .unwrap_or_else(|| just_written_score_md.to_string());
+    let update_readme = config.update_readme.unwrap_or(true);
+    let label = config.label.unwrap_or_else(|| "jankurai".to_string());
+
+    run(BadgeArgs {
+        repo: repo.to_path_buf(),
+        score,
+        out: svg,
+        json_out: Some(json),
+        readme: Some(readme),
+        link,
+        update_readme,
+        check: false,
+        print_markdown: false,
+        label,
+    })
+}
+
+pub fn run(args: BadgeArgs) -> Result<()> {
+    let input = load_score_input(&args.repo, &args.score)?;
+    let message = format!("{}/100 {}", input.score, input.decision);
+    let svg = render_badge_svg(&args.label, &message, &input);
+
+    let readme_block = args.readme.as_ref().map(|readme| {
+        let image_path = relative_markdown_path(readme, &args.out);
+        let link_path = relative_markdown_path(readme, &args.link);
+        render_readme_block(&image_path, &link_path, &input)
+    });
+
+    let metadata = BadgeMetadata {
+        schema_version: "1.0.0".to_string(),
+        standard: "jankurai".to_string(),
+        standard_version: input.standard_version.clone(),
+        auditor_version: input.auditor_version.clone(),
+        source_report: input.source_report.clone(),
+        source_badge_fingerprint: input.source_badge_fingerprint.clone(),
+        score: input.score,
+        raw_score: input.raw_score,
+        minimum_score: input.minimum_score,
+        decision: input.decision.clone(),
+        passed: input.passed,
+        findings: input.findings,
+        hard_findings: input.hard_findings,
+        soft_findings: input.soft_findings,
+        caps: input.caps,
+        conformance_level: input.conformance_level.clone(),
+        badge_svg: normalize_path(&args.repo, &args.out),
+        readme: args
+            .readme
+            .as_ref()
+            .filter(|_| args.update_readme)
+            .map(|p| normalize_path(&args.repo, p)),
+        markdown: readme_block.clone().unwrap_or_default(),
+    };
+
+    if args.print_markdown {
+        if let Some(block) = &readme_block {
+            println!("{}", block.trim_end());
+        } else {
+            let block = render_readme_block(&args.out, &args.link, &input);
+            println!("{}", block.trim_end());
+        }
+    }
+
+    if args.check {
+        return check_outputs(&args, &svg, args.json_out.as_ref(), &metadata, readme_block.as_ref());
+    }
+
+    let badge_path = resolve_path(&args.repo, &args.out);
+    write_if_changed(&badge_path, svg.as_bytes())?;
+
+    if let Some(json_out) = args.json_out.as_ref() {
+        crate::validation::validate_serializable(
+            &args.repo,
+            crate::validation::ArtifactSchema::ReadmeBadge,
+            &metadata,
+        )?;
+        let json_text = format!("{}\n", serde_json::to_string_pretty(&metadata)?);
+        let json_path = resolve_path(&args.repo, json_out);
+        write_if_changed(&json_path, json_text.as_bytes())?;
+    }
+
+    if args.update_readme {
+        let readme = args
+            .readme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--update-readme requires --readme PATH"))?;
+        let block = readme_block
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("internal error: missing README block"))?;
+        let readme_path = resolve_path(&args.repo, readme);
+        let existing = fs::read_to_string(&readme_path).unwrap_or_default();
+        let updated = upsert_badge_block(&existing, block)?;
+        write_if_changed(&readme_path, updated.as_bytes())?;
+    }
+
+    Ok(())
+}
+
+fn check_outputs(
+    args: &BadgeArgs,
+    svg: &str,
+    json_out: Option<&String>,
+    metadata: &BadgeMetadata,
+    readme_block: Option<&String>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+
+    compare_text_file(
+        &resolve_path(&args.repo, &args.out),
+        svg,
+        "badge SVG",
+        &mut failures,
+    );
+
+    if let Some(json_out) = json_out {
+        let json_text = format!("{}\n", serde_json::to_string_pretty(metadata)?);
+        compare_text_file(
+            &resolve_path(&args.repo, json_out),
+            &json_text,
+            "badge JSON",
+            &mut failures,
+        );
+    }
+
+    if args.update_readme {
+        let readme = args
+            .readme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--check --update-readme requires --readme PATH"))?;
+        let block = readme_block
+            .ok_or_else(|| anyhow::anyhow!("internal error: missing README block"))?;
+        let readme_path = resolve_path(&args.repo, readme);
+        let existing = fs::read_to_string(&readme_path)
+            .with_context(|| format!("read {}", readme_path.display()))?;
+        let expected = upsert_badge_block(&existing, block)?;
+        if existing != expected {
+            failures.push(format!(
+                "README badge block is stale or missing in {}",
+                readme_path.display()
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        println!("jankurai badge is current");
+        Ok(())
+    } else {
+        bail!("jankurai badge drift:\n- {}", failures.join("\n- "))
+    }
+}
+
+fn compare_text_file(path: &Path, expected: &str, label: &str, failures: &mut Vec<String>) {
+    match fs::read_to_string(path) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => failures.push(format!("{label} differs: {}", path.display())),
+        Err(_) => failures.push(format!("{label} is missing: {}", path.display())),
+    }
+}
+
+fn load_score_input(repo: &Path, score_path: &str) -> Result<ScoreInput> {
+    let abs = resolve_path(repo, score_path);
+    let text = fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
+    let value: Value = serde_json::from_str(&text).with_context(|| format!("parse {}", abs.display()))?;
+
+    let score = get_i32(&value, "score")
+        .ok_or_else(|| anyhow::anyhow!("{} is missing integer field `score`", abs.display()))?;
+
+    let raw_score = get_i32(&value, "raw_score");
+
+    let policy_minimum = value
+        .get("policy")
+        .and_then(|p| get_i32(p, "minimum_score"));
+
+    let decision_value = value.get("decision");
+    let decision_minimum = decision_value.and_then(|d| get_i32(d, "minimum_score"));
+    let minimum_score = decision_minimum.or(policy_minimum);
+
+    let status = decision_value
+        .and_then(|d| d.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            if Some(score) >= minimum_score {
+                "pass"
+            } else {
+                "fail"
+            }
+        });
+
+    let explicit_passed = decision_value
+        .and_then(|d| d.get("passed"))
+        .and_then(Value::as_bool);
+
+    let findings = value
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    let hard_findings_from_decision = decision_value
+        .and_then(|d| d.get("hard_findings"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+
+    let soft_findings_from_decision = decision_value
+        .and_then(|d| d.get("soft_findings"))
+        .and_then(Value::as_u64)
+        .map(|n| n as usize);
+
+    let hard_findings = hard_findings_from_decision.unwrap_or_else(|| count_hard_findings(&value));
+    let soft_findings = soft_findings_from_decision.unwrap_or_else(|| findings.saturating_sub(hard_findings));
+
+    let passed = explicit_passed.unwrap_or_else(|| {
+        let min_ok = minimum_score.map(|m| score >= m).unwrap_or(true);
+        min_ok && hard_findings == 0 && status != "fail"
+    });
+
+    let decision = if status == "advisory" {
+        "advisory"
+    } else if passed {
+        "pass"
+    } else {
+        "fail"
+    }
+    .to_string();
+
+    let caps = value
+        .get("caps_applied")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    let conformance_level = value
+        .get("observed_conformance_level")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("claimed_conformance_level").and_then(Value::as_str))
+        .map(str::to_string);
+
+    let standard_version = value
+        .get("standard_version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let auditor_version = value
+        .get("auditor_version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let source_report = normalize_path(repo, score_path);
+
+    let fingerprint_value = serde_json::json!({
+        "standard_version": standard_version,
+        "auditor_version": auditor_version,
+        "score": score,
+        "raw_score": raw_score,
+        "minimum_score": minimum_score,
+        "decision": decision,
+        "passed": passed,
+        "findings": findings,
+        "hard_findings": hard_findings,
+        "soft_findings": soft_findings,
+        "caps": caps,
+        "conformance_level": conformance_level,
+    });
+
+    let source_badge_fingerprint = format!(
+        "sha256:{:x}",
+        Sha256::digest(serde_json::to_vec(&fingerprint_value)?)
+    );
+
+    Ok(ScoreInput {
+        source_report,
+        source_badge_fingerprint,
+        standard_version,
+        auditor_version,
+        score,
+        raw_score,
+        minimum_score,
+        decision,
+        passed,
+        findings,
+        hard_findings,
+        soft_findings,
+        caps,
+        conformance_level,
+    })
+}
+
+fn get_i32(value: &Value, key: &str) -> Option<i32> {
+    value.get(key)?.as_i64().map(|n| n as i32)
+}
+
+fn count_hard_findings(value: &Value) -> usize {
+    value
+        .get("findings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|finding| {
+            finding
+                .get("severity")
+                .and_then(Value::as_str)
+                .map(|s| matches!(s, "high" | "critical"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+fn render_readme_block(image_path: &str, link_path: &str, input: &ScoreInput) -> String {
+    let alt = format!(
+        "Jankurai score: {}/100 ({})",
+        input.score, input.decision
+    );
+
+    format!(
+        "{START_MARKER}\n[![{alt}]({image_path})]({link_path})\n{END_MARKER}\n"
+    )
+}
+
+fn render_badge_svg(label: &str, message: &str, input: &ScoreInput) -> String {
+    let label = escape_xml(label);
+    let message = escape_xml(message);
+    let title = escape_xml(&format!(
+        "Jankurai score: {}/100 ({})",
+        input.score, input.decision
+    ));
+
+    let icon_width = 24usize;
+    let label_width = text_width(&label, 62);
+    let message_width = text_width(&message, 88);
+    let width = icon_width + label_width + message_width;
+    let label_x = icon_width;
+    let message_x = icon_width + label_width;
+    let label_center = label_x + label_width / 2;
+    let message_center = message_x + message_width / 2;
+
+    let color = badge_color(input);
+
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="20" role="img" aria-label="{title}">
+<title>{title}</title>
+<linearGradient id="jankurai-badge-shadow" x2="0" y2="100%">
+  <stop offset="0" stop-color="#fff" stop-opacity=".16"/>
+  <stop offset="1" stop-color="#000" stop-opacity=".16"/>
+</linearGradient>
+<rect width="{width}" height="20" rx="3" fill="#111827"/>
+<rect x="{label_x}" width="{label_width}" height="20" fill="#374151"/>
+<rect x="{message_x}" width="{message_width}" height="20" fill="{color}"/>
+<rect width="{width}" height="20" rx="3" fill="url(#jankurai-badge-shadow)"/>
+<g fill="none" stroke="#f9fafb" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">
+  <path d="M12 4.3v7.2c0 3.1-1.9 4.4-4.5 4.4"/>
+  <path d="M16.8 5.2 12.4 10l4.4 4.8"/>
+  <path d="M6.7 6.4h7.6"/>
+</g>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+  <text x="{label_center}" y="15" fill="#010101" fill-opacity=".28">{label}</text>
+  <text x="{label_center}" y="14">{label}</text>
+  <text x="{message_center}" y="15" fill="#010101" fill-opacity=".28">{message}</text>
+  <text x="{message_center}" y="14">{message}</text>
+</g>
+</svg>
+"##
+    )
+}
+
+fn text_width(text: &str, minimum: usize) -> usize {
+    ((text.chars().count() * 7) + 18).max(minimum)
+}
+
+fn badge_color(input: &ScoreInput) -> &'static str {
+    if input.decision == "fail" {
+        return "#e05d44";
+    }
+
+    if input.decision == "advisory" {
+        if input.score >= input.minimum_score.unwrap_or(85) {
+            return "#dfb317";
+        }
+        return "#fe7d37";
+    }
+
+    match input.score {
+        90..=100 => "#4c1",
+        85..=89 => "#97ca00",
+        70..=84 => "#dfb317",
+        50..=69 => "#fe7d37",
+        _ => "#e05d44",
+    }
+}
+
+fn upsert_badge_block(existing: &str, block: &str) -> Result<String> {
+    let eol = if existing.contains("\r\n") { "\r\n" } else { "\n" };
+    let normalized = existing.replace("\r\n", "\n");
+    let block = block.trim_end_matches('\n');
+
+    let updated = if let Some(start) = normalized.find(START_MARKER) {
+        let after_start = start + START_MARKER.len();
+        let Some(end_rel) = normalized[after_start..].find(END_MARKER) else {
+            bail!("README contains `{START_MARKER}` without `{END_MARKER}`");
+        };
+
+        let end = after_start + end_rel + END_MARKER.len();
+        let before = &normalized[..start];
+        let after = normalized[end..].trim_start_matches('\n');
+
+        let mut out = String::new();
+        out.push_str(before);
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(block);
+        out.push('\n');
+        if !after.is_empty() {
+            out.push('\n');
+            out.push_str(after);
+        }
+        out
+    } else {
+        let insert_at = readme_insert_index(&normalized);
+        let before = &normalized[..insert_at];
+        let after = normalized[insert_at..].trim_start_matches('\n');
+
+        let mut out = String::new();
+        out.push_str(before);
+
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            if out.ends_with('\n') {
+                out.push('\n');
+            } else {
+                out.push_str("\n\n");
+            }
+        }
+
+        out.push_str(block);
+        out.push('\n');
+
+        if !after.is_empty() {
+            out.push('\n');
+            out.push_str(after);
+        }
+
+        out
+    };
+
+    Ok(if eol == "\r\n" {
+        updated.replace('\n', "\r\n")
+    } else {
+        updated
+    })
+}
+
+fn readme_insert_index(text: &str) -> usize {
+    let mut index = 0usize;
+    let mut saw_title = false;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+
+        if index == 0 && trimmed.starts_with("# ") {
+            index += line.len();
+            saw_title = true;
+            continue;
+        }
+
+        if saw_title && (trimmed.is_empty() || looks_like_top_badge_line(trimmed)) {
+            index += line.len();
+            continue;
+        }
+
+        break;
+    }
+
+    if saw_title { index } else { 0 }
+}
+
+fn looks_like_top_badge_line(line: &str) -> bool {
+    line.starts_with("[![")
+        || line.starts_with("![")
+        || line.contains("shields.io")
+        || (line.contains("<img") && line.to_ascii_lowercase().contains("badge"))
+        || line.starts_with("<p align=")
+        || line == "</p>"
+}
+
+fn relative_markdown_path(readme: &str, target: &str) -> String {
+    if looks_like_url(target) || target.starts_with('#') {
+        return target.to_string();
+    }
+
+    let target_path = Path::new(target);
+    if target_path.is_absolute() {
+        return path_to_posix(target_path);
+    }
+
+    let readme_path = Path::new(readme);
+    let base = readme_path.parent().unwrap_or_else(|| Path::new(""));
+    let rel = relative_path(base, target_path);
+    if rel.is_empty() { ".".to_string() } else { rel }
+}
+
+fn relative_path(base: &Path, target: &Path) -> String {
+    let base_parts = normal_components(base);
+    let target_parts = normal_components(target);
+
+    let mut common = 0usize;
+    while common < base_parts.len()
+        && common < target_parts.len()
+        && base_parts[common] == target_parts[common]
+    {
+        common += 1;
+    }
+
+    let mut parts = Vec::new();
+    for _ in common..base_parts.len() {
+        parts.push("..".to_string());
+    }
+    for part in target_parts.iter().skip(common) {
+        parts.push(part.clone());
+    }
+
+    parts.join("/")
+}
+
+fn normal_components(path: &Path) -> Vec<String> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            Component::ParentDir => Some("..".to_string()),
+            Component::CurDir => None,
+            _ => None,
+        })
+        .collect()
+}
+
+fn resolve_path(repo: &Path, path: &str) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        repo.join(candidate)
+    }
+}
+
+fn normalize_path(repo: &Path, path: &str) -> String {
+    let candidate = PathBuf::from(path);
+    let relative = if candidate.is_absolute() {
+        candidate
+            .strip_prefix(repo)
+            .map(Path::to_path_buf)
+            .unwrap_or(candidate)
+    } else {
+        candidate
+    };
+    path_to_posix(&relative)
+}
+
+fn path_to_posix(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn looks_like_url(value: &str) -> bool {
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("mailto:")
+}
+
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn write_if_changed(path: &Path, content: &[u8]) -> Result<bool> {
+    if fs::read(path).ok().as_deref() == Some(content) {
+        return Ok(false);
+    }
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+    }
+
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_paths_work_from_nested_readme() {
+        assert_eq!(
+            relative_markdown_path("docs/README.md", "agent/jankurai-badge.svg"),
+            "../agent/jankurai-badge.svg"
+        );
+        assert_eq!(
+            relative_markdown_path("README.md", "agent/jankurai-badge.svg"),
+            "agent/jankurai-badge.svg"
+        );
+    }
+
+    #[test]
+    fn upsert_replaces_existing_block() {
+        let first = "# Demo\n\nhello\n";
+        let block = format!("{START_MARKER}\nBADGE\n{END_MARKER}\n");
+        let updated = upsert_badge_block(first, &block).unwrap();
+        assert!(updated.contains("BADGE"));
+
+        let replacement = format!("{START_MARKER}\nNEW\n{END_MARKER}\n");
+        let updated = upsert_badge_block(&updated, &replacement).unwrap();
+        assert!(updated.contains("NEW"));
+        assert!(!updated.contains("BADGE"));
+    }
+}
+```
+
+---
+
+# 2. Register the command module
+
+Edit:
+
+```rust
+// crates/jankurai/src/commands.rs
+```
+
+Add:
+
+```rust
+pub mod badge;
+```
+
+For example, the beginning should become:
+
+```rust
+pub mod adopt;
+pub mod agent;
+pub mod badge;
+pub mod bench;
+```
+
+---
+
+# 3. Register the new JSON schema
+
+Edit:
+
+```rust
+// crates/jankurai/src/validation.rs
+```
+
+Add `ReadmeBadge` to `ArtifactSchema`:
+
+```rust
+pub enum ArtifactSchema {
+    AdoptionPlan,
+    RepoScore,
+    ProofPlan,
+    ProofReceipt,
+    EvidenceIndex,
+    ProofVerification,
+    DoctorReceipt,
+    InitReceipt,
+    InitProfile,
+    SecurityPolicy,
+    ToolAdoption,
+    SecurityEvidence,
+    ContextPack,
+    RepairPlan,
+    RepairRun,
+    RepairPrDraft,
+    OptimizationReport,
+    ExceptionExpiryReport,
+    Boundaries,
+    UxQaPolicy,
+    UxQaReport,
+    MigrationReport,
+    MigrationPlan,
+    BenchmarkSuite,
+    BenchmarkReport,
+    Certification,
+    CertificationBadge,
+    ReadmeBadge,
+    GovernancePolicy,
+    PublicEvidenceBundle,
+    CellManifest,
+    CellRegistry,
+    AuditPolicy,
+    OwnerMap,
+    TestMap,
+    GeneratedZones,
+    ProofLanes,
+    StandardVersion,
+    UpdatePlan,
+    UpdateReceipt,
+    Finding,
+    RepairQueueItem,
+    RuleRegistry,
+    RuleVerify,
+    MergeWitness,
+    ScoreDiff,
+    ScoreTrend,
+    VibeCoverageSource,
+    VibeCoverageReport,
+}
+```
+
+Add the schema path mapping:
+
+```rust
+Self::ReadmeBadge => "readme-badge.schema.json",
+```
+
+Place it next to the existing badge schema mapping:
+
+```rust
+Self::Certification => "certification.schema.json",
+Self::CertificationBadge => "certification-badge.schema.json",
+Self::ReadmeBadge => "readme-badge.schema.json",
+Self::GovernancePolicy => "governance-policy.schema.json",
+```
+
+Create this schema:
+
+```json
+// schemas/readme-badge.schema.json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/readme-badge.schema.json",
+  "title": "Jankurai README Badge",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "standard",
+    "source_report",
+    "source_badge_fingerprint",
+    "score",
+    "decision",
+    "passed",
+    "findings",
+    "hard_findings",
+    "soft_findings",
+    "caps",
+    "badge_svg",
+    "markdown"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "standard": {
+      "const": "jankurai"
+    },
+    "standard_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "auditor_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_report": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_badge_fingerprint": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "raw_score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "minimum_score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "decision": {
+      "type": "string",
+      "minLength": 1
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "findings": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "hard_findings": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "soft_findings": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "caps": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "conformance_level": {
+      "type": "string",
+      "minLength": 1
+    },
+    "badge_svg": {
+      "type": "string",
+      "minLength": 1
+    },
+    "readme": {
+      "type": "string",
+      "minLength": 1
+    },
+    "markdown": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}
+```
+
+---
+
+# 4. Wire the command into `main.rs`
+
+Edit:
+
+```rust
+// crates/jankurai/src/main.rs
+```
+
+In the command import list, add `badge`:
+
+```rust
+use jankurai::commands::{
+    adopt, agent, badge, bench, cell, certify, context_pack, doctor, exceptions, govern, hooks,
+    init, migrate, optimize, proof, publish, registry, repair, repair_plan, rules, rust, score,
+    security, update, vibe, witness,
+};
+```
+
+Add a top-level subcommand variant:
+
+```rust
+Badge(BadgeArgs),
+```
+
+A good location is right after:
+
+```rust
+Audit(AuditArgs),
+```
+
+Add this CLI args struct near `AuditArgs`:
+
+```rust
+#[derive(Args, Debug)]
+struct BadgeArgs {
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+
+    #[arg(long, value_name = "PATH", default_value = "agent/repo-score.json")]
+    score: String,
+
+    #[arg(long, value_name = "PATH", default_value = "agent/jankurai-badge.svg")]
+    out: String,
+
+    #[arg(long, value_name = "PATH", default_value = "agent/jankurai-badge.json")]
+    json_out: String,
+
+    #[arg(long)]
+    no_json: bool,
+
+    #[arg(long, value_name = "PATH", default_value = "README.md")]
+    readme: String,
+
+    #[arg(long, value_name = "PATH_OR_URL", default_value = "agent/repo-score.md")]
+    link: String,
+
+    #[arg(long)]
+    update_readme: bool,
+
+    #[arg(long)]
+    check: bool,
+
+    #[arg(long)]
+    print_markdown: bool,
+
+    #[arg(long, default_value = "jankurai")]
+    label: String,
+}
+```
+
+Add a match arm:
+
+```rust
+Some(Commands::Badge(args)) => {
+    badge::run(badge::BadgeArgs {
+        repo: args.repo,
+        score: args.score,
+        out: args.out,
+        json_out: if args.no_json { None } else { Some(args.json_out) },
+        readme: Some(args.readme),
+        link: args.link,
+        update_readme: args.update_readme,
+        check: args.check,
+        print_markdown: args.print_markdown,
+        label: args.label,
+    })?;
+}
+```
+
+A good location is immediately after the `Audit` arm:
+
+```rust
+Some(Commands::Audit(args)) => {
+    run_audit_and_write(args)?;
+}
+```
+
+---
+
+# 5. Make adopted repos auto-update the badge after audit
+
+In `run_audit_and_write`, after the score JSON and Markdown are written:
+
+```rust
+validation::write_json(&args.repo, ArtifactSchema::RepoScore, &args.json, &report)?;
+write_markdown(&args.md, &md_text)?;
+```
+
+Add:
+
+```rust
+if !args.changed_fast {
+    badge::run_from_config_after_audit(&args.repo, &args.json, &args.md)?;
+}
+```
+
+This is the key automation layer. Plain one-off audits remain non-mutating unless the repo has explicitly opted in with `agent/badge.toml`. Repos initialized with the new template below will opt in automatically.
+
+---
+
+# 6. Add the badge config template
+
+Create:
+
+```toml
+# crates/jankurai/templates/agent/badge.toml
+
+enabled = true
+
+# Source report produced by the normal Jankurai score lane.
+score = "agent/repo-score.json"
+
+# Committed README badge assets.
+svg = "agent/jankurai-badge.svg"
+json = "agent/jankurai-badge.json"
+
+# README insertion target.
+readme = "README.md"
+link = "agent/repo-score.md"
+
+# When true, `jankurai audit` updates the marker block if this config exists.
+update_readme = true
+
+# Left-side badge label.
+label = "jankurai"
+```
+
+Register the template in:
+
+```rust
+// crates/jankurai/src/init/templates.rs
+```
+
+Add:
+
+```rust
+Template {
+    path: "agent/badge.toml",
+    body: include_str!("../../templates/agent/badge.toml"),
+},
+```
+
+A good location is near the other `agent/*.toml` templates, for example right after `agent/audit-policy.toml`.
+
+---
+
+# 7. Add badge files to generated zones
+
+Append this to:
+
+```toml
+# crates/jankurai/templates/agent/generated-zones.toml
+
+[[zone]]
+path = "agent/jankurai-badge.svg"
+source = "crates/jankurai"
+command = "jankurai badge . --score agent/repo-score.json --out agent/jankurai-badge.svg --json-out agent/jankurai-badge.json --update-readme"
+read_only = false
+
+[[zone]]
+path = "agent/jankurai-badge.json"
+source = "crates/jankurai"
+command = "jankurai badge . --score agent/repo-score.json --out agent/jankurai-badge.svg --json-out agent/jankurai-badge.json --update-readme"
+read_only = false
+```
+
+---
+
+# 8. Add `agent/badge.toml` to every bundled init profile
+
+In each file under:
+
+```text
+crates/jankurai/templates/profiles/*.json
+```
+
+Add this to `generatedPaths`:
+
+```json
+"agent/badge.toml"
+```
+
+For example:
+
+```json
+"generatedPaths": [
+  "AGENTS.md",
+  "CLAUDE.md",
+  "...",
+  "agent/audit-policy.toml",
+  "agent/badge.toml",
+  "agent/boundaries.toml",
+  "..."
+]
+```
+
+This makes badge auto-update part of the Jankurai standard for every future `jankurai init`.
+
+---
+
+# 9. Update `jankurai ci install --github`
+
+The generated CI should verify that the committed badge is current. GitHub Actions supports read/write token scoping through the `permissions` key, and checkout supports authenticated pushes when a workflow is intentionally configured to push changes; for PR safety, the default CI below only checks drift and does not push. ([GitHub Docs][4])
+
+Replace the `workflow` function in:
+
+```rust
+// crates/jankurai/src/commands/ci.rs
+```
+
+with:
+
+```rust
+fn workflow(mode: &str, min_score: i32, baseline: Option<&str>) -> String {
+    let audit_mode = if mode == "ratchet" {
+        "ratchet"
+    } else {
+        "advisory"
+    };
+
+    let baseline_arg = baseline
+        .map(|path| format!(" --baseline {path}"))
+        .unwrap_or_default();
+
+    let gate = if mode == "ratchet" {
+        format!(
+            r#"
+      - name: Enforce score floor
+        run: test "$(jq -r '.score' agent/repo-score.json)" -ge {min_score}
+"#
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        r#"name: jankurai
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install jankurai
+        run: cargo install jankurai --locked
+
+      - run: jankurai --version
+
+      - name: jankurai audit
+        run: >
+          jankurai audit .
+          --mode {audit_mode}{baseline_arg}
+          --json agent/repo-score.json
+          --md agent/repo-score.md
+          --sarif target/jankurai/jankurai.sarif
+          --github-step-summary target/jankurai/summary.md
+          --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+
+      - name: Verify Jankurai README badge
+        run: |
+          jankurai badge . \
+            --score agent/repo-score.json \
+            --out agent/jankurai-badge.svg \
+            --json-out agent/jankurai-badge.json \
+            --update-readme \
+            --check
+{gate}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jankurai-adoption-evidence
+          path: |
+            agent/repo-score.json
+            agent/repo-score.md
+            agent/jankurai-badge.svg
+            agent/jankurai-badge.json
+            target/jankurai/jankurai.sarif
+            target/jankurai/repair-queue.jsonl
+"#
+    )
+}
+```
+
+Update the tests in the same file:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::workflow;
+
+    #[test]
+    fn ratchet_workflow_uses_installed_jankurai_and_score_gate() {
+        let rendered = workflow("ratchet", 85, None);
+        assert!(rendered.contains("cargo install jankurai --locked"));
+        assert!(rendered.contains("--mode ratchet"));
+        assert!(rendered.contains("-ge 85"));
+        assert!(rendered.contains("agent/repo-score.json"));
+        assert!(rendered.contains("jankurai badge ."));
+        assert!(rendered.contains("--check"));
+    }
+
+    #[test]
+    fn observe_workflow_has_no_score_gate() {
+        let rendered = workflow("observe", 85, None);
+        assert!(rendered.contains("--mode advisory"));
+        assert!(!rendered.contains("Enforce score floor"));
+        assert!(!rendered.contains("cargo run -p jankurai"));
+    }
+
+    #[test]
+    fn ratchet_workflow_can_use_baseline() {
+        let rendered = workflow("ratchet", 85, Some("agent/repo-score.json"));
+        assert!(rendered.contains("--baseline agent/repo-score.json"));
+        assert!(rendered.contains("agent/repo-score.json"));
+    }
+}
+```
+
+---
+
+# 10. Add regression tests
+
+Create:
+
+```rust
+// crates/jankurai/tests/badge.rs
+
+use jankurai::commands::badge::{self, BadgeArgs};
+use serde_json::json;
+use std::fs;
+use tempfile::tempdir;
+
+fn args(check: bool) -> BadgeArgs {
+    BadgeArgs {
+        repo: std::path::PathBuf::new(),
+        score: "agent/repo-score.json".into(),
+        out: "agent/jankurai-badge.svg".into(),
+        json_out: Some("agent/jankurai-badge.json".into()),
+        readme: Some("README.md".into()),
+        link: "agent/repo-score.md".into(),
+        update_readme: true,
+        check,
+        print_markdown: false,
+        label: "jankurai".into(),
+    }
+}
+
+#[test]
+fn badge_generates_svg_json_and_readme_block() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("agent")).unwrap();
+
+    fs::write(
+        dir.path().join("agent/repo-score.json"),
+        serde_json::to_string_pretty(&json!({
+            "standard": "jankurai",
+            "standard_version": "0.7.0",
+            "auditor_version": "0.7.0",
+            "score": 93,
+            "raw_score": 94,
+            "decision": {
+                "status": "pass",
+                "minimum_score": 85,
+                "passed": true,
+                "hard_findings": 0,
+                "soft_findings": 2
+            },
+            "caps_applied": [],
+            "observed_conformance_level": "HL3",
+            "findings": [
+                { "severity": "low" },
+                { "severity": "medium" }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    fs::write(dir.path().join("agent/repo-score.md"), "# Score\n").unwrap();
+    fs::write(dir.path().join("README.md"), "# Demo\n\nExisting intro.\n").unwrap();
+
+    let mut run_args = args(false);
+    run_args.repo = dir.path().to_path_buf();
+
+    badge::run(run_args).unwrap();
+
+    let svg = fs::read_to_string(dir.path().join("agent/jankurai-badge.svg")).unwrap();
+    assert!(svg.contains("93/100 pass"));
+    assert!(svg.contains("<svg"));
+
+    let metadata = fs::read_to_string(dir.path().join("agent/jankurai-badge.json")).unwrap();
+    assert!(metadata.contains("\"score\": 93"));
+    assert!(metadata.contains("\"decision\": \"pass\""));
+
+    let readme = fs::read_to_string(dir.path().join("README.md")).unwrap();
+    assert!(readme.contains("<!-- jankurai-badge:start -->"));
+    assert!(readme.contains("[![Jankurai score: 93/100 (pass)](agent/jankurai-badge.svg)](agent/repo-score.md)"));
+
+    let mut check_args = args(true);
+    check_args.repo = dir.path().to_path_buf();
+    badge::run(check_args).unwrap();
+}
+
+#[test]
+fn badge_check_fails_when_readme_is_stale() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("agent")).unwrap();
+
+    fs::write(
+        dir.path().join("agent/repo-score.json"),
+        serde_json::to_string_pretty(&json!({
+            "score": 72,
+            "decision": {
+                "status": "fail",
+                "minimum_score": 85,
+                "passed": false,
+                "hard_findings": 1,
+                "soft_findings": 0
+            },
+            "findings": [{ "severity": "high" }],
+            "caps_applied": ["no-deterministic-fast-lane"]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    fs::write(dir.path().join("README.md"), "# Demo\n").unwrap();
+
+    let mut check_args = args(true);
+    check_args.repo = dir.path().to_path_buf();
+
+    let err = badge::run(check_args).expect_err("missing badge should fail check mode");
+    assert!(err.to_string().contains("jankurai badge drift"));
+}
+```
+
+---
+
+# 11. Add docs for users
+
+Create:
+
+````md
+<!-- docs/jankurai-badge.md -->
+
+# Jankurai README Badge
+
+The Jankurai badge is a committed, deterministic SVG badge generated from `agent/repo-score.json`.
+
+It is intentionally local:
+
+- no hosted badge service is required;
+- no repository contents are sent to a third-party badge renderer;
+- the README displays the same score that Jankurai wrote into the repo score report.
+
+## Standard paths
+
+```text
+agent/repo-score.json
+agent/repo-score.md
+agent/jankurai-badge.svg
+agent/jankurai-badge.json
+README.md
+````
+
+## README block
+
+```md
+<!-- jankurai-badge:start -->
+[![Jankurai score](agent/jankurai-badge.svg)](agent/repo-score.md)
+<!-- jankurai-badge:end -->
+```
+
+Jankurai owns only the marker block. Everything else in the README is left unchanged.
+
+## Generate or update
+
+```bash
+jankurai audit . \
+  --mode advisory \
+  --json agent/repo-score.json \
+  --md agent/repo-score.md
+
+jankurai badge . \
+  --score agent/repo-score.json \
+  --out agent/jankurai-badge.svg \
+  --json-out agent/jankurai-badge.json \
+  --update-readme
+```
+
+## Verify in CI
+
+```bash
+jankurai badge . \
+  --score agent/repo-score.json \
+  --out agent/jankurai-badge.svg \
+  --json-out agent/jankurai-badge.json \
+  --update-readme \
+  --check
+```
+
+## Opt-in auto-update after audit
+
+Create `agent/badge.toml`:
+
+```toml
+enabled = true
+score = "agent/repo-score.json"
+svg = "agent/jankurai-badge.svg"
+json = "agent/jankurai-badge.json"
+readme = "README.md"
+link = "agent/repo-score.md"
+update_readme = true
+label = "jankurai"
+```
+
+After that, `jankurai audit` updates the badge automatically after writing the score report.
+
+## Optional trusted-main auto-commit workflow
+
+Use this only on trusted branches, never on `pull_request_target`.
+
+```yaml
+name: jankurai badge update
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  badge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install jankurai
+        run: cargo install jankurai --locked
+
+      - name: Audit
+        run: >
+          jankurai audit .
+          --mode advisory
+          --json agent/repo-score.json
+          --md agent/repo-score.md
+          --sarif target/jankurai/jankurai.sarif
+          --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+
+      - name: Update README badge
+        run: >
+          jankurai badge .
+          --score agent/repo-score.json
+          --out agent/jankurai-badge.svg
+          --json-out agent/jankurai-badge.json
+          --update-readme
+
+      - name: Commit badge update
+        run: |
+          if git diff --quiet -- README.md agent/jankurai-badge.svg agent/jankurai-badge.json; then
+            echo "Jankurai badge already current"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md agent/jankurai-badge.svg agent/jankurai-badge.json
+          git commit -m "Update Jankurai badge"
+          git push
+```
+
+````
+
+---
+
+# 12. Usage after the patch
+
+For an already-scored repo:
+
+```bash
+jankurai badge . --update-readme
+git add README.md agent/jankurai-badge.svg agent/jankurai-badge.json
+git commit -m "Add Jankurai badge"
+````
+
+For a fresh repo adopting Jankurai:
+
+```bash
+jankurai init . --level full --yes
+jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md
+git add README.md agent/repo-score.json agent/repo-score.md agent/jankurai-badge.svg agent/jankurai-badge.json agent/badge.toml
+git commit -m "Adopt Jankurai badge"
+```
+
+For CI drift checking:
+
+```bash
+jankurai badge . \
+  --score agent/repo-score.json \
+  --out agent/jankurai-badge.svg \
+  --json-out agent/jankurai-badge.json \
+  --update-readme \
+  --check
+```
+
+The result is a durable “badge of honor” that follows the Jankurai standard: local evidence first, deterministic rendering, README marker ownership, CI drift checking, and optional trusted-branch auto-commit.
+
+[1]: https://github.com/jeppsontaylor/Jankurai "GitHub - jeppsontaylor/Jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[2]: https://docs.github.com/github/creating-cloning-and-archiving-repositories/about-readmes?utm_source=chatgpt.com "About the repository README file - GitHub Docs"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/commands/publish.rs "{label}: {message}"
+[4]: https://docs.github.com/en/actions/reference/github_token-reference?utm_source=chatgpt.com "Workflow syntax for GitHub Actions - GitHub Docs"
+

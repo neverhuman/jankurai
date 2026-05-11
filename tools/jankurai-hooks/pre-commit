@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# JANKURAI MANAGED HOOK: pre-commit
+set -euo pipefail
+
+if [ "${JANKURAI_SKIP_HOOKS:-}" = "1" ]; then
+  exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+git_dir="$(git rev-parse --git-dir 2>/dev/null || printf '%s/.git' "$repo_root")"
+case "$git_dir" in
+  /*) ;;
+  *) git_dir="$repo_root/$git_dir" ;;
+esac
+jankurai_dir="$git_dir/jankurai"
+mkdir -p "$jankurai_dir"
+
+env_file="$jankurai_dir/env"
+if [ -f "$env_file" ]; then
+  # shellcheck disable=SC1090
+  . "$env_file"
+fi
+
+if [ -n "${JANKURAI_PRE_COMMIT_CHAIN:-}" ] && [ -x "$JANKURAI_PRE_COMMIT_CHAIN" ] && [ -z "${JANKURAI_CHAINED_HOOK:-}" ]; then
+  JANKURAI_CHAINED_HOOK=1 "$JANKURAI_PRE_COMMIT_CHAIN" "$@"
+fi
+
+if [ -n "${JANKURAI_BIN:-}" ] && [ -x "$JANKURAI_BIN" ]; then
+  jankurai_cmd="$JANKURAI_BIN"
+else
+  jankurai_cmd="${JANKURAI_FALLBACK_BIN:-jankurai}"
+fi
+
+cd "$repo_root"
+
+report_dir="${JANKURAI_HOOK_REPORT_DIR:-target/jankurai/hooks}"
+mkdir -p "$report_dir"
+report_json="$report_dir/pre-commit-score.json"
+report_md="$report_dir/pre-commit-score.md"
+report_history_jsonl="$report_dir/pre-commit-score-history.jsonl"
+report_history_csv="$report_dir/pre-commit-score-history.csv"
+
+audit_args=(
+  audit .
+  --mode advisory
+  --json "$report_json"
+  --md "$report_md"
+  --score-history "$report_history_jsonl"
+  --score-history-csv "$report_history_csv"
+)
+
+if [ -n "${JANKURAI_HISTORY_MIRROR:-}" ]; then
+  audit_args+=(--score-history-mirror "$JANKURAI_HISTORY_MIRROR")
+fi
+if [ "${JANKURAI_HISTORY_MIRROR_REQUIRED:-}" = "1" ]; then
+  audit_args+=(--score-history-mirror-required)
+fi
+if [ -n "${JANKURAI_SCORE_HISTORY_MAX_ROWS:-}" ]; then
+  audit_args+=(--score-history-max-rows "$JANKURAI_SCORE_HISTORY_MAX_ROWS")
+fi
+if [ -n "${JANKURAI_SCORE_HISTORY_MAX_BYTES:-}" ]; then
+  audit_args+=(--score-history-max-bytes "$JANKURAI_SCORE_HISTORY_MAX_BYTES")
+fi
+
+if ! "$jankurai_cmd" "${audit_args[@]}"; then
+  echo "jankurai pre-commit audit failed; set JANKURAI_SKIP_HOOKS=1 to bypass local hooks" >&2
+  exit 1
+fi
+
+if [ "${JANKURAI_HOOK_STAGE_ARTIFACTS:-}" = "1" ]; then
+  git add -- "$report_json" "$report_md" "$report_history_jsonl" "$report_history_csv" 2>/dev/null || true
+fi
+
+report_path="$report_json"
+json_int() {
+  sed -n "s/^[[:space:]]*\"$1\":[[:space:]]*\([-0-9][0-9]*\).*/\1/p" "$report_path" | head -n 1
+}
+score="$(json_int score)"
+raw_score="$(json_int raw_score)"
+minimum_score="$(json_int minimum_score)"
+hard_findings="$(json_int hard_findings)"
+finding_count="$(grep -c '^[[:space:]]*"check_id":' "$report_path" || true)"
+
+score="${score:-0}"
+raw_score="${raw_score:-$score}"
+minimum_score="${minimum_score:-85}"
+hard_findings="${hard_findings:-0}"
+decision="pass"
+if [ "$hard_findings" -gt 0 ] || [ "$score" -lt "$minimum_score" ]; then
+  decision="fail"
+fi
+
+cat > "$jankurai_dir/last-score.env" <<EOF
+JANKURAI_SCORE='$score'
+JANKURAI_RAW_SCORE='$raw_score'
+JANKURAI_FINDINGS='$finding_count'
+JANKURAI_HARD_FINDINGS='$hard_findings'
+JANKURAI_DECISION='$decision'
+JANKURAI_REPORT='${report_json}'
+EOF

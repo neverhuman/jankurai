@@ -1,0 +1,686 @@
+# Phase name: Phase 03 — Proof Router + Evidence Ledger
+
+Consider the following response as the Phase 03 closeout package for `tips/phases/03-proof-router-evidence-ledger.md`.
+
+The right interpretation of “100% finished” here is not to rebuild the proof router from scratch. The phase file already says the repo has `jankurai lane`, `jankurai proof`, and `jankurai prove`, plus normalized receipts, logs, evidence index writing, command allowlisting, and changed-path entry points. The remaining hardening it explicitly calls out is: persist generated changed-mode proof plans as durable artifacts, populate `rules_covered` only where the route metadata is deterministic, and strengthen evidence cross-links as future artifact types become defined. ([GitHub][1])
+
+That also matches the moonshot: every path should map to ownership/proof, generated truth and evidence should be machine-readable and durable, exceptions should be explicit, and proof should not “pass” without covering the behavior or route it claims to cover. ([GitHub][2]) The implementation below closes Phase 03 without inventing speculative behavioral coverage. It only claims `rules_covered` for deterministic routing facts: owner-map coverage and test/proof-map coverage. It intentionally does **not** claim broader rules like false-green or generated-security coverage until a future explicit lane-to-rule contract exists.
+
+The current code path for `prove --changed` / `--changed-from` builds a plan in memory and records the plan as `"in-memory"` in receipts/evidence; the current execution receipt writes `rules_covered: vec![]`. ([GitHub][3]) The patch below fixes that by making changed-mode `prove` write the generated plan JSON and Markdown before execution, then reuses that plan path in receipts and the evidence index. It also uses the existing `RuleCoverage` model, and it does not require a schema bump: the proof receipt schema already supports rich `rules_covered` objects, and the proof plan schema allows extra planned-run properties. ([GitHub][4]) Command safety stays on the existing allowlist model: planned commands still have to come from `agent/proof-lanes.toml` or `agent/test-map.json`, unless the existing explicit escape hatch is used. ([GitHub][5])
+
+I could not run the patch in a live checkout here because the environment could not clone GitHub, so the validation commands are included at the end and should be run from your repo root.
+
+````bash
+# Phase 03 closeout patch
+# Apply from the repository root.
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/src/main.rs
+@@
+ struct ProveArgs {
+     #[arg(default_value = ".", value_parser = parse_repo_arg)]
+     repo: PathBuf,
+     #[arg(long, value_name = "PATH")]
+     plan: Option<String>,
++    /// Output path for generated proof-plan JSON when --changed/--changed-from is used.
++    #[arg(
++        long = "plan-out",
++        value_name = "PATH",
++        default_value = "target/jankurai/proof-plan.json"
++    )]
++    plan_out: String,
++    /// Output path for generated proof-plan Markdown when --changed/--changed-from is used.
++    #[arg(
++        long = "plan-md",
++        value_name = "PATH",
++        default_value = "target/jankurai/proof-plan.md"
++    )]
++    plan_md: String,
+     /// Changed paths to route into proof lanes. May be repeated.
+     #[arg(long)]
+     changed: Vec<PathBuf>,
+@@
+         Commands::Prove(args) => proof::run_prove(proof::ProveArgs {
+             repo: args.repo,
+             plan: args.plan,
++            plan_out: args.plan_out,
++            plan_md: args.plan_md,
+             changed: args.changed,
+             changed_from: args.changed_from,
+             out_dir: args.out_dir,
+*** End Patch
+PATCH
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/src/commands/proof.rs
+@@
+-use crate::model::{ProofReceipt, STANDARD_VERSION};
++use crate::model::{ProofReceipt, RuleCoverage, STANDARD_VERSION};
+@@
+ pub struct ProveArgs {
+     pub repo: PathBuf,
+     pub plan: Option<String>,
++    pub plan_out: String,
++    pub plan_md: String,
+     pub changed: Vec<PathBuf>,
+     pub changed_from: Option<String>,
+     pub out_dir: String,
+@@
+ pub struct PlannedRun {
+     pub lane: String,
+     pub command: String,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub owner: Option<String>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub changed_paths: Vec<String>,
++    #[serde(default, skip_serializing_if = "Vec::is_empty")]
++    pub rules_covered: Vec<RuleCoverage>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+     pub artifacts: Vec<String>,
+     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+@@
+ pub fn run_prove(args: ProveArgs) -> Result<()> {
+-    let plan_text = if let Some(plan_path) = &args.plan {
+-        fs::read_to_string(plan_path).with_context(|| format!("read proof plan {}", plan_path))?
++    let (plan_text, plan_path_str) = if let Some(plan_path) = &args.plan {
++        let plan_path_buf = PathBuf::from(plan_path);
++        let plan_text =
++            fs::read_to_string(&plan_path_buf).with_context(|| format!("read proof plan {}", plan_path))?;
++        let plan_path_str = display_path_for_ledger(&args.repo, &plan_path_buf);
++        (plan_text, plan_path_str)
+     } else if !args.changed.is_empty() || args.changed_from.is_some() {
+         let plan = build_proof_plan(&args.repo, &args.changed, args.changed_from.as_deref())?;
+-        serde_json::to_string(&plan)?
++
++        let plan_json_path = repo_path(&args.repo, &args.plan_out);
++        let plan_md_path = repo_path(&args.repo, &args.plan_md);
++        let plan_json_path_string = plan_json_path.to_string_lossy().to_string();
++        let plan_md_path_string = plan_md_path.to_string_lossy().to_string();
++
++        write_plan(
++            &args.repo,
++            &plan,
++            Some(plan_json_path_string.as_str()),
++            Some(plan_md_path_string.as_str()),
++        )?;
++
++        let plan_path_str = display_relative(&args.repo, plan_json_path.as_path());
++        (serde_json::to_string(&plan)?, plan_path_str)
+     } else {
+         anyhow::bail!("must provide either --plan or --changed/--changed-from");
+     };
+ 
+     let plan: ProofPlan = serde_json::from_str(&plan_text).context("parse proof plan")?;
+@@
+-    let plan_path_str = args.plan.clone().unwrap_or_else(|| "in-memory".to_string());
+-    let receipt_dir = PathBuf::from(&args.out_dir);
+-    let log_dir = PathBuf::from("target/jankurai/logs");
++    let receipt_dir = repo_path(&args.repo, &args.out_dir);
++    let log_dir = args.repo.join("target/jankurai/logs");
+     fs::create_dir_all(&receipt_dir).with_context(|| format!("create {}", receipt_dir.display()))?;
+     fs::create_dir_all(&log_dir).with_context(|| format!("create {}", log_dir.display()))?;
+@@
+-    let evidence_index_path = PathBuf::from(&args.evidence_index);
++    let evidence_index_path = repo_path(&args.repo, &args.evidence_index);
+     if let Some(parent) = evidence_index_path.parent() {
+         fs::create_dir_all(parent)
+             .with_context(|| format!("create {}", parent.display()))?;
+@@
+         generated_at: generated_at.clone(),
+         repo_root: display_relative_or_absolute(&args.repo),
+         git_head,
+         plan_path: plan_path_str.clone(),
+-        receipt_dir: receipt_dir.display().to_string(),
+-        log_dir: log_dir.display().to_string(),
++        receipt_dir: display_relative(&args.repo, receipt_dir.as_path()),
++        log_dir: display_relative(&args.repo, log_dir.as_path()),
+         commands: commands_run,
+         receipts: receipts.iter().map(|path| display_relative(&args.repo, path)).collect(),
+*** End Patch
+PATCH
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/src/commands/proof.rs
+@@
+             let owner = catalog
+                 .owner_prefix_for_path(path)
+                 .and_then(|prefix| catalog.owner_for_path(&prefix))
+                 .map(|owner| owner.team.clone());
+             let route_note = route_risk_note(path);
++            let rules_covered = deterministic_rules_for_path(&catalog, path);
+             let entry = planned_runs
+                 .entry(spec.command.clone())
+                 .or_insert_with(|| PlannedRun {
+                     lane: lane_label,
+                     command: spec.command.clone(),
+                     owner: owner.clone(),
+                     changed_paths: vec![path.clone()],
++                    rules_covered: rules_covered.clone(),
+                     artifacts: vec![
+                         format!("target/jankurai/logs/{}", command_log_name(&spec.command)),
+                         format!(
+                             "target/jankurai/proof-receipts/{}.json",
+@@
+                     skipped_reason: None,
+                 });
+             push_unique(&mut entry.changed_paths, path.clone());
++            push_rule_coverage(&mut entry.rules_covered, rules_covered);
+             push_unique(&mut entry.residual_risk, route_note);
+             if entry.owner.is_none() {
+                 entry.owner = owner;
+@@
+         .map(|command| PlannedRun {
+             lane: format!("custom:{}", short_command_label(command)),
+             command,
+             owner: None,
+             changed_paths: plan.changed_paths.clone(),
++            rules_covered: vec![],
+             artifacts: vec![],
+             residual_risk: vec!["legacy proof plan command had no planned run metadata".to_string()],
+             skipped_reason: None,
+*** End Patch
+PATCH
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/src/commands/proof.rs
+@@
+         let _ = writeln!(out, "- owner: `{}`", run.owner.as_deref().unwrap_or("unknown"));
+         let _ = writeln!(out, "- changed paths: `{}`", join_or_none(&run.changed_paths));
+         let _ = writeln!(out, "- residual risk: `{}`", join_or_none(&run.residual_risk));
++        let _ = writeln!(
++            out,
++            "- rules covered: `{}`",
++            render_rule_coverage(&run.rules_covered)
++        );
+         if let Some(reason) = &run.skipped_reason {
+             let _ = writeln!(out, "- skipped reason: `{}`", reason);
+         }
+*** End Patch
+PATCH
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/src/commands/proof.rs
+@@
+     let receipt = ProofReceipt {
+         lane: run.lane.clone(),
+         command: run.command.clone(),
+         exit_code,
+         elapsed_ms,
+         artifacts,
+         plan_path: Some(plan_path.to_string()),
+-        rules_covered: vec![],
++        rules_covered: receipt_rules_for_run(run),
+     };
+*** End Patch
+PATCH
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/src/commands/proof.rs
+@@
+ fn fallback_runs_from_plan(plan: &ProofPlan) -> Vec<PlannedRun> {
+     plan.commands
+         .iter()
+         .cloned()
+         .map(|command| PlannedRun {
+             lane: format!("custom:{}", short_command_label(&command)),
+             command,
+             owner: None,
+             changed_paths: plan.changed_paths.clone(),
++            rules_covered: vec![],
+             artifacts: vec![],
+             residual_risk: vec!["legacy proof plan command had no planned run metadata".to_string()],
+             skipped_reason: None,
+@@
+         .collect()
+ }
++
++fn deterministic_rules_for_path(catalog: &RepoCatalog, path: &str) -> Vec<RuleCoverage> {
++    let mut rules = Vec::new();
++
++    // This is deliberately narrow. These are route-evidence claims, not
++    // behavioral correctness claims. A receipt may claim these only because
++    // the planner deterministically matched this path against the repo's
++    // durable owner/test maps.
++    if catalog.owner_prefix_for_path(path).is_some() {
++        push_rule_coverage(
++            &mut rules,
++            vec![route_rule_coverage("HLT-003-OWNERLESS-PATH")],
++        );
++    }
++
++    if catalog.test_route_for_path(path).is_some() {
++        push_rule_coverage(
++            &mut rules,
++            vec![route_rule_coverage("HLT-004-UNMAPPED-PROOF")],
++        );
++    }
++
++    rules
++}
++
++fn route_rule_coverage(rule_id: &str) -> RuleCoverage {
++    RuleCoverage::Rich {
++        rule_id: rule_id.to_string(),
++        status: "route-evidence".to_string(),
++    }
++}
++
++fn push_rule_coverage(out: &mut Vec<RuleCoverage>, incoming: Vec<RuleCoverage>) {
++    for rule in incoming {
++        if !out.contains(&rule) {
++            out.push(rule);
++        }
++    }
++}
++
++fn receipt_rules_for_run(run: &PlannedRun) -> Vec<RuleCoverage> {
++    run.rules_covered
++        .iter()
++        .filter_map(|rule| match rule {
++            RuleCoverage::Rich { rule_id, status } => Some(RuleCoverage::Rich {
++                rule_id: rule_id.clone(),
++                status: status.clone(),
++            }),
++            // The model can read legacy simple rule coverage, but receipts
++            // should continue to serialize rich objects so they validate
++            // against schemas/proof-receipt.schema.json.
++            RuleCoverage::Simple(_) => None,
++        })
++        .collect()
++}
++
++fn render_rule_coverage(rules: &[RuleCoverage]) -> String {
++    if rules.is_empty() {
++        return "none".to_string();
++    }
++
++    rules
++        .iter()
++        .map(|rule| match rule {
++            RuleCoverage::Rich { rule_id, status } => format!("{rule_id}:{status}"),
++            RuleCoverage::Simple(rule_id) => rule_id.clone(),
++        })
++        .collect::<Vec<_>>()
++        .join(", ")
++}
++
++fn repo_path(repo: &Path, path: &str) -> PathBuf {
++    let path = PathBuf::from(path);
++    if path.is_absolute() {
++        path
++    } else {
++        repo.join(path)
++    }
++}
++
++fn display_path_for_ledger(repo: &Path, path: &Path) -> String {
++    let concrete = if path.is_absolute() {
++        path.to_path_buf()
++    } else {
++        repo.join(path)
++    };
++    display_relative(repo, concrete.as_path())
++}
+*** End Patch
+PATCH
+
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: crates/jankurai/tests/proof_surface_smoke.rs
+@@
+     let receipt_text = fs::read_to_string(receipt_path).expect("read receipt");
+     assert!(receipt_text.contains("\"lane\""));
+     assert!(receipt_text.contains("fixture"));
++    let receipt_value: serde_json::Value =
++        serde_json::from_str(&receipt_text).expect("receipt json");
++    assert!(
++        receipt_value.get("rules_covered").is_none(),
++        "explicit --plan receipts should not claim route coverage unless the plan supplies deterministic metadata"
++    );
+ 
+     let receipt_schema: serde_json::Value = serde_json::from_str(
+         &fs::read_to_string(root.join("schemas/proof-receipt.schema.json")).unwrap(),
+     )
+@@
+ fn prove_shorthand_writes_receipts_with_changed() {
+     let repo = tempdir().expect("tempdir");
+     seed_catalog(repo.path());
+@@
+     let receipt_text = fs::read_to_string(receipt_path).expect("read receipt");
+     assert!(receipt_text.contains("\"lane\""));
+     assert!(receipt_text.contains("\"fixture\""));
++
++    let plan_json = repo.path().join("target/jankurai/proof-plan.json");
++    let plan_md = repo.path().join("target/jankurai/proof-plan.md");
++    assert!(plan_json.is_file(), "prove --changed should persist generated plan JSON");
++    assert!(plan_md.is_file(), "prove --changed should persist generated plan Markdown");
++
++    let plan_value: serde_json::Value =
++        serde_json::from_str(&fs::read_to_string(&plan_json).expect("read generated plan"))
++            .expect("generated plan json");
++    let planned_rules = plan_value["planned_runs"][0]["rules_covered"]
++        .as_array()
++        .expect("planned rules_covered array");
++    assert!(
++        planned_rules.iter().any(|rule| {
++            rule["rule_id"] == "HLT-003-OWNERLESS-PATH"
++                && rule["status"] == "route-evidence"
++        }),
++        "generated plan should carry deterministic owner-map route evidence"
++    );
++    assert!(
++        planned_rules.iter().any(|rule| {
++            rule["rule_id"] == "HLT-004-UNMAPPED-PROOF"
++                && rule["status"] == "route-evidence"
++        }),
++        "generated plan should carry deterministic proof-map route evidence"
++    );
++
++    let receipt_value: serde_json::Value =
++        serde_json::from_str(&receipt_text).expect("receipt json");
++    assert_eq!(
++        receipt_value["plan_path"],
++        "target/jankurai/proof-plan.json",
++        "receipt should point at the durable generated plan path"
++    );
++    let receipt_rules = receipt_value["rules_covered"]
++        .as_array()
++        .expect("receipt rules_covered array");
++    assert!(
++        receipt_rules.iter().any(|rule| {
++            rule["rule_id"] == "HLT-003-OWNERLESS-PATH"
++                && rule["status"] == "route-evidence"
++        }),
++        "receipt should carry deterministic owner-map route evidence"
++    );
++    assert!(
++        receipt_rules.iter().any(|rule| {
++            rule["rule_id"] == "HLT-004-UNMAPPED-PROOF"
++                && rule["status"] == "route-evidence"
++        }),
++        "receipt should carry deterministic proof-map route evidence"
++    );
++
++    let evidence_index = repo.path().join("target/jankurai/evidence-index.json");
++    let evidence_value: serde_json::Value = serde_json::from_str(
++        &fs::read_to_string(&evidence_index).expect("read evidence index"),
++    )
++    .expect("evidence index json");
++    assert_eq!(
++        evidence_value["plan_path"],
++        "target/jankurai/proof-plan.json",
++        "evidence index should point at the durable generated plan path"
++    );
++    assert!(
++        evidence_value["receipts"][0]
++            .as_str()
++            .expect("receipt path")
++            .starts_with("target/jankurai/proof-receipts/"),
++        "evidence index should cross-link generated receipts"
++    );
+ }
++
++#[test]
++fn prove_changed_accepts_custom_plan_artifact_paths() {
++    let repo = tempdir().expect("tempdir");
++    seed_catalog(repo.path());
++
++    let root = repo.path();
++    fs::create_dir_all(root.join("docs")).unwrap();
++    fs::write(root.join("docs/custom.md"), "custom proof route\n").unwrap();
++
++    let bin = env!("CARGO_BIN_EXE_jankurai");
++    let output = Command::new(bin)
++        .current_dir(repo.path())
++        .args([
++            "prove",
++            ".",
++            "--changed",
++            "docs/custom.md",
++            "--plan-out",
++            "target/jankurai/custom-proof-plan.json",
++            "--plan-md",
++            "target/jankurai/custom-proof-plan.md",
++        ])
++        .output()
++        .expect("run prove");
++
++    assert!(
++        output.status.success(),
++        "prove failed\nstdout:\n{}\nstderr:\n{}",
++        String::from_utf8_lossy(&output.stdout),
++        String::from_utf8_lossy(&output.stderr)
++    );
++
++    assert!(
++        root.join("target/jankurai/custom-proof-plan.json").is_file(),
++        "custom JSON plan path should be written"
++    );
++    assert!(
++        root.join("target/jankurai/custom-proof-plan.md").is_file(),
++        "custom Markdown plan path should be written"
++    );
++
++    let evidence_value: serde_json::Value = serde_json::from_str(
++        &fs::read_to_string(root.join("target/jankurai/evidence-index.json"))
++            .expect("read evidence index"),
++    )
++    .expect("evidence index json");
++    assert_eq!(
++        evidence_value["plan_path"],
++        "target/jankurai/custom-proof-plan.json",
++        "custom changed-mode plan path should be the ledger plan_path"
++    );
++}
+*** End Patch
+PATCH
+
+# Append Phase 03 operational docs without disturbing existing content.
+python - <<'PY'
+from pathlib import Path
+
+docs = Path("docs/testing.md")
+section = """\
+## Phase 03 proof router and evidence ledger
+
+`jankurai lane` and `jankurai proof` remain the planning-oriented proof-router commands. `jankurai prove --plan <path>` remains the execution-oriented command for an already materialized plan.
+
+`jankurai prove --changed <path>` and `jankurai prove --changed-from <ref>` are first-class bridge commands. They now:
+
+1. build the same changed-path proof plan as `jankurai proof`;
+2. persist that generated plan as JSON and Markdown before command execution;
+3. execute only allowlisted proof commands unless the explicit unsigned-command escape hatch is used;
+4. write one proof receipt per planned run;
+5. write command logs under `target/jankurai/logs/`; and
+6. write `target/jankurai/evidence-index.json` with durable cross-links to the generated plan, receipts, and logs.
+
+Default generated plan artifacts:
+
+```bash
+target/jankurai/proof-plan.json
+target/jankurai/proof-plan.md
+````
+
+Custom generated plan artifacts:
+
+```bash
+cargo run -p jankurai -- prove . \\
+  --changed crates/jankurai/src/commands/proof.rs \\
+  --plan-out target/jankurai/phase03-proof-plan.json \\
+  --plan-md target/jankurai/phase03-proof-plan.md
+```
+
+`rules_covered` semantics are intentionally conservative. A generated changed-path plan may claim only route-evidence rule coverage that the planner derived from durable repo metadata:
+
+* `HLT-003-OWNERLESS-PATH` when the changed path matched `agent/owner-map.json`;
+* `HLT-004-UNMAPPED-PROOF` when the changed path matched `agent/test-map.json`.
+
+Receipts must not infer behavioral coverage from lane names alone. Unknown, legacy, or custom plans keep `rules_covered` empty unless they carry explicit rich rule coverage metadata that validates against `schemas/proof-receipt.schema.json`.
+"""
+
+text = docs.read_text()
+if "## Phase 03 proof router and evidence ledger" not in text:
+docs.write_text(text.rstrip() + "\n\n" + section)
+PY
+
+# Add a closeout note to the Phase 03 phase file.
+
+python - <<'PY'
+from pathlib import Path
+
+phase = Path("tips/phases/03-proof-router-evidence-ledger.md")
+section = """\
+
+## Phase 03 closeout hardening
+
+This phase is considered complete when changed-mode proving is durable and evidence-ledger safe:
+
+* `jankurai prove --changed` and `jankurai prove --changed-from` persist generated proof plans to JSON and Markdown before executing commands.
+* Generated changed-mode receipts and evidence indexes reference the durable generated plan path instead of an in-memory marker.
+* Generated planned runs and receipts populate `rules_covered` only for deterministic route-evidence facts:
+
+  * `HLT-003-OWNERLESS-PATH` when the changed path matched the owner map.
+  * `HLT-004-UNMAPPED-PROOF` when the changed path matched the test/proof map.
+* Unknown, legacy, or custom plans continue to emit empty `rules_covered` unless explicit rich rule coverage is present.
+* Command execution remains allowlisted through `agent/proof-lanes.toml` and `agent/test-map.json`.
+
+Residual non-Phase-03 limitation: behavioral lane-to-rule coverage should remain empty until a future explicit lane-to-rule contract exists. Phase 03 must not guess that a lane proves a standard rule merely because the lane name sounds related.
+"""
+
+text = phase.read_text()
+if "## Phase 03 closeout hardening" not in text:
+phase.write_text(text.rstrip() + "\n\n" + section)
+PY
+
+# Append the phase log entry using the local UTC timestamp.
+
+mkdir -p tips/phases/logs
+printf '%s | phase-03-proof-router-evidence-ledger | closeout-hardening | changed-mode prove now persists generated proof-plan JSON/Markdown; receipts/evidence index reference durable plan_path; deterministic route-evidence rules_covered added for HLT-003 and HLT-004 only; unknown/custom coverage remains empty | touched: crates/jankurai/src/main.rs, crates/jankurai/src/commands/proof.rs, crates/jankurai/tests/proof_surface_smoke.rs, docs/testing.md, tips/phases/03-proof-router-evidence-ledger.md | validate: cargo fmt; cargo test -p jankurai prove_writes_receipts_and_logs; cargo test -p jankurai prove_shorthand_writes_receipts_with_changed; cargo test -p jankurai prove_changed_accepts_custom_plan_artifact_paths; cargo test -p jankurai; just fast\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> tips/phases/logs/03-proof-router-evidence-ledger.log
+
+# Format and validate.
+
+cargo fmt
+
+cargo test -p jankurai prove_writes_receipts_and_logs
+cargo test -p jankurai prove_shorthand_writes_receipts_with_changed
+cargo test -p jankurai prove_changed_accepts_custom_plan_artifact_paths
+cargo test -p jankurai
+
+cargo run -p jankurai -- prove . 
+--changed crates/jankurai/src/commands/proof.rs 
+--changed crates/jankurai/src/main.rs 
+--changed crates/jankurai/tests/proof_surface_smoke.rs 
+--plan-out target/jankurai/phase03-proof-plan.json 
+--plan-md target/jankurai/phase03-proof-plan.md 
+--out-dir target/jankurai/phase03-proof-receipts 
+--evidence-index target/jankurai/phase03-evidence-index.json
+
+just fast
+
+````
+
+## What this completes
+
+This completes Phase 03 by making the proof-router output durable from the moment a changed-path proof is executed. Before this patch, `prove --changed` was useful as a shortcut, but the generated plan was not a durable evidence artifact. That left receipts pointing at `"in-memory"`, which is bad for later agents because they cannot replay the exact proof plan from the evidence index.
+
+After this patch, the changed-mode flow is:
+
+```text
+changed paths
+  -> owner/test-map routing
+  -> generated proof plan JSON + Markdown
+  -> allowlisted command execution
+  -> command logs
+  -> proof receipts
+  -> evidence index with durable plan/log/receipt cross-links
+````
+
+That is the evidence-ledger behavior the moonshot wants: a future agent can open the evidence index, follow `plan_path`, inspect planned runs, inspect command logs, inspect receipts, and understand why each command was selected without reconstructing the whole repo context.
+
+## Why `rules_covered` is deliberately narrow
+
+The important design choice is to avoid false proof claims. It would be tempting to map `fast` to `HLT-008-FALSE-GREEN-RISK`, `security` to `HLT-010-SECRET-SPRAWL`, or `ux-qa` to UI rules. That would be unsafe without an explicit lane-to-rule contract proving that a lane actually checks those rules.
+
+So this Phase 03 closeout only writes:
+
+```json
+{
+  "rule_id": "HLT-003-OWNERLESS-PATH",
+  "status": "route-evidence"
+}
+```
+
+when the changed path matched the owner map, and:
+
+```json
+{
+  "rule_id": "HLT-004-UNMAPPED-PROOF",
+  "status": "route-evidence"
+}
+```
+
+when the changed path matched the test/proof map.
+
+That means the receipt is saying: “this proof run was deterministically routed through the durable ownership/proof metadata for this changed path.” It is **not** saying: “this command proved all semantic behavior touched by the change.” That distinction keeps Phase 03 aligned with the standard instead of creating a new false-green risk.
+
+## Expected output after validation
+
+After running the changed-mode validation command, these artifacts should exist:
+
+```text
+target/jankurai/phase03-proof-plan.json
+target/jankurai/phase03-proof-plan.md
+target/jankurai/phase03-proof-receipts/*.json
+target/jankurai/logs/*.log
+target/jankurai/phase03-evidence-index.json
+```
+
+The generated evidence index should contain:
+
+```json
+{
+  "plan_path": "target/jankurai/phase03-proof-plan.json",
+  "receipt_dir": "target/jankurai/phase03-proof-receipts",
+  "log_dir": "target/jankurai/logs"
+}
+```
+
+Each receipt produced from a changed-path generated plan should contain a durable plan link:
+
+```json
+{
+  "plan_path": "target/jankurai/phase03-proof-plan.json"
+}
+```
+
+And for owner/test-map-routed paths, the receipt should include conservative route evidence:
+
+```json
+{
+  "rules_covered": [
+    {
+      "rule_id": "HLT-003-OWNERLESS-PATH",
+      "status": "route-evidence"
+    },
+    {
+      "rule_id": "HLT-004-UNMAPPED-PROOF",
+      "status": "route-evidence"
+    }
+  ]
+}
+```
+
+Existing `prove --plan` behavior remains intact. A hand-written or legacy plan that does not contain deterministic route metadata should still produce receipts with no `rules_covered` field, which is the correct safe behavior.
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/03-proof-router-evidence-ledger.md "raw.githubusercontent.com"
+[2]: https://github.com/jeppsontaylor/Jankurai/blob/main/docs/moonshot.md "Jankurai/docs/moonshot.md at main · jeppsontaylor/Jankurai · GitHub"
+[3]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/src/commands/proof.rs "Jankurai/crates/jankurai/src/commands/proof.rs at main · jeppsontaylor/Jankurai · GitHub"
+[4]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/src/model.rs "Jankurai/crates/jankurai/src/model.rs at main · jeppsontaylor/Jankurai · GitHub"
+[5]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/src/commands/context_data.rs "Jankurai/crates/jankurai/src/commands/context_data.rs at main · jeppsontaylor/Jankurai · GitHub"
+

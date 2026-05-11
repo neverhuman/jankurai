@@ -1,0 +1,1800 @@
+## Proposal: `tuiwright` — a Playwright-class, 100% Rust TUI tester
+
+The core idea is to treat a terminal application the way Playwright treats a browser page: launch it in a real runtime, drive it with real user input, observe what a user would see, auto-wait for stable UI states, make high-level assertions, and preserve rich failure artifacts.
+
+The key difference is that TUIs do not have a DOM. They expose a terminal byte stream. So the tester must include three things Playwright gets from the browser for free: a real PTY, a virtual terminal emulator, and a deterministic renderer.
+
+There are already partial building blocks in the ecosystem. Ratatui has `TestBackend`, which renders to an in-memory buffer for integration tests, and Ratatui’s docs show snapshot testing with `insta`; this is useful but does not exercise raw mode, terminal escape behavior, actual keyboard/mouse protocols, process lifecycle, or PTY timing. ([Docs.rs][1]) There are also PTY-oriented efforts such as `ratatui-testlib`, and Microsoft’s `tui-test`, but Microsoft’s package is Node/Bun-based and uses `xterm.js`, so it is not a pure Rust, cargo-native answer. ([Docs.rs][2]) `tuiwright` would be the Rust-native equivalent: PTY, terminal model, renderer, recorder, assertions, runner, trace viewer, and optional Ratatui semantic integration, all built in Rust.
+
+---
+
+# 1. Product goals
+
+`tuiwright` should support three classes of testing.
+
+First, **black-box end-to-end testing**: launch any terminal binary, whether built with Ratatui, Cursive, raw `crossterm`, Go Bubble Tea, Python Textual, or a shell script. Drive it through a real PTY. Assert the rendered terminal screen.
+
+Second, **Rust-native TUI integration testing**: when the app is a Rust app, especially Ratatui, provide optional semantic hooks that expose test IDs, roles, labels, focused regions, widget bounds, and stable selectors. This gives Playwright-like locators even though a terminal does not have a DOM.
+
+Third, **visual regression and artifact testing**: produce deterministic screenshots, GIF recordings, cell snapshots, ANSI replays, trace files, and rich failure reports that work in headless CI.
+
+The project should feel like this:
+
+```rust
+use tuiwright::{expect, key, Tui};
+
+#[tuiwright::test]
+async fn search_flow(tui: Tui) -> anyhow::Result<()> {
+    let app = tui
+        .spawn(tuiwright::cargo_bin!("my-tui-app"))
+        .size(120, 36)
+        .term("xterm-256color")
+        .env("COLORTERM", "truecolor")
+        .record_video_on_failure()
+        .trace_on_failure()
+        .await?;
+
+    expect(app.get_by_text("Welcome")).to_be_visible().await?;
+
+    app.press(key::CTRL_K).await?;
+    app.type_text("rust testing").await?;
+    app.press(key::ENTER).await?;
+
+    expect(app.get_by_text_regex(r"\d+ results"))
+        .to_be_visible()
+        .await?;
+
+    app.get_by_text("rust testing").screenshot("artifacts/search-row.png").await?;
+    app.screenshot("artifacts/search-screen.png").await?;
+
+    Ok(())
+}
+```
+
+The API should deliberately mirror Playwright concepts: launch, context, page/screen, locator, action, auto-waiting assertion, screenshot, video, trace, codegen, report.
+
+Playwright’s power comes heavily from locators, auto-waiting, retrying assertions, screenshots, videos, and traceable artifacts. Its docs describe locators as the central mechanism for auto-waiting and retryability, and Playwright assertions auto-retry until the condition is met. ([Playwright][3]) The Rust TUI tester should copy those principles, not merely expose “send bytes and sleep.”
+
+---
+
+# 2. High-level architecture
+
+`tuiwright` should be a workspace of focused crates rather than one giant crate.
+
+```text
+tuiwright/
+  crates/
+    tuiwright                  # public prelude and high-level API
+    tuiwright-core             # session model, locators, waits, assertions
+    tuiwright-runner           # cargo subcommand, sharding, retries, reports
+    tuiwright-pty              # portable PTY process harness
+    tuiwright-vterm            # terminal emulator abstraction and state
+    tuiwright-input            # keyboard, mouse, paste, resize encoding
+    tuiwright-render           # terminal-to-PNG/SVG/HTML rendering
+    tuiwright-record           # GIF/APNG recording and compression
+    tuiwright-snapshot         # cell, ANSI, image, and semantic snapshots
+    tuiwright-trace            # trace format and replay
+    tuiwright-ratatui          # optional Ratatui semantic integration
+    tuiwright-macros           # #[tuiwright::test], cargo_bin!, fixtures
+    tuiwright-codegen          # interactive recorder/test generator
+    cargo-tuiwright            # CLI
+```
+
+The runtime pipeline should look like this:
+
+```text
+Test code
+  |
+  v
+Tuiwright session
+  |
+  +--> PTY process harness
+  |       - spawn app
+  |       - set TERM/COLORTERM/LANG
+  |       - resize terminal
+  |       - write keyboard/mouse/paste bytes
+  |       - read raw output bytes
+  |
+  +--> Virtual terminal model
+  |       - parse ANSI/VT escape sequences
+  |       - maintain screen, scrollback, alt screen, cursor, modes
+  |       - track mouse modes, bracketed paste, focus mode
+  |       - expose stable snapshots
+  |
+  +--> Locator engine
+  |       - find text, regex, regions, cursor, semantic IDs
+  |       - auto-wait and retry
+  |       - resolve click coordinates
+  |
+  +--> Renderer
+  |       - convert terminal snapshot to high-resolution PNG/SVG/HTML
+  |       - crop locator screenshots
+  |       - render cursor/action annotations
+  |
+  +--> Recorder/trace
+          - raw byte stream
+          - input events
+          - terminal snapshots
+          - screenshots
+          - compressed high-res GIF
+          - replayable trace bundle
+```
+
+The most important architectural decision is that tests should run against a **real PTY**, not redirected stdin/stdout. Many TUIs only behave correctly when stdin/stdout are attached to a terminal, raw mode is enabled, alternate screen is available, mouse/focus modes are negotiated, and resize events become terminal events. `portable-pty` already provides a cross-platform PTY abstraction and supports spawning a command, reading output, and writing input through the PTY master. ([Docs.rs][4])
+
+---
+
+# 3. “100% built in Rust” definition
+
+The proposal should be strict:
+
+No Node, Bun, Python, Chromium, xterm.js, Electron, ffmpeg, ImageMagick, tmux, asciinema, or system screenshot tools.
+
+Allowed:
+
+Rust crates, Rust-written CLI tools, OS PTY APIs, OS process APIs, and optional Rust/WASM trace viewers compiled from Rust.
+
+For images and recordings, use Rust-native encoders. The `gif` crate provides GIF encoding/decoding, and the `png` / `image` ecosystem provides native Rust image functionality. ([Docs.rs][5]) For text rendering, use a Rust text stack such as `cosmic-text` for shaping, fallback, layout, and rasterization, or a simpler `fontdue` path for deterministic monospace rendering. `cosmic-text` documents support for shaping, font discovery, fallback, layout, rasterization, and editing; `fontdue` is a Rust font parser/rasterizer/layout crate. ([Docs.rs][6])
+
+The only caveat: OS PTY APIs themselves are platform facilities. Calling them from Rust is acceptable; depending on external terminal emulators or external encoders is not.
+
+---
+
+# 4. Core abstraction: terminal is the “page”
+
+Playwright has `browser`, `context`, `page`, and `locator`.
+
+`tuiwright` should have:
+
+```rust
+Tui                  // test fixture / factory
+TuiContext           // isolated temp dir, env, shell profile, artifacts
+TerminalApp          // spawned process + PTY + virtual terminal
+Screen               // current terminal viewport and scrollback
+Locator              // deferred query over current/future screen state
+Expectation          // auto-retrying assertion
+Trace                // timeline of everything that happened
+```
+
+Example:
+
+```rust
+let app = tui.spawn("./target/debug/my-app")
+    .size(100, 30)
+    .cwd(temp.path())
+    .env("RUST_LOG", "debug")
+    .await?;
+
+app.get_by_text("Login").click().await?;
+app.get_by_label("Username").fill("alice").await?;
+app.get_by_label("Password").fill_secret("correct-horse").await?;
+app.press(key::ENTER).await?;
+
+expect(app.get_by_text("Dashboard")).to_be_visible().await?;
+```
+
+Because terminals do not have a DOM, `Locator` is a query over one or more of these layers:
+
+1. **Visible cell grid**: text, regex, grapheme clusters, styles, colors, box drawings.
+2. **Scrollback**: optional assertions against prior output.
+3. **Cursor state**: cursor location, shape, visibility, focused input-like region.
+4. **Terminal modes**: alternate screen, mouse tracking, bracketed paste, focus reporting.
+5. **Semantic metadata**: optional Rust/Ratatui integration that exposes roles, labels, IDs, and widget bounds.
+6. **Rendered pixels**: visual snapshots and pixel-level matching.
+
+---
+
+# 5. PTY and process engine
+
+The `tuiwright-pty` crate should provide a robust process harness.
+
+## Responsibilities
+
+It should:
+
+* Spawn a command under a real PTY.
+* Set terminal size in rows/columns and, when supported, pixel dimensions.
+* Set environment variables: `TERM`, `COLORTERM`, `LANG`, `LC_ALL`, `NO_COLOR`, `TUIWRIGHT`, `TUIWRIGHT_SEMANTIC_PIPE`.
+* Support direct binary execution and shell execution.
+* Capture raw PTY output with nanosecond or microsecond timestamps.
+* Write encoded input bytes.
+* Resize and deliver resize semantics.
+* Clean up process groups reliably.
+* Detect hangs, zombie children, and orphaned process trees.
+* Support Linux, macOS, and Windows through one Rust API.
+
+The harness should default to direct program launch:
+
+```rust
+tui.spawn(Command::new("./my-app"))
+```
+
+But also support shell profiles:
+
+```rust
+tui.shell("zsh")
+   .command("cargo run --bin demo")
+   .await?;
+```
+
+## Isolation
+
+Each test gets:
+
+```text
+/tmp/tuiwright/<test-id>/
+  home/
+  cwd/
+  artifacts/
+  logs/
+  trace/
+```
+
+The test context should set `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and optionally `TMPDIR` to isolate config and state. On Windows, use equivalent temporary profile directories.
+
+## Process cleanup
+
+`TerminalApp::drop` should be defensive:
+
+1. Send graceful exit if requested.
+2. Send Ctrl-C or Ctrl-D if configured.
+3. Kill child process group after timeout.
+4. Drain PTY output.
+5. Save final trace.
+6. Mark leaked children in the report.
+
+---
+
+# 6. Virtual terminal engine
+
+This is the heart of the project.
+
+A terminal app writes bytes, not pixels. To know what a user sees, `tuiwright` must emulate a terminal. Existing crates cover pieces of this. `vt100` parses a terminal byte stream into an in-memory representation of rendered contents; `vte` is a parser for implementing terminal emulators but deliberately does not assign terminal semantics; `alacritty_terminal` exposes grid and terminal state APIs used for terminal emulation. ([Docs.rs][7])
+
+I would design `tuiwright-vterm` with a backend trait:
+
+```rust
+pub trait VirtualTerminal {
+    fn resize(&mut self, cols: u16, rows: u16, pixels: PixelSize);
+    fn process_output(&mut self, bytes: &[u8], timestamp: Instant);
+    fn snapshot(&self) -> TerminalSnapshot;
+    fn modes(&self) -> TerminalModes;
+    fn scrollback(&self) -> ScrollbackSnapshot;
+}
+```
+
+Then implement multiple backends:
+
+```text
+Vt100Backend
+  - fastest MVP
+  - good for text, colors, basic control sequences
+  - limited modern graphics/protocol support
+
+AlacrittyBackend
+  - default high-fidelity backend
+  - robust terminal grid/model behavior
+  - closer to real terminal emulator behavior
+
+ReferenceBackend
+  - long-term custom tuiwright emulator
+  - built on vte/termwiz-style parsing
+  - designed specifically for testability, serialization, and trace replay
+```
+
+This avoids coupling the public API to one terminal emulator implementation.
+
+## Terminal state model
+
+The internal `TerminalSnapshot` should be serializable and stable:
+
+```rust
+pub struct TerminalSnapshot {
+    pub size: CellSize,
+    pub pixel_size: PixelSize,
+    pub active_screen: ScreenKind, // Main or Alternate
+    pub title: Option<String>,
+    pub cursor: CursorState,
+    pub modes: TerminalModes,
+    pub viewport: Grid,
+    pub scrollback: Option<Grid>,
+    pub images: Vec<TerminalImage>,
+    pub hyperlinks: Vec<HyperlinkRegion>,
+    pub semantic_tree: Option<SemanticTree>,
+    pub timestamp: Instant,
+    pub frame_id: u64,
+}
+
+pub struct Cell {
+    pub grapheme: String,
+    pub width: CellWidth,       // Narrow, WideLeading, WideContinuation, Zero
+    pub fg: TerminalColor,
+    pub bg: TerminalColor,
+    pub attrs: CellAttrs,       // bold, italic, underline, dim, blink, reverse, hidden, strike
+    pub hyperlink_id: Option<HyperlinkId>,
+    pub semantic_id: Option<SemanticId>,
+}
+```
+
+## Must-support terminal features
+
+For a Playwright-class tester, the virtual terminal must handle:
+
+* Main and alternate screen.
+* Cursor position, visibility, shape.
+* Scroll regions.
+* Line wrapping and reflow behavior.
+* SGR colors: 16-color, 256-color, truecolor.
+* Bold, dim, italic, underline, double underline, strikethrough, inverse, hidden.
+* Erase display/line.
+* Insert/delete chars and lines.
+* Tabs.
+* Unicode grapheme clusters.
+* Combining marks.
+* East Asian wide characters.
+* Emoji fallback as a longer-term target.
+* Bracketed paste.
+* Focus in/out reporting.
+* Mouse modes: X10, normal, button-event, any-event, SGR mouse.
+* Terminal title changes.
+* OSC 8 hyperlinks.
+* OSC 52 clipboard, with safe test interception.
+* Kitty keyboard protocol as an advanced feature.
+* Sixel, Kitty graphics, and iTerm image protocol as optional advanced features.
+
+`crossterm` documents that raw mode is needed for proper keyboard events and that mouse and focus events are explicitly enabled by terminal commands. ([Docs.rs][8]) The tester should observe those mode-enabling escape sequences so it knows whether a click, wheel, paste, or focus event would actually be delivered to the app.
+
+---
+
+# 7. Input driver
+
+The input driver should turn high-level user actions into terminal bytes.
+
+## Keyboard
+
+```rust
+app.press(key::ENTER).await?;
+app.press(key::CTRL_C).await?;
+app.press(key::ALT_X).await?;
+app.press(key::SHIFT_TAB).await?;
+app.type_text("hello").await?;
+app.fill("hello world").await?;
+app.paste("large\nmulti-line\ntext").await?;
+```
+
+Keyboard input must support:
+
+* Printable text.
+* Control keys.
+* Alt/meta keys.
+* Function keys.
+* Arrow/navigation keys.
+* Modified keys.
+* Kitty keyboard protocol when negotiated.
+* Raw bytes escape hatch.
+
+The difference between `type_text` and `paste` matters:
+
+```rust
+type_text("abc")     // emits user-like keystrokes
+paste("abc\nxyz")    // emits bracketed paste if app enabled it, otherwise configurable fallback
+write_raw(bytes)     // expert mode
+```
+
+## Mouse
+
+```rust
+app.get_by_text("Save").click().await?;
+app.get_by_text("Item").double_click().await?;
+app.mouse().move_to(10, 5).await?;
+app.mouse().drag((10, 5), (40, 12)).await?;
+app.mouse().wheel_down(5).await?;
+```
+
+Clicking a locator should:
+
+1. Auto-wait until the locator is visible.
+2. Resolve the locator to a cell rectangle.
+3. Pick a click point, defaulting to the center of the rectangle.
+4. Check whether mouse reporting is enabled.
+5. Encode the click using the app’s negotiated mouse protocol.
+6. Write the bytes to the PTY.
+7. Wait for the screen to settle or for the next expected condition.
+
+If mouse reporting is not enabled, `click()` should fail with a helpful error:
+
+```text
+Cannot click locator get_by_text("Save"):
+the application has not enabled terminal mouse tracking.
+A real terminal would not deliver this click to the app.
+Use .force() to send a mouse sequence anyway.
+```
+
+This mirrors Playwright’s philosophy of actionability checks, including a `force` escape hatch. Playwright similarly performs actionability checks before actions and allows force for some actions. ([Playwright][9])
+
+## Resize and focus
+
+```rust
+app.resize(160, 48).await?;
+app.focus().await?;
+app.blur().await?;
+```
+
+Resize should update the PTY size and inject the correct terminal resize behavior. In Rust apps using `crossterm`, this should surface as a resize event.
+
+---
+
+# 8. Locator system
+
+The biggest design challenge is building useful locators without a DOM.
+
+## Built-in black-box locators
+
+```rust
+app.get_by_text("Settings")
+app.get_by_text_regex(r"Total:\s+\$[0-9.]+")
+app.get_by_line(12)
+app.get_by_cell(10, 5)
+app.get_by_region(Rect::new(0, 0, 40, 10))
+app.get_by_cursor()
+app.get_by_style(|style| style.fg == Color::Red)
+app.get_by_box_title("Logs")
+app.get_by_table_cell("Name", "alice")
+```
+
+Text locators should support:
+
+* Exact and fuzzy matching.
+* Regex.
+* Normalized whitespace.
+* Unicode normalization.
+* Match within viewport or scrollback.
+* Match across wrapped lines.
+* Match including or excluding hidden cells.
+* Strict mode: fail if multiple matches.
+* `.first()`, `.last()`, `.nth(n)`, `.filter(...)`.
+
+Example:
+
+```rust
+let row = app
+    .get_by_text_regex(r"alice\s+admin\s+active")
+    .first();
+
+expect(row).to_be_visible().await?;
+row.click().await?;
+```
+
+## Semantic locators
+
+Black-box locators are not enough for complex apps. `tuiwright` should provide optional semantic instrumentation for Rust apps.
+
+```rust
+app.get_by_test_id("submit-button")
+app.get_by_role(Role::Button, "Submit")
+app.get_by_label("Username")
+app.get_by_placeholder("Search")
+app.get_by_focused()
+```
+
+For Ratatui:
+
+```rust
+use tuiwright_ratatui::{SemanticFrameExt, Role};
+
+frame.render_semantic_widget(
+    button,
+    area,
+    Semantic::new(Role::Button)
+        .name("Save")
+        .test_id("save-button")
+        .enabled(app.can_save),
+);
+```
+
+Or a builder-style wrapper:
+
+```rust
+Button::new("Save")
+    .test_id("save-button")
+    .role(Role::Button)
+    .render(frame, area);
+```
+
+## How semantic metadata should be transported
+
+Do **not** put metadata directly into visible terminal cells.
+
+Use a side channel:
+
+```text
+Unix:
+  TUIWRIGHT_SEMANTIC_FD=3
+
+Windows:
+  TUIWRIGHT_SEMANTIC_PIPE=\\.\pipe\tuiwright-<id>
+```
+
+The app, when compiled with the optional `tuiwright` feature, writes semantic frame metadata to that side channel:
+
+```json
+{
+  "frame": 42,
+  "widgets": [
+    {
+      "id": "save-button",
+      "role": "button",
+      "name": "Save",
+      "rect": { "x": 80, "y": 30, "w": 10, "h": 1 },
+      "enabled": true,
+      "focused": false
+    }
+  ]
+}
+```
+
+This gives Playwright-like role and test-id locators while preserving black-box behavior.
+
+For apps that cannot be instrumented, text/cell/visual locators still work.
+
+---
+
+# 9. Auto-waiting and flake resistance
+
+The framework should make fixed sleeps unnecessary.
+
+Bad:
+
+```rust
+app.press(key::ENTER).await?;
+tokio::time::sleep(Duration::from_secs(1)).await;
+assert!(app.screen_text().contains("Done"));
+```
+
+Good:
+
+```rust
+app.press(key::ENTER).await?;
+expect(app.get_by_text("Done")).to_be_visible().await?;
+```
+
+## Wait engine
+
+The wait engine should be event-driven:
+
+```rust
+pub struct WaitOptions {
+    pub timeout: Duration,
+    pub poll_interval: Duration,
+    pub require_stable_for: Duration,
+    pub settle_after_input: bool,
+}
+```
+
+It subscribes to terminal model updates. Every time PTY output changes the virtual screen, pending locators and expectations re-evaluate immediately.
+
+## Settling algorithm
+
+A screen is “settled” when:
+
+* No PTY bytes have arrived for `quiet_for`.
+* The virtual terminal snapshot hash is unchanged for `stable_for`.
+* The child process is still alive unless the test expected exit.
+* Optional semantic frame ID has advanced after the action.
+* Optional animation policy is satisfied.
+
+Example defaults:
+
+```toml
+[wait]
+timeout = "5s"
+quiet_for = "30ms"
+stable_for = "50ms"
+poll_interval = "10ms"
+```
+
+## Auto-retrying expectations
+
+```rust
+expect(app.get_by_text("Saved")).to_be_visible().await?;
+expect(app.get_by_text("Error")).to_be_hidden().await?;
+expect(app.get_by_test_id("status")).to_have_text("Ready").await?;
+expect(app.get_by_cursor()).to_be_at(10, 4).await?;
+expect(app).to_have_screen_text("Dashboard").await?;
+expect(app).to_match_snapshot("dashboard").await?;
+```
+
+The assertion should keep retrying until it passes or times out. On timeout, it should include:
+
+* Last visible screen as text.
+* Highlighted locator matches.
+* Screenshot path.
+* GIF path if enabled.
+* Trace path.
+* Raw error details.
+* Suggested fixes.
+
+Example failure:
+
+```text
+Timed out after 5s:
+  expect(get_by_text("Saved")).to_be_visible()
+
+Last screen:
+  ┌────────────────────────────┐
+  │ Settings                   │
+  │ Status: Saving...          │
+  └────────────────────────────┘
+
+Nearby matches:
+  "Saving..." at row 2, cols 10..18
+
+Artifacts:
+  screenshot: target/tuiwright/settings_flow/failure.png
+  recording:  target/tuiwright/settings_flow/failure.gif
+  trace:      target/tuiwright/settings_flow/trace.tuitrace
+```
+
+---
+
+# 10. Screenshots
+
+Playwright supports page screenshots, buffer screenshots, and locator screenshots. ([Playwright][10]) `tuiwright` should support the terminal equivalents:
+
+```rust
+app.screenshot("screen.png").await?;
+
+app.screenshot_with(ScreenshotOptions {
+    path: "screen@2x.png".into(),
+    scale: 2.0,
+    include_cursor: true,
+    include_padding: true,
+    theme: Theme::Dark,
+    font_size: 16.0,
+    ..Default::default()
+}).await?;
+
+app.get_by_text("Results")
+    .screenshot("results-row.png")
+    .await?;
+```
+
+## Screenshot types
+
+`tuiwright` should produce several artifact types:
+
+```text
+screen.png          # high-resolution terminal screenshot
+screen.svg          # scalable vector-ish terminal rendering
+screen.html         # inspectable artifact
+screen.ansi         # replayable terminal bytes or reconstructed screen
+screen.cells.json   # exact cell/state snapshot
+screen.txt          # plain text fallback
+```
+
+The PNG is for humans and visual diffing. The cell snapshot is for deterministic assertions. The ANSI/text files are for debugging.
+
+## Deterministic rendering profile
+
+A terminal screenshot is only “equivalent to a user on terminal” under a defined profile. Different real terminals, fonts, line heights, emoji renderers, and antialiasing strategies differ.
+
+So `tuiwright` should define explicit rendering profiles:
+
+```toml
+[screenshot]
+cols = 120
+rows = 36
+font_family = "monospace"
+font_path = "tests/fonts/YourPinnedFont.ttf"
+font_size = 16
+line_height = 1.2
+cell_width = 9
+cell_height = 19
+padding_x = 8
+padding_y = 8
+scale = 2
+theme = "ansi-dark"
+cursor = true
+```
+
+For CI, users should pin a font path or use a deterministic project-provided test font. The renderer should never rely on the developer’s local terminal settings unless explicitly requested.
+
+## Rendering pipeline
+
+```text
+TerminalSnapshot
+  -> Resolve colors and attributes
+  -> Compute cell metrics
+  -> Layout grapheme clusters
+  -> Rasterize glyphs
+  -> Draw backgrounds
+  -> Draw images/graphics layers
+  -> Draw text glyph atlas
+  -> Draw underlines/strikethrough/cursor
+  -> Draw optional action annotations
+  -> Encode PNG/SVG/HTML
+```
+
+## Visual diffing
+
+```rust
+expect(app).to_match_image_snapshot("dashboard").await?;
+expect(app).to_match_cell_snapshot("dashboard").await?;
+expect(app).to_match_ansi_snapshot("dashboard").await?;
+```
+
+Image snapshots should support:
+
+* Pixel threshold.
+* Anti-alias tolerance.
+* Ignore regions.
+* Mask dynamic text.
+* Crop to locator.
+* Compare at 1x even if screenshot captured at 2x.
+* Generate `expected.png`, `actual.png`, `diff.png`.
+
+Cell snapshots should be the default for stable CI because they compare terminal state, not font rendering.
+
+---
+
+# 11. High-resolution GIF recordings
+
+Playwright can record videos for tests, including modes like always-on, retain-on-failure, and first-retry-only. ([Playwright][11]) `tuiwright` should offer the same policy model, but emit optimized GIF by default because terminal content compresses extremely well as indexed-color frames.
+
+```rust
+let app = tui.spawn("./my-app")
+    .recording(Recording::retain_on_failure()
+        .format(RecordingFormat::Gif)
+        .scale(2.0)
+        .fps(20)
+        .max_width(1400)
+        .annotate_actions(true)
+        .web_optimized(true))
+    .await?;
+```
+
+## Recording modes
+
+```rust
+RecordingMode::Off
+RecordingMode::On
+RecordingMode::RetainOnFailure
+RecordingMode::OnFirstRetry
+RecordingMode::TraceOnly
+```
+
+## GIF compression strategy
+
+Terminals are ideal for GIF if rendered carefully.
+
+The recorder should:
+
+1. Capture terminal snapshots only when the virtual screen changes.
+2. Coalesce frames that occur within a tiny time window.
+3. Enforce min/max frame duration.
+4. Use a stable global palette for ANSI colors when possible.
+5. Use local palettes only for image-heavy frames.
+6. Use dirty-rectangle frame encoding.
+7. Deduplicate identical frames.
+8. Quantize truecolor themes into a small palette.
+9. Optionally crop to active region or locator.
+10. Optionally annotate actions with small overlays.
+11. Optionally produce a tiny preview GIF and a full-resolution GIF.
+
+Example artifact set:
+
+```text
+recording.gif             # optimized high-res web GIF
+recording.preview.gif     # smaller CI summary preview
+recording.frames.json     # timing, hashes, dirty rects
+recording.raw.tuitrace    # replayable trace source
+```
+
+## Recording API
+
+```rust
+app.recording().start().await?;
+app.press(key::CTRL_R).await?;
+app.type_text("demo").await?;
+app.recording().stop("demo-flow.gif").await?;
+```
+
+Locator-scoped recording:
+
+```rust
+let panel = app.get_by_test_id("log-panel");
+
+app.record_region(panel)
+    .fps(15)
+    .scale(2.0)
+    .until(async {
+        app.press(key::ENTER).await?;
+        expect(app.get_by_text("Done")).to_be_visible().await
+    })
+    .save("log-panel.gif")
+    .await?;
+```
+
+## Why not shell out to ffmpeg?
+
+Because the requirement is 100% Rust. GIF can be encoded in-process with Rust crates. For web compression, implement terminal-specific palette/delta optimizations rather than delegating to `gifsicle` or ffmpeg.
+
+Long term, add optional APNG and WebP if pure Rust encoders meet quality requirements, but GIF should be first-class.
+
+---
+
+# 12. Trace system
+
+The trace system should be one of the flagship features.
+
+A `.tuitrace` file should be a compressed archive:
+
+```text
+trace.tuitrace
+  metadata.toml
+  events.jsonl.zst
+  pty-output.bin.zst
+  pty-input.bin.zst
+  snapshots/
+    000001.cells.zst
+    000002.cells.zst
+  screenshots/
+    final.png
+    failure.png
+  recordings/
+    recording.gif
+  semantic/
+    frames.jsonl.zst
+  logs/
+    test.log
+    stderr.log
+```
+
+## Trace events
+
+```json
+{"t":0.000, "type":"spawn", "cmd":"./my-app", "cols":120, "rows":36}
+{"t":0.014, "type":"pty_output", "offset":0, "len":391}
+{"t":0.020, "type":"frame", "frame_id":1, "hash":"..."}
+{"t":0.240, "type":"action", "name":"press", "key":"Ctrl+K"}
+{"t":0.242, "type":"pty_input", "offset":0, "len":1}
+{"t":0.300, "type":"expect", "locator":"get_by_text(\"Search\")", "result":"pass"}
+```
+
+## Trace viewer
+
+Because the project is Rust-native, provide two viewers:
+
+```bash
+cargo tuiwright show-trace target/tuiwright/my_test/trace.tuitrace
+```
+
+This opens a Rust TUI trace viewer in the terminal.
+
+And:
+
+```bash
+cargo tuiwright show-trace --web trace.tuitrace
+```
+
+This starts a local Rust web server serving a WASM viewer compiled from Rust. No Node build step.
+
+The viewer should show:
+
+* Timeline.
+* Screen at each frame.
+* Raw PTY bytes.
+* Input actions.
+* Expectations and retries.
+* Locator match overlays.
+* Diff between frames.
+* Final screenshot.
+* Recording preview.
+* Semantic tree, if available.
+
+---
+
+# 13. Snapshot testing
+
+`tuiwright` should support several snapshot layers.
+
+## Plain text snapshot
+
+```rust
+expect(app).to_match_text_snapshot("main_menu").await?;
+```
+
+Good for simple CLIs.
+
+## Cell snapshot
+
+```rust
+expect(app).to_match_cell_snapshot("dashboard").await?;
+```
+
+Stores graphemes, colors, attributes, cursor, and selected terminal modes.
+
+Example snapshot:
+
+```ron
+Screen(
+  size: (80, 24),
+  cursor: Cursor(row: 3, col: 12, visible: true),
+  cells: [
+    Row([
+      Cell("S", fg: Green, bg: Default, bold: true),
+      Cell("e", fg: Green, bg: Default, bold: true),
+      ...
+    ])
+  ]
+)
+```
+
+## ANSI snapshot
+
+```rust
+expect(app).to_match_ansi_snapshot("startup").await?;
+```
+
+Stores normalized terminal escape output. Useful when verifying emitted escape sequences.
+
+## Image snapshot
+
+```rust
+expect(app).to_match_image_snapshot("settings").await?;
+```
+
+Good for visual polish, borders, layout, and rendering regressions.
+
+## Semantic snapshot
+
+```rust
+expect(app).to_match_semantic_snapshot("settings_semantics").await?;
+```
+
+Stores roles, names, bounds, focused states, disabled states.
+
+## Snapshot masking
+
+Dynamic regions are common: clocks, spinners, progress bars, random IDs.
+
+```rust
+expect(app)
+    .to_match_cell_snapshot_with("dashboard", SnapshotOptions::new()
+        .mask(app.get_by_text_regex(r"\d{2}:\d{2}:\d{2}"), "<time>")
+        .mask(app.get_by_test_id("spinner"), "<spinner>")
+        .ignore_style_in(app.get_by_test_id("log-panel")))
+    .await?;
+```
+
+---
+
+# 14. Ratatui integration
+
+Ratatui is immediate-mode: widgets render into a buffer, and that buffer becomes terminal output. Ratatui’s buffer model contains cells with graphemes, foreground/background colors, and styles. ([Docs.rs][12]) That makes it perfect for a fast in-process layer and a semantic metadata layer.
+
+`tuiwright-ratatui` should provide two modes.
+
+## Mode A: fast component/integration mode
+
+For testing rendering without a child process:
+
+```rust
+#[test]
+fn settings_panel_renders() {
+    let mut harness = RatatuiHarness::new(80, 24);
+    harness.render(|frame| {
+        render_settings(frame, &AppState::default());
+    });
+
+    harness.expect_text("Settings");
+    harness.expect_cell_snapshot("settings_panel");
+    harness.screenshot("settings_panel.png");
+}
+```
+
+This is faster than E2E and complements Ratatui’s `TestBackend`.
+
+## Mode B: full E2E semantic mode
+
+For real app tests, add semantic metadata:
+
+```rust
+#[cfg(feature = "tuiwright")]
+use tuiwright_ratatui::SemanticFrameExt;
+
+fn render(frame: &mut Frame, app: &App) {
+    let save_area = Rect::new(70, 20, 8, 1);
+
+    frame.render_widget("Save", save_area);
+
+    #[cfg(feature = "tuiwright")]
+    frame.semantic(save_area)
+        .role(Role::Button)
+        .name("Save")
+        .test_id("save-button")
+        .enabled(app.can_save);
+}
+```
+
+Then the E2E test can use:
+
+```rust
+app.get_by_role(Role::Button, "Save").click().await?;
+expect(app.get_by_test_id("save-button")).to_be_enabled().await?;
+```
+
+This semantic mode is optional. It should not be required for black-box tests.
+
+---
+
+# 15. Test runner and CLI
+
+The project should support both normal `cargo test` and a dedicated runner.
+
+## Library mode
+
+```rust
+#[tuiwright::test]
+async fn flow(tui: Tui) -> anyhow::Result<()> {
+    // ...
+    Ok(())
+}
+```
+
+This works inside ordinary Rust test workflows.
+
+## Cargo subcommand
+
+```bash
+cargo tuiwright test
+cargo tuiwright test --headed
+cargo tuiwright test --trace on
+cargo tuiwright test --record retain-on-failure
+cargo tuiwright test --update-snapshots
+cargo tuiwright show-trace target/tuiwright/.../trace.tuitrace
+cargo tuiwright codegen -- cargo run --bin my-app
+```
+
+## Config file
+
+```toml
+# tuiwright.toml
+
+[terminal]
+cols = 120
+rows = 36
+term = "xterm-256color"
+colorterm = "truecolor"
+lang = "en_US.UTF-8"
+
+[wait]
+timeout = "5s"
+quiet_for = "30ms"
+stable_for = "50ms"
+
+[artifacts]
+dir = "target/tuiwright"
+screenshot = "only-on-failure"
+trace = "retain-on-failure"
+recording = "retain-on-failure"
+
+[screenshot]
+scale = 2
+font_size = 16
+padding_x = 8
+padding_y = 8
+theme = "ansi-dark"
+
+[recording]
+format = "gif"
+fps = 20
+web_optimized = true
+annotate_actions = true
+
+[retries]
+count = 2
+record_on_first_retry = true
+
+[reporters]
+junit = true
+json = true
+html = true
+github_actions = true
+```
+
+## Reporters
+
+Produce:
+
+```text
+target/tuiwright/
+  report.html
+  report.json
+  junit.xml
+  tests/
+    search_flow/
+      failure.png
+      recording.gif
+      trace.tuitrace
+      stdout.log
+      stderr.log
+```
+
+The HTML report should be generated entirely by Rust.
+
+---
+
+# 16. Code generation
+
+A Playwright-like tester should have a recorder.
+
+```bash
+cargo tuiwright codegen -- cargo run --bin my-app
+```
+
+This starts the app in a PTY, mirrors the app to the developer’s real terminal, records keystrokes/mouse actions, observes resulting screen changes, and emits Rust code:
+
+```rust
+#[tuiwright::test]
+async fn generated_flow(tui: Tui) -> anyhow::Result<()> {
+    let app = tui.spawn(tuiwright::cargo_bin!("my-app"))
+        .size(120, 36)
+        .await?;
+
+    expect(app.get_by_text("Welcome")).to_be_visible().await?;
+
+    app.press(key::CTRL_K).await?;
+    expect(app.get_by_text("Search")).to_be_visible().await?;
+
+    app.type_text("accounts").await?;
+    app.press(key::ENTER).await?;
+
+    expect(app.get_by_text("Accounts")).to_be_visible().await?;
+
+    Ok(())
+}
+```
+
+The recorder should prefer stable locators:
+
+1. Semantic test ID.
+2. Semantic role + name.
+3. Label.
+4. Unique visible text.
+5. Regex text.
+6. Cell coordinates as last resort.
+
+It should warn when it had to use unstable coordinates:
+
+```rust
+// TODO: coordinate locator generated because no stable text/semantic locator was found.
+app.click_cell(42, 13).await?;
+```
+
+---
+
+# 17. Assertions catalog
+
+The public assertion API should be broad.
+
+## Screen assertions
+
+```rust
+expect(app).to_have_title("my app").await?;
+expect(app).to_use_alt_screen().await?;
+expect(app).to_have_size(120, 36).await?;
+expect(app).to_have_screen_text("Ready").await?;
+expect(app).to_exit_successfully().await?;
+expect(app).to_stay_running().await?;
+```
+
+## Locator assertions
+
+```rust
+expect(locator).to_be_visible().await?;
+expect(locator).to_be_hidden().await?;
+expect(locator).to_have_text("Save").await?;
+expect(locator).to_contain_text("Saved").await?;
+expect(locator).to_have_style(StyleMatcher::fg(Color::Green)).await?;
+expect(locator).to_have_rect(Rect::new(10, 5, 20, 1)).await?;
+expect(locator).to_be_focused().await?;
+expect(locator).to_be_enabled().await?;
+expect(locator).to_be_disabled().await?;
+```
+
+## Cursor assertions
+
+```rust
+expect(app.cursor()).to_be_visible().await?;
+expect(app.cursor()).to_be_at(20, 4).await?;
+expect(app.cursor()).to_have_shape(CursorShape::Bar).await?;
+```
+
+## Mode assertions
+
+```rust
+expect(app.modes()).to_have_mouse_tracking().await?;
+expect(app.modes()).to_have_bracketed_paste().await?;
+expect(app.modes()).to_have_focus_reporting().await?;
+```
+
+## Snapshot assertions
+
+```rust
+expect(app).to_match_text_snapshot("startup").await?;
+expect(app).to_match_cell_snapshot("dashboard").await?;
+expect(app).to_match_image_snapshot("dashboard").await?;
+expect(app).to_match_semantic_snapshot("dashboard").await?;
+```
+
+---
+
+# 18. Handling hard TUI cases
+
+## Animations and spinners
+
+Animations cause snapshot flake. Provide:
+
+```rust
+app.freeze_animations_if_supported().await?;
+```
+
+For black-box apps, support masks:
+
+```rust
+SnapshotOptions::new()
+    .mask(app.get_by_text_regex(r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"), "<spinner>")
+```
+
+For instrumented Rust apps, offer:
+
+```rust
+#[cfg(feature = "tuiwright")]
+app.disable_animation_ticks();
+```
+
+## Time and randomness
+
+Offer helpers:
+
+```rust
+tui.spawn("./app")
+    .env("TZ", "UTC")
+    .env("TUIWRIGHT_FIXED_TIME", "2026-05-05T12:00:00Z")
+    .env("TUIWRIGHT_SEED", "1");
+```
+
+And optional Rust-side crates:
+
+```rust
+tuiwright_time::now()
+tuiwright_rng::rng()
+```
+
+These become deterministic during tests.
+
+## Alternate screen
+
+Most full-screen TUIs use alternate screen. The virtual terminal must separately track main and alternate screen. Screenshots should default to the active screen, while traces preserve both.
+
+## Scrollback
+
+Support:
+
+```rust
+expect(app.scrollback()).to_contain_text("build complete").await?;
+app.screenshot_full_scrollback("full-session.png").await?;
+```
+
+“Full page screenshot” for terminals should mean one of two things:
+
+```rust
+FullPageMode::ViewportOnly
+FullPageMode::ScrollbackAndViewport
+```
+
+## Programs that exit quickly
+
+For CLI-like programs:
+
+```rust
+let app = tui.spawn("git --help")
+    .wait_for_exit()
+    .await?;
+
+expect(app.output()).to_contain_text("usage: git").await?;
+expect(app).to_exit_successfully().await?;
+```
+
+## TUI apps using direct terminal queries
+
+Some apps query terminal capabilities, cursor position, or colors. The virtual terminal and PTY harness should answer common queries where appropriate, or expose config:
+
+```toml
+[terminal.responses]
+primary_device_attributes = "xterm-256color"
+cursor_position = true
+theme_query = true
+```
+
+---
+
+# 19. Advanced terminal graphics
+
+Modern TUIs may render charts, images, or pixel graphics.
+
+Add feature-gated support:
+
+```toml
+[features]
+graphics = ["sixel", "kitty-graphics", "iterm-images"]
+```
+
+Support:
+
+* Sixel decode and placement.
+* Kitty graphics protocol.
+* iTerm inline images.
+* Unicode block, Braille, and half-block rendering.
+* Pixel-level screenshot and diff.
+
+`termwiz` already documents helpers for modeling image data and mentions iTerm, Sixel, and Kitty graphics protocol considerations, which makes it a useful reference point even if `tuiwright` implements its own test-oriented representation. ([Docs.rs][13])
+
+---
+
+# 20. Failure experience
+
+The failure experience should be obsessive.
+
+A failed test should show:
+
+```text
+FAILED search_flow
+
+Action:
+  app.press(Enter)
+
+Expectation:
+  expect(get_by_text("Results")).to_be_visible()
+
+Reason:
+  Timed out after 5s.
+  Screen settled 17 times.
+  Last matching text candidates:
+    "No results" at row 14, col 4
+
+Artifacts:
+  PNG:   target/tuiwright/search_flow/failure.png
+  GIF:   target/tuiwright/search_flow/recording.gif
+  Trace: target/tuiwright/search_flow/trace.tuitrace
+  Text:  target/tuiwright/search_flow/final.txt
+
+Hint:
+  The app displayed "No results"; check the test data fixture or search query.
+```
+
+When a locator is ambiguous:
+
+```text
+get_by_text("Delete") matched 3 regions:
+  1. row 5, col 60
+  2. row 8, col 60
+  3. row 11, col 60
+
+Use:
+  get_by_text("Delete").nth(1)
+  get_by_test_id("delete-user-alice")
+  get_by_role(Role::Button, "Delete").filter(...)
+```
+
+When a click cannot work:
+
+```text
+Cannot click get_by_text("Save"):
+  application has not enabled mouse reporting.
+
+A real terminal would not deliver this mouse event to the app.
+Use keyboard navigation, enable mouse support in the app, or call .force().
+```
+
+---
+
+# 21. Internal concurrency model
+
+Use async internally, probably Tokio behind a feature, with a sync facade for ordinary tests.
+
+```text
+PTY reader task
+  -> reads bytes
+  -> timestamps chunks
+  -> sends chunks to vterm task
+  -> appends to trace
+
+VTerm task
+  -> processes bytes
+  -> updates TerminalSnapshot
+  -> broadcasts frame updates
+
+Action task
+  -> encodes input
+  -> writes PTY master
+  -> appends action event
+  -> waits for settle if configured
+
+Expectation task
+  -> subscribes to frame updates
+  -> re-evaluates locators
+  -> resolves on pass or timeout
+
+Recorder task
+  -> receives frame updates
+  -> renders selected frames
+  -> writes optimized GIF on finalize
+```
+
+Public methods should be `async`, but a blocking wrapper is useful:
+
+```rust
+app.blocking().press(key::ENTER)?;
+```
+
+---
+
+# 22. Data structures for locators
+
+A locator should be lazy and re-resolved against each new frame, not a fixed rectangle.
+
+```rust
+pub struct Locator {
+    app: TerminalAppHandle,
+    query: LocatorQuery,
+    filters: Vec<LocatorFilter>,
+    strict: bool,
+}
+
+pub enum LocatorQuery {
+    Text(TextMatcher),
+    Regex(Regex),
+    TestId(String),
+    Role { role: Role, name: Option<TextMatcher> },
+    Label(String),
+    Placeholder(String),
+    Cursor,
+    Cell { x: u16, y: u16 },
+    Region(Rect),
+    Style(StyleMatcher),
+    Composite(Vec<LocatorQuery>),
+}
+```
+
+Resolved form:
+
+```rust
+pub struct LocatorMatch {
+    pub rect: Rect,
+    pub text: String,
+    pub cells: Vec<CellRef>,
+    pub semantic: Option<SemanticNode>,
+    pub confidence: f32,
+}
+```
+
+Strict mode should default to true for action methods:
+
+```rust
+app.get_by_text("Save").click().await?;
+```
+
+If multiple matches exist, fail unless the user calls `.first()`, `.nth()`, or narrows the locator.
+
+---
+
+# 23. Artifact retention policy
+
+Same spirit as Playwright:
+
+```rust
+ArtifactMode::Off
+ArtifactMode::On
+ArtifactMode::OnlyOnFailure
+ArtifactMode::RetainOnFailure
+ArtifactMode::OnFirstRetry
+```
+
+Recommended defaults:
+
+```toml
+[artifacts]
+trace = "retain-on-failure"
+screenshot = "only-on-failure"
+recording = "retain-on-failure"
+stdout = "retain-on-failure"
+stderr = "retain-on-failure"
+cell_snapshots = "on"
+```
+
+---
+
+# 24. CI integration
+
+The tester must work with no display server because it renders from a terminal model, not from an OS window.
+
+CI features:
+
+* GitHub Actions annotations.
+* JUnit XML.
+* JSON report.
+* HTML report.
+* Failure artifact directory.
+* Snapshot update mode.
+* Test sharding.
+* Retries.
+* Quarantine/flake report.
+* Deterministic fonts/theme config.
+* `--headless` default.
+* `--headed` for local mirrored debugging.
+
+Example GitHub Actions:
+
+```yaml
+name: tui-tests
+
+on: [push, pull_request]
+
+jobs:
+  tui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-tuiwright
+      - run: cargo tuiwright test --reporter github --reporter junit
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: tuiwright-artifacts
+          path: target/tuiwright
+```
+
+---
+
+# 25. Implementation roadmap
+
+## Milestone 1: black-box MVP
+
+Deliver:
+
+* `cargo tuiwright test`
+* spawn binary in PTY
+* fixed terminal size
+* raw output capture
+* basic virtual terminal state
+* `get_by_text`
+* `get_by_text_regex`
+* `press`
+* `type_text`
+* `paste`
+* `expect(...).to_be_visible()`
+* text snapshots
+* failure text artifact
+* Linux/macOS support
+
+Definition of done:
+
+```rust
+#[tuiwright::test]
+async fn git_help(tui: Tui) -> anyhow::Result<()> {
+    let app = tui.spawn("git --help").await?;
+    expect(app.get_by_text("usage: git")).to_be_visible().await?;
+    Ok(())
+}
+```
+
+## Milestone 2: real TUI driving
+
+Deliver:
+
+* alternate screen support
+* resize support
+* cursor support
+* bracketed paste
+* focus reporting
+* mouse mode detection
+* SGR mouse click/wheel/drag
+* Windows ConPTY support
+* process cleanup hardening
+* stable wait engine
+
+Definition of done:
+
+* Drive a Ratatui app through keyboard navigation.
+* Drive a mouse-enabled TUI through clicks.
+* Detect and explain non-deliverable mouse clicks.
+
+## Milestone 3: screenshots and cell snapshots
+
+Deliver:
+
+* terminal snapshot schema
+* PNG renderer
+* SVG/HTML renderer
+* locator screenshot crop
+* cell snapshots
+* image snapshots
+* visual diff artifacts
+* deterministic render profile
+
+Definition of done:
+
+```rust
+app.screenshot("dashboard.png").await?;
+expect(app).to_match_cell_snapshot("dashboard").await?;
+expect(app).to_match_image_snapshot("dashboard").await?;
+```
+
+## Milestone 4: GIF recording and trace
+
+Deliver:
+
+* recording modes
+* frame sampling from terminal changes
+* high-resolution GIF rendering
+* web optimization
+* action annotations
+* `.tuitrace` archive
+* `show-trace` TUI viewer
+* failure artifact report
+
+Definition of done:
+
+* A failed CI test uploads a compact GIF and trace that fully explain the flow.
+
+## Milestone 5: Ratatui semantic integration
+
+Deliver:
+
+* `tuiwright-ratatui`
+* semantic side channel
+* roles, names, test IDs, labels, bounds
+* semantic snapshot
+* `get_by_role`
+* `get_by_test_id`
+* `get_by_label`
+* generated semantic diagnostics
+
+Definition of done:
+
+```rust
+app.get_by_role(Role::Button, "Save").click().await?;
+expect(app.get_by_test_id("status")).to_have_text("Saved").await?;
+```
+
+## Milestone 6: codegen and inspector
+
+Deliver:
+
+* `cargo tuiwright codegen`
+* mirrored interactive PTY session
+* action recording
+* locator suggestion
+* generated Rust test
+* interactive locator picker
+* trace-backed debugging
+
+Definition of done:
+
+* A developer can manually use their TUI and receive a useful starter test.
+
+## Milestone 7: advanced terminal fidelity
+
+Deliver:
+
+* Kitty keyboard protocol
+* OSC 8 hyperlinks
+* OSC 52 test clipboard
+* Sixel support
+* Kitty/iTerm image support
+* wide Unicode/emoji rendering hardening
+* terminal emulator compliance suite
+* fuzz testing escape parser
+
+Definition of done:
+
+* Complex modern terminal apps produce accurate screenshots and stable cell snapshots.
+
+---
+
+# 26. Testing `tuiwright` itself
+
+The project needs its own serious test strategy.
+
+## Terminal compliance tests
+
+Build a suite of known escape sequences and expected snapshots:
+
+```text
+colors/
+cursor/
+erase/
+scroll-region/
+alternate-screen/
+mouse/
+bracketed-paste/
+wide-unicode/
+combining-marks/
+sixel/
+kitty-graphics/
+```
+
+## Golden visual tests
+
+Render snapshots to PNG and compare against checked-in expected images.
+
+## PTY integration tests
+
+Spawn small fixture apps that:
+
+* Enable raw mode.
+* Enter alternate screen.
+* Draw frames.
+* Handle keypresses.
+* Handle mouse clicks.
+* Handle resize.
+* Exit cleanly.
+* Intentionally hang.
+* Intentionally crash.
+
+## Fuzzing
+
+Fuzz the terminal parser with arbitrary byte streams. The invariant is simple: never panic, never allocate unboundedly, never produce invalid cell state.
+
+## Cross-platform matrix
+
+Run tests on:
+
+* Linux
+* macOS
+* Windows
+* different shells
+* UTF-8 locales
+* constrained CI environments
+
+---
+
+# 27. Why this would be materially better than today’s options
+
+Ratatui `TestBackend` is excellent for unit and integration rendering tests, but it is not a full user-behavior test harness. It does not prove that the compiled app behaves correctly through a real terminal. ([Docs.rs][1]) Existing PTY libraries solve process IO, but not Playwright-class locators, auto-waiting, screenshots, recordings, traces, and semantic selectors. `portable-pty` gives the critical cross-platform PTY substrate, but the tester needs to build a full testing product on top. ([Docs.rs][4]) Microsoft’s `tui-test` demonstrates that a Playwright-like terminal tester is a compelling direction, but it is Node/Bun-based and uses `xterm.js`; the proposed tool would bring that class of experience to Rust projects without leaving Cargo or relying on JavaScript infrastructure. ([GitHub][14])
+
+The winning design is not “snapshot stdout.” It is:
+
+```text
+real PTY
++ virtual terminal
++ locator engine
++ auto-waiting assertions
++ deterministic renderer
++ high-res screenshots
++ optimized GIF recordings
++ trace replay
++ optional Rust/Ratatui semantic metadata
++ cargo-native runner
+```
+
+That combination would give Rust TUI authors the same confidence web developers get from Playwright: tests that validate actual user flows, produce understandable artifacts, and fail with enough evidence to fix the bug quickly.
+
+[1]: https://docs.rs/ratatui/latest/ratatui/backend/struct.TestBackend.html?utm_source=chatgpt.com "TestBackend in ratatui::backend - Rust"
+[2]: https://docs.rs/ratatui-testlib "ratatui_testlib - Rust"
+[3]: https://playwright.dev/docs/locators "Locators | Playwright"
+[4]: https://docs.rs/portable-pty "portable_pty - Rust"
+[5]: https://docs.rs/gif?utm_source=chatgpt.com "gif - Rust"
+[6]: https://docs.rs/cosmic-text?utm_source=chatgpt.com "cosmic_text - Rust"
+[7]: https://docs.rs/crate/vt100/latest "vt100 0.16.2 - Docs.rs"
+[8]: https://docs.rs/crossterm/latest/crossterm/event/index.html "crossterm::event - Rust"
+[9]: https://playwright.dev/docs/actionability "Auto-waiting | Playwright"
+[10]: https://playwright.dev/docs/screenshots "Screenshots | Playwright"
+[11]: https://playwright.dev/docs/videos "Videos | Playwright"
+[12]: https://docs.rs/ratatui/latest/ratatui/buffer/struct.Buffer.html?utm_source=chatgpt.com "Buffer in ratatui::buffer - Rust"
+[13]: https://docs.rs/termwiz "termwiz - Rust"
+[14]: https://github.com/microsoft/tui-test "GitHub - microsoft/tui-test: An end-to-end terminal testing framework for CLI and TUI experiences · GitHub"
+

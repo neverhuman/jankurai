@@ -1,0 +1,1359 @@
+Absolutely — below is a comprehensive taxonomy of **bad agent behavior** around `Dockerfile`, Docker image builds, Docker runtime flags, and `docker-compose.yml` / `compose.yaml`, with performance and security treated together.
+
+I’m interpreting “agent behavior” as: **things an AI/coding agent, automation script, CI job, or developer-assistant might incorrectly generate, modify, recommend, or run** when working with Docker. Some items are always bad; others are “bad by default” and only acceptable with a narrow, documented exception.
+
+I used official Docker docs, Docker Compose docs, OWASP, NIST/CIS-style security guidance, GitHub/GitLab/Bitbucket resources, academic publications, and community reports. Quora was not accessible during this pass, and X/Twitter snippets were too thin to use as authority, so I did **not** rely on either as a factual source. Reddit/community material is treated as anecdotal signal, not as authoritative guidance.
+
+---
+
+# 1. Highest-risk bad behaviors
+
+These are the items I would put on a “block the PR immediately” list.
+
+| Bad behavior                                                       | Why it is bad                                                                                                                                                                                                           | Safer default                                                                                       |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Mounting `/var/run/docker.sock` into a container                   | Docker socket access is effectively root-equivalent on the host; read-only socket mounts are still not a full mitigation. OWASP explicitly says not to expose the Docker daemon socket. ([OWASP Cheat Sheet Series][1]) | Avoid it. Use a narrow socket proxy, rootless Docker, a separate builder, or purpose-built APIs.    |
+| `privileged: true` or `--privileged`                               | Gives broad host-level powers; OWASP says privileged containers get all Linux capabilities and should not be used by default. ([OWASP Cheat Sheet Series][1])                                                           | Drop all capabilities, add back only what is required.                                              |
+| `cap_add: [ALL]` or casual `SYS_ADMIN`                             | `SYS_ADMIN` is extremely broad; `ALL` defeats container isolation. Compose supports `cap_add`, including `ALL`, which makes this easy to accidentally generate. ([Docker Documentation][2])                             | `cap_drop: ["ALL"]`, then explicitly add the minimum capability.                                    |
+| `network_mode: host`                                               | Gives the container raw host network access; Compose documents `host` as raw access to the host network interface. ([Docker Documentation][2])                                                                          | Use bridge networks, service DNS, and publish only necessary ports.                                 |
+| Publishing ports without host IP binding                           | Docker/Compose publish to all interfaces by default, exposing services externally unless constrained. ([Docker Documentation][3])                                                                                       | Bind to `127.0.0.1` for local-only services.                                                        |
+| Secrets in `ARG`, `ENV`, `.env`, Dockerfile, labels, or build logs | Docker warns that `ARG`/`ENV` are inappropriate for build secrets because they persist; Compose recommends secrets rather than environment variables for sensitive data. ([Docker Documentation][4])                    | Use BuildKit build secrets and Compose runtime secrets.                                             |
+| Running as root by default                                         | Compose `user` defaults to the image’s `USER`; if not set, many images run as root. OWASP recommends unprivileged users, user namespaces, or rootless mode. ([Docker Documentation][2])                                 | Use a non-root numeric UID/GID and fix file ownership at build time.                                |
+| Blindly running untrusted Compose files                            | Docker says Compose files are trusted input and can fully control container/host interactions; remote includes can hide privileged containers or host bind mounts. ([Docker Documentation][5])                          | Review `docker compose config` output before running.                                               |
+| `latest` tags everywhere                                           | Tags are mutable; Docker documents that tags can be reassigned and digest pinning is needed for exact reproducibility. ([Docker Documentation][6])                                                                      | Pin versions, and for production-critical workloads pin digests with an update process.             |
+| No vulnerability scanning, SBOM, provenance, or signing            | OWASP recommends scanning in CI and supply-chain controls including provenance, SBOMs, signing, and trusted registries. ([OWASP Cheat Sheet Series][1])                                                                 | Scan Dockerfiles/images, generate SBOMs, sign images, and continuously rescan.                      |
+| Bad build cache structure                                          | Poor layer ordering and oversized contexts cause slow builds; Docker documents `.dockerignore`, layer ordering, cache mounts, and external cache for CI. ([Docker Documentation][7])                                    | Keep contexts small, copy dependency manifests first, use BuildKit cache mounts and registry cache. |
+
+---
+
+# 2. Bad agent behavior before touching Dockerfiles or Compose
+
+This is the “meta” layer: how agents go wrong while editing or running Docker.
+
+## 2.1 Trust and review failures
+
+Bad agent behavior:
+
+1. **Runs a Compose file from the internet without inspection.**
+   Compose files are equivalent to host-affecting configuration. Docker explicitly says Compose files should be treated as trusted input and applied as written. ([Docker Documentation][5])
+
+2. **Follows remote `include` or `extends` chains without reviewing transitive files.**
+   Docker warns that remote Compose references can be chained and can introduce risky fields such as `privileged`, host bind mounts, host networking, and suspicious images. ([Docker Documentation][5])
+
+3. **Does not run `docker compose config` before applying a generated Compose file.**
+   Docker specifically recommends reviewing the fully resolved config, especially when remote includes, anchors, or overrides are involved. ([Docker Documentation][5])
+
+4. **Adds an override file that secretly weakens production settings.**
+   Examples: `docker-compose.override.yml` adds `privileged: true`, bind-mounts the source tree, exposes databases, disables healthchecks, or changes users to root.
+
+5. **Copies snippets from GitHub gists, Reddit, Stack Overflow, old blog posts, or LLM outputs without checking current Compose spec behavior.**
+   Compose v2 now implements the Compose Specification; legacy 2.x/3.x distinctions were merged, and old assumptions can be wrong. ([Docker Documentation][8])
+
+6. **Treats generated infrastructure files as “just config,” not code requiring security review.**
+
+7. **Automatically accepts prompts from Docker Desktop / Compose about running untrusted resources.**
+
+8. **Runs containers against the host’s real Docker daemon during analysis without understanding side effects.**
+
+9. **Runs destructive cleanup commands such as `docker system prune -a`, `docker volume prune`, or `docker compose down -v` on a shared or production host.**
+
+10. **Touches production Docker hosts from a development agent session.**
+
+11. **Generates “works on my machine” Docker settings and ships them to production.**
+    Common examples: source bind mounts, debug ports, hot reload, `tty: true`, `stdin_open: true`, admin UIs, weak passwords, `restart: always` on dev-only services.
+
+12. **Conflates build-time, test-time, and production-time needs.**
+    Build tools, test frameworks, compilers, dev servers, browsers, SSH clients, and debug dependencies often do not belong in the runtime image.
+
+---
+
+## 2.2 “Make it work” security regressions
+
+Bad agent behavior:
+
+1. Replaces file-permission fixes with `USER root`.
+2. Fixes permission errors with `chmod -R 777`.
+3. Adds `privileged: true` to fix device, networking, or filesystem problems.
+4. Adds `network_mode: host` because service discovery is misconfigured.
+5. Mounts the entire project root into production.
+6. Mounts `/`, `/etc`, `/var`, `/home`, `/root`, `/proc`, `/sys`, `/run`, or `/var/lib/docker`.
+7. Mounts SSH agent sockets, cloud credential directories, kubeconfigs, or Docker credentials into general app containers.
+8. Changes `security_opt` to `seccomp=unconfined` or `apparmor=unconfined`.
+9. Adds `cap_add: ["SYS_ADMIN"]` as a universal fix.
+10. Disables healthchecks instead of making them correct.
+11. Disables TLS verification, package signature checks, or GPG verification.
+12. Stores a copied token in `ENV` “temporarily” and never removes it.
+
+These are especially dangerous because they look like productivity improvements but permanently erode isolation.
+
+---
+
+# 3. Bad behavior in `Dockerfile`
+
+## 3.1 Build-time performance anti-patterns
+
+| Bad Dockerfile behavior                                   | Why it hurts                                                                                                                                                                                     | Better behavior                                                           |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| No `.dockerignore`                                        | Sends `.git`, `node_modules`, virtualenvs, build outputs, logs, caches, and secrets into the build context. Docker recommends `.dockerignore` to keep context small. ([Docker Documentation][6]) | Add a strict `.dockerignore`.                                             |
+| `COPY . .` before installing dependencies                 | Any source change invalidates dependency layers. Docker recommends ordering less frequently changed layers earlier. ([Docker Documentation][9])                                                  | Copy lockfiles first, install deps, then copy app source.                 |
+| Dynamic `ARG`/`ENV` early in the file                     | Busts cache for every following layer.                                                                                                                                                           | Put volatile build args late, or isolate them.                            |
+| `RUN apt-get update` in its own layer                     | Docker documents that this can reuse stale cache and not actually update package indexes. ([Docker Documentation][6])                                                                            | Combine `apt-get update && apt-get install` in one `RUN`.                 |
+| No cleanup of package indexes                             | Leaves unnecessary bytes in image. Docker recommends removing `/var/lib/apt/lists/*` in the same layer. ([Docker Documentation][6])                                                              | Clean package lists in the same `RUN`.                                    |
+| Installs recommended packages by default                  | Larger images, more vulnerabilities, slower pulls.                                                                                                                                               | Use `--no-install-recommends` where appropriate.                          |
+| Leaves compilers/build tools in runtime image             | Larger attack surface and slower deploys. Docker recommends multi-stage builds to leave build tools and intermediates out of the final image. ([Docker Documentation][10])                       | Multi-stage builds.                                                       |
+| Uses a huge base image unnecessarily                      | Larger downloads, more CVEs, slower CI. Docker recommends minimal, trusted base images. ([Docker Documentation][6])                                                                              | Use slim/distroless/minimal base when compatible.                         |
+| Always builds with `--no-cache`                           | Defeats Docker’s layer cache.                                                                                                                                                                    | Use cache intentionally; invalidate only when needed.                     |
+| Does not use BuildKit                                     | Misses parallel build stages, skipped unused stages, incremental context transfer, and other performance improvements. ([Docker Documentation][11])                                              | Use BuildKit/buildx.                                                      |
+| No cache mounts for package managers                      | CI repeatedly downloads npm/pip/apt/go/maven caches. Docker documents cache mounts for package managers. ([Docker Documentation][7])                                                             | Use `RUN --mount=type=cache`.                                             |
+| No external cache in ephemeral CI                         | GitHub/GitLab/Bitbucket runners often start cold; Docker documents external cache for CI/CD. ([Docker Documentation][7])                                                                         | Use registry-backed BuildKit cache.                                       |
+| Multi-stage file targets not used                         | Builds unnecessary stages. BuildKit skips unused stages; legacy builder may not. ([Docker Documentation][10])                                                                                    | Use `--target` and BuildKit.                                              |
+| Downloads remote tarballs without cache strategy          | Slow, flaky, unreproducible.                                                                                                                                                                     | Pin checksums and isolate downloads.                                      |
+| Installs dependencies after copying all app source        | Slow rebuilds.                                                                                                                                                                                   | Copy `package-lock.json`, `poetry.lock`, `go.mod`, `pom.xml`, etc. first. |
+| Builds dev/test/prod from one bloated final image         | Bigger images and slower startup.                                                                                                                                                                | Separate stages: `builder`, `test`, `runtime`.                            |
+| Uses Alpine blindly                                       | Alpine can be excellent, but native dependencies may require extra compilation or compatibility fixes.                                                                                           | Benchmark against slim/distroless; choose deliberately.                   |
+| Forces wrong platform                                     | QEMU emulation can make builds very slow.                                                                                                                                                        | Build native where possible; use multi-platform only when needed.         |
+| Rebuilds vendored dependencies constantly                 | Large context and poor cache reuse.                                                                                                                                                              | Use lockfiles and package-manager caches.                                 |
+| Copies documentation/tests/examples into production image | More bytes, more scan noise, more disclosure.                                                                                                                                                    | Copy only runtime artifacts.                                              |
+| Performs `chown -R` after copying large trees             | Creates expensive extra layers.                                                                                                                                                                  | Use `COPY --chown` or fix ownership before copy.                          |
+| Puts cleanup in a later layer                             | Earlier layer still contains the bytes.                                                                                                                                                          | Install and clean in the same `RUN`.                                      |
+| Uses shell pipelines without `pipefail`                   | Build may succeed despite failed downloads/verification. Docker notes shell pipelines can hide failures without `pipefail`. ([Docker Documentation][6])                                          | Use `set -o pipefail` where supported.                                    |
+| Leaves package caches, test caches, compiler caches       | Larger image and slower distribution.                                                                                                                                                            | Use cache mounts or clean before final stage.                             |
+| Not sorting package lists                                 | Merge conflicts and accidental duplicates. Docker recommends sorting multiline package arguments. ([Docker Documentation][6])                                                                    | Sort package names alphabetically.                                        |
+| Bloated images in CI                                      | Community CI reports repeatedly point to large images causing slow pulls on ephemeral runners. ([Reddit][12])                                                                                    | Keep runtime images small and cache layers externally.                    |
+
+Academic work backs up why these “smells” matter: one large empirical study found Dockerfile smells added an average of about 48 MB per smelly image, and a later 2025 refactoring study reported average reductions of 32% in image size and 6% in build duration after automated Dockerfile refactoring. ([arXiv][13])
+
+---
+
+## 3.2 Dockerfile security anti-patterns
+
+### Base image and supply-chain problems
+
+Bad behavior:
+
+1. `FROM ubuntu:latest`, `node:latest`, `python:latest`, or no tag.
+2. Using mutable tags in production without digest pinning.
+3. Pinning a digest but never updating it.
+4. Pulling base images from unknown publishers.
+5. Using abandoned images.
+6. Using images with huge dependency surfaces when a smaller base is sufficient.
+7. Copying binaries from untrusted external images.
+8. Copying from an external build stage by tag rather than digest.
+9. Installing packages from unsigned repositories.
+10. Disabling package signature checks.
+11. Using HTTP package mirrors where HTTPS/signatures are available.
+12. `curl | sh` installation scripts.
+13. `wget` or `curl` downloads without checksum/signature verification.
+14. `git clone` from a moving branch instead of a pinned commit/tag.
+15. Adding package repositories without pinning or validating keys.
+16. Not rebuilding images regularly to pick up patched base layers. Docker recommends rebuilding often and using `--pull` to get updated base images. ([Docker Documentation][6])
+17. No image scanning.
+18. No SBOM.
+19. No image signing.
+20. No provenance/attestation.
+21. No policy that defines allowed registries.
+22. No trusted registry or private registry policy for internal workloads.
+23. No exception process for vulnerabilities.
+24. Scans only once at build time and never rescans deployed images.
+
+Docker explicitly recommends choosing trusted/minimal base images, rebuilding often, and understanding the tradeoff between digest pinning and automatic security updates. OWASP also recommends scanning, provenance, SBOMs, image signing, and trusted registries. ([Docker Documentation][6])
+
+---
+
+### Secrets leakage in Dockerfile builds
+
+Bad behavior:
+
+1. `ARG TOKEN=...`
+2. `ARG AWS_SECRET_ACCESS_KEY`
+3. `ENV NPM_TOKEN=...`
+4. `ENV DATABASE_URL=postgres://user:password@...`
+5. `RUN echo "$SECRET" > file`
+6. `RUN npm config set //registry.npmjs.org/:_authToken=$NPM_TOKEN`
+7. Copying `.npmrc`, `.pypirc`, `.netrc`, `.docker/config.json`, `id_rsa`, `.aws`, `.gcloud`, `.kube`.
+8. Copying `.env` into the image.
+9. Copying `.git` into the image, including secret history.
+10. Logging tokens in build output.
+11. Using `--build-arg` for secrets.
+12. Assuming deleting a secret later removes it from prior layers.
+13. Using build cache layers that already captured secret-derived files.
+14. Using remote `ADD`/`curl` with credentialed URLs.
+15. Using package manager auth files in a layer instead of BuildKit secret mounts.
+16. Forgetting that `ENV` persists in the image and descendant stages. Docker documents that `ENV` values persist in built images. ([Docker Documentation][6])
+17. Assuming secret changes invalidate cache automatically. Docker documents that build secret contents do not participate in cache invalidation. ([Docker Documentation][9])
+
+Docker’s own build checks warn against putting sensitive data in `ARG` or `ENV`; BuildKit secret mounts and SSH mounts are the intended mechanisms. ([Docker Documentation][4])
+
+---
+
+### Bad user, permission, and filesystem choices
+
+Bad behavior:
+
+1. No `USER` instruction in final image.
+2. `USER root` in final image “because permissions are hard.”
+3. Creates a non-root user but leaves app files owned by root and writable only by root.
+4. Fixes permissions with `chmod -R 777`.
+5. Runs package managers at container startup.
+6. Leaves `sudo` installed in runtime image.
+7. Leaves SSH server installed in runtime image.
+8. Leaves compilers and linkers installed in runtime image.
+9. Leaves setuid/setgid binaries unnecessarily.
+10. Makes application source writable at runtime when it only needs read access.
+11. Stores runtime data inside the container writable layer instead of a volume.
+12. Uses root-owned volumes and then switches service back to root.
+13. Uses unpredictable user names rather than stable numeric UID/GID for production.
+14. Uses `chown -R` during startup, slowing every container start.
+15. Gives the container write access to configuration files that should be immutable.
+16. Assumes non-root automatically fixes all privilege problems. It helps, but capabilities, mounts, devices, and Docker socket access can still dominate risk.
+
+OWASP recommends setting an unprivileged user, user namespaces, or rootless mode, and Docker documents rootless mode as running the daemon and containers without root privileges except for limited helper binaries. ([OWASP Cheat Sheet Series][1])
+
+---
+
+### Entrypoint and process behavior mistakes
+
+Bad behavior:
+
+1. Shell-form `ENTRYPOINT` that swallows signals.
+2. Shell-form `CMD` when signal behavior matters.
+3. Entrypoint script that does not `exec "$@"`.
+4. PID 1 process that does not reap children.
+5. Running multiple unrelated daemons in one container.
+6. Running `supervisord` to avoid designing proper services.
+7. `tail -f /dev/null` to keep a broken container alive.
+8. No `HEALTHCHECK` for long-lived services.
+9. `HEALTHCHECK NONE` without a reason.
+10. Healthcheck depends on tools not installed in final image.
+11. Healthcheck mutates state.
+12. Healthcheck logs secrets.
+13. Startup script downloads dependencies from the internet every boot.
+14. Startup script performs database migrations from every replica concurrently.
+15. Startup script silently ignores failures.
+16. Startup script runs as root then drops privileges incorrectly.
+17. Entrypoint modifies mounted source code.
+18. Entrypoint waits forever instead of failing clearly.
+
+Docker recommends exec-form `ENTRYPOINT` so the process can receive Unix signals correctly. ([Docker Documentation][6])
+
+---
+
+### Metadata and maintainability problems
+
+Bad behavior:
+
+1. No OCI labels for source, revision, license, vendor, description.
+2. No versioned image tags tied to commit SHA or release.
+3. Image cannot be traced back to source.
+4. No build date or revision metadata when useful.
+5. No ownership information.
+6. No `STOPSIGNAL` when the app needs a non-default shutdown signal.
+7. No documented ports.
+8. Wrong `EXPOSE` values.
+9. Treating `EXPOSE` as a security control. It is metadata; port publishing is controlled at runtime/Compose.
+10. Ambiguous `WORKDIR`.
+11. Writes files to `/` by accident.
+12. Ignores `.dockerignore` drift.
+13. Dockerfile comments explain nothing about security exceptions.
+14. Has duplicated package lists or stale build steps.
+15. Uses deprecated instructions/patterns without justification.
+16. Hardcodes production URLs, credentials, tenants, or region-specific endpoints.
+17. Enables debug mode by default.
+18. Ships test certificates or self-signed dev CA into production image.
+
+---
+
+# 4. Bad behavior in `docker-compose.yml` / `compose.yaml`
+
+Docker Compose is particularly risky because it describes not only containers but also host mounts, networks, ports, secrets, devices, and privileges. Docker’s own trust model says Compose files can give containers broad control over host interaction. ([Docker Documentation][5])
+
+## 4.1 Compose trust, include, and schema mistakes
+
+Bad behavior:
+
+1. Running untrusted Compose files.
+2. Running remote Compose includes without review.
+3. Trusting nested `include` or `extends` chains.
+4. Not reviewing `docker compose config`.
+5. Using YAML anchors to hide risky defaults.
+6. Using override files that silently add debug ports or root privileges.
+7. Keeping `docker-compose.override.yml` enabled in production.
+8. Assuming `version: "3"` gives Swarm semantics in modern Compose. The Compose spec merged legacy 2.x and 3.x formats; current Compose uses the latest implemented schema. ([Docker Documentation][8])
+9. Using `deploy:` settings locally and assuming every Compose implementation enforces them. Compose says `deploy` is optional and ignored if unsupported. ([Docker Documentation][2])
+10. Duplicate YAML keys where one silently overrides another.
+11. Unquoted port mappings such as `80:80`; Docker recommends quoting ports to avoid YAML base-60 ambiguity. ([Docker Documentation][2])
+12. Unquoted boolean-like environment values such as `true`, `false`, `yes`, `no`; Compose warns booleans should be quoted. ([Docker Documentation][2])
+13. Using old `docker-compose` v1 assumptions with Docker Compose v2.
+14. Generating Compose that works only on Docker Desktop but not Linux servers.
+15. Generating Linux-only host paths for cross-platform developer teams.
+16. Overusing `container_name`, which can cause name collisions and scaling problems.
+17. Hardcoding project names and network names that collide on shared hosts.
+18. Not separating dev, test, CI, and production Compose files.
+
+---
+
+## 4.2 Privilege and isolation failures
+
+Bad behavior:
+
+1. `privileged: true`.
+2. `cap_add: ["ALL"]`.
+3. `cap_add: ["SYS_ADMIN"]` without a narrow reason.
+4. `cap_add: ["NET_ADMIN"]` for ordinary web apps.
+5. `cap_add: ["NET_RAW"]` when not needed.
+6. No `cap_drop`.
+7. No `security_opt: ["no-new-privileges:true"]`.
+8. `security_opt: ["seccomp=unconfined"]`.
+9. `security_opt: ["apparmor=unconfined"]`.
+10. Disabling SELinux labels.
+11. Running as root by default.
+12. `user: "0:0"`.
+13. Using `userns_mode: host`.
+14. `pid: host`.
+15. `ipc: host`.
+16. Sharing IPC namespaces between unrelated containers.
+17. `network_mode: host`.
+18. Broad `sysctls` that change network/kernel behavior.
+19. Granting devices broadly: `/dev:/dev`, `/dev/sda`, `/dev/kvm`, `/dev/fuse`, GPU devices without need.
+20. Using lifecycle hooks with `privileged: true`; Compose supports privileged lifecycle hooks, which should be scrutinized. ([Docker Documentation][2])
+21. Giving monitoring/sidecar containers more privilege than the app.
+22. Adding Docker socket access to Watchtower-like or management containers without considering host takeover risk.
+23. Running Docker-in-Docker in privileged mode in shared CI.
+24. Assuming “inside a container” means “safe.”
+
+Relevant Compose fields are explicitly documented: `privileged`, `cap_add`, `security_opt`, `network_mode: host`, `pid`, `ipc`, `devices`, and `user` all materially affect isolation. ([Docker Documentation][2])
+
+---
+
+## 4.3 Host filesystem and volume mistakes
+
+Bad behavior:
+
+1. Mounting `/var/run/docker.sock`.
+2. Mounting `/`.
+3. Mounting `/etc`.
+4. Mounting `/root`.
+5. Mounting `/home`.
+6. Mounting `/var/lib/docker`.
+7. Mounting `/proc`.
+8. Mounting `/sys`.
+9. Mounting `/run`.
+10. Mounting cloud credential directories: `~/.aws`, `~/.gcloud`, `~/.azure`.
+11. Mounting `~/.kube`.
+12. Mounting SSH keys or SSH agent sockets.
+13. Mounting browser profiles.
+14. Mounting password-manager exports.
+15. Mounting host source code read-write in production.
+16. Mounting config files read-write when read-only is sufficient.
+17. Using broad bind mounts instead of narrow file mounts.
+18. Relying on relative host paths that resolve differently across machines.
+19. Mounting secrets from a repository directory.
+20. Mounting the same read-write volume into multiple services that are not designed for concurrent writes.
+21. Storing databases in the container writable layer.
+22. Using anonymous volumes accidentally, then losing track of data.
+23. Running `docker compose down -v` in scripts that may be executed against valuable data.
+24. No backup strategy for named volumes.
+25. No restore test for named volumes.
+26. No ownership plan for volumes when running non-root.
+27. Using root-owned data directories to justify running the service as root.
+28. Mounting host timezone, certificates, or Docker config files without validating the trust implications.
+29. Using `volumes_from` to inherit more mounts than intended.
+30. Mounting build caches into runtime containers.
+
+Compose supports bind mounts, named volumes, and host paths; that power should be used narrowly. ([Docker Documentation][2]) OWASP recommends read-only filesystems and read-only mounts where possible. ([OWASP Cheat Sheet Series][1])
+
+---
+
+## 4.4 Networking and port exposure mistakes
+
+Bad behavior:
+
+1. `ports: ["5432:5432"]` for Postgres on a developer laptop connected to public Wi-Fi.
+2. `ports: ["6379:6379"]` for Redis.
+3. `ports: ["3306:3306"]` for MySQL/MariaDB.
+4. Publishing Elasticsearch, MongoDB, RabbitMQ, Prometheus, Grafana, admin UIs, mail catchers, or debug dashboards by default.
+5. Publishing ports without `127.0.0.1`.
+6. Assuming Docker only binds localhost by default; it does not.
+7. Using `network_mode: host` to avoid learning Compose networking.
+8. Using `links` instead of normal service-name DNS. Docker says links are not required for services to communicate on the default network. ([Docker Documentation][14])
+9. Hardcoding container IPs. Compose service containers can be recreated with different IPs; use service names.
+10. Putting every service on one flat default network.
+11. Not separating `frontend`, `backend`, and `database` networks.
+12. Not using `internal: true` for private backend networks.
+13. Giving every service outbound internet access when not needed.
+14. Using `extra_hosts: host.docker.internal:host-gateway` for every service.
+15. Adding custom DNS servers unnecessarily.
+16. Exposing metrics endpoints publicly.
+17. Exposing health endpoints with sensitive details.
+18. Exposing admin consoles with default credentials.
+19. Treating `expose` as host publishing. Compose `expose` is internal service exposure; `ports` publishes to the host. ([Docker Documentation][2])
+20. Using host networking and `ports` together incorrectly; Compose notes port mapping must not be used with host network mode. ([Docker Documentation][2])
+21. Binding to IPv6 unintentionally.
+22. Publishing debug ports such as `9229`, `5005`, `5678`, `2345`.
+23. Publishing ephemeral random host ports in production without firewall awareness.
+24. Not documenting expected ingress paths.
+
+Docker’s port publishing docs are blunt: published ports are insecure by default unless constrained, and default binding uses all interfaces. ([Docker Documentation][3])
+
+---
+
+## 4.5 Secrets and environment mistakes in Compose
+
+Bad behavior:
+
+1. Putting passwords in `environment`.
+2. Putting API keys in `environment`.
+3. Putting tokens in `env_file`.
+4. Committing `.env`.
+5. Committing `secrets/*.txt`.
+6. Storing production secrets next to `compose.yaml`.
+7. Using the same secret for dev, staging, and prod.
+8. Granting all secrets to all services.
+9. Passing secrets as command-line arguments.
+10. Passing secrets as labels.
+11. Putting credentials in image names or registry URLs.
+12. Logging environment variables during startup.
+13. Using `env_file` with interpolation surprises.
+14. Using `required: false` on important `env_file` entries and silently running with missing config. Compose supports optional env files; that is dangerous for required production config. ([Docker Documentation][2])
+15. Not using `_FILE` variants when images support them.
+16. Not using Compose secrets.
+17. Using Compose secrets but storing the source files unencrypted in Git.
+18. Assuming Compose secrets are a complete enterprise secret manager.
+19. Reusing database root passwords in app services.
+20. Sharing `.env` files in tickets or chat.
+21. Building images with runtime secrets.
+22. Leaving generated `.env` in the build context.
+23. Forgetting `.env` values can be interpolated into the Compose file.
+24. Using boolean-like unquoted env values and getting YAML coercion surprises. ([Docker Documentation][2])
+
+Compose explicitly recommends secrets for sensitive data and notes environment variables can be exposed through logs or process inspection. ([Docker Documentation][15])
+
+---
+
+## 4.6 Startup ordering, health, and reliability mistakes
+
+Bad behavior:
+
+1. Using short-form `depends_on` and assuming the dependency is ready.
+2. No healthcheck on databases, brokers, or APIs.
+3. Healthchecks that only check “process exists” instead of “service is usable.”
+4. Healthchecks that require network tools not installed in the image.
+5. Healthchecks that mutate state.
+6. Healthchecks that are too frequent and create load.
+7. Healthchecks that leak credentials in command output.
+8. Disabling healthchecks inherited from images.
+9. `depends_on` cycles.
+10. Migration jobs racing from multiple replicas.
+11. Long-running services depend on one-shot migration jobs but do not check success.
+12. `restart: always` on one-shot jobs.
+13. No `restart` policy for production services that should recover.
+14. `restart: always` on services that should fail visibly.
+15. No graceful shutdown settings.
+16. No `stop_grace_period` for apps that need time to drain.
+17. No `init: true` for processes that spawn children and do not reap them.
+18. Entrypoint scripts swallowing signals.
+19. Containers kept alive with `sleep infinity` or `tail -f /dev/null`.
+20. Services write critical data to ephemeral container filesystem.
+
+Compose documents that short-form `depends_on` controls creation/removal order; long-form `condition: service_healthy` is needed when readiness matters. Compose also supports healthchecks directly. ([Docker Documentation][2])
+
+---
+
+## 4.7 Resource, logging, and denial-of-service mistakes
+
+Bad behavior:
+
+1. No memory limits.
+2. No CPU limits.
+3. No PID limits.
+4. No ulimits.
+5. No log rotation.
+6. `oom_kill_disable: true` without strict memory limits.
+7. Unlimited file descriptors.
+8. Unlimited process creation.
+9. Unlimited container logs filling disks.
+10. Debug-level logs in production.
+11. Verbose database logs on shared disks.
+12. Heavy healthchecks that become self-inflicted DoS.
+13. Resource-heavy builds on shared Docker hosts.
+14. Not pruning builder cache on shared CI machines.
+15. Pruning too aggressively and destroying useful cache.
+16. Large image pulls on every deploy.
+17. No registry mirror or dependency cache where appropriate.
+18. No monitoring of container disk usage.
+19. No monitoring of Docker daemon disk usage.
+20. No alerts for restart loops.
+
+OWASP includes resource limiting as a Docker security rule because resource exhaustion is a security issue, not just a performance issue. ([OWASP Cheat Sheet Series][1])
+
+---
+
+## 4.8 Compose build mistakes
+
+Bad behavior:
+
+1. `build.context: .` at a monorepo root without `.dockerignore`.
+2. `build.context: ../..` pulling huge unrelated context.
+3. Build context contains secrets.
+4. Build context contains `.git`.
+5. Build context contains test data, dumps, logs, `node_modules`, virtualenvs, or compiled artifacts.
+6. No `target` specified for multi-stage Dockerfiles.
+7. Using production Compose to build dev stages.
+8. Using dev Compose to deploy production.
+9. `args` used for secrets.
+10. Compose build secrets not used when needed.
+11. No BuildKit cache.
+12. No platform awareness.
+13. Forcing `platform: linux/amd64` on ARM Macs, causing slow emulation.
+14. Building images from remote Git URLs without pinning commit.
+15. Using `image: myapp:latest` for every local and CI build.
+16. Race conditions where multiple CI jobs push the same tag.
+17. Not tagging images with commit SHA.
+18. Not pushing immutable release tags.
+19. No `pull_policy` or update policy.
+20. Not using `--pull` or equivalent periodic base refresh.
+21. Not separating image build from service orchestration in CI.
+22. Running builds on production hosts.
+23. Using Docker-in-Docker privileged mode where a rootless or remote builder would work.
+24. Not using Bitbucket/GitLab/GitHub cache features where available; GitLab and Bitbucket both document Docker/cache patterns for faster CI. ([GitLab Docs][16])
+
+---
+
+## 4.9 Data persistence mistakes
+
+Bad behavior:
+
+1. Database data stored in container writable layer.
+2. No named volume for stateful services.
+3. Named volumes with no backup.
+4. Backups exist but restores are never tested.
+5. `docker compose down -v` in README cleanup command without warning.
+6. `docker volume prune` in automated cleanup.
+7. Mixing dev and prod project names so volumes collide.
+8. Using the same volume for incompatible app versions.
+9. Mounting a single writable volume into multiple containers that are not designed for it.
+10. Mounting host directories with wrong ownership, then running container as root.
+11. Mounting NFS/SMB volumes without checking database compatibility.
+12. No data migration plan.
+13. No initialization idempotency.
+14. `depends_on` used instead of migration orchestration.
+15. Secret files stored in persistent app volumes.
+16. Logs stored in app data volumes indefinitely.
+17. Unbounded caches stored in named volumes.
+18. Anonymous volumes created accidentally and forgotten.
+
+---
+
+## 4.10 Debug/dev tools leaking into production Compose
+
+Bad behavior:
+
+1. `phpMyAdmin`, Adminer, MailHog, Mailpit, Redis Commander, pgAdmin, RabbitMQ management UI, Jaeger, Zipkin, Prometheus, Grafana exposed by default.
+2. Debug ports published.
+3. Hot reload enabled in production.
+4. Source bind mounts enabled in production.
+5. Development credentials in production Compose.
+6. Test databases seeded with realistic sensitive data.
+7. `NODE_ENV=development`, `FLASK_DEBUG=1`, `DJANGO_DEBUG=True`, `RAILS_ENV=development`.
+8. Browser automation containers shipped with production stack.
+9. Local-only mock services active in staging/prod.
+10. Profilers exposed without auth.
+11. Dev-only reverse proxy rules.
+12. Self-signed dev certs in production.
+13. `extra_hosts` to internal resources copied from developer machines.
+14. `.env.local` accidentally loaded.
+15. Compose `profiles` not used to isolate dev services.
+16. Profiles used but CI/prod enables all profiles accidentally.
+
+---
+
+# 5. Bad CI/CD behavior with Docker
+
+## 5.1 Security mistakes in CI
+
+Bad behavior:
+
+1. Exposing the host Docker socket to untrusted CI jobs.
+2. Running privileged Docker-in-Docker for pull requests from forks.
+3. Letting generated Compose mount CI secrets into containers.
+4. Building untrusted Dockerfiles with access to production registry credentials.
+5. Pushing images from unreviewed branches.
+6. Pushing `latest` from multiple branches.
+7. Reusing the same tag for different code.
+8. No immutable tag such as commit SHA.
+9. No provenance metadata.
+10. No SBOM.
+11. No image signing.
+12. No image scanning gate.
+13. Scanning only the Dockerfile, not the final image.
+14. Scanning only once at build time, never after new CVEs are published.
+15. No secret scanning of Dockerfiles, Compose files, `.env`, and build context.
+16. Printing `docker login` credentials.
+17. Passing secrets as build args.
+18. Running `docker compose up` in CI with host network or host mounts.
+19. Running untrusted integration tests against shared Docker daemon.
+20. No policy-as-code for forbidden Compose fields.
+21. No approval step for privileged/device/socket changes.
+22. No separation between CI builder identity and deployer identity.
+23. No registry retention policy.
+24. No cleanup, causing disk exhaustion.
+25. Over-cleanup, destroying cache and slowing every build.
+26. Running production deploys from mutable tags.
+
+GitLab documents that one common Docker-in-Docker method requires privileged mode, which is exactly why CI Docker access should be treated as high risk. ([GitLab Docs][17])
+
+---
+
+## 5.2 Performance mistakes in CI
+
+Bad behavior:
+
+1. Cold builds every time.
+2. No Docker layer cache.
+3. No dependency cache.
+4. No registry-backed BuildKit cache.
+5. No `.dockerignore`.
+6. Huge monorepo build context.
+7. Tests run after full production image build when an earlier test stage would fail faster.
+8. Image scan downloads huge images repeatedly.
+9. Multiple jobs build the same image independently.
+10. No build matrix discipline.
+11. Multi-platform builds on every branch.
+12. QEMU emulation for normal PR checks.
+13. Always using `--no-cache`.
+14. Never using `--pull`, causing stale bases.
+15. Always using `--pull` in inner-loop dev builds, causing unnecessary remote checks.
+16. No remote registry mirror.
+17. No package-manager cache mounts.
+18. No parallelized independent stages.
+19. Legacy builder instead of BuildKit.
+20. Large base images in every job.
+
+Docker documents external caches for CI/CD, and BuildKit specifically improves performance through skipped unused stages, parallelism, incremental context transfer, and smarter cache behavior. ([Docker Documentation][7])
+
+---
+
+# 6. Bad community-observed patterns
+
+Community discussions are not policy sources, but they are useful evidence of recurring real-world failure modes. Recent Reddit discussions repeatedly surface the same pain points: Docker socket exposure, privileged containers, slow CI from huge images, mutable `latest` tags, and the need for continuous scanning rather than one-time scans. ([Reddit][18])
+
+The important lesson: these are not theoretical issues. They are common enough that teams keep rediscovering them.
+
+---
+
+# 7. Best practices: detailed, opinionated baseline
+
+## 7.1 Treat Docker and Compose as privileged code
+
+Best practices:
+
+1. Require code review for `Dockerfile`, `.dockerignore`, `compose.yaml`, override files, and CI build scripts.
+2. Require review for any addition of:
+
+   * `privileged`
+   * `cap_add`
+   * `security_opt`
+   * `network_mode: host`
+   * `pid: host`
+   * `ipc: host`
+   * `devices`
+   * Docker socket mounts
+   * host filesystem bind mounts
+   * published ports
+   * `user: root`
+   * secrets/environment changes
+3. Always run:
+
+```bash
+docker compose config
+```
+
+4. Review the fully rendered output, not just source YAML.
+5. For remote includes, review all transitive includes.
+6. Do not run untrusted Compose files directly.
+7. Keep dev and prod Compose separate.
+8. Use `profiles` for optional debug/admin/dev services.
+9. Maintain an exception register for privileged containers.
+10. Expire exceptions automatically.
+
+Docker’s Compose trust model strongly supports this stance: Compose files are trusted input and can control host interaction. ([Docker Documentation][5])
+
+---
+
+## 7.2 Build fast and reproducibly
+
+A good Dockerfile structure:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+FROM python:3.12-slim@sha256:<pin-real-digest-here> AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+# Create a non-root runtime user early.
+RUN groupadd --system --gid 10001 app \
+ && useradd --system --uid 10001 --gid 10001 --home-dir /app app
+
+FROM base AS deps
+
+# Install only build dependencies needed to compile/install packages.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update \
+ && apt-get install -y --no-install-recommends build-essential gcc \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip wheel --wheel-dir /wheels -r requirements.txt
+
+FROM base AS runtime
+
+COPY --from=deps /wheels /wheels
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+ && rm -rf /wheels
+
+COPY --chown=10001:10001 . .
+
+USER 10001:10001
+
+EXPOSE 8000
+
+ENTRYPOINT ["python", "-m", "myapp"]
+```
+
+Why this is good:
+
+1. Uses BuildKit syntax.
+2. Pins base image by digest for reproducibility.
+3. Uses a minimal base.
+4. Creates a non-root user.
+5. Copies dependency metadata before source code.
+6. Uses multi-stage builds.
+7. Keeps build tools out of the final image.
+8. Uses cache mounts.
+9. Cleans apt metadata in the same layer.
+10. Uses exec-form entrypoint.
+11. Avoids secrets in `ARG` or `ENV`.
+12. Avoids root in runtime.
+
+Docker’s build docs recommend minimal/trusted images, `.dockerignore`, multi-stage builds, cache-aware ordering, cache mounts, and external caches for CI. ([Docker Documentation][6])
+
+---
+
+## 7.3 Use a strong `.dockerignore`
+
+A practical baseline:
+
+```dockerignore
+.git
+.gitignore
+.github
+.gitlab
+.bitbucket
+
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+.aws
+.gcloud
+.azure
+.kube
+
+node_modules
+.venv
+venv
+__pycache__
+.pytest_cache
+.mypy_cache
+.coverage
+coverage
+dist
+build
+target
+out
+
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+docker-compose*.yml
+compose*.yaml
+secrets
+tmp
+cache
+```
+
+Adjust it per project. The point is not to blindly exclude everything; the point is to make the build context intentional. Docker explicitly recommends `.dockerignore` to exclude files not relevant to the build. ([Docker Documentation][6])
+
+---
+
+## 7.4 Use BuildKit secrets, not `ARG` or `ENV`
+
+Build command:
+
+```bash
+docker build \
+  --secret id=npm_token,src="$HOME/.npm-token" \
+  -t ghcr.io/acme/app:${GIT_SHA} .
+```
+
+Dockerfile:
+
+```dockerfile
+# syntax=docker/dockerfile:1
+
+RUN --mount=type=secret,id=npm_token \
+    NPM_TOKEN="$(cat /run/secrets/npm_token)" \
+ && npm ci
+```
+
+Compose build secret example:
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      secrets:
+        - npm_token
+
+secrets:
+  npm_token:
+    file: ./local-secrets/npm_token.txt
+```
+
+Runtime secret example:
+
+```yaml
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+Rules:
+
+1. No secrets in Dockerfile.
+2. No secrets in `ARG`.
+3. No secrets in `ENV`.
+4. No secrets in image labels.
+5. No secrets in build logs.
+6. No committed `.env` secrets.
+7. Use BuildKit secret mounts for build-time access.
+8. Use Compose secrets or a real secret manager for runtime.
+9. Grant each service only the secrets it needs.
+10. Secret source files should not be committed unencrypted.
+
+Docker and Compose both explicitly recommend secrets mechanisms over `ARG`/`ENV` for sensitive data. ([Docker Documentation][4])
+
+---
+
+## 7.5 Harden Compose services by default
+
+A hardened baseline:
+
+```yaml
+services:
+  app:
+    image: ghcr.io/acme/app:1.4.2@sha256:<pin-real-digest-here>
+
+    user: "10001:10001"
+
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+
+    cap_drop:
+      - ALL
+
+    security_opt:
+      - no-new-privileges:true
+
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: "1.0"
+
+    healthcheck:
+      test: ["CMD", "/app/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    restart: unless-stopped
+
+    networks:
+      - app_net
+
+    secrets:
+      - db_password
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  app_net:
+    internal: true
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+This should be adapted per service, but the posture is right: non-root, read-only filesystem, no extra capabilities, no privilege escalation, bounded resources, healthchecks, private networking, and explicit secrets. Compose supports `read_only`, `security_opt`, healthchecks, secrets, and user selection. ([Docker Documentation][2])
+
+---
+
+## 7.6 Publish ports safely
+
+Bad:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "5432:5432"
+```
+
+Better for local-only development:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "127.0.0.1:5432:5432"
+```
+
+Better for production internal dependency:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    expose:
+      - "5432"
+    networks:
+      - backend
+
+networks:
+  backend:
+    internal: true
+```
+
+Rules:
+
+1. Do not publish databases by default.
+2. Do not publish caches by default.
+3. Bind local-only services to `127.0.0.1`.
+4. Use reverse proxies for public ingress.
+5. Use internal networks for backend dependencies.
+6. Use service names, not hardcoded IPs.
+7. Avoid `network_mode: host`.
+8. Treat every `ports:` entry as an exposure decision.
+
+Docker documents that publishing without a host IP binds all interfaces by default; OWASP recommends binding to localhost when only local access is needed. ([Docker Documentation][3])
+
+---
+
+## 7.7 Use Compose networks intentionally
+
+Good pattern:
+
+```yaml
+services:
+  reverse_proxy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - public
+      - app
+
+  app:
+    image: ghcr.io/acme/app:1.4.2
+    networks:
+      - app
+      - backend
+
+  postgres:
+    image: postgres:16
+    networks:
+      - backend
+
+networks:
+  public:
+  app:
+    internal: true
+  backend:
+    internal: true
+```
+
+Rules:
+
+1. Public ingress service joins public network.
+2. App joins only the networks it needs.
+3. Database is not on the public network.
+4. Backend network is internal.
+5. Avoid a single flat default network for everything.
+6. Avoid `links`; Compose service DNS is enough for normal communication. ([Docker Documentation][14])
+
+---
+
+## 7.8 Handle startup correctly
+
+Bad:
+
+```yaml
+services:
+  app:
+    depends_on:
+      - db
+```
+
+Better:
+
+```yaml
+services:
+  app:
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+```
+
+Rules:
+
+1. Use healthchecks for real readiness.
+2. Use long-form `depends_on` with `condition: service_healthy` where needed.
+3. Do not use sleeps as readiness logic.
+4. Make migrations idempotent.
+5. Ensure one-shot jobs have appropriate restart behavior.
+6. Make containers fail clearly instead of hanging forever.
+
+Compose documents the difference between basic dependency order and health-based conditions. ([Docker Documentation][2])
+
+---
+
+## 7.9 Use image tags and digests responsibly
+
+Recommended tagging pattern:
+
+```bash
+IMAGE=ghcr.io/acme/app
+
+docker buildx build \
+  --pull \
+  --tag "$IMAGE:${GIT_SHA}" \
+  --tag "$IMAGE:1.4.2" \
+  --push .
+```
+
+Production Compose:
+
+```yaml
+services:
+  app:
+    image: ghcr.io/acme/app:1.4.2@sha256:<real-digest>
+```
+
+Rules:
+
+1. Use immutable tags such as commit SHA.
+2. Use release tags for humans.
+3. Avoid deploying `latest`.
+4. Pin digests for reproducibility-critical environments.
+5. Use an update bot or scheduled rebuilds so digest pinning does not freeze vulnerabilities forever.
+6. Rebuild regularly with updated bases.
+7. Scan continuously after deployment, not only at build time.
+
+Docker documents the mutable-tag problem and the tradeoff that digest pinning improves reproducibility but opts out of automatic base updates unless paired with an update workflow. ([Docker Documentation][6])
+
+---
+
+## 7.10 Scan, lint, and enforce policy
+
+Recommended checks:
+
+```bash
+# Dockerfile lint
+hadolint Dockerfile
+
+# Render and validate Compose
+docker compose config --quiet
+docker compose config > rendered-compose.yaml
+
+# Secret scanning
+gitleaks detect --source .
+trufflehog filesystem .
+
+# Filesystem and IaC scanning
+trivy fs --scanners vuln,secret,misconfig .
+
+# Image scanning
+trivy image --exit-code 1 --severity HIGH,CRITICAL ghcr.io/acme/app:${GIT_SHA}
+
+# Optional benchmark/policy checks on hosts
+docker-bench-security
+```
+
+Useful categories:
+
+1. **Dockerfile lint:** Hadolint parses Dockerfiles and integrates ShellCheck for shell in `RUN` instructions. ([GitHub][19])
+2. **Image vulnerability scanning:** Trivy, Grype, Docker Scout, Clair, and similar tools.
+3. **Secret scanning:** Gitleaks and TruffleHog.
+4. **Host benchmark:** Docker Bench for Security / CIS Docker Benchmark.
+5. **Policy-as-code:** OPA/Conftest for blocking forbidden Compose fields.
+6. **Supply chain:** SBOM generation, provenance, signing, trusted registries.
+
+OWASP lists scanning tools, secret scanners, Docker Bench, and supply-chain controls as part of Docker security practice. ([OWASP Cheat Sheet Series][1]) CIS and NIST also provide container security baselines and recommendations. ([CIS][20])
+
+---
+
+# 8. Agent-specific guardrails
+
+Here is the rule set I would give to an AI agent that edits Docker and Compose files.
+
+## 8.1 Never generate these without an explicit exception
+
+Block by default:
+
+```yaml
+privileged: true
+network_mode: host
+pid: host
+ipc: host
+user: root
+user: "0"
+user: "0:0"
+cap_add:
+  - ALL
+security_opt:
+  - seccomp=unconfined
+security_opt:
+  - apparmor=unconfined
+volumes:
+  - /var/run/docker.sock:/var/run/docker.sock
+  - /:/host
+devices:
+  - /dev:/dev
+```
+
+Also block by default:
+
+```dockerfile
+ARG AWS_SECRET_ACCESS_KEY
+ARG TOKEN
+ENV PASSWORD=...
+ENV SECRET=...
+RUN curl ... | sh
+FROM something:latest
+USER root
+```
+
+## 8.2 Require a written justification for these
+
+1. Any `cap_add`.
+2. Any host bind mount.
+3. Any published port.
+4. Any `devices` mapping.
+5. Any `sysctls`.
+6. Any `security_opt`.
+7. Any root user.
+8. Any Docker socket access.
+9. Any secret file source.
+10. Any public image from an unverified publisher.
+11. Any digest-pinned image without an update process.
+12. Any disabled healthcheck.
+13. Any missing resource limits in production.
+14. Any CI job requiring privileged mode.
+
+## 8.3 Always do these when generating Dockerfiles
+
+1. Add `.dockerignore`.
+2. Use multi-stage builds.
+3. Put dependency lockfile copy before app source copy.
+4. Use BuildKit syntax.
+5. Use cache mounts for package managers.
+6. Avoid secrets in `ARG`/`ENV`.
+7. Use non-root runtime user.
+8. Avoid compilers in final image.
+9. Clean package manager indexes in the same layer.
+10. Use exec-form `ENTRYPOINT`/`CMD`.
+11. Keep final image minimal.
+12. Add a healthcheck when appropriate.
+13. Pin base image versions; use digests for production reproducibility.
+14. Add labels for source/revision where useful.
+15. Sort multiline package installs.
+16. Rebuild with `--pull` on a schedule or release pipeline.
+
+## 8.4 Always do these when generating Compose
+
+1. Use `compose.yaml` or `compose.yml`.
+2. Do not rely on obsolete `version` behavior.
+3. Separate dev and prod files.
+4. Use profiles for optional services.
+5. Bind local-only ports to `127.0.0.1`.
+6. Do not publish databases/caches by default.
+7. Use private/internal networks.
+8. Use service names instead of container IPs.
+9. Use runtime secrets rather than env secrets.
+10. Use non-root user.
+11. Use `read_only: true` where possible.
+12. Use `tmpfs` for writable temp directories.
+13. Drop capabilities.
+14. Set `no-new-privileges:true`.
+15. Add resource limits.
+16. Add log rotation.
+17. Add healthchecks.
+18. Use long-form `depends_on` where readiness matters.
+19. Avoid Docker socket mounts.
+20. Avoid host network, host PID, host IPC.
+21. Avoid broad host bind mounts.
+22. Avoid `privileged`.
+23. Review rendered config with `docker compose config`.
+
+---
+
+# 9. Practical “bad behavior” checklist
+
+Use this as a PR checklist.
+
+## Dockerfile checklist
+
+Reject or investigate when you see:
+
+* [ ] `FROM ...:latest`
+* [ ] No digest pin for production-critical base images
+* [ ] No update process for pinned digests
+* [ ] No `.dockerignore`
+* [ ] `COPY . .` before dependency installation
+* [ ] Secrets in `ARG`
+* [ ] Secrets in `ENV`
+* [ ] `.env` copied into image
+* [ ] `.git` copied into image
+* [ ] SSH keys copied into image
+* [ ] `curl | sh`
+* [ ] Remote downloads without checksum/signature
+* [ ] `apt-get update` alone
+* [ ] Package install without cleanup
+* [ ] Build tools in final image
+* [ ] Final image runs as root
+* [ ] `chmod -R 777`
+* [ ] No multi-stage build for compiled apps
+* [ ] Huge base image without reason
+* [ ] No cache mounts in slow dependency builds
+* [ ] No healthcheck for long-running service
+* [ ] Shell-form entrypoint where signals matter
+* [ ] Startup script downloads dependencies
+* [ ] No image scanning
+* [ ] No SBOM/provenance/signing for production
+
+## Compose checklist
+
+Reject or investigate when you see:
+
+* [ ] Untrusted remote include
+* [ ] No `docker compose config` review
+* [ ] `privileged: true`
+* [ ] `cap_add: ["ALL"]`
+* [ ] `SYS_ADMIN`
+* [ ] `network_mode: host`
+* [ ] `pid: host`
+* [ ] `ipc: host`
+* [ ] `user: root`
+* [ ] No non-root user
+* [ ] No `cap_drop`
+* [ ] No `no-new-privileges`
+* [ ] `seccomp=unconfined`
+* [ ] `apparmor=unconfined`
+* [ ] Docker socket mount
+* [ ] Broad host filesystem mount
+* [ ] Sensitive credential mounts
+* [ ] Writable config bind mounts
+* [ ] Database/cache ports published to all interfaces
+* [ ] Ports missing `127.0.0.1` for local-only services
+* [ ] Secrets in `environment`
+* [ ] Secrets in committed `.env`
+* [ ] All services receive all secrets
+* [ ] No healthchecks
+* [ ] Short `depends_on` used as readiness
+* [ ] No resource limits
+* [ ] No log rotation
+* [ ] Debug/admin services enabled by default
+* [ ] Source bind mounts in production
+* [ ] `docker compose down -v` in routine scripts
+* [ ] Unquoted ports
+* [ ] Unquoted boolean env values
+* [ ] `deploy:` settings assumed to be enforced locally
+* [ ] `latest` image tags
+* [ ] No immutable tag or digest
+
+---
+
+# 10. Bottom line
+
+The worst Docker/Compose agent behavior falls into four buckets:
+
+1. **Breaking isolation:** Docker socket, privileged containers, host networking, host PID/IPC, broad devices, broad bind mounts.
+2. **Leaking secrets:** `ARG`, `ENV`, `.env`, build logs, copied credential files, committed secret files.
+3. **Destroying reproducibility and supply-chain trust:** mutable tags, untrusted images, unpinned downloads, no scanning, no SBOM/signing/provenance.
+4. **Making builds painfully slow:** huge contexts, bad layer ordering, no BuildKit, no cache mounts, no external CI cache, bloated runtime images.
+
+The safest default posture is: **minimal image, non-root user, no Docker socket, no privileged mode, no host network, explicit localhost port bindings, internal networks, BuildKit secrets, Compose secrets, healthchecks, resource limits, scanning, and reviewed rendered Compose config.**
+
+[1]: https://cheatsheetseries.owasp.org/cheatsheets/Docker_Security_Cheat_Sheet.html "Docker Security - OWASP Cheat Sheet Series"
+[2]: https://docs.docker.com/reference/compose-file/services/ "Define services in Docker Compose | Docker Docs"
+[3]: https://docs.docker.com/engine/network/port-publishing/ "Port publishing and mapping | Docker Docs"
+[4]: https://docs.docker.com/build/building/secrets/ "Build secrets | Docker Docs"
+[5]: https://docs.docker.com/compose/trust-model/ "Trust model for Compose files | Docker Docs"
+[6]: https://docs.docker.com/build/building/best-practices/ "Building best practices | Docker Docs"
+[7]: https://docs.docker.com/build/cache/optimize/ "Optimize cache usage in builds | Docker Docs"
+[8]: https://docs.docker.com/reference/compose-file/ "Compose file reference | Docker Docs"
+[9]: https://docs.docker.com/build/cache/invalidation/ "Build cache invalidation | Docker Docs"
+[10]: https://docs.docker.com/build/building/multi-stage/ "Multi-stage builds | Docker Docs"
+[11]: https://docs.docker.com/build/buildkit/ "BuildKit | Docker Docs"
+[12]: https://www.reddit.com/r/docker/comments/1o8rykq/docker_size_is_too_big/?utm_source=chatgpt.com "Docker size is too big"
+[13]: https://arxiv.org/abs/2312.13888?utm_source=chatgpt.com "Empirical Study of the Docker Smells Impact on the Image Size"
+[14]: https://docs.docker.com/compose/how-tos/networking/ "Networking in Compose | Docker Docs"
+[15]: https://docs.docker.com/compose/how-tos/use-secrets/ "Manage secrets securely in Docker Compose | Docker Docs"
+[16]: https://docs.gitlab.com/ci/docker/docker_layer_caching/?utm_source=chatgpt.com "Cache Docker layers in Docker-in-Docker builds"
+[17]: https://docs.gitlab.com/ci/docker/using_docker_build/?utm_source=chatgpt.com "Use Docker to build Docker images | GitLab Docs"
+[18]: https://www.reddit.com/r/docker/comments/1pri6hi/dockersock_security_concerns_in_2025/?utm_source=chatgpt.com "docker.sock: Security concerns in 2025"
+[19]: https://github.com/hadolint/hadolint?utm_source=chatgpt.com "Hadolint - Haskell Dockerfile Linter"
+[20]: https://www.cisecurity.org/benchmark/docker?utm_source=chatgpt.com "CIS Docker Benchmarks"
+

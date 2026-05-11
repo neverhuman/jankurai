@@ -1,0 +1,1289 @@
+I found the key thing: **Jankurai is already pointed in the right direction.** It is not just a SQL lint repo; it is trying to make repository changes **provable, auditable, agent-readable, and merge-gatable**. For migrations, the standard should not merely say “write safe SQL.” It should require that every schema/data change leaves enough **machine-readable evidence** for an agent, reviewer, and CI system to answer:
+
+**What changes? What can break? What lock does it take? What data can be lost? How is it rolled forward or rolled back? What proof was run? Who owns it?**
+
+I did not literally ingest every X/LinkedIn/Quora post, because those surfaces are unbounded and noisy. I treated public/community discussion as secondary signal, then grounded the recommendations in the uploaded Jankurai repo plus authoritative sources: PostgreSQL and SQLite docs, GitLab’s migration guidance, Flyway, Fowler’s evolutionary database design, Strong Migrations, and Safe PG Migrations.
+
+---
+
+## What Jankurai is trying to do with migrations
+
+In this repo, Jankurai’s direction is clear:
+
+**Jankurai’s migration standard is about preventing silent data-risk merges.** It wants SQL changes to be routed through proof lanes, blocked when they are destructive without evidence, and documented close enough to the change that agents can find the proof.
+
+The repo already has the right core pieces:
+
+* `db/` is the durable-truth root.
+* `db/migrations/` is the active migration surface.
+* `db/constraints/` is the durable invariant surface.
+* `agent/boundaries.toml` declares DB roots and migration paths.
+* `agent/test-map.json` routes `db/migrations/` to migration analysis.
+* `agent/proof-lanes.toml` defines `db-migration-analyze`.
+* `HLT-021-DESTRUCTIVE-MIGRATION` blocks destructive SQL without safety evidence.
+* `docs/BAD_SQL.md` already contains many of the right migration anti-patterns.
+
+The strongest recommendation is therefore: **do not scatter migration files into framework-specific or app-local directories. Keep the canonical migration truth under `db/`, and make `agent/*` route, score, and prove it.**
+
+---
+
+# Best practices for SQLite/PostgreSQL migrations
+
+## 1. Every database change must be version-controlled
+
+Every DDL and durable DML change should live in version control, be reviewed, be replayable from scratch, and be tied to the application release that depends on it. Fowler’s evolutionary database design guidance is explicit that all database artifacts should be version-controlled with the application, and all database changes should be expressed as migrations rather than ad hoc edits. Flyway’s model reinforces the same core principle: versioned migrations are applied once, in order, with metadata/checksums tracked in a schema history table. ([martinfowler.com][1])
+
+**Best practice:**
+
+```text
+db/migrations/postgres/000012_add_billing_customer_id.up.sql
+db/migrations/postgres/000012_add_billing_customer_id.down.sql
+db/migrations/postgres/000012_add_billing_customer_id.meta.toml
+```
+
+**Jankurai enforcement target:** no migration file should be accepted unless it is inside the declared migration root and has an adjacent metadata/proof file or canonical header.
+
+---
+
+## 2. Never edit an applied migration
+
+Once a migration has run anywhere shared — CI, staging, production, a teammate’s machine — it is immutable. Fixes must be new migrations.
+
+Flyway treats versioned migrations as unique, ordered, and checksum-tracked. Changing an already-applied migration creates drift between environments and destroys trust in the migration history. ([GitHub][2])
+
+**Good:**
+
+```text
+000041_add_user_status.up.sql
+000042_fix_user_status_default.up.sql
+```
+
+**Bad:**
+
+```text
+# Editing this after it already ran:
+000041_add_user_status.up.sql
+```
+
+**Jankurai enforcement target:** detect changed checksums for committed migrations if a migration manifest exists.
+
+---
+
+## 3. Use expand/contract for incompatible changes
+
+For production systems, destructive or incompatible changes should usually happen across multiple releases:
+
+1. **Expand:** add new nullable column/table/index/constraint in a backward-compatible way.
+2. **Deploy compatible app code:** dual-read or dual-write if needed.
+3. **Backfill:** update existing data in batches.
+4. **Validate:** constraints, counts, app behavior, query plans.
+5. **Contract:** remove old schema only after all old code paths are gone.
+
+Fowler’s migration example for splitting a column uses parallel schema and gradual migration. GitLab’s migration guidance also emphasizes online changes, staged work, and separate migration classes for regular, post-deployment, and batched background work. ([martinfowler.com][1])
+
+**Good:**
+
+```text
+000120_add_users_display_name.up.sql
+000121_backfill_users_display_name.sql
+000122_validate_users_display_name.up.sql
+000180_drop_users_full_name.up.sql
+```
+
+**Bad:**
+
+```sql
+ALTER TABLE users RENAME COLUMN full_name TO display_name;
+-- deployed while old app versions still read users.full_name
+```
+
+---
+
+## 4. Keep migrations small, explicit, and single-purpose
+
+The safest migrations are boring. One migration should do one coherent thing. A migration that adds a column, creates three indexes, backfills millions of rows, drops old columns, changes permissions, and rewrites application assumptions is not reviewable.
+
+Fowler specifically calls out small migrations as best, because they are easier to test, sequence, and recover from. ([martinfowler.com][1])
+
+**Best practice:**
+
+```text
+000010_create_accounts_table.up.sql
+000011_add_accounts_email_index.up.sql
+000012_add_accounts_email_unique_constraint.up.sql
+000013_backfill_accounts_email_normalized.sql
+```
+
+**Jankurai enforcement target:** score down migrations that combine schema change, data backfill, and destructive cleanup in one file.
+
+---
+
+## 5. Require a migration safety header or adjacent metadata file
+
+Every migration should answer the same questions in the same place.
+
+Recommended adjacent metadata:
+
+```toml
+# db/migrations/postgres/000123_add_user_phone.meta.toml
+
+id = "000123_add_user_phone"
+dialect = "postgres"
+kind = "expand"
+owner = "platform-db"
+risk = "medium"
+
+objects = [
+  "public.users"
+]
+
+deploy_phase = "pre-deploy"
+compatible_with_old_app = true
+compatible_with_new_app = true
+
+expected_locks = [
+  { relation = "public.users", mode = "ACCESS EXCLUSIVE", max_wait = "5s", expected_hold = "<1s" }
+]
+
+timeouts = {
+  lock = "5s",
+  statement = "15min"
+}
+
+backfill = "none"
+rollback = "000123_add_user_phone.down.sql"
+forward_fix = "drop_column_after_no_reads.md"
+
+proof = [
+  "target/jankurai/migration-report.json"
+]
+```
+
+This is the single biggest agent-efficiency improvement I would make to the repo: **a machine-readable `.meta.toml` next to every migration.**
+
+A human comment header is useful, but agents and CI should not have to scrape prose forever.
+
+---
+
+## 6. Use lock and timeout discipline
+
+PostgreSQL commands acquire locks, and some operations take very strong locks. `TRUNCATE`, for example, takes an `ACCESS EXCLUSIVE` lock, and PostgreSQL’s docs explain that lock modes conflict in ways that can block reads/writes depending on the operation. ([PostgreSQL][3])
+
+PostgreSQL’s `lock_timeout` aborts a statement if it waits too long for a lock, and the docs specifically caution against setting it globally because it affects all sessions. It should be set locally/session-wise for migration execution. ([PostgreSQL][4])
+
+**Best practice:**
+
+```sql
+-- db/migrations/postgres/000123_add_user_phone.up.sql
+
+SET lock_timeout = '5s';
+SET statement_timeout = '15min';
+
+ALTER TABLE public.users
+  ADD COLUMN phone_e164 text;
+```
+
+**Good migration metadata must include:**
+
+* expected lock mode
+* expected lock wait
+* expected lock hold time
+* table size or row count if relevant
+* whether the migration can be retried
+* whether it runs inside or outside a transaction
+
+Strong Migrations and Safe PG Migrations both emphasize short lock timeouts, appropriate statement timeouts, and special handling for operations that cannot run safely inside a transaction, such as concurrent index creation. ([GitHub][5])
+
+---
+
+## 7. PostgreSQL indexes on hot/large tables should usually be concurrent
+
+On PostgreSQL, ordinary `CREATE INDEX` blocks writes. `CREATE INDEX CONCURRENTLY` avoids blocking inserts, updates, and deletes, but it has tradeoffs: it takes longer, cannot run inside a transaction block, and failed concurrent builds can leave invalid indexes that must be cleaned up. ([PostgreSQL][6])
+
+**Good:**
+
+```sql
+-- Must run outside a transaction.
+SET lock_timeout = '5s';
+SET statement_timeout = '30min';
+
+CREATE INDEX CONCURRENTLY idx_users_email_lower
+  ON public.users ((lower(email)));
+```
+
+**Bad on a hot production table:**
+
+```sql
+CREATE INDEX idx_users_email_lower
+  ON users ((lower(email)));
+```
+
+**Jankurai enforcement target:** flag `CREATE INDEX` under Postgres migration paths unless the file says why non-concurrent is safe, or metadata classifies the table as small/cold.
+
+---
+
+## 8. Add constraints safely and validate deliberately
+
+Constraints are good. The bad behavior is adding them in a way that blocks production or fails because old data is dirty.
+
+PostgreSQL supports `NOT VALID` for some constraints, allowing future writes to be checked while deferring the full table scan. Later, `VALIDATE CONSTRAINT` scans existing rows with a less disruptive lock profile than adding and validating immediately. ([PostgreSQL][7])
+
+**Good staged constraint:**
+
+```sql
+ALTER TABLE public.orders
+  ADD CONSTRAINT orders_total_nonnegative
+  CHECK (total_cents >= 0) NOT VALID;
+
+ALTER TABLE public.orders
+  VALIDATE CONSTRAINT orders_total_nonnegative;
+```
+
+**But also important:** `NOT VALID` must not be left forever. The repo should require either a same-file validation step for small tables or a follow-up migration ID in metadata.
+
+**Bad:**
+
+```sql
+ALTER TABLE orders
+  ADD CONSTRAINT orders_total_nonnegative
+  CHECK (total_cents >= 0);
+-- no dirty-data check, no lock analysis, no validation plan
+```
+
+---
+
+## 9. Know PostgreSQL rewrite behavior before changing defaults or types
+
+PostgreSQL can add a column with a non-volatile default efficiently in modern versions, but volatile defaults and many type changes can force table rewrites. PostgreSQL’s docs describe when defaults are stored in metadata versus when the table must be rewritten, and also note that type changes commonly require rewriting the table and rebuilding indexes. ([PostgreSQL][8])
+
+**Good:**
+
+```sql
+ALTER TABLE accounts
+  ADD COLUMN plan text;
+
+ALTER TABLE accounts
+  ALTER COLUMN plan SET DEFAULT 'free';
+```
+
+**Risky without proof:**
+
+```sql
+ALTER TABLE events
+  ADD COLUMN created_uuid uuid DEFAULT gen_random_uuid() NOT NULL;
+```
+
+For large tables, prefer:
+
+1. add nullable column
+2. backfill in batches
+3. set default
+4. validate no nulls
+5. add `NOT NULL` safely
+
+---
+
+## 10. Backfills must be batched, resumable, observable, and idempotent
+
+Backfills are not “just migrations.” They are production jobs.
+
+GitLab separates regular migrations, post-deployment migrations, and batched background migrations; it recommends batched background migrations for data migrations exceeding timing thresholds and states that batched background migrations should not change schema. ([GitLab Docs][9])
+
+**Best practice for backfills:**
+
+* bounded batch size
+* deterministic ordering
+* progress checkpoint
+* retry-safe
+* pause/resume capable
+* row-count estimates
+* statement timeout
+* monitoring for locks, WAL, replication lag, error rate, and queue depth
+* no dependence on volatile app models
+* no external API calls inside migration logic
+
+**Good:**
+
+```sql
+UPDATE users
+SET normalized_email = lower(email)
+WHERE id >= :min_id
+  AND id < :max_id
+  AND normalized_email IS NULL;
+```
+
+**Bad:**
+
+```sql
+UPDATE users
+SET normalized_email = lower(email);
+-- one giant transaction, no WHERE, no batches, no progress, no retry plan
+```
+
+---
+
+## 11. Migrations should not depend on current application models
+
+GitLab warns against using application code or models inside migrations because migrations remain in the repository while models evolve, making old migrations fragile. ([GitLab Docs][9])
+
+**Good:**
+
+```sql
+UPDATE accounts
+SET status = 'active'
+WHERE status IS NULL;
+```
+
+**Bad:**
+
+```ruby
+Account.where(status: nil).find_each { |a| a.activate! }
+# depends on current model validations, callbacks, associations, and app code
+```
+
+**Jankurai enforcement target:** migration files should not call app service code, ORM model callbacks, network APIs, or time-dependent business methods.
+
+---
+
+## 12. Destructive changes require proof, not vibes
+
+Destructive operations include:
+
+* `DROP TABLE`
+* `DROP COLUMN`
+* `DROP SCHEMA`
+* `TRUNCATE`
+* `DELETE FROM` without a tight predicate
+* `UPDATE` without a tight predicate
+* `DROP ... CASCADE`
+* destructive type changes
+* irreversible enum/domain changes
+* removing constraints or RLS without replacement
+
+Flyway’s undo migration documentation explicitly warns that destructive changes make undo troublesome and that backups must be tested; undo scripts also cannot fix every kind of failed partial migration. ([GitHub][2])
+
+For Jankurai, the right policy is:
+
+```text
+Destructive SQL without explicit rollback/restore/forward-fix/backfill/lock proof = hard block.
+```
+
+The existing `HLT-021-DESTRUCTIVE-MIGRATION` rule is exactly right. I would strengthen it so a simple magic comment cannot permanently suppress risk unless paired with metadata.
+
+---
+
+## 13. SQLite migrations need SQLite-specific rules
+
+SQLite is not “small Postgres.” Its migration behavior is different.
+
+SQLite foreign key enforcement must be enabled per connection; the SQLite docs say enforcement is disabled by default and must be turned on. SQLite also documents a specific generalized ALTER TABLE procedure for table rebuilds: disable foreign keys, begin transaction, create the new table, copy data, drop old table, rename, recreate indexes/triggers/views, run `foreign_key_check`, commit, and re-enable foreign keys. ([SQLite][10])
+
+**Good SQLite rebuild pattern:**
+
+```sql
+PRAGMA foreign_keys = OFF;
+
+BEGIN TRANSACTION;
+
+CREATE TABLE new_users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+INSERT INTO new_users (id, email, created_at)
+SELECT id, email, created_at
+FROM users;
+
+DROP TABLE users;
+
+ALTER TABLE new_users RENAME TO users;
+
+PRAGMA foreign_key_check;
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;
+```
+
+**Bad SQLite pattern:**
+
+```sql
+ALTER TABLE users RENAME TO old_users;
+CREATE TABLE users (...);
+INSERT INTO users SELECT ... FROM old_users;
+DROP TABLE old_users;
+-- no foreign_key_check, no trigger/index/view recreation, unsafe reference handling
+```
+
+**Jankurai enforcement target:** SQLite migration metadata must declare `dialect = "sqlite"` and table-rebuild migrations must include `foreign_key_check` or an explicit reason.
+
+---
+
+## 14. Test both “fresh install” and “upgrade from previous production”
+
+Migration proof must cover both:
+
+```text
+empty database -> all migrations -> current schema
+previous production schema + data -> new migrations -> current schema
+```
+
+Fowler’s guidance emphasizes running migrations locally, then through CI, then production, and keeping database artifacts versioned with the application. ([martinfowler.com][1])
+
+**Required proof should include:**
+
+* fresh database migration replay
+* upgrade test from prior schema
+* rollback or forward-fix rehearsal
+* representative data volume
+* constraint validation
+* query plan check for new/changed hot queries
+* app compatibility with old and new schema during rollout
+* generated `target/jankurai/migration-report.json`
+
+---
+
+## 15. Separate durable migration source from generated proof artifacts
+
+Committed source should live under `db/`.
+
+Generated proof should live under `target/jankurai/`.
+
+**Good:**
+
+```text
+db/migrations/postgres/000123_add_user_phone.up.sql
+db/migrations/postgres/000123_add_user_phone.meta.toml
+target/jankurai/migration-report.json
+target/jankurai/migrations/000123_add_user_phone.receipt.json
+```
+
+**Bad:**
+
+```text
+db/migrations/postgres/migration-report.json
+db/migrations/postgres/output-from-my-local-run.txt
+```
+
+The source tree should contain durable intent, not noisy local run artifacts.
+
+---
+
+# Worst practices / inexcusable bad behaviors
+
+These are the behaviors I would classify as **hard blocks** in Jankurai.
+
+## 1. Manual production DDL outside version control
+
+This is the worst migration behavior. It creates drift, makes rollback uncertain, and prevents agents/CI/reviewers from knowing the real schema.
+
+**Bad:**
+
+```sql
+-- run manually in prod psql
+ALTER TABLE users ADD COLUMN foo text;
+```
+
+**Jankurai policy:** hard block unless there is a captured emergency receipt and a follow-up canonical migration.
+
+---
+
+## 2. Editing old migrations after they ran
+
+This breaks checksum history and makes environments diverge.
+
+**Bad:**
+
+```text
+000017_create_orders.sql  # changed after staging/prod already ran it
+```
+
+**Correct behavior:** create `000018_fix_orders_schema.sql`.
+
+---
+
+## 3. ORM auto-sync / auto-migrate in production
+
+Letting an ORM mutate production schema automatically is not an acceptable migration strategy for serious systems. Generated SQL can be useful as a draft, but it must be reviewed, versioned, and proven.
+
+**Bad:**
+
+```text
+NODE_ENV=production prisma db push
+hibernate.hbm2ddl.auto=update
+sequelize.sync({ alter: true })
+```
+
+**Jankurai policy:** hard block for production-bound code paths that auto-mutate schema.
+
+---
+
+## 4. Destructive SQL without proof
+
+**Bad:**
+
+```sql
+DROP TABLE users;
+TRUNCATE audit_events;
+ALTER TABLE accounts DROP COLUMN email;
+DELETE FROM invoices;
+UPDATE users SET role = 'user';
+DROP SCHEMA public CASCADE;
+```
+
+This is exactly the class of behavior Jankurai’s `HLT-021-DESTRUCTIVE-MIGRATION` should block.
+
+---
+
+## 5. `DROP ... CASCADE` without an enumerated blast radius
+
+`CASCADE` is a chainsaw. It can remove dependent views, constraints, and objects that were not reviewed.
+
+**Bad:**
+
+```sql
+DROP TABLE accounts CASCADE;
+```
+
+**Required proof:**
+
+* enumerated dependent objects
+* owner approval
+* backup/restore plan
+* forward-fix plan
+* app compatibility proof
+
+---
+
+## 6. One-step rename/drop while old app versions still run
+
+**Bad:**
+
+```sql
+ALTER TABLE users RENAME COLUMN name TO full_name;
+```
+
+If old code reads `users.name`, the deployment breaks. The safe pattern is additive compatibility first, then contract later.
+
+---
+
+## 7. Large backfill in one transaction
+
+**Bad:**
+
+```sql
+UPDATE events SET processed = true;
+```
+
+This can create lock pressure, WAL spikes, replication lag, vacuum issues, and unbounded rollback cost.
+
+**Correct:** batch, checkpoint, throttle, observe, and retry.
+
+---
+
+## 8. No lock analysis
+
+**Bad migration comment:**
+
+```text
+Should be fine.
+```
+
+**Required:**
+
+```text
+Lock mode: ACCESS EXCLUSIVE
+Expected wait: <= 5s due lock_timeout
+Expected hold: metadata-only, <1s on PG 15
+Tested on: 12M-row staging copy
+```
+
+---
+
+## 9. No rollback or forward-fix path
+
+A migration does not always need a perfect down migration, especially for irreversible data changes. But it always needs a declared recovery strategy.
+
+**Bad:**
+
+```text
+Rollback: none
+```
+
+**Acceptable:**
+
+```text
+Rollback: irreversible after data deletion.
+Recovery: PITR restore tested on 2026-05-08; restore playbook db/restore/pitr.md.
+Forward fix: db/rollback/000123_restore_deleted_accounts.forward.sql.
+Approval: data owner + incident commander.
+```
+
+---
+
+## 10. Leaving `NOT VALID` constraints forever
+
+`NOT VALID` is a safe staging tool, not a way to pretend constraints exist.
+
+**Bad:**
+
+```sql
+ALTER TABLE orders
+  ADD CONSTRAINT orders_user_fk
+  FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
+
+-- no follow-up validation ever
+```
+
+---
+
+## 11. Non-concurrent index creation on hot PostgreSQL tables
+
+PostgreSQL’s ordinary `CREATE INDEX` blocks writes; `CREATE INDEX CONCURRENTLY` avoids blocking writes but has its own required handling. ([PostgreSQL][6])
+
+**Bad:**
+
+```sql
+CREATE INDEX idx_events_created_at ON events(created_at);
+```
+
+on a large production table without proof that it is cold/small.
+
+---
+
+## 12. Failed concurrent index left invalid
+
+PostgreSQL docs note that failed concurrent index builds can leave invalid indexes that still consume maintenance overhead and should be dropped/retried or reindexed appropriately. ([PostgreSQL][6])
+
+**Bad:** ignoring an invalid index after a failed migration.
+
+---
+
+## 13. Disabling triggers, constraints, or RLS without revalidation
+
+**Bad:**
+
+```sql
+ALTER TABLE orders DISABLE TRIGGER ALL;
+-- data load
+-- forgot to re-enable
+```
+
+This is a hard block unless heavily justified and proven.
+
+---
+
+## 14. Migration depends on app callbacks, external APIs, or wall-clock business logic
+
+**Bad:**
+
+```ruby
+User.find_each { |u| BillingApi.sync_user(u) }
+```
+
+Migrations should be deterministic and replayable. External calls and mutable app logic make them unsafe.
+
+---
+
+## 15. Running migrations from a laptop with personal credentials
+
+**Bad:**
+
+```text
+developer laptop -> direct prod DDL as superuser
+```
+
+Migrations should run through controlled deploy infrastructure with audited credentials.
+
+---
+
+## 16. SQLite table rebuild without the official safety sequence
+
+For SQLite, unsafe table rebuilds can lose indexes/triggers/views or break foreign-key references. The official docs describe the safer generalized procedure and warn against unsafe rename-first patterns. ([SQLite][11])
+
+**Hard block:** SQLite table rebuild with no transaction, no object recreation, and no `PRAGMA foreign_key_check`.
+
+---
+
+## 17. “AI generated it” as a reason to trust SQL
+
+Generated SQL is a draft. It is not proof.
+
+**Jankurai-specific rule:** AI-generated migration SQL should be treated as **higher review risk**, not lower.
+
+---
+
+# Best file tree recommendation
+
+## Keep `db/` as the canonical migration root
+
+The best future tree for Jankurai is:
+
+```text
+db/
+  README.md
+  AGENTS.md
+
+  migrations/
+    README.md
+
+    postgres/
+      README.md
+      manifest.toml
+
+      000001_init.up.sql
+      000001_init.down.sql
+      000001_init.meta.toml
+
+      000002_create_auth_sessions.up.sql
+      000002_create_auth_sessions.down.sql
+      000002_create_auth_sessions.meta.toml
+
+      000003_add_users_email_index.up.sql
+      000003_add_users_email_index.down.sql
+      000003_add_users_email_index.meta.toml
+
+    sqlite/
+      README.md
+      manifest.toml
+
+      000001_init.up.sql
+      000001_init.down.sql
+      000001_init.meta.toml
+
+      000002_rebuild_users_add_status.up.sql
+      000002_rebuild_users_add_status.down.sql
+      000002_rebuild_users_add_status.meta.toml
+
+  backfills/
+    README.md
+
+    postgres/
+      000010_backfill_users_normalized_email.sql
+      000010_backfill_users_normalized_email.meta.toml
+
+    sqlite/
+      000010_backfill_users_normalized_email.sql
+      000010_backfill_users_normalized_email.meta.toml
+
+  constraints/
+    README.md
+
+    postgres/
+      accounts.constraints.sql
+      orders.constraints.sql
+      rls/
+        accounts.rls.sql
+
+    sqlite/
+      accounts.constraints.sql
+      orders.constraints.sql
+
+  repeatable/
+    README.md
+
+    postgres/
+      R__views.sql
+      R__functions.sql
+      R__reference_data.sql
+
+    sqlite/
+      R__views.sql
+      R__reference_data.sql
+
+  seeds/
+    README.md
+    postgres/
+      000001_reference_roles.sql
+    sqlite/
+      000001_reference_roles.sql
+
+  restore/
+    README.md
+    postgres/
+      pitr.md
+      restore_from_snapshot.md
+    sqlite/
+      restore_from_backup.md
+
+  evidence/
+    README.md
+    examples/
+      000003_add_users_email_index.lock-plan.example.md
+      000003_add_users_email_index.rollback.example.md
+```
+
+And generated artifacts should go here, not in source:
+
+```text
+target/
+  jankurai/
+    migration-report.json
+    migrations/
+      000003_add_users_email_index.receipt.json
+      000003_add_users_email_index.lock-report.json
+```
+
+---
+
+## Why this tree is optimal for agents
+
+This layout gives agents a predictable map:
+
+```text
+Question: Where are migrations?
+Answer: db/migrations/<dialect>/
+
+Question: Where are data backfills?
+Answer: db/backfills/<dialect>/
+
+Question: Where are constraints/RLS/invariants?
+Answer: db/constraints/<dialect>/
+
+Question: Where is rollback/restore policy?
+Answer: db/restore/
+
+Question: Where is generated proof?
+Answer: target/jankurai/
+```
+
+It also keeps responsibilities clean:
+
+| Location                | Purpose                                  |
+| ----------------------- | ---------------------------------------- |
+| `db/migrations/`        | versioned schema changes                 |
+| `db/backfills/`         | versioned data movement jobs             |
+| `db/constraints/`       | durable invariants, FKs, checks, RLS     |
+| `db/repeatable/`        | repeatable views/functions/reference SQL |
+| `db/seeds/`             | deterministic seed/reference data        |
+| `db/restore/`           | restore and recovery playbooks           |
+| `db/evidence/examples/` | committed examples/templates only        |
+| `target/jankurai/`      | generated audit/proof receipts           |
+
+---
+
+# Recommended `agent/boundaries.toml` update
+
+Current repo direction is good. I would make the DB surface more explicit:
+
+```toml
+[db]
+root_paths = ["db"]
+
+migration_paths = [
+  "db/migrations",
+  "db/migrations/postgres",
+  "db/migrations/sqlite"
+]
+
+backfill_paths = [
+  "db/backfills",
+  "db/backfills/postgres",
+  "db/backfills/sqlite"
+]
+
+constraint_paths = [
+  "db/constraints",
+  "db/constraints/postgres",
+  "db/constraints/sqlite"
+]
+
+restore_paths = [
+  "db/restore"
+]
+
+generated_proof_paths = [
+  "target/jankurai"
+]
+```
+
+The important part: **`agent/` declares policy and routing; `db/` contains durable database truth.**
+
+---
+
+# Recommended `agent/test-map.json` routing
+
+Add or keep prefix routing so all dialect subdirectories inherit the proof lane:
+
+```json
+{
+  "db/migrations/": {
+    "purpose": "verify migration inventory, dialect metadata, destructive SQL risk, lock evidence, rollback/forward-fix evidence",
+    "commands": [
+      "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json"
+    ],
+    "required": true
+  },
+  "db/backfills/": {
+    "purpose": "verify batched, resumable, bounded data movement",
+    "commands": [
+      "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json"
+    ],
+    "required": true
+  },
+  "db/constraints/": {
+    "purpose": "verify durable data invariants, RLS, FK/check/unique constraint intent",
+    "commands": [
+      "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json"
+    ],
+    "required": true
+  }
+}
+```
+
+---
+
+# Recommended migration file example
+
+## PostgreSQL expand migration
+
+```sql
+-- jankurai:migration
+-- id: 000123_add_user_phone
+-- dialect: postgres
+-- kind: expand
+-- owner: platform-db
+-- risk: medium
+-- compatible_with_old_app: true
+-- compatible_with_new_app: true
+-- rollback: 000123_add_user_phone.down.sql
+-- lock: ACCESS EXCLUSIVE on public.users; expected metadata-only hold <1s
+-- proof: target/jankurai/migration-report.json
+
+SET lock_timeout = '5s';
+SET statement_timeout = '15min';
+
+ALTER TABLE public.users
+  ADD COLUMN phone_e164 text;
+```
+
+```sql
+-- db/migrations/postgres/000123_add_user_phone.down.sql
+
+SET lock_timeout = '5s';
+SET statement_timeout = '15min';
+
+ALTER TABLE public.users
+  DROP COLUMN phone_e164;
+```
+
+```toml
+# db/migrations/postgres/000123_add_user_phone.meta.toml
+
+id = "000123_add_user_phone"
+dialect = "postgres"
+kind = "expand"
+owner = "platform-db"
+risk = "medium"
+
+objects = ["public.users"]
+
+compatible_with_old_app = true
+compatible_with_new_app = true
+
+expected_locks = [
+  { relation = "public.users", mode = "ACCESS EXCLUSIVE", max_wait = "5s", expected_hold = "<1s" }
+]
+
+timeouts = { lock = "5s", statement = "15min" }
+
+backfill = "none"
+rollback = "000123_add_user_phone.down.sql"
+forward_fix = "none"
+
+proof = [
+  "target/jankurai/migration-report.json"
+]
+```
+
+---
+
+## PostgreSQL concurrent index migration
+
+```sql
+-- jankurai:migration
+-- id: 000124_add_users_email_idx
+-- dialect: postgres
+-- kind: index
+-- owner: platform-db
+-- risk: medium
+-- transaction: disabled
+-- reason: CREATE INDEX CONCURRENTLY cannot run inside a transaction block
+-- rollback: DROP INDEX CONCURRENTLY IF EXISTS idx_users_email_lower;
+
+SET lock_timeout = '5s';
+SET statement_timeout = '30min';
+
+CREATE INDEX CONCURRENTLY idx_users_email_lower
+  ON public.users ((lower(email)));
+```
+
+---
+
+## PostgreSQL staged constraint migration
+
+```sql
+-- jankurai:migration
+-- id: 000125_add_orders_total_check
+-- dialect: postgres
+-- kind: constraint
+-- owner: platform-db
+-- risk: medium
+-- validation: staged
+-- rollback: ALTER TABLE public.orders DROP CONSTRAINT orders_total_nonnegative;
+
+SET lock_timeout = '5s';
+SET statement_timeout = '15min';
+
+ALTER TABLE public.orders
+  ADD CONSTRAINT orders_total_nonnegative
+  CHECK (total_cents >= 0) NOT VALID;
+```
+
+Follow-up:
+
+```sql
+-- jankurai:migration
+-- id: 000126_validate_orders_total_check
+-- dialect: postgres
+-- kind: constraint-validation
+-- owner: platform-db
+-- risk: medium
+
+SET lock_timeout = '5s';
+SET statement_timeout = '30min';
+
+ALTER TABLE public.orders
+  VALIDATE CONSTRAINT orders_total_nonnegative;
+```
+
+---
+
+## SQLite table rebuild migration
+
+```sql
+-- jankurai:migration
+-- id: 000020_rebuild_users_add_status
+-- dialect: sqlite
+-- kind: table-rebuild
+-- owner: platform-db
+-- risk: high
+-- rollback: 000020_rebuild_users_add_status.down.sql
+-- proof: requires PRAGMA foreign_key_check
+
+PRAGMA foreign_keys = OFF;
+
+BEGIN TRANSACTION;
+
+CREATE TABLE new_users (
+  id INTEGER PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL
+);
+
+INSERT INTO new_users (id, email, status, created_at)
+SELECT id, email, 'active', created_at
+FROM users;
+
+DROP TABLE users;
+
+ALTER TABLE new_users RENAME TO users;
+
+CREATE INDEX idx_users_email ON users(email);
+
+PRAGMA foreign_key_check;
+
+COMMIT;
+
+PRAGMA foreign_keys = ON;
+```
+
+---
+
+# Jankurai enforcement upgrades I recommend
+
+The repo already has `HLT-021-DESTRUCTIVE-MIGRATION`. I would add these migration-specific checks:
+
+## 1. Require dialect declaration
+
+Every migration must declare one of:
+
+```toml
+dialect = "postgres"
+dialect = "sqlite"
+```
+
+or live under:
+
+```text
+db/migrations/postgres/
+db/migrations/sqlite/
+```
+
+**Why:** agents should not infer dialect from SQL syntax.
+
+---
+
+## 2. Require adjacent metadata for all migrations
+
+Hard rule:
+
+```text
+db/migrations/**/000123_name.up.sql
+requires
+db/migrations/**/000123_name.meta.toml
+```
+
+This is the biggest improvement for agent efficiency.
+
+---
+
+## 3. Destructive SQL requires structured proof
+
+For destructive tokens, require:
+
+```toml
+risk = "high"
+destructive = true
+rollback = "..."
+forward_fix = "..."
+backup_or_restore = "..."
+approved_by = "..."
+lock_plan = "..."
+```
+
+A simple `jankurai:migration-safe` comment should not be enough by itself.
+
+---
+
+## 4. Detect dangerous Postgres patterns
+
+Add hard or high-severity findings for:
+
+```sql
+CREATE INDEX ...
+```
+
+without `CONCURRENTLY` on hot/large tables.
+
+```sql
+ALTER TABLE ... ADD CONSTRAINT ...
+```
+
+without `NOT VALID` or explicit small-table proof.
+
+```sql
+ALTER TABLE ... ALTER COLUMN ... SET NOT NULL
+```
+
+without prior validation/backfill proof.
+
+```sql
+DROP ... CASCADE
+```
+
+without enumerated dependencies.
+
+```sql
+ALTER TABLE ... ALTER COLUMN ... TYPE ...
+```
+
+without rewrite/lock proof.
+
+---
+
+## 5. Detect dangerous SQLite patterns
+
+Add findings for:
+
+* table rebuild without transaction
+* table rebuild without `PRAGMA foreign_key_check`
+* unsafe rename-first rebuild pattern
+* migration missing `PRAGMA foreign_keys` policy
+* dropping/recreating table without recreating indexes/triggers/views
+
+---
+
+## 6. Require proof lane output for migration changes
+
+For any change under:
+
+```text
+db/migrations/
+db/backfills/
+db/constraints/
+```
+
+require:
+
+```text
+target/jankurai/migration-report.json
+```
+
+That is already the direction of the repo. I would make it non-optional for merge witnesses.
+
+---
+
+# Final recommendation
+
+The best future standard is:
+
+```text
+All durable DB truth lives under db/.
+All migration policy/routing lives under agent/.
+All generated proof lives under target/jankurai/.
+Every migration has:
+  - dialect
+  - owner
+  - risk level
+  - lock/timeout plan
+  - rollback or forward-fix plan
+  - backfill plan if applicable
+  - compatibility statement
+  - proof receipt
+```
+
+The optimal migration location is:
+
+```text
+db/migrations/<dialect>/<version>_<name>.up.sql
+db/migrations/<dialect>/<version>_<name>.down.sql
+db/migrations/<dialect>/<version>_<name>.meta.toml
+```
+
+For this repo specifically, I would evolve toward:
+
+```text
+db/migrations/postgres/
+db/migrations/sqlite/
+db/backfills/postgres/
+db/backfills/sqlite/
+db/constraints/postgres/
+db/constraints/sqlite/
+target/jankurai/migration-report.json
+```
+
+And I would make this the core Jankurai rule:
+
+```text
+No migration merge without structured migration metadata and proof.
+No destructive migration without rollback/restore/forward-fix evidence.
+No manual production schema change without a captured receipt and follow-up canonical migration.
+```
+
+That matches Jankurai’s underlying philosophy: **no proof, no merge; no receipt, no trust.**
+
+[1]: https://martinfowler.com/articles/evodb.html "Evolutionary Database Design"
+[2]: https://github.com/flyway/flywaydb.org/blob/gh-pages/documentation/concepts/migrations.md "flywaydb.org/documentation/concepts/migrations.md at gh-pages · flyway/flywaydb.org · GitHub"
+[3]: https://www.postgresql.org/docs/current/explicit-locking.html "PostgreSQL: Documentation: 18: 13.3. Explicit Locking"
+[4]: https://www.postgresql.org/docs/current/runtime-config-client.html "PostgreSQL: Documentation: 18: 19.11. Client Connection Defaults"
+[5]: https://github.com/ankane/strong_migrations "GitHub - ankane/strong_migrations: Catch unsafe migrations in development · GitHub"
+[6]: https://www.postgresql.org/docs/current/sql-createindex.html "PostgreSQL: Documentation: 18: CREATE INDEX"
+[7]: https://www.postgresql.org/docs/current/sql-altertable.html "PostgreSQL: Documentation: 18: ALTER TABLE"
+[8]: https://www.postgresql.org/docs/current/ddl-alter.html "PostgreSQL: Documentation: 18: 5.7. Modifying Tables"
+[9]: https://docs.gitlab.com/development/migration_style_guide/ "Migration Style Guide | GitLab Docs"
+[10]: https://sqlite.org/foreignkeys.html "SQLite Foreign Key Support"
+[11]: https://www.sqlite.org/lang_altertable.html "ALTER TABLE"
+

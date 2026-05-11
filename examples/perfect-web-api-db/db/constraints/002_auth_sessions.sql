@@ -1,0 +1,26 @@
+-- Constraint documentation for auth_sessions table.
+--
+-- 1. Session identity:
+--    Constraint: PRIMARY KEY (id)
+--    Domain invariant: SessionId is stable and unique.
+--
+-- 2. Account ownership:
+--    Constraint: account_id REFERENCES accounts(id) ON DELETE CASCADE
+--    Application invariant: sessions belong to durable accounts.
+--
+-- 3. No raw token persistence:
+--    Constraint: token_hash TEXT NOT NULL UNIQUE CHECK length >= 32
+--    Security invariant: raw session tokens never cross durable storage.
+--
+-- 4. Expiry:
+--    Constraint: expires_at > created_at
+--    Domain invariant: a session must have a positive TTL.
+--
+-- 5. Revocation:
+--    Constraint: revoked_at IS NULL OR revoked_at >= created_at
+--    Application invariant: revocation is monotonic and idempotent.
+--
+-- 6. Provider shell:
+--    Constraint: provider enum-like CHECK
+--    Adapter invariant: concrete providers are added through provider adapters,
+--    not by moving provider-specific truth into domain or UI code.

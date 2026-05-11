@@ -1,0 +1,2644 @@
+## Phase name: **Phase 02 — Rule Engine And Semantic Oracle**
+
+I would finish **Phase 02** rather than move to a later phase, because the moonshot depends on the repo being able to convert intent into bounded agents, proof lanes, evidence, expiring exceptions, and reusable primitives; that only works when findings come from stable rules instead of scattered heuristics. ([GitHub][1]) Phase 02’s own plan says the target architecture is `inventory -> analyzers -> rule registry -> findings -> caps -> score -> reports`, with rule metadata, boundary oracle checks, generated-zone checks, an AST/import pilot, and finding-quality guarantees. ([GitHub][2]) The current repo already has a partial registry, finding builder, caps, boundary manifest ingestion, and shallow AST pilot, but Phase 02’s receipt explicitly says the analyzer split and AST/import pilot remain partial follow-on work. ([GitHub][2])
+
+The core steering decision: **do not widen the report JSON shape**. The standard already requires findings to carry stable repair metadata such as `rule_id`, severity, category, path, line when available, problem, evidence, `agent_fix`, owner, validation lane, and docs link. ([GitHub][3]) This patch keeps that shape intact and completes Phase 02 by making the semantic analyzer produce better findings through the existing builder.
+
+Below is a single copy-paste patch script. Run it from the repo root. It overwrites/adds the needed files and patches the existing audit pipeline to route semantic-oracle findings through the rule registry.
+
+I could not run the repo’s test suite inside this environment because direct `git clone` failed DNS resolution here, so treat the validation commands at the end as mandatory before merging.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+python3 <<'PY'
+from pathlib import Path
+
+def write(path: str, text: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text.strip() + "\n")
+
+write("crates/jankurai/src/boundaries/manifest.rs", r'''
+use anyhow::Result;
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BoundaryManifest {
+    pub stack: Option<Stack>,
+
+    #[serde(default)]
+    pub rust: Option<RustBoundary>,
+
+    #[serde(default)]
+    pub typescript: Option<TypeScriptBoundary>,
+
+    #[serde(default)]
+    pub python: Option<PythonBoundary>,
+
+    #[serde(default)]
+    pub queues: Option<QueueBoundary>,
+
+    #[serde(default)]
+    pub db: Option<DbBoundary>,
+
+    #[serde(default)]
+    pub streaming_exception: Vec<StreamingException>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Stack {
+    pub id: String,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RustBoundary {
+    #[serde(default)]
+    pub domain_paths: Vec<String>,
+
+    #[serde(default)]
+    pub forbidden_domain_imports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TypeScriptBoundary {
+    #[serde(default)]
+    pub web_paths: Vec<String>,
+
+    #[serde(default)]
+    pub forbidden_web_imports: Vec<String>,
+
+    #[serde(default)]
+    pub generated_contract_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PythonBoundary {
+    #[serde(default)]
+    pub allowed_truth_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct QueueBoundary {
+    #[serde(default)]
+    pub adapter_paths: Vec<String>,
+
+    #[serde(default)]
+    pub event_contract_paths: Vec<String>,
+
+    #[serde(default)]
+    pub generated_type_paths: Vec<String>,
+
+    #[serde(default)]
+    pub client_markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DbBoundary {
+    #[serde(default)]
+    pub root_paths: Vec<String>,
+
+    #[serde(default)]
+    pub migration_paths: Vec<String>,
+
+    #[serde(default)]
+    pub constraint_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamingException {
+    pub runtime: String,
+    pub classification: Option<String>,
+    pub reason: Option<String>,
+    pub owner: String,
+    pub expires: String,
+    pub migration_path: String,
+}
+
+pub fn parse(text: &str) -> Result<BoundaryManifest> {
+    Ok(toml::from_str(text)?)
+}
+
+pub fn load(path: &Path) -> Result<BoundaryManifest> {
+    parse(&fs::read_to_string(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse;
+
+    #[test]
+    fn parses_queue_streaming_db_and_language_boundaries() {
+        let text = r#"
+[stack]
+id = "rust-ts-vite-react-postgres-bounded-python"
+version = "0.4.0"
+
+[rust]
+domain_paths = ["crates/domain", "crates/*/src/domain"]
+forbidden_domain_imports = ["std::fs", "sqlx::"]
+
+[typescript]
+web_paths = ["apps/web", "packages/ui"]
+forbidden_web_imports = ["pg", "postgres"]
+generated_contract_paths = ["contracts/generated"]
+
+[python]
+allowed_truth_paths = ["python/ai-service", "tools"]
+
+[queues]
+adapter_paths = ["crates/adapters/queues", "crates/adapters/src/queues"]
+event_contract_paths = ["contracts/events"]
+generated_type_paths = ["contracts/generated"]
+client_markers = ["rdkafka", "kafkajs"]
+
+[db]
+root_paths = ["db"]
+migration_paths = ["db/migrations"]
+constraint_paths = ["db/constraints"]
+
+[[streaming_exception]]
+runtime = "kafka"
+classification = "brownfield"
+owner = "platform"
+expires = "2026-12-31"
+migration_path = "Keep Kafka behind queue adapters."
+"#;
+
+        let manifest = parse(text).unwrap();
+
+        assert_eq!(
+            manifest.stack.as_ref().map(|stack| stack.id.as_str()),
+            Some("rust-ts-vite-react-postgres-bounded-python")
+        );
+        assert_eq!(
+            manifest
+                .rust
+                .as_ref()
+                .map(|rust| rust.domain_paths.len()),
+            Some(2)
+        );
+        assert_eq!(
+            manifest
+                .typescript
+                .as_ref()
+                .map(|typescript| typescript.web_paths.len()),
+            Some(2)
+        );
+        assert_eq!(
+            manifest
+                .python
+                .as_ref()
+                .map(|python| python.allowed_truth_paths.as_slice()),
+            Some(&["python/ai-service".to_string(), "tools".to_string()][..])
+        );
+        assert_eq!(
+            manifest
+                .queues
+                .as_ref()
+                .map(|queues| queues.adapter_paths.len()),
+            Some(2)
+        );
+        assert_eq!(
+            manifest.db.as_ref().map(|db| db.root_paths.as_slice()),
+            Some(&["db".to_string()][..])
+        );
+        assert_eq!(
+            manifest.streaming_exception[0].classification.as_deref(),
+            Some("brownfield")
+        );
+    }
+}
+''')
+
+write("crates/jankurai/src/audit/rules.rs", r'''
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub category: &'static str,
+    pub tlr: &'static str,
+    pub lane: &'static str,
+    pub docs_url: &'static str,
+    pub owner_hint: &'static str,
+    pub evidence_kind: &'static str,
+    pub severity: &'static str,
+    pub repairable: bool,
+    pub default_confidence: u8,
+    pub cap_ids: &'static [&'static str],
+}
+
+pub const RULES: &[RuleSpec] = &[
+    RuleSpec {
+        id: "HLT-001-DEAD-MARKER",
+        name: "Future-hostile language and placeholder markers",
+        category: "vibe",
+        tlr: "Entropy",
+        lane: "fast",
+        docs_url: "docs/audit-rubric.md#future-hostile-language-rule",
+        owner_hint: "tools",
+        evidence_kind: "repository-scan",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &[
+            "vibe-placeholders-in-product-code",
+            "fallback-soup-in-product-code",
+            "future-hostile-dead-language-in-product-code",
+            "severe-duplication-in-product-code",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-002-GENERATED-MUTATION",
+        name: "Generated zone mutation risk",
+        category: "generated",
+        tlr: "Contracts/data",
+        lane: "contract",
+        docs_url: "agent/JANKURAI_STANDARD.md#generated-zones",
+        owner_hint: "tools",
+        evidence_kind: "contract-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &["generated-zone-mutation-risk"],
+    },
+    RuleSpec {
+        id: "HLT-003-OWNERLESS-PATH",
+        name: "Ownerless path",
+        category: "context",
+        tlr: "Context/setup",
+        lane: "fast",
+        docs_url: "agent/JANKURAI_STANDARD.md#ownership-boundaries",
+        owner_hint: "agent",
+        evidence_kind: "policy-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 90,
+        cap_ids: &[],
+    },
+    RuleSpec {
+        id: "HLT-004-UNMAPPED-PROOF",
+        name: "Unmapped proof lane",
+        category: "proof",
+        tlr: "Verification",
+        lane: "fast",
+        docs_url: "agent/JANKURAI_STANDARD.md#proof-lanes",
+        owner_hint: "tools",
+        evidence_kind: "policy-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 90,
+        cap_ids: &[
+            "no-one-command-setup-or-validation",
+            "no-deterministic-fast-lane",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-005-PYTHON-PRODUCT-TRUTH",
+        name: "Python product truth spill",
+        category: "python",
+        tlr: "Business truth",
+        lane: "contract",
+        docs_url: "docs/boundary-oracle.md#python-product-truth-containment",
+        owner_hint: "tools",
+        evidence_kind: "semantic-boundary",
+        severity: "high",
+        repairable: true,
+        default_confidence: 87,
+        cap_ids: &[
+            "python-direct-product-truth-or-db-ownership",
+            "too-much-python-in-product-surface",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-006-DIRECT-DB-WRONG-LAYER",
+        name: "Direct DB access from wrong layer",
+        category: "data",
+        tlr: "Contracts/data",
+        lane: "db",
+        docs_url: "docs/boundary-oracle.md#direct-db-access",
+        owner_hint: "tools",
+        evidence_kind: "semantic-boundary",
+        severity: "high",
+        repairable: true,
+        default_confidence: 90,
+        cap_ids: &["direct-db-access-from-wrong-layer"],
+    },
+    RuleSpec {
+        id: "HLT-007-HANDWRITTEN-CONTRACT",
+        name: "Handwritten contract drift",
+        category: "boundary",
+        tlr: "Contracts/data",
+        lane: "contract",
+        docs_url: "docs/audit-rubric.md#known-vibe-coding-insults",
+        owner_hint: "tools",
+        evidence_kind: "contract-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 84,
+        cap_ids: &["generated-contracts-or-public-api-drift-untested"],
+    },
+    RuleSpec {
+        id: "HLT-008-FALSE-GREEN-RISK",
+        name: "False green test risk",
+        category: "test",
+        tlr: "Verification",
+        lane: "fast",
+        docs_url: "docs/testing.md",
+        owner_hint: "tools",
+        evidence_kind: "test",
+        severity: "high",
+        repairable: true,
+        default_confidence: 86,
+        cap_ids: &[
+            "false-green-test-risk",
+            "missing-rust-property-or-integration-tests",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-009-GENERATED-SECURITY",
+        name: "Generated security gap",
+        category: "security",
+        tlr: "Security, secrets, agency",
+        lane: "security",
+        docs_url: "docs/audit-rubric.md#top-level-risk-mapping",
+        owner_hint: "ops",
+        evidence_kind: "workflow-command",
+        severity: "high",
+        repairable: true,
+        default_confidence: 84,
+        cap_ids: &["no-security-lane-on-high-risk-repo"],
+    },
+    RuleSpec {
+        id: "HLT-010-SECRET-SPRAWL",
+        name: "Secret-like content detected",
+        category: "security",
+        tlr: "Security, secrets, agency",
+        lane: "security",
+        docs_url: "docs/audit-rubric.md#top-level-risk-mapping",
+        owner_hint: "ops",
+        evidence_kind: "repository-scan",
+        severity: "critical",
+        repairable: true,
+        default_confidence: 95,
+        cap_ids: &[
+            "secret-like-content-detected",
+            "no-secret-or-dependency-scanning-in-ci",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-011-PROMPT-INJECTION",
+        name: "Prompt injection risk",
+        category: "security",
+        tlr: "Security, secrets, agency",
+        lane: "security",
+        docs_url: "docs/audit-rubric.md#top-level-risk-mapping",
+        owner_hint: "ops",
+        evidence_kind: "policy-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &["prompt-injection-risk"],
+    },
+    RuleSpec {
+        id: "HLT-012-OVERBROAD-AGENCY",
+        name: "Overbroad agent agency",
+        category: "security",
+        tlr: "Security, secrets, agency",
+        lane: "security",
+        docs_url: "docs/audit-rubric.md#top-level-risk-mapping",
+        owner_hint: "ops",
+        evidence_kind: "policy-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &["overbroad-agent-agency"],
+    },
+    RuleSpec {
+        id: "HLT-013-RENDERED-UX-GAP",
+        name: "Rendered UX proof gap",
+        category: "ux-qa",
+        tlr: "Verification and rendered UX",
+        lane: "web",
+        docs_url: "docs/testing.md",
+        owner_hint: "tools",
+        evidence_kind: "ux-proof",
+        severity: "high",
+        repairable: true,
+        default_confidence: 86,
+        cap_ids: &[
+            "missing-web-e2e-lane",
+            "missing-rendered-ux-qa-lane",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-014-A11Y-GAP",
+        name: "Accessibility proof gap",
+        category: "ux-qa",
+        tlr: "Verification and rendered UX",
+        lane: "web",
+        docs_url: "docs/agent-native-standard.md",
+        owner_hint: "tools",
+        evidence_kind: "ux-proof",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &[],
+    },
+    RuleSpec {
+        id: "HLT-015-CONTEXT-SETUP-GAP",
+        name: "Context and setup gap",
+        category: "context",
+        tlr: "Context/setup",
+        lane: "fast",
+        docs_url: "docs/agent-native-standard.md",
+        owner_hint: "agent",
+        evidence_kind: "policy-manifest",
+        severity: "medium",
+        repairable: true,
+        default_confidence: 76,
+        cap_ids: &[
+            "no-root-agent-instructions",
+            "missing-agent-readable-docs",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-016-SUPPLY-CHAIN-DRIFT",
+        name: "Supply-chain drift",
+        category: "security",
+        tlr: "Security, secrets, agency",
+        lane: "security",
+        docs_url: "docs/audit-rubric.md#top-level-risk-mapping",
+        owner_hint: "ops",
+        evidence_kind: "workflow-command",
+        severity: "high",
+        repairable: true,
+        default_confidence: 84,
+        cap_ids: &["supply-chain-drift"],
+    },
+    RuleSpec {
+        id: "HLT-017-OPAQUE-OBSERVABILITY",
+        name: "Opaque observability",
+        category: "observability",
+        tlr: "Repair",
+        lane: "observability",
+        docs_url: "agent/JANKURAI_STANDARD.md#repair-receipts",
+        owner_hint: "tools",
+        evidence_kind: "repository-scan",
+        severity: "high",
+        repairable: true,
+        default_confidence: 78,
+        cap_ids: &[
+            "no-agent-friendly-exception-pattern",
+            "no-jankurai-audit-lane-in-ci",
+        ],
+    },
+    RuleSpec {
+        id: "HLT-018-PERF-CONCURRENCY-DRIFT",
+        name: "Performance and concurrency drift",
+        category: "proof",
+        tlr: "Verification",
+        lane: "fast",
+        docs_url: "docs/testing.md",
+        owner_hint: "tools",
+        evidence_kind: "repository-scan",
+        severity: "medium",
+        repairable: true,
+        default_confidence: 72,
+        cap_ids: &[],
+    },
+    RuleSpec {
+        id: "HLT-019-STREAMING-RUNTIME-DRIFT",
+        name: "Streaming runtime drift",
+        category: "boundary",
+        tlr: "Contracts/data",
+        lane: "db",
+        docs_url: "docs/boundary-oracle.md#streaming-runtime-boundary",
+        owner_hint: "tools",
+        evidence_kind: "semantic-boundary",
+        severity: "high",
+        repairable: true,
+        default_confidence: 90,
+        cap_ids: &["streaming-runtime-drift"],
+    },
+    RuleSpec {
+        id: "HLT-020-CI-HARDENING-GAP",
+        name: "CI workflow hardening gap",
+        category: "security",
+        tlr: "Security, secrets, agency",
+        lane: "security",
+        docs_url: "docs/audit-rubric.md#top-level-risk-mapping",
+        owner_hint: "ops",
+        evidence_kind: "policy-manifest",
+        severity: "high",
+        repairable: true,
+        default_confidence: 86,
+        cap_ids: &[],
+    },
+    RuleSpec {
+        id: "HLT-021-DESTRUCTIVE-MIGRATION",
+        name: "Destructive SQL migration without safety evidence",
+        category: "data",
+        tlr: "Contracts/data",
+        lane: "db-migration-analyze",
+        docs_url: "docs/testing.md",
+        owner_hint: "tools",
+        evidence_kind: "sql",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &["destructive-migration-risk"],
+    },
+    RuleSpec {
+        id: "HLT-022-RUST-DOMAIN-IMPURITY",
+        name: "Rust domain impurity",
+        category: "boundary",
+        tlr: "Contracts/data",
+        lane: "fast",
+        docs_url: "docs/boundary-oracle.md#rust-domain-purity",
+        owner_hint: "tools",
+        evidence_kind: "semantic-boundary",
+        severity: "high",
+        repairable: true,
+        default_confidence: 90,
+        cap_ids: &[],
+    },
+    RuleSpec {
+        id: "HLT-023-TS-WEB-DURABLE-TRUTH",
+        name: "TypeScript web durable truth access",
+        category: "boundary",
+        tlr: "Contracts/data",
+        lane: "contract",
+        docs_url: "docs/boundary-oracle.md#typescript-web-boundary",
+        owner_hint: "tools",
+        evidence_kind: "semantic-boundary",
+        severity: "high",
+        repairable: true,
+        default_confidence: 88,
+        cap_ids: &[],
+    },
+];
+
+pub fn all() -> &'static [RuleSpec] {
+    RULES
+}
+
+pub fn lookup(rule_id: &str) -> Option<RuleSpec> {
+    RULES.iter().copied().find(|rule| rule.id == rule_id)
+}
+
+pub fn docs_for_rule_id(rule_id: &str) -> Option<&'static str> {
+    lookup(rule_id).map(|rule| rule.docs_url)
+}
+
+pub fn rule_for_cap_id(cap_id: &str) -> Option<RuleSpec> {
+    RULES
+        .iter()
+        .copied()
+        .find(|rule| rule.cap_ids.iter().any(|candidate| *candidate == cap_id))
+}
+''')
+
+write("crates/jankurai/src/audit/finding_builder.rs", r'''
+use super::helpers::*;
+use super::rules;
+use crate::model::*;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+
+pub struct FindingBuilder<'a> {
+    ctx: &'a AuditContext,
+    findings: Vec<Finding>,
+    has_any_finding: bool,
+    has_context_finding: bool,
+}
+
+impl<'a> FindingBuilder<'a> {
+    pub fn new(ctx: &'a AuditContext) -> Self {
+        Self {
+            ctx,
+            findings: Vec::new(),
+            has_any_finding: false,
+            has_context_finding: false,
+        }
+    }
+
+    pub fn add(
+        &mut self,
+        severity: &str,
+        category: &str,
+        path: &str,
+        problem: &str,
+        fix: &str,
+        evidence: Vec<String>,
+        rule_id: Option<&str>,
+        line: Option<usize>,
+    ) {
+        self.add_structured(
+            Some(severity),
+            Some(category),
+            path,
+            problem,
+            fix,
+            evidence,
+            rule_id,
+            line,
+            None,
+            None,
+        );
+    }
+
+    pub fn add_structured(
+        &mut self,
+        severity: Option<&str>,
+        category: Option<&str>,
+        path: &str,
+        problem: &str,
+        fix: &str,
+        evidence: Vec<String>,
+        rule_id: Option<&str>,
+        line: Option<usize>,
+        matched_term: Option<String>,
+        reason: Option<String>,
+    ) {
+        let rule_meta = rule_id.and_then(rules::lookup);
+
+        let severity = severity
+            .or_else(|| rule_meta.map(|rule| rule.severity))
+            .unwrap_or("medium");
+
+        let category = category
+            .or_else(|| rule_meta.map(|rule| rule.category))
+            .unwrap_or("audit");
+
+        if category == "context" {
+            self.has_context_finding = true;
+        }
+        self.has_any_finding = true;
+
+        let effective_rule = rule_id.unwrap_or("HLT-000-SCORE-DIMENSION");
+
+        let lane = rule_meta
+            .map(|rule| rule.lane)
+            .or_else(|| lane_for(category))
+            .map(str::to_string);
+
+        let owner = owner_for_path(self.ctx, path).or_else(|| {
+            rule_meta
+                .filter(|rule| !rule.owner_hint.is_empty())
+                .map(|rule| rule.owner_hint.to_string())
+        });
+
+        let evidence_kind = rule_meta
+            .map(|rule| rule.evidence_kind)
+            .unwrap_or_else(|| evidence_kind_for_path(path));
+
+        let fingerprint = finding_fingerprint(
+            effective_rule,
+            category,
+            path,
+            problem,
+            matched_term.as_deref(),
+        );
+
+        self.findings.push(Finding {
+            severity: severity.into(),
+            category: category.into(),
+            path: path.into(),
+            problem: problem.into(),
+            agent_fix: fix.into(),
+            evidence,
+            check_id: format!("{effective_rule}:{category}"),
+            hardness: hardness_for_severity(severity).into(),
+            confidence: confidence_for_rule_or_severity(rule_meta, severity),
+            evidence_kind: evidence_kind.into(),
+            rerun_command: rerun_command_for_lane(lane.as_deref()).into(),
+            fingerprint,
+            rule_id: rule_id.map(str::to_string),
+            tlr: rule_meta
+                .map(|rule| rule.tlr)
+                .or_else(|| tlr_for(category))
+                .map(str::to_string),
+            lane,
+            docs_url: rule_meta.map(|rule| rule.docs_url.to_string()),
+            owner,
+            line,
+            matched_term,
+            reason,
+        });
+    }
+
+    pub fn has_any_finding(&self) -> bool {
+        self.has_any_finding
+    }
+
+    pub fn has_context_finding(&self) -> bool {
+        self.has_context_finding
+    }
+
+    pub fn into_findings(self) -> Vec<Finding> {
+        self.findings
+    }
+}
+
+pub fn hardness_for_severity(severity: &str) -> &'static str {
+    match severity {
+        "critical" | "high" => "hard",
+        _ => "soft",
+    }
+}
+
+pub fn confidence_for_severity(severity: &str) -> f64 {
+    match severity {
+        "critical" => 0.95,
+        "high" => 0.88,
+        "medium" => 0.76,
+        _ => 0.62,
+    }
+}
+
+pub fn confidence_for_rule_or_severity(rule: Option<rules::RuleSpec>, severity: &str) -> f64 {
+    rule.map(|rule| (rule.default_confidence as f64) / 100.0)
+        .unwrap_or_else(|| confidence_for_severity(severity))
+}
+
+pub fn evidence_kind_for_path(path: &str) -> &'static str {
+    if path.starts_with(".github/workflows") {
+        "workflow-command"
+    } else if path.starts_with("agent/") {
+        "policy-manifest"
+    } else if path.starts_with("docs/") {
+        "documentation"
+    } else {
+        "repository-scan"
+    }
+}
+
+pub fn rerun_command_for_lane(lane: Option<&str>) -> &'static str {
+    match lane.unwrap_or("audit") {
+        "security" => "just security",
+        "contract" => "just fast",
+        "db" => "just fast",
+        "db-migration-analyze" => {
+            "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json"
+        }
+        "web" | "e2e" => "just ux-qa",
+        "fast" => "just fast",
+        "release" => "just check",
+        "observability" => "just score",
+        _ => "just score",
+    }
+}
+
+pub fn finding_fingerprint(
+    rule_id: &str,
+    category: &str,
+    path: &str,
+    problem: &str,
+    matched_term: Option<&str>,
+) -> String {
+    let mut hasher = DefaultHasher::new();
+    rule_id.hash(&mut hasher);
+    category.hash(&mut hasher);
+    path.hash(&mut hasher);
+    problem.hash(&mut hasher);
+    if let Some(matched_term) = matched_term {
+        matched_term.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+pub fn tlr_for(category: &str) -> Option<&'static str> {
+    Some(match category {
+        "security" => "Security",
+        "python" => "Business truth",
+        "data" => "Contracts/data",
+        "test" => "Verification",
+        "audit" => "Context/setup",
+        "generated" => "Contracts/data",
+        "boundary" => "Contracts/data",
+        "context" => "Context/setup",
+        "vibe" => "Entropy",
+        "shape" => "Entropy",
+        "observability" => "Repair",
+        "docs" => "Context/setup",
+        "proof" => "Verification",
+        "stack" => "Context/setup",
+        "ux-qa" => "Verification and rendered UX",
+        "exceptions" => "Repair",
+        _ => return None,
+    })
+}
+
+pub fn lane_for(category: &str) -> Option<&'static str> {
+    Some(match category {
+        "security" => "security",
+        "python" => "contract",
+        "data" => "db",
+        "test" => "fast",
+        "audit" => "audit",
+        "generated" => "contract",
+        "boundary" => "contract",
+        "context" => "fast",
+        "vibe" => "fast",
+        "shape" => "fast",
+        "observability" => "observability",
+        "docs" => "audit",
+        "proof" => "fast",
+        "stack" => "audit",
+        "ux-qa" => "web",
+        "exceptions" => "observability",
+        _ => return None,
+    })
+}
+
+fn owner_for_path(ctx: &AuditContext, rel_path: &str) -> Option<String> {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct OwnerMapFile {
+        owners: HashMap<String, String>,
+    }
+
+    if let Ok(text) = std::fs::read_to_string(ctx.root.join("agent/owner-map.json")) {
+        if let Ok(parsed) = serde_json::from_str::<OwnerMapFile>(&text) {
+            let mut best: Option<(&String, &String)> = None;
+            for (prefix, owner) in parsed.owners.iter() {
+                if prefix_matches_path(rel_path, prefix)
+                    && best
+                        .map(|(best_prefix, _)| prefix.len() > best_prefix.len())
+                        .unwrap_or(true)
+                {
+                    best = Some((prefix, owner));
+                }
+            }
+            if let Some((_, owner)) = best {
+                return Some(owner.clone());
+            }
+        }
+    }
+
+    OWNER_MAP_PREFIXES
+        .iter()
+        .filter(|(prefix, _)| prefix_matches_path(rel_path, prefix))
+        .max_by_key(|(prefix, _)| prefix.len())
+        .map(|(_, owner)| (*owner).to_string())
+}
+
+fn prefix_matches_path(rel_path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    rel_path == prefix || rel_path.starts_with(&format!("{prefix}/"))
+}
+
+pub fn dimension_soft_route(
+    name: &str,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match name {
+        "Ownership and navigation surface" => (
+            "context",
+            "agent/owner-map.json",
+            "HLT-003-OWNERLESS-PATH",
+            "tighten owner/test maps and root routing until agents can localize ownership without inference",
+        ),
+        "Contract and boundary integrity" => (
+            "boundary",
+            "agent/boundaries.toml",
+            "HLT-007-HANDWRITTEN-CONTRACT",
+            "add generated contracts and boundary checks for public APIs, data access, and cross-runtime seams",
+        ),
+        "Proof lanes and test routing" => (
+            "proof",
+            "agent/test-map.json",
+            "HLT-004-UNMAPPED-PROOF",
+            "route each owned path to a deterministic proof command and make the lane executable in CI",
+        ),
+        "Security and supply-chain posture" => (
+            "security",
+            ".github/workflows/jankurai.yml",
+            "HLT-016-SUPPLY-CHAIN-DRIFT",
+            "wire secret, dependency, provenance, and workflow scans into an operational CI lane",
+        ),
+        "Code shape and semantic surface" => (
+            "shape",
+            ".",
+            "HLT-001-DEAD-MARKER",
+            "split large or ambiguous authored code into smaller semantic modules with focused tests",
+        ),
+        "Data truth and workflow safety" => (
+            "data",
+            "db/",
+            "HLT-006-DIRECT-DB-WRONG-LAYER",
+            "move durable truth into migrations, constraints, adapters, and application-owned transactions",
+        ),
+        "Observability and repair evidence" => (
+            "observability",
+            "docs/testing.md",
+            "HLT-017-OPAQUE-OBSERVABILITY",
+            "add structured errors, telemetry, and repair receipts that tell the next agent where to rerun proof",
+        ),
+        "Context economy and agent instructions" => (
+            "context",
+            "AGENTS.md",
+            "HLT-015-CONTEXT-SETUP-GAP",
+            "keep root guidance short and route durable detail through agent-readable manifests and docs",
+        ),
+        "Python containment and polyglot hygiene" => (
+            "python",
+            "python/ai-service",
+            "HLT-005-PYTHON-PRODUCT-TRUTH",
+            "keep Python bounded to AI/data tooling and move product truth into Rust, SQL, and generated contracts",
+        ),
+        "Build speed signals" => (
+            "proof",
+            "Justfile",
+            "HLT-018-PERF-CONCURRENCY-DRIFT",
+            "add fast deterministic build/test targets, caches, and narrow proof lanes for agent iteration",
+        ),
+        _ => (
+            "audit",
+            "agent/audit-policy.toml",
+            "HLT-017-OPAQUE-OBSERVABILITY",
+            "add a rule-specific repair route for this below-floor dimension",
+        ),
+    }
+}
+''')
+
+write("crates/jankurai/src/audit/analyzers/mod.rs", r'''
+pub mod ast;
+pub mod context;
+pub mod contracts;
+pub mod data;
+pub mod observability;
+pub mod ownership;
+pub mod proof;
+pub mod python;
+pub mod security;
+pub mod semantic;
+pub mod shape;
+pub mod speed;
+pub mod test;
+
+use super::helpers::AuditContext;
+use crate::model::*;
+
+pub fn all_dimensions(ctx: &AuditContext) -> Vec<DimensionResult> {
+    vec![
+        ownership::analyze(ctx),
+        contracts::analyze(ctx),
+        proof::analyze(ctx),
+        security::analyze(ctx),
+        shape::analyze(ctx),
+        data::analyze(ctx),
+        observability::analyze(ctx),
+        context::analyze(ctx),
+        python::analyze(ctx),
+        speed::analyze(ctx),
+    ]
+}
+
+pub fn ux_qa_status(ctx: &AuditContext) -> UxQaReadiness {
+    use super::helpers::*;
+
+    let evidence = serde_json::json!({
+        "storybook": paths_with(
+            ctx,
+            &[".storybook/", ".stories.", ".story."],
+            &["@storybook", "storybook", "component story format", "csf"],
+        ),
+        "playwright_visual": paths_with(
+            ctx,
+            &[],
+            &["tohavescreenshot", "page.screenshot", "locator.screenshot", "visual comparisons", "screenshotpath"],
+        ),
+        "visual_review": paths_with(
+            ctx,
+            &["backstop", "loki", "argos", "chromatic", "percy", "applitools"],
+            &["@argos-ci", "argos", "chromatic", "percy", "applitools", "backstopjs", "loki", "visual regression", "visual review"],
+        ),
+        "accessibility": paths_with(
+            ctx,
+            &[],
+            &["@axe-core", "axe-core", "pa11y", "storybook-addon-a11y", "eslint-plugin-jsx-a11y", "accessibility testing", "wcag"],
+        ),
+        "layout_stability": paths_with(
+            ctx,
+            &[],
+            &["lighthouse", "lhci", "web-vitals", "cumulative layout shift", "layout shift", "cls"],
+        ),
+        "api_mocks": paths_with(
+            ctx,
+            &[],
+            &["msw", "mock service worker", "msw-storybook-addon", "mockserviceworker", "orval"],
+        ),
+        "design_tokens": paths_with(
+            ctx,
+            &["tokens/", "design-tokens", "style-dictionary"],
+            &["design tokens", "design-token", "style dictionary", "style-dictionary", "figma variables", "semantic tokens"],
+        ),
+        "geometry_runtime": paths_with(
+            ctx,
+            &["packages/ux-qa", "ux-qa"],
+            &["@jankurai/ux-qa", "jankurai-ux-qa", "analyzepage", "expectnouxviolations", "edge clearance", "target size", "getboundingclientrect"],
+        ),
+        "artifact_backed_proof": paths_with(
+            ctx,
+            &["ux-qa-artifacts", "test-results", "playwright-report"],
+            &["--artifacts-dir", "--screenshot", "--aria-snapshot", "artifactpath", "artifactsdir", "ariasnapshot", "tohavescreenshot", "tomatchariasnapshot", "page.screenshot", "trace"],
+        ),
+    });
+
+    let web_surface = has_web_surface(ctx);
+    let missing = if !web_surface {
+        vec![]
+    } else {
+        let mut v = vec![];
+
+        let storybook = evidence
+            .get("storybook")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let playwright = evidence
+            .get("playwright_visual")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let visual = evidence
+            .get("visual_review")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let accessibility = evidence
+            .get("accessibility")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let layout = evidence
+            .get("layout_stability")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let mocks = evidence
+            .get("api_mocks")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let design = evidence
+            .get("design_tokens")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+        let proof = evidence
+            .get("artifact_backed_proof")
+            .and_then(|v| v.as_array())
+            .map(|a| a.is_empty())
+            .unwrap_or(true);
+
+        if storybook {
+            v.push("Storybook state coverage".into());
+        }
+        if playwright {
+            v.push("Playwright screenshot capture".into());
+        }
+        if visual {
+            v.push("visual review or geometry runtime".into());
+        }
+        if accessibility {
+            v.push("accessibility automation".into());
+        }
+        if layout {
+            v.push("layout stability checks".into());
+        }
+        if mocks {
+            v.push("generated API mocks".into());
+        }
+        if design {
+            v.push("design token discipline".into());
+        }
+        if proof {
+            v.push("artifact-backed UX proof receipts".into());
+        }
+
+        v
+    };
+
+    UxQaReadiness {
+        web_surface,
+        has_rendered_ux_lane: !web_surface || missing.is_empty(),
+        missing_categories: missing,
+        evidence,
+        artifact: None,
+    }
+}
+''')
+
+write("crates/jankurai/src/audit/analyzers/semantic.rs", r'''
+use crate::audit::helpers::{boundary_manifest, path_matches_prefix, AuditContext};
+use crate::boundaries::manifest::{BoundaryManifest, StreamingException};
+use crate::model::FileInfo;
+use once_cell::sync::Lazy;
+use regex::Regex;
+use std::collections::BTreeSet;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone)]
+pub struct SemanticFinding {
+    pub severity: &'static str,
+    pub category: &'static str,
+    pub path: String,
+    pub problem: String,
+    pub agent_fix: String,
+    pub evidence: Vec<String>,
+    pub rule_id: &'static str,
+    pub line: Option<usize>,
+    pub matched_term: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImportRef {
+    target: String,
+    line: usize,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct BoundaryPolicy {
+    rust_domain_paths: Vec<String>,
+    rust_forbidden_imports: Vec<String>,
+    typescript_web_paths: Vec<String>,
+    typescript_forbidden_imports: Vec<String>,
+    python_allowed_truth_paths: Vec<String>,
+    queue_adapter_paths: Vec<String>,
+    queue_client_markers: Vec<String>,
+    db_allowed_paths: Vec<String>,
+    streaming_exceptions: Vec<StreamingException>,
+}
+
+impl BoundaryPolicy {
+    fn load(ctx: &AuditContext) -> Self {
+        let manifest = boundary_manifest(ctx);
+        Self::from_manifest(manifest.as_ref())
+    }
+
+    fn from_manifest(manifest: Option<&BoundaryManifest>) -> Self {
+        let rust_domain_paths = manifest
+            .and_then(|m| m.rust.as_ref())
+            .map(|rust| rust.domain_paths.clone())
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| vec!["crates/domain".into(), "crates/*/src/domain".into(), "domain".into()]);
+
+        let rust_forbidden_imports = manifest
+            .and_then(|m| m.rust.as_ref())
+            .map(|rust| rust.forbidden_domain_imports.clone())
+            .filter(|markers| !markers.is_empty())
+            .unwrap_or_else(|| {
+                crate::boundaries::rust::DOMAIN_FORBIDDEN_IMPORTS
+                    .iter()
+                    .map(|marker| (*marker).to_string())
+                    .collect()
+            });
+
+        let typescript_web_paths = manifest
+            .and_then(|m| m.typescript.as_ref())
+            .map(|typescript| typescript.web_paths.clone())
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "apps/web".into(),
+                    "frontend".into(),
+                    "ui".into(),
+                    "packages/web".into(),
+                    "packages/ui".into(),
+                ]
+            });
+
+        let typescript_forbidden_imports = manifest
+            .and_then(|m| m.typescript.as_ref())
+            .map(|typescript| typescript.forbidden_web_imports.clone())
+            .filter(|markers| !markers.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "pg".into(),
+                    "postgres".into(),
+                    "mysql".into(),
+                    "mysql2".into(),
+                    "better-sqlite3".into(),
+                    "@aws-sdk/client-s3".into(),
+                ]
+            });
+
+        let python_allowed_truth_paths = manifest
+            .and_then(|m| m.python.as_ref())
+            .map(|python| python.allowed_truth_paths.clone())
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| vec!["python/ai-service".into(), "tools".into()]);
+
+        let queue_adapter_paths = manifest
+            .and_then(|m| m.queues.as_ref())
+            .map(|queues| queues.adapter_paths.clone())
+            .filter(|paths| !paths.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    "crates/adapters/queues".into(),
+                    "crates/adapters/src/queues".into(),
+                    "adapters/queues".into(),
+                    "apps/api/src/adapters/queues".into(),
+                ]
+            });
+
+        let mut queue_client_markers: Vec<String> = crate::boundaries::streaming::STREAMING_CLIENT_MARKERS
+            .iter()
+            .map(|marker| (*marker).to_string())
+            .collect();
+
+        if let Some(markers) = manifest
+            .and_then(|m| m.queues.as_ref())
+            .map(|queues| queues.client_markers.clone())
+        {
+            queue_client_markers.extend(markers);
+        }
+        queue_client_markers.sort();
+        queue_client_markers.dedup();
+
+        let mut db_allowed_paths = vec![
+            "db".into(),
+            "migrations".into(),
+            "crates/adapters".into(),
+            "crates/*/src/adapters".into(),
+            "apps/api/src/adapters".into(),
+        ];
+
+        if let Some(db) = manifest.and_then(|m| m.db.as_ref()) {
+            db_allowed_paths.extend(db.root_paths.clone());
+            db_allowed_paths.extend(db.migration_paths.clone());
+            db_allowed_paths.extend(db.constraint_paths.clone());
+        }
+        db_allowed_paths.sort();
+        db_allowed_paths.dedup();
+
+        let streaming_exceptions = manifest
+            .map(|m| m.streaming_exception.clone())
+            .unwrap_or_default();
+
+        Self {
+            rust_domain_paths,
+            rust_forbidden_imports,
+            typescript_web_paths,
+            typescript_forbidden_imports,
+            python_allowed_truth_paths,
+            queue_adapter_paths,
+            queue_client_markers,
+            db_allowed_paths,
+            streaming_exceptions,
+        }
+    }
+
+    fn is_rust_domain_path(&self, path: &str) -> bool {
+        self.rust_domain_paths
+            .iter()
+            .any(|pattern| path_matches_glob_or_prefix(path, pattern))
+    }
+
+    fn is_typescript_web_path(&self, path: &str) -> bool {
+        self.typescript_web_paths
+            .iter()
+            .any(|pattern| path_matches_glob_or_prefix(path, pattern))
+    }
+
+    fn is_python_truth_allowed_path(&self, path: &str) -> bool {
+        self.python_allowed_truth_paths
+            .iter()
+            .any(|pattern| path_matches_glob_or_prefix(path, pattern))
+    }
+
+    fn is_queue_adapter_path(&self, path: &str) -> bool {
+        self.queue_adapter_paths
+            .iter()
+            .any(|pattern| path_matches_glob_or_prefix(path, pattern))
+    }
+
+    fn is_db_allowed_path(&self, path: &str) -> bool {
+        self.db_allowed_paths
+            .iter()
+            .any(|pattern| path_matches_glob_or_prefix(path, pattern))
+    }
+
+    fn has_valid_streaming_exception_for(&self, marker: &str) -> bool {
+        self.streaming_exceptions.iter().any(|exception| {
+            runtime_matches_marker(&exception.runtime, marker) && streaming_exception_complete(exception)
+        })
+    }
+}
+
+pub fn run(ctx: &AuditContext) -> Vec<SemanticFinding> {
+    let policy = BoundaryPolicy::load(ctx);
+    let mut findings = Vec::new();
+
+    findings.extend(validate_streaming_exceptions(ctx, &policy));
+
+    for file in &ctx.scope_files {
+        if should_skip_file(ctx, file) {
+            continue;
+        }
+
+        findings.extend(detect_direct_db_access(file, &policy));
+        findings.extend(detect_rust_domain_impurity(file, &policy));
+        findings.extend(detect_typescript_web_impurity(file, &policy));
+        findings.extend(detect_python_product_truth(file, &policy));
+        findings.extend(detect_streaming_runtime_drift(file, &policy));
+    }
+
+    dedupe_and_sort(findings)
+}
+
+fn detect_direct_db_access(file: &FileInfo, policy: &BoundaryPolicy) -> Vec<SemanticFinding> {
+    if !file.is_code && file.suffix != ".sql" {
+        return Vec::new();
+    }
+    if policy.is_db_allowed_path(&file.rel_path) {
+        return Vec::new();
+    }
+
+    let Some((marker, line)) = first_db_marker(&file.text) else {
+        return Vec::new();
+    };
+
+    vec![SemanticFinding {
+        severity: "high",
+        category: "data",
+        path: file.rel_path.clone(),
+        problem: "direct database access appears outside the declared DB or adapter boundary".into(),
+        agent_fix: "move SQL clients and durable writes behind the DB adapter/application boundary, then rerun the db or fast lane".into(),
+        evidence: vec![
+            format!("{}:{} contains database marker `{}`", file.rel_path, line.unwrap_or(1), marker),
+            "allowed DB roots are declared in `agent/boundaries.toml` under `[db]`".into(),
+        ],
+        rule_id: "HLT-006-DIRECT-DB-WRONG-LAYER",
+        line,
+        matched_term: Some(marker.into()),
+        reason: "path plus import/content evidence indicates durable data access escaped the owning DB/adapters layer".into(),
+    }]
+}
+
+fn detect_rust_domain_impurity(file: &FileInfo, policy: &BoundaryPolicy) -> Vec<SemanticFinding> {
+    if file.suffix != ".rs" || !policy.is_rust_domain_path(&file.rel_path) {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for marker in &policy.rust_forbidden_imports {
+        let Some(line) = line_for_marker(&file.text, marker) else {
+            continue;
+        };
+
+        if is_db_marker(marker) {
+            continue;
+        }
+
+        findings.push(SemanticFinding {
+            severity: "high",
+            category: "boundary",
+            path: file.rel_path.clone(),
+            problem: format!("Rust domain layer imports or uses forbidden side-effect marker `{marker}`"),
+            agent_fix: "extract IO, env, time, random, network, logging, and external-system behavior to application/adapters; inject pure ports into the domain".into(),
+            evidence: vec![
+                format!("{}:{} matched `{}`", file.rel_path, line, marker),
+                "Rust domain paths are declared in `agent/boundaries.toml` under `[rust].domain_paths`".into(),
+            ],
+            rule_id: "HLT-022-RUST-DOMAIN-IMPURITY",
+            line: Some(line),
+            matched_term: Some(marker.clone()),
+            reason: "domain code must stay deterministic and side-effect free so agents can prove invariants locally".into(),
+        });
+    }
+
+    findings
+}
+
+fn detect_typescript_web_impurity(file: &FileInfo, policy: &BoundaryPolicy) -> Vec<SemanticFinding> {
+    if !matches!(file.suffix.as_str(), ".ts" | ".tsx" | ".js" | ".jsx")
+        || !policy.is_typescript_web_path(&file.rel_path)
+    {
+        return Vec::new();
+    }
+
+    let imports = extract_typescript_imports(&file.text);
+    let mut findings = Vec::new();
+
+    for import_ref in imports {
+        let target = import_ref.target.to_ascii_lowercase();
+
+        if import_target_is_db_client(&target, policy) {
+            continue;
+        }
+
+        let backend_or_adapter =
+            target.contains("backend")
+                || target.contains("adapters/db")
+                || target.contains("/db")
+                || target.contains("@app/api")
+                || target.contains("@server")
+                || target.contains("server/");
+
+        if backend_or_adapter {
+            findings.push(SemanticFinding {
+                severity: "high",
+                category: "boundary",
+                path: file.rel_path.clone(),
+                problem: format!(
+                    "TypeScript web layer imports backend or durable-truth module `{}`",
+                    import_ref.target
+                ),
+                agent_fix: "replace backend/internal imports with generated contract clients or a typed API boundary, then run the contract/web lane".into(),
+                evidence: vec![
+                    format!("{}:{} `{}`", file.rel_path, import_ref.line, import_ref.source),
+                    "web paths and generated contract paths are declared in `agent/boundaries.toml` under `[typescript]`".into(),
+                ],
+                rule_id: "HLT-023-TS-WEB-DURABLE-TRUTH",
+                line: Some(import_ref.line),
+                matched_term: Some(import_ref.target),
+                reason: "UI code may render state and call generated clients, but must not own durable truth or backend internals".into(),
+            });
+        }
+    }
+
+    findings
+}
+
+fn detect_python_product_truth(file: &FileInfo, policy: &BoundaryPolicy) -> Vec<SemanticFinding> {
+    if file.suffix != ".py" {
+        return Vec::new();
+    }
+
+    let allowed_path = policy.is_python_truth_allowed_path(&file.rel_path);
+    let lower = file.text.to_ascii_lowercase();
+    let db_marker = first_db_marker(&file.text).map(|(marker, line)| (marker.to_string(), line));
+    let product_marker = first_product_truth_marker(&lower);
+
+    let should_flag = (!allowed_path && (db_marker.is_some() || product_marker.is_some()))
+        || (allowed_path && db_marker.is_some() && product_marker.is_some());
+
+    if !should_flag {
+        return Vec::new();
+    }
+
+    let matched = db_marker
+        .as_ref()
+        .map(|(marker, _)| marker.clone())
+        .or_else(|| product_marker.map(str::to_string))
+        .unwrap_or_else(|| "product truth marker".into());
+
+    let line = db_marker
+        .and_then(|(_, line)| line)
+        .or_else(|| line_for_marker(&file.text, &matched));
+
+    vec![SemanticFinding {
+        severity: "high",
+        category: "python",
+        path: file.rel_path.clone(),
+        problem: "Python appears to own product truth, authorization, or direct production data access".into(),
+        agent_fix: "move durable product behavior into Rust application/domain plus SQL constraints; keep Python to AI/data/eval tooling behind typed generated contracts".into(),
+        evidence: vec![
+            format!("{}:{} matched `{}`", file.rel_path, line.unwrap_or(1), matched),
+            "allowed Python truth paths are declared in `agent/boundaries.toml` under `[python].allowed_truth_paths`".into(),
+        ],
+        rule_id: "HLT-005-PYTHON-PRODUCT-TRUTH",
+        line,
+        matched_term: Some(matched),
+        reason: "Python is bounded to AI/data tooling; product authorization and durable truth must be owned by Rust/SQL/generated contracts".into(),
+    }]
+}
+
+fn detect_streaming_runtime_drift(file: &FileInfo, policy: &BoundaryPolicy) -> Vec<SemanticFinding> {
+    if !file.is_code || policy.is_queue_adapter_path(&file.rel_path) {
+        return Vec::new();
+    }
+
+    let lower = file.text.to_ascii_lowercase();
+    for marker in &policy.queue_client_markers {
+        let marker_lower = marker.to_ascii_lowercase();
+        if !lower.contains(&marker_lower) {
+            continue;
+        }
+
+        if policy.has_valid_streaming_exception_for(&marker_lower) {
+            return Vec::new();
+        }
+
+        let line = line_for_marker(&file.text, marker);
+        return vec![SemanticFinding {
+            severity: "high",
+            category: "boundary",
+            path: file.rel_path.clone(),
+            problem: format!(
+                "streaming runtime client `{}` appears outside declared queue adapters",
+                marker
+            ),
+            agent_fix: "move Kafka/Tansu/Iggy/Fluvio/NATS/Redis Streams clients behind declared queue adapters, or add a brownfield exception with owner, expiry, and migration path".into(),
+            evidence: vec![
+                format!("{}:{} matched `{}`", file.rel_path, line.unwrap_or(1), marker),
+                "queue adapter paths and client markers are declared in `agent/boundaries.toml` under `[queues]`".into(),
+            ],
+            rule_id: "HLT-019-STREAMING-RUNTIME-DRIFT",
+            line,
+            matched_term: Some(marker.clone()),
+            reason: "streaming clients define durable workflow behavior and must be isolated behind adapter boundaries".into(),
+        }];
+    }
+
+    Vec::new()
+}
+
+fn validate_streaming_exceptions(ctx: &AuditContext, policy: &BoundaryPolicy) -> Vec<SemanticFinding> {
+    if !ctx.root.join("agent/boundaries.toml").is_file() {
+        return Vec::new();
+    }
+
+    let mut findings = Vec::new();
+    for exception in &policy.streaming_exceptions {
+        let gaps = streaming_exception_gaps(exception);
+        if gaps.is_empty() {
+            continue;
+        }
+
+        findings.push(SemanticFinding {
+            severity: "high",
+            category: "boundary",
+            path: "agent/boundaries.toml".into(),
+            problem: format!(
+                "streaming exception for runtime `{}` is not actionable",
+                exception.runtime
+            ),
+            agent_fix: "complete the streaming exception with non-empty owner, future ISO expiry, brownfield classification/reason, and migration path; otherwise move the client behind adapters".into(),
+            evidence: vec![
+                format!("runtime `{}` gaps: {}", exception.runtime, gaps.join(", ")),
+                "Kafka/streaming exceptions must expire and must carry a migration path".into(),
+            ],
+            rule_id: "HLT-019-STREAMING-RUNTIME-DRIFT",
+            line: Some(1),
+            matched_term: Some(exception.runtime.clone()),
+            reason: "unbounded streaming exceptions become hidden architecture unless they expire and tell agents how to migrate".into(),
+        });
+    }
+
+    findings
+}
+
+fn should_skip_file(ctx: &AuditContext, file: &FileInfo) -> bool {
+    if file.is_generated {
+        return true;
+    }
+
+    let path = file.rel_path.as_str();
+
+    if !ctx.self_audit && path.starts_with("crates/jankurai/") {
+        return true;
+    }
+
+    const SKIP_PREFIXES: &[&str] = &[
+        ".git/",
+        "agent/",
+        "assets/",
+        "docs/",
+        "examples/",
+        "node_modules/",
+        "paper/",
+        "packages/ux-qa/",
+        "reference/",
+        "schemas/",
+        "target/",
+        "tests/",
+        "tips/",
+        "vendor/",
+    ];
+
+    SKIP_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+        || path.contains("/tests/")
+        || path.contains("/__tests__/")
+        || path.ends_with(".md")
+        || path.ends_with(".txt")
+}
+
+fn first_db_marker(text: &str) -> Option<(&'static str, Option<usize>)> {
+    const DB_MARKERS: &[&str] = &[
+        "sqlx::",
+        "diesel::",
+        "sea_orm",
+        "tokio_postgres",
+        "postgres::",
+        "psycopg",
+        "asyncpg",
+        "sqlalchemy",
+        "create_engine(",
+        "better-sqlite3",
+        "mysql2",
+        "sqlite3",
+        " from 'pg'",
+        " from \"pg\"",
+        "require('pg')",
+        "require(\"pg\")",
+        "select ",
+        "insert ",
+        "update ",
+        "delete ",
+    ];
+
+    for marker in DB_MARKERS {
+        if let Some(line) = line_for_marker(text, marker) {
+            return Some((marker, Some(line)));
+        }
+    }
+
+    None
+}
+
+fn is_db_marker(marker: &str) -> bool {
+    let marker = marker.to_ascii_lowercase();
+    [
+        "sqlx",
+        "diesel",
+        "postgres",
+        "psycopg",
+        "sqlite",
+        "mysql",
+        "select ",
+        "insert ",
+        "update ",
+        "delete ",
+    ]
+    .iter()
+    .any(|candidate| marker.contains(candidate))
+}
+
+fn import_target_is_db_client(target_lower: &str, policy: &BoundaryPolicy) -> bool {
+    policy
+        .typescript_forbidden_imports
+        .iter()
+        .any(|marker| import_target_matches(target_lower, &marker.to_ascii_lowercase()))
+}
+
+fn first_product_truth_marker(lower_text: &str) -> Option<&'static str> {
+    const MARKERS: &[&str] = &[
+        "authorize",
+        "authorization",
+        "authz",
+        "tenant_id",
+        "role",
+        "permission",
+        "order",
+        "payment",
+        "invoice",
+        "subscription",
+        "account_id",
+        "user_id",
+        "business_rule",
+        "product_api",
+    ];
+
+    MARKERS.iter().copied().find(|marker| lower_text.contains(marker))
+}
+
+fn extract_typescript_imports(text: &str) -> Vec<ImportRef> {
+    static TS_FROM_IMPORT: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"^\s*(?:import|export)\s+(?:type\s+)?(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]"#)
+            .expect("TypeScript import regex is valid")
+    });
+    static TS_REQUIRE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"require\(\s*['"]([^'"]+)['"]\s*\)"#)
+            .expect("TypeScript require regex is valid")
+    });
+
+    let mut imports = Vec::new();
+
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
+
+        if let Some(caps) = TS_FROM_IMPORT.captures(line) {
+            if let Some(target) = caps.get(1) {
+                imports.push(ImportRef {
+                    target: target.as_str().to_string(),
+                    line: line_no,
+                    source: line.trim().chars().take(180).collect(),
+                });
+            }
+        }
+
+        if let Some(caps) = TS_REQUIRE.captures(line) {
+            if let Some(target) = caps.get(1) {
+                imports.push(ImportRef {
+                    target: target.as_str().to_string(),
+                    line: line_no,
+                    source: line.trim().chars().take(180).collect(),
+                });
+            }
+        }
+    }
+
+    imports
+}
+
+fn line_for_marker(text: &str, marker: &str) -> Option<usize> {
+    let marker = marker.to_ascii_lowercase();
+    text.lines()
+        .position(|line| line.to_ascii_lowercase().contains(&marker))
+        .map(|idx| idx + 1)
+}
+
+fn import_target_matches(target_lower: &str, marker_lower: &str) -> bool {
+    target_lower == marker_lower
+        || target_lower.starts_with(&format!("{marker_lower}/"))
+        || target_lower.ends_with(&format!("/{marker_lower}"))
+        || target_lower.contains(&format!("/{marker_lower}/"))
+        || (marker_lower.contains('/') && target_lower.contains(marker_lower))
+        || (marker_lower.starts_with('@') && target_lower.contains(marker_lower))
+}
+
+fn runtime_matches_marker(runtime: &str, marker: &str) -> bool {
+    let runtime = runtime.to_ascii_lowercase();
+    let marker = marker.to_ascii_lowercase();
+    marker.contains(&runtime) || runtime.contains(&marker)
+}
+
+fn streaming_exception_complete(exception: &StreamingException) -> bool {
+    exception.owner.trim().len() >= 2
+        && exception.migration_path.trim().len() >= 8
+        && expiry_is_valid_future(&exception.expires)
+        && streaming_exception_is_brownfield(exception)
+}
+
+fn streaming_exception_gaps(exception: &StreamingException) -> Vec<String> {
+    let mut gaps = Vec::new();
+
+    if exception.owner.trim().is_empty() {
+        gaps.push("missing owner".into());
+    }
+    if exception.migration_path.trim().is_empty() {
+        gaps.push("missing migration_path".into());
+    }
+    if !expiry_is_valid_future(&exception.expires) {
+        gaps.push("missing, invalid, or expired expires date".into());
+    }
+    if !streaming_exception_is_brownfield(exception) {
+        gaps.push("missing brownfield classification or reason".into());
+    }
+
+    gaps
+}
+
+fn streaming_exception_is_brownfield(exception: &StreamingException) -> bool {
+    exception
+        .classification
+        .as_deref()
+        .or(exception.reason.as_deref())
+        .map(|value| value.to_ascii_lowercase().contains("brownfield"))
+        .unwrap_or(false)
+}
+
+fn expiry_is_valid_future(expires: &str) -> bool {
+    let Some(expiry) = parse_ymd(expires) else {
+        return false;
+    };
+
+    let Some(today) = today_ymd() else {
+        return true;
+    };
+
+    expiry >= today
+}
+
+fn parse_ymd(value: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = value.split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    Some((year, month, day))
+}
+
+fn today_ymd() -> Option<(i32, u32, u32)> {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(civil_from_days((secs / 86_400) as i64))
+}
+
+// Howard Hinnant civil-from-days algorithm, adapted to avoid a chrono dependency.
+fn civil_from_days(days_since_unix_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+
+    if m <= 2 {
+        y += 1;
+    }
+
+    (y as i32, m as u32, d as u32)
+}
+
+fn path_matches_glob_or_prefix(path: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim_end_matches('/');
+    if !pattern.contains('*') {
+        return path_matches_prefix(path, pattern);
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut cursor = 0usize;
+
+    if let Some(first) = parts.first() {
+        if !path.starts_with(first) {
+            return false;
+        }
+        cursor = first.len();
+    }
+
+    for part in parts.iter().skip(1) {
+        if part.is_empty() {
+            continue;
+        }
+
+        let Some(offset) = path[cursor..].find(part) else {
+            return false;
+        };
+        cursor += offset + part.len();
+    }
+
+    true
+}
+
+fn dedupe_and_sort(findings: Vec<SemanticFinding>) -> Vec<SemanticFinding> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+
+    for finding in findings {
+        let key = format!(
+            "{}:{}:{}:{}",
+            finding.rule_id,
+            finding.path,
+            finding.line.unwrap_or(0),
+            finding.problem
+        );
+
+        if seen.insert(key) {
+            out.push(finding);
+        }
+    }
+
+    out.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.unwrap_or(0).cmp(&b.line.unwrap_or(0)))
+            .then(a.rule_id.cmp(b.rule_id))
+            .then(a.problem.cmp(&b.problem))
+    });
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_handles_unix_epoch() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn glob_prefix_matches_crate_domain_path() {
+        assert!(path_matches_glob_or_prefix(
+            "crates/orders/src/domain/state.rs",
+            "crates/*/src/domain"
+        ));
+        assert!(!path_matches_glob_or_prefix(
+            "crates/orders/src/adapters/db.rs",
+            "crates/*/src/domain"
+        ));
+    }
+}
+''')
+
+write("schemas/boundaries.schema.json", r'''
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/boundaries.schema.json",
+  "title": "jankurai boundary manifest",
+  "type": "object",
+  "required": ["stack", "queues"],
+  "properties": {
+    "stack": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "rust": {
+      "type": "object",
+      "properties": {
+        "domain_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "forbidden_domain_imports": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "typescript": {
+      "type": "object",
+      "properties": {
+        "web_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "forbidden_web_imports": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "generated_contract_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "python": {
+      "type": "object",
+      "properties": {
+        "allowed_truth_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "db": {
+      "type": "object",
+      "properties": {
+        "root_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "migration_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "constraint_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "queues": {
+      "type": "object",
+      "required": ["adapter_paths", "event_contract_paths", "generated_type_paths"],
+      "properties": {
+        "adapter_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "event_contract_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "generated_type_paths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "client_markers": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "streaming_exception": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["runtime", "owner", "expires", "migration_path"],
+        "properties": {
+          "runtime": { "type": "string" },
+          "classification": { "type": "string" },
+          "reason": { "type": "string" },
+          "owner": { "type": "string" },
+          "expires": { "type": "string" },
+          "migration_path": { "type": "string" }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}
+''')
+
+write("docs/boundary-oracle.md", r'''
+# Boundary Oracle
+
+Status: implemented slice for Phase 02  
+Owner: tools  
+Last reviewed: 2026-05-03  
+Applies to: `agent/boundaries.toml`, `crates/jankurai/src/audit/analyzers/semantic.rs`, boundary findings
+
+The boundary oracle turns the Jankurai ownership standard into machine-checkable semantic findings. It is intentionally dependency-light: it uses manifest parsing, path matching, shallow import extraction, and content markers rather than heavyweight language parsers. Parser failures must not crash the audit.
+
+## Policy Input
+
+The first-class input is `agent/boundaries.toml`.
+
+Supported sections:
+
+- `[rust]`
+  - `domain_paths`
+  - `forbidden_domain_imports`
+- `[typescript]`
+  - `web_paths`
+  - `forbidden_web_imports`
+  - `generated_contract_paths`
+- `[python]`
+  - `allowed_truth_paths`
+- `[db]`
+  - `root_paths`
+  - `migration_paths`
+  - `constraint_paths`
+- `[queues]`
+  - `adapter_paths`
+  - `event_contract_paths`
+  - `generated_type_paths`
+  - `client_markers`
+- `[[streaming_exception]]`
+  - `runtime`
+  - `classification` or `reason`
+  - `owner`
+  - `expires`
+  - `migration_path`
+
+## Direct DB Access
+
+Rule: `HLT-006-DIRECT-DB-WRONG-LAYER`
+
+Direct DB access is allowed only in DB roots, migrations, constraints, or adapter paths. The oracle combines path evidence with import/content evidence such as `sqlx::`, `diesel::`, `psycopg`, `sqlalchemy`, `better-sqlite3`, `pg`, or raw SQL statement markers.
+
+Findings tell agents to move durable writes and SQL clients behind DB adapters or application-owned transactions.
+
+## Rust Domain Purity
+
+Rule: `HLT-022-RUST-DOMAIN-IMPURITY`
+
+Rust domain paths must remain deterministic and side-effect free. Forbidden domain markers include filesystem, env, network, clock, random, database, queue, tracing, and logging imports.
+
+Repair direction:
+
+1. Move side effects to `crates/adapters` or application ports.
+2. Keep domain modules to IDs, invariants, value objects, state machines, and pure decisions.
+3. Rerun the `fast` lane after extraction.
+
+## TypeScript Web Boundary
+
+Rule: `HLT-023-TS-WEB-DURABLE-TRUTH`
+
+TypeScript web paths may own UI, forms, local rendering state, and generated clients. They must not import backend internals, server modules, DB adapters, storage clients, or durable truth code.
+
+Repair direction:
+
+1. Replace backend/internal imports with generated contract clients.
+2. Move durable truth to Rust application/domain and SQL constraints.
+3. Rerun contract/web proof lanes.
+
+## Python Product Truth Containment
+
+Rule: `HLT-005-PYTHON-PRODUCT-TRUTH`
+
+Python is bounded to AI/data/eval tooling and must not own product authorization, durable product truth, or direct production DB writes. The oracle combines path evidence with DB/auth/product markers so generic Python tooling does not create noise.
+
+Repair direction:
+
+1. Move durable product behavior into Rust/SQL.
+2. Keep Python behind typed generated contracts.
+3. Use Python for models, embeddings, evals, transforms, and offline analysis only.
+
+## Streaming Runtime Boundary
+
+Rule: `HLT-019-STREAMING-RUNTIME-DRIFT`
+
+Kafka, Tansu, Iggy, Fluvio, NATS, Redis Streams, and similar clients must live behind declared queue adapters. Brownfield exceptions are allowed only when they are actionable.
+
+Every streaming exception must include:
+
+- runtime
+- owner
+- future ISO `expires`
+- brownfield `classification` or `reason`
+- migration path
+
+Expired or incomplete exceptions are high-severity findings because they become hidden architecture.
+
+## False-Positive Allowlist
+
+The oracle skips generated files and non-runtime material under:
+
+- `docs/`
+- `paper/`
+- `reference/`
+- `tips/`
+- `vendor/`
+- `node_modules/`
+- `target/`
+- tests and fixtures
+
+Generated-zone enforcement belongs to the generated-zone oracle, not this semantic boundary oracle.
+''')
+
+write("docs/rule-index.md", r'''
+# Jankurai Rule Index
+
+Status: implemented slice for Phase 02  
+Owner: tools  
+Last reviewed: 2026-05-03  
+Applies to: `crates/jankurai/src/audit/rules.rs`, audit findings, repair queue routing
+
+This is the human-readable index for stable rule metadata. The machine-readable source of truth is `crates/jankurai/src/audit/rules.rs`.
+
+| Rule ID | Name | Category | Lane | Evidence kind |
+| --- | --- | --- | --- | --- |
+| `HLT-001-DEAD-MARKER` | Future-hostile language and placeholder markers | vibe | fast | repository-scan |
+| `HLT-002-GENERATED-MUTATION` | Generated zone mutation risk | generated | contract | contract-manifest |
+| `HLT-003-OWNERLESS-PATH` | Ownerless path | context | fast | policy-manifest |
+| `HLT-004-UNMAPPED-PROOF` | Unmapped proof lane | proof | fast | policy-manifest |
+| `HLT-005-PYTHON-PRODUCT-TRUTH` | Python product truth spill | python | contract | semantic-boundary |
+| `HLT-006-DIRECT-DB-WRONG-LAYER` | Direct DB access from wrong layer | data | db | semantic-boundary |
+| `HLT-007-HANDWRITTEN-CONTRACT` | Handwritten contract drift | boundary | contract | contract-manifest |
+| `HLT-008-FALSE-GREEN-RISK` | False green test risk | test | fast | test |
+| `HLT-009-GENERATED-SECURITY` | Generated security gap | security | security | workflow-command |
+| `HLT-010-SECRET-SPRAWL` | Secret-like content detected | security | security | repository-scan |
+| `HLT-011-PROMPT-INJECTION` | Prompt injection risk | security | security | policy-manifest |
+| `HLT-012-OVERBROAD-AGENCY` | Overbroad agent agency | security | security | policy-manifest |
+| `HLT-013-RENDERED-UX-GAP` | Rendered UX proof gap | ux-qa | web | ux-proof |
+| `HLT-014-A11Y-GAP` | Accessibility proof gap | ux-qa | web | ux-proof |
+| `HLT-015-CONTEXT-SETUP-GAP` | Context and setup gap | context | fast | policy-manifest |
+| `HLT-016-SUPPLY-CHAIN-DRIFT` | Supply-chain drift | security | security | workflow-command |
+| `HLT-017-OPAQUE-OBSERVABILITY` | Opaque observability | observability | observability | repository-scan |
+| `HLT-018-PERF-CONCURRENCY-DRIFT` | Performance and concurrency drift | proof | fast | repository-scan |
+| `HLT-019-STREAMING-RUNTIME-DRIFT` | Streaming runtime drift | boundary | db | semantic-boundary |
+| `HLT-020-CI-HARDENING-GAP` | CI workflow hardening gap | security | security | policy-manifest |
+| `HLT-021-DESTRUCTIVE-MIGRATION` | Destructive SQL migration without safety evidence | data | db-migration-analyze | sql |
+| `HLT-022-RUST-DOMAIN-IMPURITY` | Rust domain impurity | boundary | fast | semantic-boundary |
+| `HLT-023-TS-WEB-DURABLE-TRUTH` | TypeScript web durable truth access | boundary | contract | semantic-boundary |
+
+## Metadata Contract
+
+Each stable rule must provide:
+
+- stable ID
+- name
+- category
+- top-level risk
+- default severity
+- default lane
+- docs URL
+- owner hint
+- evidence kind
+- repairability
+- confidence convention
+- legacy cap IDs where applicable
+
+New emitted `rule_id` values must be registered before they can appear in audit output.
+''')
+
+write("crates/jankurai/tests/rule_registry_smoke.rs", r'''
+use jankurai::audit::{rule_registry, rules};
+use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+}
+
+#[test]
+fn rule_registry_ids_are_unique() {
+    let mut seen = HashSet::new();
+
+    for rule in rule_registry() {
+        assert!(
+            seen.insert(rule.id),
+            "duplicate rule id in registry: {}",
+            rule.id
+        );
+    }
+}
+
+#[test]
+fn rule_registry_metadata_is_complete() {
+    for rule in rule_registry() {
+        assert!(rule.id.starts_with("HLT-"), "bad rule id: {}", rule.id);
+        assert!(!rule.name.trim().is_empty(), "{} missing name", rule.id);
+        assert!(!rule.category.trim().is_empty(), "{} missing category", rule.id);
+        assert!(!rule.tlr.trim().is_empty(), "{} missing tlr", rule.id);
+        assert!(!rule.lane.trim().is_empty(), "{} missing lane", rule.id);
+        assert!(!rule.docs_url.trim().is_empty(), "{} missing docs_url", rule.id);
+        assert!(
+            !rule.evidence_kind.trim().is_empty(),
+            "{} missing evidence_kind",
+            rule.id
+        );
+        assert!(
+            (50..=100).contains(&rule.default_confidence),
+            "{} has unrealistic default_confidence {}",
+            rule.id,
+            rule.default_confidence
+        );
+    }
+}
+
+#[test]
+fn rule_index_mentions_every_registered_rule() {
+    let index = fs::read_to_string(repo_root().join("docs/rule-index.md")).unwrap();
+
+    for rule in rule_registry() {
+        assert!(
+            index.contains(rule.id),
+            "docs/rule-index.md does not mention {}",
+            rule.id
+        );
+    }
+}
+
+#[test]
+fn semantic_oracle_rules_are_registered() {
+    let rust = rules::lookup("HLT-022-RUST-DOMAIN-IMPURITY")
+        .expect("HLT-022-RUST-DOMAIN-IMPURITY must exist in registry");
+    assert_eq!(rust.category, "boundary");
+    assert_eq!(rust.evidence_kind, "semantic-boundary");
+
+    let ts = rules::lookup("HLT-023-TS-WEB-DURABLE-TRUTH")
+        .expect("HLT-023-TS-WEB-DURABLE-TRUTH must exist in registry");
+    assert_eq!(ts.category, "boundary");
+    assert_eq!(ts.lane, "contract");
+}
+
+#[test]
+fn hlt014_a11y_gap_is_registered() {
+    let rule = rules::lookup("HLT-014-A11Y-GAP")
+        .expect("HLT-014-A11Y-GAP must exist in registry");
+    assert_eq!(rule.id, "HLT-014-A11Y-GAP");
+    assert_eq!(rule.category, "ux-qa");
+    assert_eq!(rule.lane, "web");
+}
+
+#[test]
+fn hlt021_destructive_migration_is_registered() {
+    let rule = rules::lookup("HLT-021-DESTRUCTIVE-MIGRATION")
+        .expect("HLT-021-DESTRUCTIVE-MIGRATION must exist in registry");
+    assert_eq!(rule.id, "HLT-021-DESTRUCTIVE-MIGRATION");
+    assert_eq!(rule.category, "data");
+    assert_eq!(rule.lane, "db-migration-analyze");
+}
+''')
+
+write("crates/jankurai/tests/semantic_oracle_smoke.rs", r'''
+use jankurai::audit::run_audit;
+use std::fs;
+use tempfile::tempdir;
+
+fn seed_repo(dir: &std::path::Path) {
+    fs::write(dir.join("AGENTS.md"), "Read agent/JANKURAI_STANDARD.md first.\n").unwrap();
+    fs::write(
+        dir.join("README.md"),
+        "# Repo\n\nworkspace layout map validate\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("Justfile"),
+        "# lanes\nfast:\n cargo test\ncheck:\n cargo test\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(dir.join("agent")).unwrap();
+    fs::write(
+        dir.join("agent/boundaries.toml"),
+        r#"
+[stack]
+id = "fixture-stack"
+version = "0.1.0"
+
+[rust]
+domain_paths = ["crates/domain", "crates/*/src/domain"]
+forbidden_domain_imports = ["std::fs", "std::env", "std::net", "std::time::SystemTime", "rand::", "sqlx::", "diesel::", "reqwest::", "rdkafka::", "tracing::", "log::"]
+
+[typescript]
+web_paths = ["apps/web", "packages/web", "packages/ui"]
+forbidden_web_imports = ["pg", "postgres", "mysql", "mysql2", "better-sqlite3", "@aws-sdk/client-s3"]
+generated_contract_paths = ["contracts/generated"]
+
+[python]
+allowed_truth_paths = ["python/ai-service", "tools"]
+
+[queues]
+adapter_paths = ["crates/adapters/queues", "crates/adapters/src/queues"]
+event_contract_paths = ["contracts/events"]
+generated_type_paths = ["contracts/generated"]
+client_markers = ["rdkafka", "kafkajs", "tansu", "iggy", "fluvio", "nats", "redis::streams"]
+
+[db]
+root_paths = ["db"]
+migration_paths = ["db/migrations"]
+constraint_paths = ["db/constraints"]
+"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn semantic_oracle_detects_rust_domain_impurity() {
+    let dir = tempdir().unwrap();
+    seed_repo(dir.path());
+
+    fs::create_dir_all(dir.path().join("crates/domain/src")).unwrap();
+    fs::write(
+        dir.path().join("crates/domain/src/lib.rs"),
+        "use std::fs::File;\n\npub fn invariant() {}\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id.as_deref() == Some("HLT-022-RUST-DOMAIN-IMPURITY"))
+        .expect("expected Rust domain impurity finding");
+
+    assert_eq!(finding.lane.as_deref(), Some("fast"));
+    assert_eq!(finding.line, Some(1));
+    assert!(finding.agent_fix.contains("extract IO"));
+    assert!(finding.reason.as_deref().unwrap_or("").contains("side-effect free"));
+}
+
+#[test]
+fn semantic_oracle_detects_typescript_web_backend_import() {
+    let dir = tempdir().unwrap();
+    seed_repo(dir.path());
+
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/index.ts"),
+        "import { loadUsers } from '@app/backend/users';\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id.as_deref() == Some("HLT-023-TS-WEB-DURABLE-TRUTH"))
+        .expect("expected TypeScript web durable-truth finding");
+
+    assert_eq!(finding.lane.as_deref(), Some("contract"));
+    assert_eq!(finding.line, Some(1));
+    assert!(finding.agent_fix.contains("generated contract clients"));
+}
+
+#[test]
+fn semantic_oracle_detects_direct_db_wrong_layer() {
+    let dir = tempdir().unwrap();
+    seed_repo(dir.path());
+
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/index.ts"),
+        "import { Client } from 'pg';\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER"))
+        .expect("expected direct DB wrong-layer finding");
+
+    assert_eq!(finding.category, "data");
+    assert_eq!(finding.lane.as_deref(), Some("db"));
+    assert_eq!(finding.line, Some(1));
+}
+
+#[test]
+fn semantic_oracle_detects_python_product_truth_leakage() {
+    let dir = tempdir().unwrap();
+    seed_repo(dir.path());
+
+    fs::create_dir_all(dir.path().join("services")).unwrap();
+    fs::write(
+        dir.path().join("services/payments.py"),
+        "import psycopg\n\ndef authorize_payment(user_id):\n    return user_id\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id.as_deref() == Some("HLT-005-PYTHON-PRODUCT-TRUTH"))
+        .expect("expected Python product-truth finding");
+
+    assert_eq!(finding.category, "python");
+    assert_eq!(finding.lane.as_deref(), Some("contract"));
+    assert!(finding.problem.contains("Python"));
+}
+
+#[test]
+fn semantic_oracle_detects_streaming_runtime_outside_adapter() {
+    let dir = tempdir().unwrap();
+    seed_repo(dir.path());
+
+    fs::create_dir_all(dir.path().join("apps/api/src")).unwrap();
+    fs::write(
+        dir.path().join("apps/api/src/main.rs"),
+        "use rdkafka::ClientConfig;\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| finding.rule_id.as_deref() == Some("HLT-019-STREAMING-RUNTIME-DRIFT"))
+        .expect("expected streaming runtime drift finding");
+
+    assert_eq!(finding.category, "boundary");
+    assert!(finding.agent_fix.contains("queue adapters"));
+}
+
+#[test]
+fn semantic_oracle_rejects_incomplete_streaming_exception() {
+    let dir = tempdir().unwrap();
+    seed_repo(dir.path());
+
+    fs::write(
+        dir.path().join("agent/boundaries.toml"),
+        r#"
+[stack]
+id = "fixture-stack"
+
+[queues]
+adapter_paths = ["crates/adapters/queues"]
+event_contract_paths = ["contracts/events"]
+generated_type_paths = ["contracts/generated"]
+client_markers = ["rdkafka"]
+
+[[streaming_exception]]
+runtime = "kafka"
+owner = ""
+expires = "2020-01-01"
+migration_path = ""
+"#,
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+
+    let finding = report
+        .findings
+        .iter()
+        .find(|finding| {
+            finding.rule_id.as_deref() == Some("HLT-019-STREAMING-RUNTIME-DRIFT")
+                && finding.path == "agent/boundaries.toml"
+        })
+        .expect("expected incomplete streaming exception finding");
+
+    assert!(finding.problem.contains("streaming exception"));
+    assert!(finding.evidence.iter().any(|e| e.contains("missing owner")));
+}
+''')
+
+# Patch audit/mod.rs to route semantic oracle findings through the common finding builder.
+mod_path = Path("crates/jankurai/src/audit/mod.rs")
+mod_text = mod_path.read_text()
+
+semantic_block = r'''
+for hit in crate::audit::analyzers::semantic::run(ctx) {
+        b.add_structured(
+            Some(hit.severity),
+            Some(hit.category),
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            hit.evidence.clone(),
+            Some(hit.rule_id),
+            hit.line,
+            hit.matched_term.clone(),
+            Some(hit.reason.clone()),
+        );
+    }
+    '''
+
+if "analyzers::semantic::run(ctx)" not in mod_text:
+    start = mod_text.find("// AST / Graph Pilot findings")
+    next_marker = 'if caps_applied.contains(&"missing-web-e2e-lane".into()) {'
+    end = mod_text.find(next_marker, start)
+
+    if start == -1 or end == -1:
+        raise SystemExit(
+            "Could not patch crates/jankurai/src/audit/mod.rs: AST pilot marker not found. "
+            "Search for the run_ast_pilot block manually and replace it with the semantic loop."
+        )
+
+    mod_text = mod_text[:start] + semantic_block + mod_text[end:]
+    mod_path.write_text(mod_text)
+
+# Append a tracked phase log receipt. This is intentionally append-only.
+log_path = Path("tips/phases/logs/02-rule-engine-semantic-oracle.md")
+log_path.parent.mkdir(parents=True, exist_ok=True)
+existing = log_path.read_text() if log_path.exists() else ""
+entry = (
+    "\n2026-05-03T00:00:00Z | GPT-5.5 Pro | 02-rule-engine-semantic-oracle | "
+    "completed rule registry metadata, semantic boundary oracle, docs, schema, and smoke tests | "
+    "changed_paths=crates/jankurai/src/audit/rules.rs,crates/jankurai/src/audit/finding_builder.rs,"
+    "crates/jankurai/src/audit/analyzers/mod.rs,crates/jankurai/src/audit/analyzers/semantic.rs,"
+    "crates/jankurai/src/boundaries/manifest.rs,schemas/boundaries.schema.json,docs/boundary-oracle.md,"
+    "docs/rule-index.md,crates/jankurai/tests/rule_registry_smoke.rs,crates/jankurai/tests/semantic_oracle_smoke.rs | "
+    "validation=pending cargo test -p jankurai && just fast | artifacts=none | git_sha=pending | "
+    "residual_risk=validation must be run locally before merge\n"
+)
+if "completed rule registry metadata, semantic boundary oracle" not in existing:
+    log_path.write_text(existing.rstrip() + entry)
+
+PY
+
+echo "Patch applied."
+echo
+echo "Required validation:"
+echo "  cargo test -p jankurai"
+echo "  just fast"
+echo
+echo "Recommended extra validation:"
+echo "  cargo test -p jankurai semantic_oracle"
+echo "  cargo test -p jankurai rule_registry"
+echo "  cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
+```
+
+### What this finishes for Phase 02
+
+This makes **Phase 02** materially complete by converting the partial implementation into a real semantic-oracle slice:
+
+1. **Rule registry is now the rule metadata contract.**
+   It includes stable IDs, category, TLR, severity, lane, owner hint, docs URL, evidence kind, repairability, confidence convention, and legacy cap mapping.
+
+2. **Boundary manifest is first-class.**
+   `agent/boundaries.toml` now parses Rust, TypeScript, Python, DB, queue, and streaming exception sections instead of only stack/queues/DB.
+
+3. **Semantic oracle is separate from dimension scoring.**
+   `audit/analyzers/semantic.rs` emits structured findings; `audit/mod.rs` only routes them through `FindingBuilder`.
+
+4. **Existing report shape is preserved.**
+   No required JSON field is removed or renamed. Existing renderers should keep working.
+
+5. **Findings become more actionable.**
+   Semantic findings include path, line when available, owner through the owner map, lane from the registry, docs URL, matched term, reason, evidence, and exact repair guidance.
+
+6. **False positives are explicitly bounded.**
+   The oracle skips docs, reference, generated, vendor, tests, node modules, target, and Jankurai’s own audit crate unless `self_audit` is enabled.
+
+7. **Streaming exceptions now expire.**
+   Kafka/streaming exceptions must carry owner, future ISO expiry, brownfield classification or reason, and migration path.
+
+8. **Rule docs are aligned.**
+   `docs/rule-index.md` becomes the human-readable rule index and tests require every registered rule to appear there.
+
+### Validation expectation before merge
+
+Run:
+
+```bash
+cargo test -p jankurai
+just fast
+cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+```
+
+The merge should be blocked until these pass. The important regression checks are that every emitted stable `rule_id` exists in the registry, every high/critical finding has repair instructions plus a lane and rerun command, and the semantic smoke fixtures emit the expected Phase 02 findings.
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/02-rule-engine-semantic-oracle.md "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/agent-native-standard.md "raw.githubusercontent.com"
+

@@ -1,0 +1,1710 @@
+## Phase 02 verdict: treat it as **complete enough to exist, not hardened enough to trust blindly**
+
+Phase 02’s stated goal is exactly the right load-bearing surface: move the audit from mostly heuristic scanning into a versioned rule engine with semantic understanding, while keeping the exit state realistic: not a compiler-grade analyzer, but a clean architecture that can support AST and graph checks incrementally without breaking the audit. ([GitHub][1])
+
+The important contradiction is that the Phase 02 header says `Status: complete`, but its own receipt says the phase is only a “partial rule engine and semantic oracle,” with “analyzer split remains partial” and “AST/import pilot remain gated follow-on work.” The Phase 00 router explicitly says that when a phase header and receipt disagree, the receipt controls. So I would not call 02 hardened yet. I would mark it **complete-with-residual** or **partial-hardening-required** until the items below are closed. ([GitHub][2]) ([GitHub][1])
+
+The target architecture is already documented as:
+
+```text
+inventory -> analyzers -> rule registry -> findings -> caps -> score -> reports
+```
+
+and Phase 02 names the core modules: `audit/rules.rs`, `audit/analyzers/`, `boundaries/`, `audit/finding_builder.rs`, and `audit/caps.rs`. It also says rule metadata must include stable ID, category, TLR, severity, lane, owner hint, docs URL, evidence kind, repair eligibility, confidence rules, and cap impact. ([GitHub][1])
+
+My plan below is to finish 02 by making that architecture true in code, then hardening it with fixtures, compatibility guards, performance proof, and receipts.
+
+---
+
+# Definition of “100% done and hardened” for Phase 02
+
+Phase 02 is done only when all of these are true:
+
+1. **Every emitted high or critical finding has a stable rule ID**, lane, owner or owner hint, docs link, evidence kind, confidence, exact repair instruction, and rerun command. This matches the standard’s audit finding requirements: findings must include `rule_id` when stable, severity, category, path, line when available, problem, evidence, `agent_fix`, owner, validation lane, and docs link. ([GitHub][3])
+
+2. **Every cap maps to one or more stable rules.** Caps can stay legacy-stable, but they cannot be a parallel hidden policy universe. A cap should be explained by rule metadata.
+
+3. **Every analyzer returns structured rule hits, not just dimension scores.** The current architecture has analyzer modules, but the hardening target is that analyzers feed the rule registry and finding builder directly, not a giant hand-built switchboard.
+
+4. **Boundary checks are policy-driven from `agent/boundaries.toml`.** Phase 02 explicitly calls for loading `agent/boundaries.toml` as first-class input and normalizing Rust, TypeScript, Python, SQL, and streaming policies. ([GitHub][1])
+
+5. **Generated-zone checks are source-oriented.** Findings must tell agents to edit source contracts and regenerate outputs, not patch generated files. Phase 02 explicitly requires generated-zone findings to direct repair toward source, command, and ownership. ([GitHub][1])
+
+6. **The AST/import graph pilot emits all applicable semantic violations, degrades safely, and is performance-bounded.** Phase 02 says parser failures must become advisory diagnostics, not audit crashes, and performance must remain compatible with `just fast`. ([GitHub][1])
+
+7. **Findings are actionable without reading the whole standard.** Phase 02’s finding-quality section says each finding must answer what failed, why it matters, where to fix, and how to prove, with stable fingerprints and deterministic repair queue ordering. ([GitHub][1])
+
+8. **The phase receipt is reconciled.** Since the receipt currently says analyzer split and AST/import pilot remain follow-on work, the hardening pass must finish those or explicitly move remaining work into a new named residual phase with proof. ([GitHub][1])
+
+---
+
+# Current state I see
+
+The repo’s own mission is a control plane for agent-native repositories: ownership, proof, generated zones, and repair evidence are made machine-readable so bad code is easier to reject than merge. The moonshot loop is `intent -> bounded agents -> proof lanes -> evidence -> expired exceptions -> reusable primitives`. ([GitHub][4])
+
+For Phase 02, the current implementation already has the right skeleton:
+
+```text
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/src/audit/caps.rs
+crates/jankurai/src/audit/scan.rs
+crates/jankurai/src/audit/analyzers/*
+crates/jankurai/src/boundaries/*
+agent/boundaries.toml
+agent/generated-zones.toml
+```
+
+The rule registry exists and contains rich `RuleSpec` metadata such as ID, name, category, TLR, lane, docs URL, owner hint, evidence kind, severity, repairability, repair eligibility, repair risk, and repair reason. ([GitHub][5])
+
+But the implementation is still not fully Phase-02-hardened because:
+
+```text
+run_audit_with_options()
+  -> inventory
+  -> dimensions = analyzers::all_dimensions()
+  -> scan/caps
+  -> build_findings(...)
+  -> report
+```
+
+The central issue is that `build_findings` remains the de facto rule engine. It consumes dimensions, caps, raw scan hits, UX artifact summaries, SQL hits, AST pilot output, and then manually builds findings. That means rules, caps, scan functions, analyzer scores, and finding construction are still coupled. Phase 02 wanted the opposite: analyzers should produce rule evidence, the registry should own metadata, the finding builder should normalize findings, and caps should map to rule impact.
+
+The highest-risk implementation gaps are:
+
+```text
+Critical:
+- Some high findings can still be built without explicit stable rule_id.
+- Caps are not first-class rule metadata.
+- Analyzer modules mostly produce dimension scores, not structured rule hits.
+- Boundary manifest parsing is not fully normalized against the richer boundary policy.
+- AST/import pilot is treated as a one-off finding source instead of a reusable semantic analyzer.
+
+High:
+- AST pilot currently needs to emit all hits, not just the first.
+- Semantic checks need positive and negative fixtures.
+- Rule docs, cap mappings, and emitted findings need contract tests.
+- Generated-zone oracle needs reproducibility-aware advisory/blocking behavior.
+
+Medium:
+- Confidence scoring is severity-derived, not rule-specific.
+- Fingerprints are useful but should be more robust to unrelated line shifts.
+- False-positive allowlists need to be explicit and tested.
+```
+
+---
+
+# Finish plan
+
+## Slice 0 — Reconcile phase state and define the hardening receipt
+
+**Goal:** Before code changes, make Phase 02’s state honest.
+
+Owned paths:
+
+```text
+tips/phases/02-rule-engine-semantic-oracle.md
+tips/phases/logs/02-rule-engine-semantic-oracle.md.log
+```
+
+Do this:
+
+1. Change the status line from `complete` to one of:
+
+```text
+Status: complete-with-residual
+```
+
+or, if you want stricter routing:
+
+```text
+Status: partial Owner: tools Last reviewed: 2026-05-04
+```
+
+2. Add a hardening sub-receipt:
+
+```text
+## Phase 02 Hardening Target
+
+Phase 02 is not hardened until:
+- analyzer split is complete enough that analyzers emit structured rule hits
+- AST/import pilot emits all hits and has fixtures
+- every cap maps to rule metadata
+- every high/critical finding has rule_id, lane, owner, docs_url, agent_fix, evidence_kind, confidence, rerun command
+- boundary and generated-zone oracles are manifest-driven
+- cargo test -p jankurai and just fast pass
+- report compatibility guard passes
+```
+
+3. Append a `start` log row before edits, and a `finish` row after validation.
+
+Acceptance:
+
+```text
+- Phase header no longer lies about hardening state.
+- Receipt names exact residuals.
+- Future agents do not skip 02 because the word "complete" masked unfinished analyzer work.
+```
+
+Validation:
+
+```bash
+git diff --check -- tips/phases/02-rule-engine-semantic-oracle.md tips/phases/logs/02-rule-engine-semantic-oracle.md.log
+cargo run -p jankurai -- lane . \
+  --changed tips/phases/02-rule-engine-semantic-oracle.md \
+  --changed tips/phases/logs/02-rule-engine-semantic-oracle.md.log \
+  --out target/jankurai/phase02-doc-lane.json \
+  --md target/jankurai/phase02-doc-lane.md
+```
+
+---
+
+## Slice 1 — Make the rule registry the real contract
+
+**Goal:** `rules.rs` becomes the single policy contract for rule metadata, cap impact, confidence policy, docs routing, and repair eligibility.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/caps.rs
+crates/jankurai/tests/rule_registry_smoke.rs
+docs/audit-rubric.md
+docs/agent-native-standard.md
+schemas/*
+```
+
+Add these fields to `RuleSpec`:
+
+```rust
+pub struct RuleSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub category: &'static str,
+    pub tlr: &'static str,
+    pub lane: &'static str,
+    pub docs_url: &'static str,
+    pub owner_hint: &'static str,
+    pub evidence_kind: &'static str,
+    pub severity: &'static str,
+
+    pub repairable: bool,
+    pub repair_eligibility: RepairEligibility,
+    pub repair_risk: RepairRisk,
+    pub repair_reason: &'static str,
+
+    // New hardening fields
+    pub confidence: ConfidencePolicy,
+    pub cap_impacts: &'static [&'static str],
+    pub detector: DetectorKind,
+    pub false_positive_allowlist: &'static [&'static str],
+}
+```
+
+Define:
+
+```rust
+pub enum ConfidencePolicy {
+    ExactManifest,
+    PathAndImport,
+    PathAndContent,
+    RegexHeuristic,
+    ArtifactBacked,
+    Advisory,
+}
+
+pub enum DetectorKind {
+    Manifest,
+    BoundaryOracle,
+    GeneratedZoneOracle,
+    AstImportGraph,
+    RepositoryScan,
+    ArtifactValidator,
+    DimensionFallback,
+}
+```
+
+Do not make confidence a random float per finding. Make it deterministic by policy:
+
+```rust
+impl ConfidencePolicy {
+    pub fn default_score(self) -> f64 {
+        match self {
+            Self::ExactManifest => 0.96,
+            Self::ArtifactBacked => 0.94,
+            Self::PathAndImport => 0.90,
+            Self::PathAndContent => 0.86,
+            Self::RegexHeuristic => 0.74,
+            Self::Advisory => 0.62,
+        }
+    }
+}
+```
+
+Add a `RuleId` wrapper to prevent stringly-typed mistakes:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RuleId(&'static str);
+
+impl RuleId {
+    pub const HLT_001_DEAD_MARKER: RuleId = RuleId("HLT-001-DEAD-MARKER");
+    pub const HLT_002_GENERATED_MUTATION: RuleId = RuleId("HLT-002-GENERATED-MUTATION");
+    // ...
+}
+```
+
+Then expose both:
+
+```rust
+pub fn lookup(rule_id: &str) -> Option<RuleSpec>;
+pub fn require(rule_id: RuleId) -> RuleSpec;
+```
+
+Hard rule: `FindingBuilder` should no longer accept `Option<&str>` for hard findings. Add two explicit paths:
+
+```rust
+pub fn add_rule_hit(&mut self, hit: RuleHit);
+
+pub fn add_advisory_dimension_gap(&mut self, gap: DimensionGap);
+```
+
+Acceptance criteria:
+
+```text
+- Every cap in CAPS is referenced by at least one RuleSpec.cap_impacts.
+- Every RuleSpec docs_url points to a real docs anchor or generated rule-index entry.
+- Every stable rule has severity, lane, TLR, evidence kind, confidence policy, repair policy, and owner hint.
+- Unknown rule IDs fail tests.
+- High/critical findings cannot be emitted without a RuleSpec unless the compiler forces an explicit advisory escape hatch.
+```
+
+Add tests:
+
+```rust
+#[test]
+fn every_cap_has_at_least_one_rule_mapping() {
+    for (cap, _) in caps::CAPS {
+        assert!(
+            rules::all().iter().any(|rule| rule.cap_impacts.contains(cap)),
+            "cap {cap} has no rule mapping"
+        );
+    }
+}
+
+#[test]
+fn every_rule_docs_url_is_non_empty_and_stable() {
+    for rule in rules::all() {
+        assert!(!rule.docs_url.trim().is_empty(), "{} missing docs_url", rule.id);
+        assert!(
+            rule.docs_url.starts_with("docs/")
+                || rule.docs_url.starts_with("agent/")
+                || rule.docs_url.starts_with("schemas/"),
+            "{} docs_url must be repo-local",
+            rule.id
+        );
+    }
+}
+
+#[test]
+fn every_rule_declares_confidence_and_detector_kind() {
+    for rule in rules::all() {
+        assert!(rule.confidence.default_score() > 0.0);
+        assert!(rule.confidence.default_score() <= 1.0);
+    }
+}
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test rule_registry_smoke
+cargo test -p jankurai --test audit_smoke audit_rule_ids_resolve_to_registry_entries
+cargo test -p jankurai
+```
+
+---
+
+## Slice 2 — Introduce a real analyzer result contract
+
+**Goal:** analyzers stop being only score calculators. They become rule-hit producers.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/analyzers/mod.rs
+crates/jankurai/src/audit/analyzers/types.rs
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/src/audit/mod.rs
+```
+
+Create:
+
+```rust
+pub struct AnalyzerOutput {
+    pub analyzer_id: &'static str,
+    pub dimensions: Vec<DimensionResult>,
+    pub rule_hits: Vec<RuleHit>,
+    pub diagnostics: Vec<AnalyzerDiagnostic>,
+    pub elapsed_ms: u128,
+}
+
+pub struct RuleHit {
+    pub rule_id: RuleId,
+    pub severity_override: Option<&'static str>,
+    pub path: String,
+    pub line: Option<usize>,
+    pub problem: String,
+    pub reason: String,
+    pub evidence: Vec<EvidenceItem>,
+    pub agent_fix: String,
+    pub matched_term: Option<String>,
+    pub confidence_override: Option<f64>,
+}
+
+pub struct EvidenceItem {
+    pub kind: EvidenceKind,
+    pub value: String,
+    pub line: Option<usize>,
+}
+
+pub enum EvidenceKind {
+    Path,
+    Import,
+    ManifestField,
+    ContentSnippet,
+    Command,
+    Artifact,
+    Policy,
+    Sql,
+    UxProof,
+}
+
+pub struct AnalyzerDiagnostic {
+    pub analyzer_id: &'static str,
+    pub severity: DiagnosticSeverity,
+    pub path: Option<String>,
+    pub message: String,
+}
+```
+
+Replace:
+
+```rust
+let dimensions = analyzers::all_dimensions(&ctx);
+```
+
+with:
+
+```rust
+let analyzer_outputs = analyzers::run_all(&ctx);
+let dimensions = collect_dimensions(&analyzer_outputs);
+let rule_hits = collect_rule_hits(&analyzer_outputs);
+let diagnostics = collect_diagnostics(&analyzer_outputs);
+```
+
+Then:
+
+```rust
+let findings = finding_builder::build_findings_from_rule_hits(
+    &ctx,
+    &rule_hits,
+    &dimensions,
+    &caps_applied,
+    ux_qa.artifact.as_ref(),
+    diagnostics,
+);
+```
+
+Keep old dimension functions for compatibility, but wrap them:
+
+```rust
+pub fn all_dimensions(ctx: &AuditContext) -> Vec<DimensionResult> {
+    run_all(ctx)
+        .into_iter()
+        .flat_map(|output| output.dimensions)
+        .collect()
+}
+```
+
+Acceptance criteria:
+
+```text
+- New analyzers can add findings without editing report rendering.
+- build_findings becomes mostly a reducer/normalizer, not a policy owner.
+- Dimension fallback findings remain, but they are explicitly classified as advisory/dimension fallback.
+- Analyzer diagnostics are included or at least retained for future report expansion without crashing audit.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test audit_smoke
+cargo test -p jankurai --test report_compatibility_guard
+cargo test -p jankurai
+```
+
+---
+
+## Slice 3 — Harden `FindingBuilder`
+
+**Goal:** the finding builder becomes the only place that normalizes rule metadata into report findings.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/src/model.rs
+crates/jankurai/tests/audit_smoke.rs
+crates/jankurai/tests/finding_quality_guard.rs
+```
+
+Add:
+
+```rust
+impl FindingBuilder<'_> {
+    pub fn add_rule_hit(&mut self, hit: RuleHit) {
+        let rule = rules::require(hit.rule_id);
+
+        let severity = hit.severity_override.unwrap_or(rule.severity);
+        let confidence = hit
+            .confidence_override
+            .unwrap_or_else(|| rule.confidence.default_score());
+
+        self.findings.push(Finding {
+            severity: severity.into(),
+            category: rule.category.into(),
+            path: hit.path,
+            problem: hit.problem,
+            agent_fix: hit.agent_fix,
+            evidence: hit.evidence.iter().map(|e| e.value.clone()).collect(),
+            check_id: format!("{}:{}", rule.id, rule.category),
+            hardness: hardness_for_severity(severity).into(),
+            confidence,
+            evidence_kind: rule.evidence_kind.into(),
+            rerun_command: rerun_command_for_lane(Some(rule.lane)).into(),
+            fingerprint: stable_rule_fingerprint(&rule, &hit),
+            rule_id: Some(rule.id.into()),
+            tlr: Some(rule.tlr.into()),
+            lane: Some(rule.lane.into()),
+            docs_url: Some(rule.docs_url.into()),
+            owner: owner_for_path(self.ctx, &hit.path)
+                .or_else(|| Some(rule.owner_hint.to_string())),
+            line: hit.line,
+            matched_term: hit.matched_term,
+            reason: Some(hit.reason),
+        });
+    }
+}
+```
+
+Keep an escape hatch only for low/medium dimension fallback:
+
+```rust
+pub fn add_dimension_gap(&mut self, gap: DimensionGap)
+```
+
+and guard it:
+
+```rust
+assert!(
+    !matches!(gap.severity, Severity::High | Severity::Critical),
+    "high/critical dimension gaps must use add_rule_hit"
+);
+```
+
+Add tests:
+
+```rust
+#[test]
+fn hard_findings_are_fully_routed() {
+    let report = fixture_report_with_all_hard_cases();
+
+    for finding in report.findings.iter().filter(|f| f.severity == "high" || f.severity == "critical") {
+        assert!(finding.rule_id.is_some(), "{:?}", finding);
+        assert!(finding.lane.is_some(), "{:?}", finding);
+        assert!(finding.docs_url.is_some(), "{:?}", finding);
+        assert!(finding.owner.is_some(), "{:?}", finding);
+        assert!(!finding.agent_fix.trim().is_empty(), "{:?}", finding);
+        assert!(!finding.rerun_command.trim().is_empty(), "{:?}", finding);
+        assert!(!finding.evidence_kind.trim().is_empty(), "{:?}", finding);
+        assert!(finding.confidence >= 0.60 && finding.confidence <= 1.0, "{:?}", finding);
+    }
+}
+```
+
+Acceptance criteria:
+
+```text
+- The builder can construct report-compatible findings from rule hits.
+- It is impossible or test-failing to emit hard findings without registry metadata.
+- It preserves existing JSON fields.
+- It improves `reason`, `matched_term`, and confidence consistency.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test finding_quality_guard
+cargo test -p jankurai --test audit_smoke
+cargo test -p jankurai --test report_compatibility_guard
+```
+
+---
+
+## Slice 4 — Convert caps into rule-backed caps
+
+**Goal:** caps remain stable but stop being disconnected from rules.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/caps.rs
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/mod.rs
+crates/jankurai/tests/caps_rule_mapping_guard.rs
+```
+
+Change:
+
+```rust
+pub const CAPS: &[(&str, i32)] = &[ ... ];
+```
+
+to:
+
+```rust
+pub struct CapSpec {
+    pub id: &'static str,
+    pub max_score: i32,
+    pub rule_ids: &'static [RuleId],
+    pub reason: &'static str,
+}
+
+pub const CAPS: &[CapSpec] = &[
+    CapSpec {
+        id: "direct-db-access-from-wrong-layer",
+        max_score: 66,
+        rule_ids: &[RuleId::HLT_006_DIRECT_DB_WRONG_LAYER],
+        reason: "direct DB access outside declared data boundary breaks durable truth ownership",
+    },
+    // ...
+];
+```
+
+Then compute caps from analyzer outputs:
+
+```rust
+pub fn caps_applied(ctx: &AuditContext, rule_hits: &[RuleHit]) -> Vec<String> {
+    CAPS.iter()
+        .filter(|cap| cap.rule_ids.iter().any(|rule| rule_hits.iter().any(|hit| hit.rule_id == *rule)))
+        .filter(|cap| cap_legacy_condition_still_holds(ctx, cap.id))
+        .map(|cap| cap.id.to_string())
+        .collect()
+}
+```
+
+Do this carefully. Do not remove the current scan-based cap triggers immediately. Keep a compatibility bridge:
+
+```rust
+pub enum CapSource {
+    RuleHit,
+    LegacyScan,
+    Both,
+}
+```
+
+During hardening:
+
+```text
+- First: assert every legacy cap has rule mapping.
+- Second: emit rule hits for every cap-triggering scan.
+- Third: make caps consume rule hits plus legacy guard.
+- Fourth: remove duplicated scan calls only after fixture parity passes.
+```
+
+Acceptance criteria:
+
+```text
+- Caps are stable IDs with max_score.
+- Every cap has mapped rule IDs.
+- Every cap that applies produces at least one corresponding finding, unless explicitly advisory.
+- Caps no longer require duplicating scan logic in both caps.rs and build_findings.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test caps_rule_mapping_guard
+cargo test -p jankurai --test audit_smoke
+cargo run -p jankurai -- . \
+  --json target/jankurai/phase02-cap-parity.json \
+  --md target/jankurai/phase02-cap-parity.md
+```
+
+---
+
+## Slice 5 — Boundary Oracle: make `agent/boundaries.toml` first-class
+
+**Goal:** boundary policy comes from manifest data, not scattered constants.
+
+Owned paths:
+
+```text
+crates/jankurai/src/boundaries/manifest.rs
+crates/jankurai/src/boundaries/rust.rs
+crates/jankurai/src/boundaries/typescript.rs
+crates/jankurai/src/boundaries/python.rs
+crates/jankurai/src/boundaries/sql.rs
+crates/jankurai/src/boundaries/streaming.rs
+crates/jankurai/src/audit/analyzers/boundary.rs
+crates/jankurai/tests/boundary_oracle_fixtures.rs
+agent/boundaries.toml
+docs/boundary-oracle.md
+```
+
+Extend `BoundaryManifest`:
+
+```rust
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BoundaryManifest {
+    pub stack: Option<Stack>,
+    pub rust: Option<RustBoundary>,
+    pub typescript: Option<TypeScriptBoundary>,
+    pub python: Option<PythonBoundary>,
+    pub queues: Option<QueueBoundary>,
+    pub db: Option<DbBoundary>,
+
+    #[serde(default)]
+    pub streaming_exception: Vec<StreamingException>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RustBoundary {
+    #[serde(default)]
+    pub domain_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_domain_imports: Vec<String>,
+    #[serde(default)]
+    pub forbidden_domain_markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TypeScriptBoundary {
+    #[serde(default)]
+    pub web_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_web_imports: Vec<String>,
+    #[serde(default)]
+    pub generated_contract_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PythonBoundary {
+    #[serde(default)]
+    pub allowed_truth_paths: Vec<String>,
+    #[serde(default)]
+    pub forbidden_product_markers: Vec<String>,
+}
+```
+
+Create `audit/analyzers/boundary.rs`:
+
+```rust
+pub fn analyze(ctx: &AuditContext, manifest: &BoundaryManifest, graph: &DependencyGraph) -> AnalyzerOutput {
+    let mut output = AnalyzerOutput::new("boundary-oracle");
+
+    output.rule_hits.extend(rust_domain_impurity(ctx, manifest, graph));
+    output.rule_hits.extend(ts_web_wrong_layer(ctx, manifest, graph));
+    output.rule_hits.extend(python_product_truth(ctx, manifest));
+    output.rule_hits.extend(wrong_layer_db(ctx, manifest));
+    output.rule_hits.extend(streaming_runtime_drift(ctx, manifest));
+
+    output
+}
+```
+
+Boundary rules to enforce:
+
+```text
+Rust:
+- Files under configured domain paths must not import IO/DB/env/network/fs/clock/random/logging/metrics adapters directly.
+- Path evidence plus import edge evidence required for high confidence.
+
+TypeScript:
+- Files under configured web paths must not import backend, DB adapters, server-only runtime, or handwritten contract mirrors.
+- Generated contract imports are allowed only from declared generated contract paths.
+
+Python:
+- Python is allowed only in declared AI/data/tooling paths.
+- Python cannot own product APIs, authz, durable DB writes, or product truth markers unless explicitly routed.
+
+SQL/DB:
+- Direct DB clients, raw SQL, migrations, and destructive SQL are allowed only in DB/adapters/migration paths.
+- Destructive migration findings must include rollback/backfill/lock-safety proof requirements.
+
+Streaming:
+- Kafka/Tansu/Iggy/Fluvio/NATS/Redis stream clients must live behind declared queue adapter paths.
+- Exceptions must include owner, expiry, classification or brownfield reason, and migration path.
+```
+
+False positive allowlist:
+
+```rust
+pub fn is_boundary_exempt(path: &str) -> bool {
+    path.starts_with("docs/")
+        || path.starts_with("reference/")
+        || path.starts_with("target/")
+        || path.starts_with("vendor/")
+        || path.contains("/generated/")
+        || path.ends_with(".md")
+}
+```
+
+But do not blanket-exempt generated files from generated-zone checks; only exempt them from boundary import scans.
+
+Acceptance criteria:
+
+```text
+- Boundary findings include path, line, owner, lane, evidence, reason, exact repair.
+- `agent/boundaries.toml` parse failure creates a hard, routed manifest finding.
+- Rust, TS, Python, SQL, and streaming policies are represented in structs.
+- Docs/reference/vendor/generated false positives are fixture-tested.
+- Streaming exceptions without owner/expiry/classification/migration path fail.
+```
+
+Fixture matrix:
+
+```text
+positive violations:
+- Rust domain imports sqlx
+- Rust domain reads env
+- TS web imports backend adapter
+- TS web imports DB module
+- Python product route imports psycopg/sqlalchemy
+- Python product route owns authz/product API
+- app code uses raw SQL outside db/adapters
+- Kafka client outside queue adapter
+- streaming exception missing expiry
+
+negative controls:
+- Rust adapter imports sqlx
+- TS web imports generated client
+- Python under python/ai-service performs model/data work only
+- docs mention sqlx/Kafka
+- reference material contains forbidden terms
+- generated contract file contains generated marker
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test boundaries_manifest_smoke
+cargo test -p jankurai --test boundary_oracle_fixtures
+cargo test -p jankurai --test audit_smoke
+```
+
+---
+
+## Slice 6 — Generated Zone Oracle
+
+**Goal:** generated outputs are protected by manifest, headers, source, command, and drift proof.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/analyzers/generated.rs
+crates/jankurai/src/audit/scan.rs
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/tests/generated_zones_manifest_smoke.rs
+crates/jankurai/tests/generated_zone_oracle.rs
+agent/generated-zones.toml
+docs/generated-zones.md
+```
+
+Define:
+
+```rust
+pub struct GeneratedZone {
+    pub path: String,
+    pub source: String,
+    pub command: String,
+    pub owner: Option<String>,
+    pub required_header: Option<String>,
+    pub checksum: Option<String>,
+    pub advisory_until_reproducible: bool,
+}
+```
+
+Analyzer behavior:
+
+```text
+1. Parse `agent/generated-zones.toml`.
+2. Validate every zone has non-empty path, source, command.
+3. Build a path matcher for zones.
+4. For files inside generated zones:
+   - require generated/do-not-edit marker where policy applies
+   - forbid direct repair instruction that patches the generated file
+   - route fix to source and command
+5. For contract source changes:
+   - require generated output diff or proof artifact
+   - if reproducibility data is absent, emit advisory/high depending on policy
+6. For suspected hand edits:
+   - if checksum exists and mismatch is unexplained, emit high
+   - if checksum does not exist, emit advisory or high based on path criticality
+```
+
+Finding text standard:
+
+```text
+problem:
+"generated file appears edited outside declared source regeneration"
+
+reason:
+"generated zones are not product truth; patching output hides drift and makes future regeneration unsafe"
+
+agent_fix:
+"edit `{source}`, run `{command}`, then commit regenerated output and proof artifact"
+```
+
+Acceptance criteria:
+
+```text
+- Generated findings always point to source and command.
+- Generated-zone manifest parse failures are routed to HLT-002 or manifest observability rule.
+- Hand-edit checks stay advisory until reproducibility metadata exists, unless the repo declares checksums.
+- Public API contract changes without generated output/proof produce a contract/generation finding.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test generated_zones_manifest_smoke
+cargo test -p jankurai --test generated_zone_oracle
+cargo test -p jankurai --test contract_source_smoke
+```
+
+---
+
+## Slice 7 — AST/import graph pilot: promote it from “pilot finding” to semantic input
+
+**Goal:** shallow semantic checks become reusable, deterministic, and complete enough for Phase 02.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/analyzers/ast.rs
+crates/jankurai/src/audit/analyzers/boundary.rs
+crates/jankurai/tests/ast_import_graph_smoke.rs
+crates/jankurai/tests/boundary_oracle_fixtures.rs
+```
+
+Current hardening target:
+
+```text
+- Build dependency graph once.
+- Emit every hit, not just first hit.
+- Preserve line numbers.
+- Separate Rust domain impurity from TS web wrong-layer rule mapping.
+- Do not use HLT-006 for every import violation if a better boundary rule is needed.
+- Parser failure becomes diagnostic, not panic.
+```
+
+Refactor:
+
+```rust
+pub fn build_dependency_graph(ctx: &AuditContext) -> AnalyzerResult<DependencyGraph> {
+    let mut graph = DependencyGraph::default();
+    let mut diagnostics = Vec::new();
+
+    for file in product_code_files(ctx) {
+        match file.suffix.as_str() {
+            ".rs" => parse_rust_imports(&file.rel_path, &file.text, &mut graph, &mut diagnostics),
+            ".ts" | ".tsx" => parse_typescript_imports(&file.rel_path, &file.text, &mut graph, &mut diagnostics),
+            _ => {}
+        }
+    }
+
+    AnalyzerResult { value: graph, diagnostics }
+}
+```
+
+Then boundary analyzer consumes the graph:
+
+```rust
+let graph_result = ast::build_dependency_graph(ctx);
+output.diagnostics.extend(graph_result.diagnostics);
+output.rule_hits.extend(boundary::rust_domain_hits(ctx, manifest, &graph_result.value));
+output.rule_hits.extend(boundary::typescript_web_hits(ctx, manifest, &graph_result.value));
+```
+
+Add rule IDs or remap:
+
+```text
+Option A: Keep HLT-006 for DB wrong-layer only, add new HLT rule for boundary import impurity.
+Option B: Use HLT-007 for handwritten/contract boundary drift and HLT-006 only for direct DB.
+Option C: Add HLT-022-BOUNDARY-IMPORT-IMPURITY with docs and tests.
+```
+
+I recommend **Option C** because Rust domain IO impurity and TS web backend import are not always direct DB access. Overloading HLT-006 makes repair routing less precise.
+
+New rule:
+
+```rust
+RuleSpec {
+    id: "HLT-022-BOUNDARY-IMPORT-IMPURITY",
+    name: "Boundary import impurity",
+    category: "boundary",
+    tlr: "Contracts/data",
+    lane: "contract",
+    docs_url: "docs/audit-rubric.md#boundary-import-impurity",
+    owner_hint: "tools",
+    evidence_kind: "import-graph",
+    severity: "high",
+    repairable: true,
+    repair_eligibility: RepairEligibility::HumanRequired,
+    repair_risk: RepairRisk::High,
+    repair_reason: "moving imports across boundaries changes ownership and proof routing",
+    confidence: ConfidencePolicy::PathAndImport,
+    cap_impacts: &["direct-db-access-from-wrong-layer"],
+    detector: DetectorKind::AstImportGraph,
+    false_positive_allowlist: &["docs/", "reference/", "vendor/", "target/"],
+}
+```
+
+Acceptance criteria:
+
+```text
+- AST graph is computed once per audit.
+- All import violations are emitted.
+- Rust and TS tests include positive and negative cases.
+- No audit crash on malformed import syntax.
+- No heavyweight parser added unless compile-time/perf delta is measured and documented.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test ast_import_graph_smoke
+cargo test -p jankurai --test boundary_oracle_fixtures
+cargo test -p jankurai
+time cargo check -p jankurai
+```
+
+---
+
+## Slice 8 — Pattern scan becomes a detector library, not the rule engine
+
+**Goal:** `scan.rs` keeps dependency-light detectors, but policy lives in analyzers/rules.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/scan.rs
+crates/jankurai/src/audit/analyzers/shape.rs
+crates/jankurai/src/audit/analyzers/security.rs
+crates/jankurai/src/audit/analyzers/data.rs
+crates/jankurai/src/audit/analyzers/generated.rs
+crates/jankurai/src/audit/analyzers/boundary.rs
+```
+
+Move policy like this:
+
+```text
+scan.rs:
+- todo_hits(ctx) -> Vec<FindingHit>
+- fallback_hits(ctx) -> Vec<FindingHit>
+- secret_hits(ctx) -> Vec<FindingHit>
+- prompt_injection_hits(ctx) -> Vec<FindingHit>
+- wrong_layer_db_hits(ctx) -> Vec<FindingHit>
+- generated_zone_issues(ctx) -> Vec<FindingHit>
+
+analyzers/security.rs:
+- converts secret/prompt/agency scan hits into RuleHit with HLT-010/011/012
+
+analyzers/shape.rs:
+- converts TODO/fallback/future-hostile/duplication hits into RuleHit with HLT-001 or a more precise entropy rule
+
+analyzers/data.rs:
+- converts destructive SQL and wrong-layer DB hits into HLT-006/021
+
+analyzers/generated.rs:
+- converts generated-zone hits into HLT-002
+
+analyzers/boundary.rs:
+- converts boundary/streaming hits into HLT-019/022
+```
+
+Acceptance criteria:
+
+```text
+- scan.rs has no knowledge of caps.
+- scan.rs has no knowledge of final severity.
+- scan.rs returns evidence; analyzers attach rule semantics.
+- build_findings no longer calls scan functions directly except through analyzer output.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test audit_smoke
+cargo test -p jankurai --test rule_registry_smoke
+cargo test -p jankurai
+```
+
+---
+
+## Slice 9 — Finding quality hardening
+
+**Goal:** every finding is good enough for an agent to repair without reading all docs.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/src/audit/fix_queue.rs
+crates/jankurai/tests/finding_quality_guard.rs
+docs/audit-rubric.md
+```
+
+Standardize fields:
+
+```text
+problem:
+- one sentence
+- states exact violation
+- mentions concrete path/layer/policy
+
+reason:
+- why it matters
+- ties to TLR and repo safety
+
+evidence:
+- first item is compact and useful in SARIF/Markdown
+- include path:line when available
+- include matched import/term/manifest field
+- no huge snippets
+
+agent_fix:
+- action-oriented
+- points to source, not symptom
+- includes proof expectation
+
+rerun_command:
+- comes from rule lane
+- never empty for hard findings
+
+fingerprint:
+- stable across unrelated line shifts
+- includes rule ID, normalized path, normalized problem class, primary evidence key
+```
+
+Use this fingerprint input:
+
+```rust
+pub struct FingerprintInput<'a> {
+    pub rule_id: &'a str,
+    pub path: &'a str,
+    pub problem_class: &'a str,
+    pub matched_term: Option<&'a str>,
+    pub evidence_key: Option<&'a str>,
+}
+```
+
+Avoid hashing full text if it causes churn. For TODO or secret findings, hash the matched term class, not the whole line. For import findings, hash the import target. For manifest findings, hash the manifest field path.
+
+Add tests:
+
+```rust
+#[test]
+fn findings_have_actionable_shape() {
+    for finding in fixture_all_rule_findings() {
+        assert!(finding.problem.len() >= 20);
+        assert!(!finding.problem.contains("maybe"));
+        assert!(!finding.agent_fix.contains("investigate"));
+        assert!(!finding.evidence.is_empty());
+        assert!(finding.reason.as_deref().map(|s| s.len() >= 20).unwrap_or(true));
+    }
+}
+
+#[test]
+fn repair_queue_is_deterministic() {
+    let a = run_fixture_audit();
+    let b = run_fixture_audit();
+    assert_eq!(a.agent_fix_queue, b.agent_fix_queue);
+}
+```
+
+Acceptance criteria:
+
+```text
+- Findings answer: what failed, why it matters, where to fix, how to prove.
+- Repair queue is stable.
+- SARIF/Markdown first evidence lines are useful.
+- Confidence is rule-policy-derived, not arbitrary.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test finding_quality_guard
+cargo test -p jankurai --test audit_smoke
+```
+
+---
+
+## Slice 10 — Golden fixture suite
+
+**Goal:** stop relying on smoke tests; prove every rule category with fixtures.
+
+Owned paths:
+
+```text
+crates/jankurai/tests/fixtures/
+crates/jankurai/tests/rule_fixtures.rs
+crates/jankurai/tests/boundary_oracle_fixtures.rs
+crates/jankurai/tests/generated_zone_oracle.rs
+crates/jankurai/tests/security_rule_fixtures.rs
+crates/jankurai/tests/finding_quality_guard.rs
+```
+
+Fixture layout:
+
+```text
+fixtures/
+  phase02/
+    hlt001_dead_marker/
+      bad/
+      good/
+    hlt002_generated_mutation/
+      bad/
+      good/
+    hlt003_ownerless_path/
+      bad/
+      good/
+    hlt004_unmapped_proof/
+      bad/
+      good/
+    hlt005_python_product_truth/
+      bad/
+      good/
+    hlt006_direct_db_wrong_layer/
+      bad/
+      good/
+    hlt010_secret_sprawl/
+      bad/
+      good/
+    hlt011_prompt_injection/
+      bad/
+      good/
+    hlt012_overbroad_agency/
+      bad/
+      good/
+    hlt019_streaming_runtime_drift/
+      bad/
+      good/
+    hlt021_destructive_migration/
+      bad/
+      good/
+    hlt022_boundary_import_impurity/
+      bad/
+      good/
+```
+
+Each fixture asserts:
+
+```text
+bad:
+- expected rule_id appears
+- expected cap appears where applicable
+- finding severity/lane/docs/evidence/agent_fix are correct
+- score fails if hard cap applies
+
+good:
+- expected rule_id does not appear
+- no false positive from docs/reference/generated/vendor
+- score/caps behave as expected
+```
+
+Add a test helper:
+
+```rust
+pub struct ExpectedFinding {
+    pub rule_id: &'static str,
+    pub severity: &'static str,
+    pub lane: &'static str,
+    pub path_contains: &'static str,
+    pub problem_contains: &'static str,
+}
+
+pub fn assert_finding(report: &Report, expected: ExpectedFinding) { ... }
+pub fn assert_no_rule(report: &Report, rule_id: &str) { ... }
+```
+
+Acceptance criteria:
+
+```text
+- Every stable hard rule has at least one positive fixture.
+- Every boundary/generated/security rule has at least one negative false-positive fixture.
+- New rules require fixtures.
+- Fixtures run under `cargo test -p jankurai`.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test rule_fixtures
+cargo test -p jankurai --test boundary_oracle_fixtures
+cargo test -p jankurai --test generated_zone_oracle
+cargo test -p jankurai --test security_rule_fixtures
+```
+
+---
+
+## Slice 11 — Report compatibility and schema hardening
+
+**Goal:** harden internals without breaking existing audit output.
+
+Owned paths:
+
+```text
+schemas/repo-score.schema.json
+crates/jankurai/tests/report_compatibility_guard.rs
+crates/jankurai/tests/schema_contracts.rs
+crates/jankurai/src/model.rs
+crates/jankurai/src/render.rs
+```
+
+Rules:
+
+```text
+- Do not remove existing fields.
+- Additive fields are allowed only if schema and compatibility tests are updated.
+- Existing JSON consumers must still parse.
+- Markdown and SARIF renderers must still work with new finding evidence.
+```
+
+Compatibility guard should assert:
+
+```rust
+#[test]
+fn report_json_shape_remains_backward_compatible() {
+    let report = run_fixture_audit();
+    let value = serde_json::to_value(&report).unwrap();
+
+    assert!(value.get("standard_version").is_some());
+    assert!(value.get("auditor_version").is_some());
+    assert!(value.get("schema_version").is_some());
+    assert!(value.get("target_stack_id").is_some());
+    assert!(value.get("score").is_some());
+    assert!(value.get("raw_score").is_some());
+    assert!(value.get("hard_rules").is_some());
+    assert!(value.get("dimensions").is_some());
+    assert!(value.get("findings").is_some());
+    assert!(value.get("agent_fix_queue").is_some());
+}
+```
+
+Add schema checks for finding fields:
+
+```text
+- rule_id optional but required for high/critical by test
+- confidence number 0..1
+- evidence_kind non-empty
+- rerun_command non-empty
+- docs_url repo-local if present
+```
+
+Acceptance criteria:
+
+```text
+- Report schema validates.
+- Rendered Markdown remains stable.
+- SARIF line/snippet behavior remains stable.
+- No breaking JSON field removals.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test report_compatibility_guard
+cargo test -p jankurai --test schema_contracts
+cargo test -p jankurai --test audit_smoke
+```
+
+---
+
+## Slice 12 — Performance, crash safety, and noise budget
+
+**Goal:** semantic oracle improves findings without slowing or flaking the fast lane.
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/analyzers/*
+crates/jankurai/tests/perf_smoke.rs
+target/jankurai/phase02-perf.md
+```
+
+Set explicit budgets:
+
+```text
+- `cargo test -p jankurai` passes.
+- `just fast` passes.
+- `cargo check -p jankurai` delta is measured and recorded.
+- Audit on this repo completes without panic.
+- Malformed TOML/JSON/import syntax emits diagnostic/finding, not crash.
+- Parser failures never suppress existing scan-based evidence.
+```
+
+Add crash-safety tests:
+
+```rust
+#[test]
+fn malformed_boundaries_manifest_does_not_crash_audit() {
+    // create agent/boundaries.toml with invalid TOML
+    // assert report contains manifest parse finding
+}
+
+#[test]
+fn malformed_typescript_import_does_not_crash_ast_pilot() {
+    // create weird TS file
+    // assert audit returns Ok(report)
+}
+
+#[test]
+fn huge_file_is_bounded_or_skipped_with_diagnostic() {
+    // create oversized file
+    // assert no panic and diagnostic exists
+}
+```
+
+Noise budget:
+
+```text
+- Any new high finding must have a negative-control fixture.
+- Any regex-only detector must have docs/reference false-positive tests.
+- Any rule that fires on text alone should be lower confidence unless artifact/manifest backed.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test perf_smoke
+cargo test -p jankurai
+just fast
+time cargo check -p jankurai
+```
+
+---
+
+# Merge order
+
+Use the merge order already documented for Phase 02: rule registry/finding builder first, then boundary and generated-zone checks, then AST/import pilot, then final compatibility validation. ([GitHub][1])
+
+My exact merge order:
+
+```text
+1. State reconciliation and hardening receipt.
+2. RuleSpec metadata expansion.
+3. FindingBuilder add_rule_hit contract.
+4. CapSpec rule mapping.
+5. AnalyzerOutput / RuleHit contract.
+6. Convert security/shape/data generated scan outputs into RuleHit.
+7. Boundary manifest structs and boundary oracle.
+8. Generated-zone oracle.
+9. AST graph promotion.
+10. Fixture matrix.
+11. Compatibility/schema/perf validation.
+12. Finish receipt and mark Phase 02 hardened.
+```
+
+Do not merge AST/parser expansion before registry and finding builder are stable. Otherwise every analyzer will invent its own finding shape.
+
+---
+
+# Parallel work packets
+
+## Packet A — Rule registry and finding builder
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/rules.rs
+crates/jankurai/src/audit/finding_builder.rs
+crates/jankurai/tests/rule_registry_smoke.rs
+crates/jankurai/tests/finding_quality_guard.rs
+docs/audit-rubric.md
+```
+
+Tasks:
+
+```text
+- Add confidence policy, detector kind, cap impacts.
+- Add RuleId wrapper.
+- Add add_rule_hit.
+- Add hard-finding metadata tests.
+- Add generated rule index or docs entries.
+```
+
+Stop if:
+
+```text
+- Public JSON shape would break.
+- Existing rule IDs would be renamed.
+- High/critical findings can still emit without rule metadata.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test rule_registry_smoke
+cargo test -p jankurai --test finding_quality_guard
+```
+
+---
+
+## Packet B — Boundary oracle
+
+Owned paths:
+
+```text
+crates/jankurai/src/boundaries/*
+crates/jankurai/src/audit/analyzers/boundary.rs
+crates/jankurai/tests/boundary_oracle_fixtures.rs
+docs/boundary-oracle.md
+```
+
+Tasks:
+
+```text
+- Expand BoundaryManifest structs.
+- Normalize Rust/TS/Python/SQL/streaming policies.
+- Emit RuleHit.
+- Test false-positive allowlists.
+- Validate streaming exception metadata.
+```
+
+Stop if:
+
+```text
+- Boundary policy hardcodes something that should come from manifest.
+- Docs/reference/generated/vendor fixtures produce hard false positives.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test boundary_oracle_fixtures
+cargo test -p jankurai --test boundaries_manifest_smoke
+```
+
+---
+
+## Packet C — Generated-zone oracle
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/analyzers/generated.rs
+crates/jankurai/tests/generated_zone_oracle.rs
+crates/jankurai/tests/generated_zones_manifest_smoke.rs
+docs/generated-zones.md
+```
+
+Tasks:
+
+```text
+- Parse generated zones.
+- Validate source/command/path metadata.
+- Detect missing headers.
+- Route repairs to source and regenerate command.
+- Keep checksum-free hand-edit checks advisory where appropriate.
+```
+
+Stop if:
+
+```text
+- Finding tells agent to patch generated output directly.
+- Generated-zone checks block without reproducibility proof unless policy says so.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test generated_zone_oracle
+cargo test -p jankurai --test generated_zones_manifest_smoke
+```
+
+---
+
+## Packet D — AST/import graph pilot
+
+Owned paths:
+
+```text
+crates/jankurai/src/audit/analyzers/ast.rs
+crates/jankurai/tests/ast_import_graph_smoke.rs
+```
+
+Tasks:
+
+```text
+- Build graph once.
+- Emit all import hits.
+- Preserve line numbers.
+- Return diagnostics.
+- Keep dependency-light unless performance proof supports parser dependency.
+```
+
+Stop if:
+
+```text
+- AST parser can crash audit.
+- Parser dependency materially slows `just fast` without documented reason.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test ast_import_graph_smoke
+time cargo check -p jankurai
+```
+
+---
+
+## Packet E — Schema, compatibility, and final validation
+
+Owned paths:
+
+```text
+schemas/*
+crates/jankurai/tests/report_compatibility_guard.rs
+crates/jankurai/tests/schema_contracts.rs
+crates/jankurai/src/render.rs
+tips/phases/02-rule-engine-semantic-oracle.md
+tips/phases/logs/02-rule-engine-semantic-oracle.md.log
+```
+
+Tasks:
+
+```text
+- Ensure report schema remains backward-compatible.
+- Ensure Markdown/SARIF still render.
+- Run full validation.
+- Write finish receipt.
+- Mark Phase 02 hardened only after evidence exists.
+```
+
+Validation:
+
+```bash
+cargo test -p jankurai --test report_compatibility_guard
+cargo test -p jankurai --test schema_contracts
+cargo test -p jankurai
+just fast
+cargo run -p jankurai -- . \
+  --json target/jankurai/phase02-final-score.json \
+  --md target/jankurai/phase02-final-score.md
+```
+
+---
+
+# Final acceptance checklist
+
+Phase 02 can be marked **hardened** only when this checklist is green:
+
+```text
+Rule registry:
+[ ] Every stable rule has ID, name, category, TLR, severity, lane, owner hint, docs URL, evidence kind.
+[ ] Every stable rule has repair eligibility, repair risk, repair reason.
+[ ] Every stable rule has confidence policy.
+[ ] Every applicable rule maps to cap impact.
+[ ] Unknown emitted rule IDs fail tests.
+[ ] Rule docs and registry stay aligned.
+
+Caps:
+[ ] Every cap maps to at least one rule.
+[ ] Every applied hard cap produces at least one corresponding finding.
+[ ] Caps no longer duplicate hidden scan logic without rule hits.
+[ ] Legacy cap IDs remain stable.
+
+Analyzers:
+[ ] AnalyzerOutput exists.
+[ ] Analyzers emit RuleHit, dimensions, diagnostics.
+[ ] build_findings is no longer the policy switchboard.
+[ ] Parser/manifest failures degrade to diagnostics/findings, not crashes.
+
+Boundary oracle:
+[ ] agent/boundaries.toml is first-class input.
+[ ] Rust, TS, Python, SQL, and streaming policies are normalized.
+[ ] Boundary findings include path, line, owner, lane, evidence, reason, exact repair.
+[ ] Streaming exceptions require owner, expiry, classification/reason, migration path.
+[ ] Docs/reference/generated/vendor false positives are allowlisted and tested.
+
+Generated-zone oracle:
+[ ] agent/generated-zones.toml is parsed.
+[ ] Generated zone metadata requires path, source, command.
+[ ] Generated findings route to source and regeneration command.
+[ ] Header and hand-edit checks have fixtures.
+[ ] Public API contract drift requires generated output or proof.
+
+AST/import graph:
+[ ] Graph built once.
+[ ] All hits emitted, not just first.
+[ ] Rust domain impurity and TS web backend imports have precise rule mapping.
+[ ] Parser failures do not crash audit.
+[ ] Performance delta recorded.
+
+Finding quality:
+[ ] Every high/critical finding has rule_id, lane, docs_url, owner, agent_fix, rerun command.
+[ ] Every finding answers what failed, why it matters, where to fix, how to prove.
+[ ] Confidence is deterministic.
+[ ] Fingerprints are stable across unrelated line shifts where possible.
+[ ] Repair queue ordering is deterministic.
+
+Fixtures:
+[ ] Positive fixture for every hard stable rule.
+[ ] Negative false-positive fixture for every regex/semantic detector.
+[ ] Boundary fixture matrix complete.
+[ ] Generated-zone fixture matrix complete.
+[ ] Security/prompt/agency fixtures complete.
+
+Compatibility:
+[ ] repo-score schema validates.
+[ ] Markdown render still works.
+[ ] SARIF render still works.
+[ ] Existing output fields are not removed.
+[ ] report compatibility guard passes.
+
+Validation:
+[ ] cargo test -p jankurai
+[ ] just fast
+[ ] cargo run -p jankurai -- . --json target/jankurai/phase02-final-score.json --md target/jankurai/phase02-final-score.md
+[ ] cargo run -p jankurai -- lane . --changed <phase02 paths> --out target/jankurai/phase02-final-lane.json --md target/jankurai/phase02-final-lane.md
+[ ] performance delta for cargo check -p jankurai recorded
+[ ] finish receipt appended
+```
+
+---
+
+# The highest-leverage next changes
+
+The first five changes I would make are:
+
+```text
+1. Add RuleSpec.cap_impacts, RuleSpec.confidence, and RuleSpec.detector.
+2. Add RuleHit and AnalyzerOutput.
+3. Change FindingBuilder to add_rule_hit(RuleHit) and make hard findings require rule metadata.
+4. Expand BoundaryManifest to parse Rust/TypeScript/Python policy sections.
+5. Refactor AST pilot to build graph once and emit all boundary import hits.
+```
+
+That sequence closes the real architectural hole: today Phase 02 has a registry, analyzers, caps, scans, and a finding builder, but they are not yet a single hardened rule engine. Once those five are done, generated-zone, fixture, and compatibility hardening become straightforward rather than messy.
+
+[1]: https://github.com/jeppsontaylor/Jankurai/blob/main/tips/phases/02-rule-engine-semantic-oracle.md "Jankurai/tips/phases/02-rule-engine-semantic-oracle.md at main · jeppsontaylor/Jankurai · GitHub"
+[2]: https://github.com/jeppsontaylor/Jankurai/blob/main/tips/phases/00-phase-index.md "Jankurai/tips/phases/00-phase-index.md at main · jeppsontaylor/Jankurai · GitHub"
+[3]: https://github.com/jeppsontaylor/Jankurai/blob/main/docs/agent-native-standard.md "Jankurai/docs/agent-native-standard.md at main · jeppsontaylor/Jankurai · GitHub"
+[4]: https://github.com/jeppsontaylor/Jankurai "GitHub - jeppsontaylor/Jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[5]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/audit/rules.rs "raw.githubusercontent.com"
+

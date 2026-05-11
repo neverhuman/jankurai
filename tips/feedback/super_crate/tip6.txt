@@ -1,0 +1,2147 @@
+# ONE-COPY IMPLEMENTATION FILE
+
+This Markdown file is self-contained: proposal, value, stack placement, usage, schemas, commands, and all implementation code are embedded below as fenced code blocks. Copy this file as one artifact.
+
+---
+
+# Jankurai-ProofBind: the one Rust crate I would add to Jankurai
+
+**Recommendation:** add one new Rust crate, `jankurai-proofbind`, and have `jankurai init --profile rust-ts-postgres --level full` include it automatically as the repository’s semantic proof router.
+
+**One-line thesis:** Jankurai already knows *which paths changed* and *which proof lanes exist*; ProofBind teaches it *which behavior surfaces changed* and makes irrelevant green tests fail the merge.
+
+**Crate name:** `jankurai-proofbind`  
+**Cargo subcommand:** `cargo proofbind`  
+**Jankurai subcommand:** `jankurai proofbind`  
+**Primary artifact:** `target/jankurai/proofbind/surface-witness.json`  
+**Primary policy file:** `agent/proofbind.toml`  
+**Primary value:** turns “I ran tests” into “I ran the required proof for the exact API/route/authz/query/tool surface I changed.”
+
+---
+
+## 1. Why this is the #1 best crate for this repo
+
+Jankurai’s current control plane is strong: the README frames the project as a repository conformance standard and local audit CLI for auditable AI-assisted merge, with the rule “no proof, no merge; no receipt, no trust.” The paper companion describes vibe-code drift as ownerless paths, unmapped proof, stale contracts, false-green tests, missing security evidence, overbroad agent permissions, unproven UI changes, and unreceipted claims. The standard requires machine-obvious ownership, generated zones, proof lanes, agent-friendly failures, and evidence receipts.
+
+The key gap is not “more lint.” It is **semantic proof selection**.
+
+Today, the existing Jankurai flow maps changed **paths** to owners and proof lanes through `agent/owner-map.json`, `agent/test-map.json`, `agent/generated-zones.toml`, and `agent/proof-lanes.toml`. That is necessary, but it is still possible for an agent to change a high-risk behavior surface inside a mapped file and run a proof lane that is technically mapped but semantically weak.
+
+Examples:
+
+- A route’s authorization branch changes, but the mapped lane only runs a smoke test.
+- A public API signature changes, but no generated-client or SemVer witness runs.
+- A `sqlx::query!` mutation changes tenant isolation, but the DB lane only applies migrations.
+- A `clap` admin command gains destructive behavior, but no negative test or confirmation proof exists.
+- An MCP tool exposes filesystem, process, network, or DB authority, but the only evidence is a passing unit test.
+- A function returns `Ok(default)` in an error path; coverage exists, but no mutation/property proof proves the behavior.
+
+`jankurai-proofbind` closes that gap by creating a **Proof-Carrying Surface Manifest**. It scans Rust semantic surfaces, computes stable surface IDs and hashes, classifies risk, and emits proof obligations that Jankurai can attach to proof plans, receipts, findings, context packs, and merge witnesses.
+
+The result is a practical rule:
+
+> If a changed semantic surface has no matching proof receipt, the merge is false green even when tests pass.
+
+That single idea best matches Jankurai’s thesis because it attacks vibe coding at the point where agents most often fool themselves: “tests passed” without proving the changed behavior.
+
+---
+
+## 2. What I found in the repo that shapes the design
+
+### Existing strengths to preserve
+
+Jankurai already has the right architecture for this crate:
+
+- `crates/jankurai` is the current Rust workspace member.
+- `crates/jankurai/src/model.rs` defines report, finding, proof receipt, evidence index, manifest fingerprint, and agent-fix data models.
+- `crates/jankurai/src/commands/proof.rs` builds proof plans, executes planned proof runs, writes receipts, and verifies evidence indexes.
+- `crates/jankurai/src/commands/context_data.rs` loads `agent/owner-map.json`, `agent/test-map.json`, `agent/generated-zones.toml`, and `agent/proof-lanes.toml` into `RepoCatalog`.
+- `RepoCatalog` currently routes by path prefix or exact path, which is simple and deterministic.
+- `crates/jankurai/src/audit/rules.rs` already has stable rule IDs for false-green tests, authorization isolation, input-boundary gaps, agent tool supply gaps, destructive migrations, supply-chain drift, and unreceipted proof claims.
+- `crates/jankurai/src/validation.rs` already validates artifacts through repo-local JSON schemas.
+- `crates/jankurai/src/init/templates.rs` already scaffolds `Justfile`, `agent/proof-lanes.toml`, `agent/tool-adoption.toml`, CI, and other control-plane files.
+
+ProofBind should therefore be a **small additive crate**, not a rewrite.
+
+### Existing gap to target
+
+The current proof planner answers:
+
+> “Given a changed path, which owner/test-map/proof lane applies?”
+
+ProofBind answers:
+
+> “Given a changed symbol, route, migration, query, CLI command, or agent tool, which exact proof obligation must be satisfied?”
+
+The latter is the missing semantic layer.
+
+---
+
+## 3. Ecosystem scan: why this is not redundant
+
+The Rust ecosystem has excellent point tools, and ProofBind should orchestrate them rather than compete with them.
+
+| Tool / standard | What it already does well | What it does not do for Jankurai |
+|---|---|---|
+| `cargo-vet` | Audits third-party dependencies against trusted audit criteria and highlights gaps. | Does not bind first-party behavior surfaces to proof lanes or receipts. |
+| `cargo-deny` | Checks licenses, bans, advisories, duplicate crates, and sources in the crate graph. | Does not know whether a changed authz function has negative tests. |
+| `cargo-nextest` | Fast, isolated Rust test runner with CI support, filtering, retries, recording, and JUnit export. | Runs tests; does not decide which semantic behavior must be proven. |
+| `cargo-mutants` | Mutation testing finds code locations where bugs can be inserted without tests failing. | Great proof backend, but not path/surface/risk aware inside Jankurai. |
+| `cargo-fuzz` | Recommended Rust fuzzing tool using libFuzzer. | Great proof backend, but does not know which changed external input surfaces require fuzzing. |
+| `cargo-semver-checks` / public API tooling | Detects Rust public API compatibility breaks. | Public API proof is only one surface type; it does not cover authz, DB, tools, CLI, or business invariants. |
+| SQLx checked queries | Can check SQL syntax and result types at compile time. | Does not prove tenant isolation, authorization semantics, destructive migration safety, or rollback policy. |
+| OpenSSF Scorecard / SLSA / NIST SSDF | Strong supply-chain and secure-development framing. | They are not repo-local semantic proof routers for AI-agent merges. |
+| MCP tool annotations | Provide tool behavior hints such as read-only, destructive, idempotent, and open-world. | The MCP spec says annotations are hints and untrusted unless from trusted servers; Jankurai needs independent evidence. |
+| OWASP GenAI / LLM security guidance | Names risks such as prompt injection, supply chain, excessive agency, and insecure output handling. | Does not generate Rust workspace proof obligations or receipts. |
+
+ProofBind’s role is therefore to be the **Jankurai-native semantic binding layer** above these tools. It selects and verifies proof obligations; it does not replace the proof engines.
+
+---
+
+## 4. The new crate in one picture
+
+```text
+changed files / git diff
+        │
+        ▼
+Cargo metadata + Rust AST + DB/contract/tool scans
+        │
+        ▼
+ProofBind Surface Witness
+  target/jankurai/proofbind/surface-witness.json
+        │
+        ▼
+Risk classifier + agent/proofbind.toml
+        │
+        ▼
+Proof obligations
+  target/jankurai/proofbind/obligations.json
+        │
+        ├── proof plan enrichment
+        │     jankurai proof / jankurai prove
+        │
+        ├── audit findings
+        │     HLT-008, HLT-021, HLT-022, HLT-023, HLT-024, HLT-027
+        │
+        ├── agent context pack
+        │     “you changed surface X; required proof is Y”
+        │
+        └── merge witness
+              “semantic obligations were satisfied by receipts A/B/C”
+```
+
+---
+
+## 5. What counts as a “surface”
+
+A surface is any code or artifact boundary where a local edit can change externally observable behavior, security posture, or durable truth.
+
+Initial MVP surface kinds:
+
+| Surface kind | Examples | Default Jankurai rule mapping |
+|---|---|---|
+| `rust_public_api` | `pub fn`, `pub struct`, `pub enum`, exported traits | `HLT-007-HANDWRITTEN-CONTRACT`, `HLT-008-FALSE-GREEN-RISK` |
+| `http_route` | `axum::Router::route`, handler functions | `HLT-022-AUTHZ-ISOLATION-GAP`, `HLT-023-INPUT-BOUNDARY-GAP` |
+| `cli_command` | `clap::Parser`, `Subcommand`, command handlers | `HLT-023-INPUT-BOUNDARY-GAP`, `HLT-024-AGENT-TOOL-SUPPLY-GAP` when commands are agent-invoked |
+| `sql_query` | `sqlx::query!`, `query_as!`, raw SQL strings | `HLT-006-DIRECT-DB-WRONG-LAYER`, `HLT-022-AUTHZ-ISOLATION-GAP` |
+| `db_migration` | `db/migrations/*.sql` | `HLT-021-DESTRUCTIVE-MIGRATION` |
+| `authz_boundary` | functions/types containing authz, authorize, policy, tenant, org, role, permission | `HLT-022-AUTHZ-ISOLATION-GAP` |
+| `input_boundary` | deserialization, JSON, env, filesystem, network, process args, tool input schemas | `HLT-023-INPUT-BOUNDARY-GAP` |
+| `mcp_tool` | MCP `Tool`, tool registry, `tools/list`, `tools/call`, annotations | `HLT-024-AGENT-TOOL-SUPPLY-GAP` |
+| `unsafe_or_process_sink` | `unsafe`, `std::process::Command`, filesystem writes, network calls | `HLT-023-INPUT-BOUNDARY-GAP`, `HLT-016-SUPPLY-CHAIN-DRIFT` |
+| `business_invariant` | pure decision functions, state transitions, pricing, workflow gates | `HLT-008-FALSE-GREEN-RISK` |
+
+The surface manifest turns code into a machine-readable map:
+
+```json
+{
+  "id": "surface:authz_boundary:crates/application/src/refunds.rs:AuthorizeRefund",
+  "kind": "authz_boundary",
+  "path": "crates/application/src/refunds.rs",
+  "line": 41,
+  "symbol": "AuthorizeRefund::check",
+  "owner": "application",
+  "risk": "critical",
+  "lanes": ["fast", "db", "security"],
+  "rules": ["HLT-022-AUTHZ-ISOLATION-GAP", "HLT-008-FALSE-GREEN-RISK"],
+  "required_proofs": [
+    "negative authorization matrix test",
+    "tenant isolation regression test",
+    "mutation proof for decision branch"
+  ],
+  "semantic_hash": "sha256:..."
+}
+```
+
+---
+
+## 6. User experience
+
+### New repo adoption
+
+```bash
+jankurai init --profile rust-ts-postgres --level full --yes
+just proofbind
+```
+
+The full Rust profile adds:
+
+```toml
+# agent/proofbind.toml
+schema_version = "1.0.0"
+mode = "standard"
+fail_on_unbound_changed_surface = true
+fail_on_missing_semantic_receipt = true
+```
+
+and this lane:
+
+```toml
+[[lane]]
+name = "proofbind"
+command = "jankurai proofbind verify . --changed-from origin/main --witness target/jankurai/proofbind/surface-witness.json --obligations target/jankurai/proofbind/obligations.json --md target/jankurai/proofbind/proofbind.md"
+purpose = "Bind changed Rust semantic surfaces to required proof obligations."
+kind = "semantic-proof"
+rules_covered = ["HLT-008-FALSE-GREEN-RISK", "HLT-021-DESTRUCTIVE-MIGRATION", "HLT-022-AUTHZ-ISOLATION-GAP", "HLT-023-INPUT-BOUNDARY-GAP", "HLT-024-AGENT-TOOL-SUPPLY-GAP", "HLT-027-HUMAN-REVIEW-EVIDENCE-GAP"]
+required_artifacts = ["target/jankurai/proofbind/surface-witness.json", "target/jankurai/proofbind/obligations.json", "target/jankurai/proofbind/proofbind.md"]
+timeout_seconds = 60
+requires_network = false
+destructive = false
+```
+
+### Local loop for agents
+
+```bash
+# See what changed semantically.
+jankurai proofbind map . --changed-from origin/main --md target/jankurai/proofbind/surface-witness.md
+
+# Fail if any changed surface lacks the required proof evidence.
+jankurai proofbind verify . --changed-from origin/main
+
+# Then run only the required lanes.
+jankurai proof --changed-from origin/main --out target/jankurai/proof-plan.json --md target/jankurai/proof-plan.md
+jankurai prove --plan target/jankurai/proof-plan.json
+```
+
+### Output agents actually need
+
+```md
+## Changed high-risk surfaces
+
+1. `AuthorizeRefund::check` in `crates/application/src/refunds.rs:41`
+   - Risk: critical
+   - Rules: HLT-022, HLT-008
+   - Required proof:
+     - `cargo nextest run -E 'test(authz_refund_matrix)'`
+     - `cargo mutants --file crates/application/src/refunds.rs --in-place --timeout 30`
+   - Missing receipt: negative authz matrix
+
+2. `admin_wipe_user` in `crates/admin/src/cli.rs:88`
+   - Risk: critical
+   - Rules: HLT-023, HLT-024
+   - Required proof:
+     - CLI destructive confirmation test
+     - no agent invocation without explicit human approval
+```
+
+This changes agent behavior. Instead of “run tests,” the agent gets a proof checklist tied to exact symbols and risk.
+
+---
+
+## 7. Where it lives in the current stack
+
+### New files
+
+```text
+crates/
+  jankurai-proofbind/
+    Cargo.toml
+    src/
+      lib.rs
+      main.rs
+      model.rs
+      config.rs
+      fs.rs
+      git.rs
+      rust_scan.rs
+      obligations.rs
+      render.rs
+    tests/
+      surface_smoke.rs
+      changed_verify.rs
+
+crates/jankurai/src/commands/proofbind.rs
+crates/jankurai/src/audit/proofbind_artifact.rs
+schemas/proofbind-witness.schema.json
+schemas/proofbind-obligations.schema.json
+crates/jankurai/templates/agent/proofbind.toml
+docs/proofbind.md
+```
+
+### Modified files
+
+```text
+Cargo.toml
+crates/jankurai/Cargo.toml
+crates/jankurai/src/commands.rs
+crates/jankurai/src/main.rs
+crates/jankurai/src/lib.rs
+crates/jankurai/src/model.rs
+crates/jankurai/src/validation.rs
+crates/jankurai/src/audit/mod.rs
+crates/jankurai/src/init/templates.rs
+crates/jankurai/templates/agent/proof-lanes.toml
+crates/jankurai/templates/agent/tool-adoption.toml
+```
+
+---
+
+## 8. Policy file: `agent/proofbind.toml`
+
+```toml
+schema_version = "1.0.0"
+mode = "standard"
+
+# In advisory mode this emits findings only. In standard mode it fails high/critical gaps.
+fail_on_unbound_changed_surface = true
+fail_on_missing_semantic_receipt = true
+fail_on_missing_owner = true
+fail_on_missing_test_route = true
+
+# Keep defaults conservative. Projects can lower risk only with reviewed exceptions.
+default_external_input_risk = "high"
+default_authz_risk = "critical"
+default_mcp_tool_risk = "critical"
+default_destructive_migration_risk = "critical"
+
+# These strings are intentionally simple and explainable. No ML classifier is required.
+authz_terms = ["authz", "authorize", "authorization", "permission", "policy", "tenant", "org", "role", "rbac", "acl"]
+input_terms = ["deserialize", "parse", "from_json", "serde_json", "request", "payload", "args", "env", "stdin", "file", "path", "url"]
+destructive_sql_terms = ["drop table", "drop column", "truncate", "delete from", "alter table", "rename column", "rename table"]
+agent_tool_terms = ["mcp", "tool", "tools/list", "tools/call", "command", "browser", "terminal", "filesystem"]
+
+[lanes]
+fast = "cargo nextest run --workspace"
+contract = "cargo semver-checks --workspace || cargo public-api diff latest"
+db = "cargo test --workspace db_ -- --nocapture"
+security = "cargo deny check && cargo audit"
+mutation = "cargo mutants --no-shuffle --timeout 30"
+fuzz = "cargo fuzz run proofbind_input -- -max_total_time=30"
+audit = "jankurai audit . --mode standard --json agent/repo-score.json --md agent/repo-score.md"
+
+[[surface_rule]]
+kind = "authz_boundary"
+required_rules = ["HLT-022-AUTHZ-ISOLATION-GAP", "HLT-008-FALSE-GREEN-RISK"]
+required_lanes = ["fast", "db", "mutation"]
+required_test_patterns = ["authz", "tenant", "negative", "denied", "role"]
+
+[[surface_rule]]
+kind = "input_boundary"
+required_rules = ["HLT-023-INPUT-BOUNDARY-GAP"]
+required_lanes = ["fast", "fuzz"]
+required_test_patterns = ["invalid", "malformed", "reject", "boundary"]
+
+[[surface_rule]]
+kind = "mcp_tool"
+required_rules = ["HLT-024-AGENT-TOOL-SUPPLY-GAP", "HLT-023-INPUT-BOUNDARY-GAP"]
+required_lanes = ["security", "fast"]
+required_test_patterns = ["tool", "permission", "confirmation", "deny", "schema"]
+
+[[surface_rule]]
+kind = "db_migration"
+required_rules = ["HLT-021-DESTRUCTIVE-MIGRATION"]
+required_lanes = ["db"]
+required_test_patterns = ["migration", "rollback", "lock", "backfill"]
+
+[[surface_rule]]
+kind = "rust_public_api"
+required_rules = ["HLT-007-HANDWRITTEN-CONTRACT", "HLT-008-FALSE-GREEN-RISK"]
+required_lanes = ["contract", "fast"]
+required_test_patterns = ["api", "compat", "contract"]
+```
+
+---
+
+## 9. Artifact schemas
+
+### `schemas/proofbind-witness.schema.json`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/proofbind-witness.schema.json",
+  "title": "Jankurai ProofBind Surface Witness",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "repo_root", "surfaces", "summary"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "repo_root": { "type": "string", "minLength": 1 },
+    "git_head": { "type": "string" },
+    "base_ref": { "type": "string" },
+    "changed_paths": { "type": "array", "items": { "type": "string" } },
+    "summary": {
+      "type": "object",
+      "required": ["surface_count", "changed_surface_count", "high_risk_count", "critical_risk_count"],
+      "properties": {
+        "surface_count": { "type": "integer", "minimum": 0 },
+        "changed_surface_count": { "type": "integer", "minimum": 0 },
+        "high_risk_count": { "type": "integer", "minimum": 0 },
+        "critical_risk_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "surfaces": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/surface" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "surface": {
+      "type": "object",
+      "required": ["id", "kind", "path", "symbol", "semantic_hash", "risk", "rules", "lanes", "changed"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "kind": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "line": { "type": "integer", "minimum": 0 },
+        "symbol": { "type": "string", "minLength": 1 },
+        "owner": { "type": "string" },
+        "semantic_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "risk": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "rules": { "type": "array", "items": { "type": "string" } },
+        "lanes": { "type": "array", "items": { "type": "string" } },
+        "required_proofs": { "type": "array", "items": { "type": "string" } },
+        "changed": { "type": "boolean" },
+        "evidence": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}
+```
+
+### `schemas/proofbind-obligations.schema.json`
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jankurai.dev/schemas/proofbind-obligations.schema.json",
+  "title": "Jankurai ProofBind Obligations",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "repo_root", "verdict", "obligations"],
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0.0" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "repo_root": { "type": "string", "minLength": 1 },
+    "verdict": { "type": "string", "enum": ["pass", "warn", "fail"] },
+    "obligations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/obligation" }
+    },
+    "issues": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "obligation": {
+      "type": "object",
+      "required": ["surface_id", "rule_id", "severity", "lane", "status", "reason"],
+      "properties": {
+        "surface_id": { "type": "string", "minLength": 1 },
+        "rule_id": { "type": "string", "minLength": 1 },
+        "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "lane": { "type": "string", "minLength": 1 },
+        "command": { "type": "string" },
+        "required_test_patterns": { "type": "array", "items": { "type": "string" } },
+        "required_artifacts": { "type": "array", "items": { "type": "string" } },
+        "status": { "type": "string", "enum": ["satisfied", "missing", "skipped", "unknown"] },
+        "reason": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}
+```
+
+---
+
+## 10. Code files
+
+The following is an implementation-ready MVP. It intentionally uses conservative, deterministic heuristics first. Later versions can add deeper type analysis through rustdoc JSON or compiler integrations.
+
+### 10.1 Root workspace patch: `Cargo.toml`
+
+```toml
+[workspace]
+members = ["crates/jankurai", "crates/jankurai-proofbind"]
+resolver = "2"
+```
+
+### 10.2 New crate manifest: `crates/jankurai-proofbind/Cargo.toml`
+
+```toml
+[package]
+name = "jankurai-proofbind"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic proof-surface router for Jankurai agent-native Rust repositories."
+license = "MIT"
+repository = "https://github.com/jeppsontaylor/Jankurai"
+keywords = ["jankurai", "testing", "agent", "security", "rust"]
+categories = ["development-tools", "command-line-utilities"]
+
+[lib]
+name = "jankurai_proofbind"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cargo-proofbind"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+cargo_metadata = "0.19"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+globset = "0.4"
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+syn = { version = "2.0", features = ["full", "visit"] }
+toml = "0.9"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.23"
+```
+
+### 10.3 `crates/jankurai-proofbind/src/model.rs`
+
+```rust
+use serde::{Deserialize, Serialize};
+
+pub const SCHEMA_VERSION: &str = "1.0.0";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SurfaceKind {
+    RustPublicApi,
+    HttpRoute,
+    CliCommand,
+    SqlQuery,
+    DbMigration,
+    AuthzBoundary,
+    InputBoundary,
+    McpTool,
+    UnsafeOrProcessSink,
+    BusinessInvariant,
+}
+
+impl SurfaceKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RustPublicApi => "rust_public_api",
+            Self::HttpRoute => "http_route",
+            Self::CliCommand => "cli_command",
+            Self::SqlQuery => "sql_query",
+            Self::DbMigration => "db_migration",
+            Self::AuthzBoundary => "authz_boundary",
+            Self::InputBoundary => "input_boundary",
+            Self::McpTool => "mcp_tool",
+            Self::UnsafeOrProcessSink => "unsafe_or_process_sink",
+            Self::BusinessInvariant => "business_invariant",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl RiskLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Surface {
+    pub id: String,
+    pub kind: String,
+    pub path: String,
+    pub line: usize,
+    pub symbol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    pub semantic_hash: String,
+    pub risk: String,
+    pub rules: Vec<String>,
+    pub lanes: Vec<String>,
+    pub required_proofs: Vec<String>,
+    pub changed: bool,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WitnessSummary {
+    pub surface_count: usize,
+    pub changed_surface_count: usize,
+    pub high_risk_count: usize,
+    pub critical_risk_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurfaceWitness {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub repo_root: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    pub changed_paths: Vec<String>,
+    pub summary: WitnessSummary,
+    pub surfaces: Vec<Surface>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProofObligation {
+    pub surface_id: String,
+    pub rule_id: String,
+    pub severity: String,
+    pub lane: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    pub required_test_patterns: Vec<String>,
+    pub required_artifacts: Vec<String>,
+    pub status: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObligationsReport {
+    pub schema_version: String,
+    pub generated_at: String,
+    pub repo_root: String,
+    pub verdict: String,
+    pub obligations: Vec<ProofObligation>,
+    pub issues: Vec<String>,
+}
+```
+
+### 10.4 `crates/jankurai-proofbind/src/config.rs`
+
+```rust
+use crate::model::SurfaceKind;
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProofbindConfig {
+    #[serde(default = "default_schema")]
+    pub schema_version: String,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+    #[serde(default = "default_true")]
+    pub fail_on_unbound_changed_surface: bool,
+    #[serde(default = "default_true")]
+    pub fail_on_missing_semantic_receipt: bool,
+    #[serde(default = "default_true")]
+    pub fail_on_missing_owner: bool,
+    #[serde(default = "default_true")]
+    pub fail_on_missing_test_route: bool,
+    #[serde(default = "default_external_input_risk")]
+    pub default_external_input_risk: String,
+    #[serde(default = "default_critical")]
+    pub default_authz_risk: String,
+    #[serde(default = "default_critical")]
+    pub default_mcp_tool_risk: String,
+    #[serde(default = "default_critical")]
+    pub default_destructive_migration_risk: String,
+    #[serde(default = "default_authz_terms")]
+    pub authz_terms: Vec<String>,
+    #[serde(default = "default_input_terms")]
+    pub input_terms: Vec<String>,
+    #[serde(default = "default_destructive_sql_terms")]
+    pub destructive_sql_terms: Vec<String>,
+    #[serde(default = "default_agent_tool_terms")]
+    pub agent_tool_terms: Vec<String>,
+    #[serde(default)]
+    pub lanes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub surface_rule: Vec<SurfaceRule>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SurfaceRule {
+    pub kind: String,
+    #[serde(default)]
+    pub required_rules: Vec<String>,
+    #[serde(default)]
+    pub required_lanes: Vec<String>,
+    #[serde(default)]
+    pub required_test_patterns: Vec<String>,
+}
+
+impl ProofbindConfig {
+    pub fn load(repo: &Path) -> Result<Self> {
+        let path = repo.join("agent/proofbind.toml");
+        if path.is_file() {
+            let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            let mut parsed: Self = toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+            parsed.fill_defaults();
+            Ok(parsed)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
+    pub fn rule_for_kind(&self, kind: &SurfaceKind) -> Option<&SurfaceRule> {
+        self.surface_rule.iter().find(|rule| rule.kind == kind.as_str())
+    }
+
+    fn fill_defaults(&mut self) {
+        let defaults = Self::default();
+        if self.lanes.is_empty() {
+            self.lanes = defaults.lanes;
+        }
+        if self.surface_rule.is_empty() {
+            self.surface_rule = defaults.surface_rule;
+        }
+    }
+}
+
+impl Default for ProofbindConfig {
+    fn default() -> Self {
+        let mut lanes = BTreeMap::new();
+        lanes.insert("fast".into(), "cargo nextest run --workspace".into());
+        lanes.insert("contract".into(), "cargo semver-checks --workspace || cargo public-api diff latest".into());
+        lanes.insert("db".into(), "cargo test --workspace db_ -- --nocapture".into());
+        lanes.insert("security".into(), "cargo deny check && cargo audit".into());
+        lanes.insert("mutation".into(), "cargo mutants --no-shuffle --timeout 30".into());
+        lanes.insert("fuzz".into(), "cargo fuzz run proofbind_input -- -max_total_time=30".into());
+        lanes.insert("audit".into(), "jankurai audit . --mode standard --json agent/repo-score.json --md agent/repo-score.md".into());
+
+        Self {
+            schema_version: default_schema(),
+            mode: default_mode(),
+            fail_on_unbound_changed_surface: true,
+            fail_on_missing_semantic_receipt: true,
+            fail_on_missing_owner: true,
+            fail_on_missing_test_route: true,
+            default_external_input_risk: default_external_input_risk(),
+            default_authz_risk: default_critical(),
+            default_mcp_tool_risk: default_critical(),
+            default_destructive_migration_risk: default_critical(),
+            authz_terms: default_authz_terms(),
+            input_terms: default_input_terms(),
+            destructive_sql_terms: default_destructive_sql_terms(),
+            agent_tool_terms: default_agent_tool_terms(),
+            lanes,
+            surface_rule: vec![
+                SurfaceRule {
+                    kind: "authz_boundary".into(),
+                    required_rules: vec!["HLT-022-AUTHZ-ISOLATION-GAP".into(), "HLT-008-FALSE-GREEN-RISK".into()],
+                    required_lanes: vec!["fast".into(), "db".into(), "mutation".into()],
+                    required_test_patterns: vec!["authz".into(), "tenant".into(), "negative".into(), "denied".into(), "role".into()],
+                },
+                SurfaceRule {
+                    kind: "input_boundary".into(),
+                    required_rules: vec!["HLT-023-INPUT-BOUNDARY-GAP".into()],
+                    required_lanes: vec!["fast".into(), "fuzz".into()],
+                    required_test_patterns: vec!["invalid".into(), "malformed".into(), "reject".into(), "boundary".into()],
+                },
+                SurfaceRule {
+                    kind: "mcp_tool".into(),
+                    required_rules: vec!["HLT-024-AGENT-TOOL-SUPPLY-GAP".into(), "HLT-023-INPUT-BOUNDARY-GAP".into()],
+                    required_lanes: vec!["security".into(), "fast".into()],
+                    required_test_patterns: vec!["tool".into(), "permission".into(), "confirmation".into(), "deny".into(), "schema".into()],
+                },
+                SurfaceRule {
+                    kind: "db_migration".into(),
+                    required_rules: vec!["HLT-021-DESTRUCTIVE-MIGRATION".into()],
+                    required_lanes: vec!["db".into()],
+                    required_test_patterns: vec!["migration".into(), "rollback".into(), "lock".into(), "backfill".into()],
+                },
+                SurfaceRule {
+                    kind: "rust_public_api".into(),
+                    required_rules: vec!["HLT-007-HANDWRITTEN-CONTRACT".into(), "HLT-008-FALSE-GREEN-RISK".into()],
+                    required_lanes: vec!["contract".into(), "fast".into()],
+                    required_test_patterns: vec!["api".into(), "compat".into(), "contract".into()],
+                },
+            ],
+        }
+    }
+}
+
+fn default_schema() -> String { "1.0.0".into() }
+fn default_mode() -> String { "standard".into() }
+fn default_true() -> bool { true }
+fn default_external_input_risk() -> String { "high".into() }
+fn default_critical() -> String { "critical".into() }
+fn default_authz_terms() -> Vec<String> { vec!["authz", "authorize", "authorization", "permission", "policy", "tenant", "org", "role", "rbac", "acl"].into_iter().map(str::to_string).collect() }
+fn default_input_terms() -> Vec<String> { vec!["deserialize", "parse", "from_json", "serde_json", "request", "payload", "args", "env", "stdin", "file", "path", "url"].into_iter().map(str::to_string).collect() }
+fn default_destructive_sql_terms() -> Vec<String> { vec!["drop table", "drop column", "truncate", "delete from", "alter table", "rename column", "rename table"].into_iter().map(str::to_string).collect() }
+fn default_agent_tool_terms() -> Vec<String> { vec!["mcp", "tool", "tools/list", "tools/call", "command", "browser", "terminal", "filesystem"].into_iter().map(str::to_string).collect() }
+```
+
+### 10.5 `crates/jankurai-proofbind/src/fs.rs`
+
+```rust
+use anyhow::Result;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
+
+pub fn rust_files(repo: &Path) -> Result<Vec<PathBuf>> {
+    let ignores = ignore_set()?;
+    let mut out = Vec::new();
+    for entry in WalkDir::new(repo).follow_links(false) {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(repo).unwrap_or(path);
+        if ignores.is_match(rel) {
+            continue;
+        }
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path.to_path_buf());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+pub fn sql_migrations(repo: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for dir in ["db/migrations", "migrations"] {
+        let root = repo.join(dir);
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("sql") {
+                out.push(path.to_path_buf());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+pub fn rel(repo: &Path, path: &Path) -> String {
+    path.strip_prefix(repo)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn ignore_set() -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in [
+        ".git/**",
+        "target/**",
+        "node_modules/**",
+        "dist/**",
+        "coverage/**",
+        "contracts/generated/**",
+        "apps/web/src/generated/**",
+    ] {
+        builder.add(Glob::new(pattern)?);
+    }
+    Ok(builder.build()?)
+}
+```
+
+### 10.6 `crates/jankurai-proofbind/src/git.rs`
+
+```rust
+use anyhow::Result;
+use std::path::Path;
+use std::process::Command;
+
+pub fn git_head(repo: &Path) -> Option<String> {
+    git_output(repo, &["rev-parse", "--short", "HEAD"])
+}
+
+pub fn changed_paths(repo: &Path, changed_from: Option<&str>, explicit: &[String]) -> Result<Vec<String>> {
+    if !explicit.is_empty() {
+        return Ok(normalize(explicit.to_vec()));
+    }
+    let Some(base) = changed_from else {
+        return Ok(Vec::new());
+    };
+    let Some(output) = git_output(repo, &["diff", "--name-only", base, "--"]) else {
+        return Ok(Vec::new());
+    };
+    Ok(normalize(output.lines().map(str::to_string).collect()))
+}
+
+fn normalize(paths: Vec<String>) -> Vec<String> {
+    let mut out = paths
+        .into_iter()
+        .map(|p| p.trim().trim_start_matches("./").replace('\\', "/"))
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+```
+
+### 10.7 `crates/jankurai-proofbind/src/rust_scan.rs`
+
+```rust
+use crate::config::ProofbindConfig;
+use crate::fs;
+use crate::model::{RiskLevel, Surface, SurfaceKind};
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::fs as stdfs;
+use std::path::Path;
+use syn::visit::{self, Visit};
+use syn::{Attribute, Expr, ExprCall, ExprMacro, File, Item, ItemEnum, ItemFn, ItemStruct, ItemTrait, Macro, Visibility};
+
+pub fn scan_rust_file(repo: &Path, path: &Path, cfg: &ProofbindConfig, changed_paths: &[String]) -> Result<Vec<Surface>> {
+    let text = stdfs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let ast: File = syn::parse_file(&text).with_context(|| format!("parse Rust AST {}", path.display()))?;
+    let rel = fs::rel(repo, path);
+    let changed = changed_paths.iter().any(|p| p == &rel || rel.starts_with(&format!("{p}/")));
+    let mut visitor = SurfaceVisitor {
+        repo,
+        rel: rel.clone(),
+        source: text.clone(),
+        cfg,
+        changed,
+        surfaces: Vec::new(),
+    };
+    visitor.visit_file(&ast);
+    Ok(visitor.surfaces)
+}
+
+struct SurfaceVisitor<'a> {
+    repo: &'a Path,
+    rel: String,
+    source: String,
+    cfg: &'a ProofbindConfig,
+    changed: bool,
+    surfaces: Vec<Surface>,
+}
+
+impl<'ast, 'a> Visit<'ast> for SurfaceVisitor<'a> {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        let name = node.sig.ident.to_string();
+        let vis_pub = matches!(node.vis, Visibility::Public(_));
+        let lower = name.to_lowercase();
+
+        if vis_pub {
+            self.push_surface(SurfaceKind::RustPublicApi, &name, "public Rust function", RiskLevel::Medium);
+        }
+        if contains_any(&lower, &self.cfg.authz_terms) {
+            self.push_surface(SurfaceKind::AuthzBoundary, &name, "authorization-looking function name", RiskLevel::Critical);
+        }
+        if contains_any(&lower, &self.cfg.input_terms) {
+            self.push_surface(SurfaceKind::InputBoundary, &name, "input-looking function name", RiskLevel::High);
+        }
+        if looks_like_business_invariant(&lower) {
+            self.push_surface(SurfaceKind::BusinessInvariant, &name, "business invariant or state transition", RiskLevel::High);
+        }
+        if has_test_attr(&node.attrs) {
+            // Tests are evidence, not product surfaces.
+        }
+        visit::visit_item_fn(self, node);
+    }
+
+    fn visit_item_struct(&mut self, node: &'ast ItemStruct) {
+        let name = node.ident.to_string();
+        if matches!(node.vis, Visibility::Public(_)) {
+            self.push_surface(SurfaceKind::RustPublicApi, &name, "public Rust struct", RiskLevel::Medium);
+        }
+        if has_attr_containing(&node.attrs, "Parser") || has_attr_containing(&node.attrs, "Args") || has_attr_containing(&node.attrs, "Subcommand") {
+            self.push_surface(SurfaceKind::CliCommand, &name, "clap command/args surface", RiskLevel::High);
+        }
+        if name.to_lowercase().contains("tool") || name.to_lowercase().contains("mcp") {
+            self.push_surface(SurfaceKind::McpTool, &name, "MCP/tool-like struct", RiskLevel::Critical);
+        }
+        visit::visit_item_struct(self, node);
+    }
+
+    fn visit_item_enum(&mut self, node: &'ast ItemEnum) {
+        let name = node.ident.to_string();
+        if matches!(node.vis, Visibility::Public(_)) {
+            self.push_surface(SurfaceKind::RustPublicApi, &name, "public Rust enum", RiskLevel::Medium);
+        }
+        if has_attr_containing(&node.attrs, "Subcommand") || name.to_lowercase().contains("command") {
+            self.push_surface(SurfaceKind::CliCommand, &name, "clap subcommand surface", RiskLevel::High);
+        }
+        visit::visit_item_enum(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
+        let name = node.ident.to_string();
+        if matches!(node.vis, Visibility::Public(_)) {
+            self.push_surface(SurfaceKind::RustPublicApi, &name, "public Rust trait", RiskLevel::Medium);
+        }
+        visit::visit_item_trait(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast Macro) {
+        let path = node.path.segments.iter().map(|s| s.ident.to_string()).collect::<Vec<_>>().join("::");
+        let tokens = node.tokens.to_string();
+        let lower = format!("{} {}", path.to_lowercase(), tokens.to_lowercase());
+
+        if lower.contains("sqlx") && lower.contains("query") {
+            self.push_surface(SurfaceKind::SqlQuery, &path, "sqlx query macro", RiskLevel::High);
+        }
+        if lower.contains("route") || lower.contains("router") || lower.contains("axum") {
+            self.push_surface(SurfaceKind::HttpRoute, &path, "route-like macro invocation", RiskLevel::High);
+        }
+        if lower.contains("tool") || lower.contains("tools/call") || lower.contains("mcp") {
+            self.push_surface(SurfaceKind::McpTool, &path, "MCP/tool macro invocation", RiskLevel::Critical);
+        }
+        visit::visit_macro(self, node);
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast ExprMacro) {
+        self.visit_macro(&node.mac);
+        visit::visit_expr_macro(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
+        let text = format!("{:?}", node.func);
+        let lower = text.to_lowercase();
+        if lower.contains("std :: process :: command") || lower.contains("command :: new") {
+            self.push_surface(SurfaceKind::UnsafeOrProcessSink, "std::process::Command", "process execution sink", RiskLevel::Critical);
+        }
+        visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr(&mut self, node: &'ast Expr) {
+        let text = format!("{:?}", node);
+        let lower = text.to_lowercase();
+        if lower.contains("unsafe") || lower.contains("unwrap") || lower.contains("expect") || lower.contains("panic !") {
+            self.push_surface(SurfaceKind::UnsafeOrProcessSink, "unsafe-or-panic", "unsafe/panic/unwrap sink", RiskLevel::High);
+        }
+        if lower.contains("serde_json :: value") || lower.contains("from_str") || lower.contains("env :: var") {
+            self.push_surface(SurfaceKind::InputBoundary, "dynamic-input", "dynamic input boundary", RiskLevel::High);
+        }
+        visit::visit_expr(self, node);
+    }
+}
+
+impl<'a> SurfaceVisitor<'a> {
+    fn push_surface(&mut self, kind: SurfaceKind, symbol: &str, evidence: &str, risk: RiskLevel) {
+        let semantic = format!("{}|{}|{}|{}", kind.as_str(), self.rel, symbol, evidence);
+        let hash = format!("sha256:{:x}", Sha256::digest(semantic.as_bytes()));
+        let id = format!("surface:{}:{}:{}", kind.as_str(), self.rel, sanitize_symbol(symbol));
+        let (rules, lanes, required_proofs) = defaults_for_kind(&kind);
+        if self.surfaces.iter().any(|s| s.id == id) {
+            return;
+        }
+        self.surfaces.push(Surface {
+            id,
+            kind: kind.as_str().into(),
+            path: self.rel.clone(),
+            line: 0,
+            symbol: symbol.into(),
+            owner: None,
+            semantic_hash: hash,
+            risk: risk.as_str().into(),
+            rules,
+            lanes,
+            required_proofs,
+            changed: self.changed,
+            evidence: vec![evidence.into()],
+        });
+    }
+}
+
+pub fn scan_sql_migration(repo: &Path, path: &Path, cfg: &ProofbindConfig, changed_paths: &[String]) -> Result<Option<Surface>> {
+    let rel = fs::rel(repo, path);
+    let text = stdfs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let lower = text.to_lowercase();
+    let destructive = cfg.destructive_sql_terms.iter().any(|term| lower.contains(term));
+    if !destructive {
+        return Ok(None);
+    }
+    let changed = changed_paths.iter().any(|p| p == &rel || rel.starts_with(&format!("{p}/")));
+    let hash = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+    Ok(Some(Surface {
+        id: format!("surface:db_migration:{}", rel),
+        kind: SurfaceKind::DbMigration.as_str().into(),
+        path: rel.clone(),
+        line: 0,
+        symbol: rel.clone(),
+        owner: None,
+        semantic_hash: hash,
+        risk: "critical".into(),
+        rules: vec!["HLT-021-DESTRUCTIVE-MIGRATION".into()],
+        lanes: vec!["db".into()],
+        required_proofs: vec!["forward apply".into(), "rollback/backfill plan".into(), "lock safety evidence".into()],
+        changed,
+        evidence: vec!["destructive SQL term detected".into()],
+    }))
+}
+
+fn defaults_for_kind(kind: &SurfaceKind) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match kind {
+        SurfaceKind::RustPublicApi => (
+            vec!["HLT-007-HANDWRITTEN-CONTRACT".into(), "HLT-008-FALSE-GREEN-RISK".into()],
+            vec!["contract".into(), "fast".into()],
+            vec!["public API compatibility check".into(), "behavior regression test".into()],
+        ),
+        SurfaceKind::AuthzBoundary => (
+            vec!["HLT-022-AUTHZ-ISOLATION-GAP".into(), "HLT-008-FALSE-GREEN-RISK".into()],
+            vec!["fast".into(), "db".into(), "mutation".into()],
+            vec!["negative authorization matrix".into(), "tenant isolation regression".into(), "mutation proof".into()],
+        ),
+        SurfaceKind::InputBoundary => (
+            vec!["HLT-023-INPUT-BOUNDARY-GAP".into()],
+            vec!["fast".into(), "fuzz".into()],
+            vec!["malformed input rejection".into(), "boundary fuzz target".into()],
+        ),
+        SurfaceKind::McpTool => (
+            vec!["HLT-024-AGENT-TOOL-SUPPLY-GAP".into(), "HLT-023-INPUT-BOUNDARY-GAP".into()],
+            vec!["security".into(), "fast".into()],
+            vec!["tool permission test".into(), "schema validation".into(), "human-confirmation evidence for destructive tools".into()],
+        ),
+        SurfaceKind::DbMigration => (
+            vec!["HLT-021-DESTRUCTIVE-MIGRATION".into()],
+            vec!["db".into()],
+            vec!["forward apply".into(), "rollback/backfill plan".into(), "lock safety evidence".into()],
+        ),
+        SurfaceKind::SqlQuery => (
+            vec!["HLT-006-DIRECT-DB-WRONG-LAYER".into(), "HLT-022-AUTHZ-ISOLATION-GAP".into()],
+            vec!["db".into(), "fast".into()],
+            vec!["query compile check".into(), "isolation/constraint test".into()],
+        ),
+        SurfaceKind::CliCommand => (
+            vec!["HLT-023-INPUT-BOUNDARY-GAP".into()],
+            vec!["fast".into(), "security".into()],
+            vec!["invalid args test".into(), "destructive confirmation test if applicable".into()],
+        ),
+        SurfaceKind::HttpRoute => (
+            vec!["HLT-022-AUTHZ-ISOLATION-GAP".into(), "HLT-023-INPUT-BOUNDARY-GAP".into()],
+            vec!["fast".into(), "security".into()],
+            vec!["authz negative route test".into(), "invalid payload test".into()],
+        ),
+        SurfaceKind::UnsafeOrProcessSink => (
+            vec!["HLT-023-INPUT-BOUNDARY-GAP".into(), "HLT-016-SUPPLY-CHAIN-DRIFT".into()],
+            vec!["security".into(), "fast".into()],
+            vec!["input validation proof".into(), "permission/allowlist proof".into()],
+        ),
+        SurfaceKind::BusinessInvariant => (
+            vec!["HLT-008-FALSE-GREEN-RISK".into()],
+            vec!["fast".into(), "mutation".into()],
+            vec!["table/property test".into(), "mutation proof".into()],
+        ),
+    }
+}
+
+fn contains_any(haystack: &str, terms: &[String]) -> bool {
+    terms.iter().any(|term| haystack.contains(&term.to_lowercase()))
+}
+
+fn looks_like_business_invariant(name: &str) -> bool {
+    ["transition", "calculate", "price", "limit", "quota", "state", "invariant", "workflow", "refund", "invoice", "order"]
+        .iter()
+        .any(|term| name.contains(term))
+}
+
+fn has_test_attr(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| attr.path().segments.last().map(|s| s.ident == "test").unwrap_or(false))
+}
+
+fn has_attr_containing(attrs: &[Attribute], needle: &str) -> bool {
+    attrs.iter().any(|attr| format!("{:?}", attr).contains(needle))
+}
+
+fn sanitize_symbol(symbol: &str) -> String {
+    symbol
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+```
+
+### 10.8 `crates/jankurai-proofbind/src/obligations.rs`
+
+```rust
+use crate::config::ProofbindConfig;
+use crate::model::{ObligationsReport, ProofObligation, SurfaceWitness, SCHEMA_VERSION};
+use chrono::Utc;
+use std::fs;
+use std::path::Path;
+
+pub fn build_obligations(repo: &Path, cfg: &ProofbindConfig, witness: &SurfaceWitness) -> ObligationsReport {
+    let mut obligations = Vec::new();
+    let mut issues = Vec::new();
+
+    for surface in witness.surfaces.iter().filter(|s| s.changed) {
+        if cfg.fail_on_missing_owner && surface.owner.is_none() {
+            issues.push(format!("changed surface `{}` has no owner", surface.id));
+        }
+
+        for rule_id in &surface.rules {
+            let lane = lane_for_rule(rule_id, surface.lanes.first().map(String::as_str).unwrap_or("fast"));
+            let command = cfg.lanes.get(&lane).cloned();
+            let required_test_patterns = required_patterns_for_surface(cfg, &surface.kind);
+            let required_artifacts = vec![
+                "target/jankurai/proof-receipts/*.json".into(),
+                "target/jankurai/logs/*.log".into(),
+            ];
+            let status = if has_matching_receipt(repo, rule_id, &lane) { "satisfied" } else { "missing" };
+            if status == "missing" && cfg.fail_on_missing_semantic_receipt {
+                issues.push(format!(
+                    "surface `{}` requires `{}` in lane `{}` but no matching receipt was found",
+                    surface.id, rule_id, lane
+                ));
+            }
+            obligations.push(ProofObligation {
+                surface_id: surface.id.clone(),
+                rule_id: rule_id.clone(),
+                severity: surface.risk.clone(),
+                lane,
+                command,
+                required_test_patterns,
+                required_artifacts,
+                status: status.into(),
+                reason: format!("changed {} surface `{}`", surface.kind, surface.symbol),
+            });
+        }
+    }
+
+    let verdict = if issues.iter().any(|issue| issue.contains("critical") || issue.contains("requires")) {
+        "fail"
+    } else if !issues.is_empty() {
+        "warn"
+    } else {
+        "pass"
+    };
+
+    ObligationsReport {
+        schema_version: SCHEMA_VERSION.into(),
+        generated_at: Utc::now().to_rfc3339(),
+        repo_root: repo.display().to_string(),
+        verdict: verdict.into(),
+        obligations,
+        issues,
+    }
+}
+
+fn lane_for_rule(rule_id: &str, fallback: &str) -> String {
+    match rule_id {
+        "HLT-021-DESTRUCTIVE-MIGRATION" => "db".into(),
+        "HLT-022-AUTHZ-ISOLATION-GAP" => "db".into(),
+        "HLT-023-INPUT-BOUNDARY-GAP" => "security".into(),
+        "HLT-024-AGENT-TOOL-SUPPLY-GAP" => "security".into(),
+        "HLT-007-HANDWRITTEN-CONTRACT" => "contract".into(),
+        "HLT-008-FALSE-GREEN-RISK" => "mutation".into(),
+        _ => fallback.into(),
+    }
+}
+
+fn required_patterns_for_surface(cfg: &ProofbindConfig, kind: &str) -> Vec<String> {
+    cfg.surface_rule
+        .iter()
+        .find(|rule| rule.kind == kind)
+        .map(|rule| rule.required_test_patterns.clone())
+        .unwrap_or_default()
+}
+
+fn has_matching_receipt(repo: &Path, rule_id: &str, lane: &str) -> bool {
+    let dir = repo.join("target/jankurai/proof-receipts");
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if text.contains(rule_id) && text.contains(&format!("\"lane\": \"{}\"", lane)) && text.contains("\"exit_code\": 0") {
+            return true;
+        }
+    }
+    false
+}
+```
+
+### 10.9 `crates/jankurai-proofbind/src/render.rs`
+
+```rust
+use crate::model::{ObligationsReport, SurfaceWitness};
+
+pub fn witness_markdown(witness: &SurfaceWitness) -> String {
+    let mut out = String::new();
+    out.push_str("# Jankurai ProofBind Surface Witness\n\n");
+    out.push_str(&format!("- Surfaces: {}\n", witness.summary.surface_count));
+    out.push_str(&format!("- Changed surfaces: {}\n", witness.summary.changed_surface_count));
+    out.push_str(&format!("- High risk: {}\n", witness.summary.high_risk_count));
+    out.push_str(&format!("- Critical risk: {}\n\n", witness.summary.critical_risk_count));
+    out.push_str("| Risk | Kind | Surface | Path | Required proof |\n");
+    out.push_str("|---|---|---|---|---|\n");
+    for s in witness.surfaces.iter().filter(|s| s.changed) {
+        out.push_str(&format!(
+            "| {} | {} | `{}` | `{}` | {} |\n",
+            s.risk,
+            s.kind,
+            s.symbol,
+            s.path,
+            s.required_proofs.join("; ")
+        ));
+    }
+    out
+}
+
+pub fn obligations_markdown(report: &ObligationsReport) -> String {
+    let mut out = String::new();
+    out.push_str("# Jankurai ProofBind Obligations\n\n");
+    out.push_str(&format!("**Verdict:** `{}`\n\n", report.verdict));
+    if !report.issues.is_empty() {
+        out.push_str("## Issues\n\n");
+        for issue in &report.issues {
+            out.push_str(&format!("- {}\n", issue));
+        }
+        out.push('\n');
+    }
+    out.push_str("## Obligations\n\n");
+    out.push_str("| Status | Severity | Rule | Lane | Surface | Reason |\n");
+    out.push_str("|---|---|---|---|---|---|\n");
+    for o in &report.obligations {
+        out.push_str(&format!(
+            "| {} | {} | `{}` | `{}` | `{}` | {} |\n",
+            o.status, o.severity, o.rule_id, o.lane, o.surface_id, o.reason
+        ));
+    }
+    out
+}
+```
+
+### 10.10 `crates/jankurai-proofbind/src/lib.rs`
+
+```rust
+pub mod config;
+pub mod fs;
+pub mod git;
+pub mod model;
+pub mod obligations;
+pub mod render;
+pub mod rust_scan;
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use config::ProofbindConfig;
+use model::{Surface, SurfaceWitness, WitnessSummary, SCHEMA_VERSION};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fs as stdfs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct MapArgs {
+    pub repo: PathBuf,
+    pub changed_from: Option<String>,
+    pub changed: Vec<String>,
+    pub out: PathBuf,
+    pub md: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifyArgs {
+    pub repo: PathBuf,
+    pub changed_from: Option<String>,
+    pub changed: Vec<String>,
+    pub witness: PathBuf,
+    pub obligations: PathBuf,
+    pub md: Option<PathBuf>,
+}
+
+pub fn map(args: MapArgs) -> Result<SurfaceWitness> {
+    let repo = args.repo.canonicalize().unwrap_or(args.repo);
+    let cfg = ProofbindConfig::load(&repo)?;
+    let changed_paths = git::changed_paths(&repo, args.changed_from.as_deref(), &args.changed)?;
+    let mut surfaces = Vec::new();
+
+    for path in fs::rust_files(&repo)? {
+        surfaces.extend(rust_scan::scan_rust_file(&repo, &path, &cfg, &changed_paths)?);
+    }
+    for path in fs::sql_migrations(&repo)? {
+        if let Some(surface) = rust_scan::scan_sql_migration(&repo, &path, &cfg, &changed_paths)? {
+            surfaces.push(surface);
+        }
+    }
+
+    attach_owner_hints(&repo, &mut surfaces);
+    dedup_surfaces(&mut surfaces);
+    let summary = summarize(&surfaces);
+    let witness = SurfaceWitness {
+        schema_version: SCHEMA_VERSION.into(),
+        generated_at: Utc::now().to_rfc3339(),
+        repo_root: repo.display().to_string(),
+        git_head: git::git_head(&repo),
+        base_ref: args.changed_from,
+        changed_paths,
+        summary,
+        surfaces,
+    };
+
+    write_json(&args.out, &witness)?;
+    if let Some(md) = args.md {
+        write_text(&md, &render::witness_markdown(&witness))?;
+    }
+    Ok(witness)
+}
+
+pub fn verify(args: VerifyArgs) -> Result<model::ObligationsReport> {
+    let repo = args.repo.canonicalize().unwrap_or(args.repo);
+    let witness = if args.witness.is_file() {
+        let text = stdfs::read_to_string(&args.witness).with_context(|| format!("read {}", args.witness.display()))?;
+        serde_json::from_str::<SurfaceWitness>(&text).with_context(|| format!("parse {}", args.witness.display()))?
+    } else {
+        map(MapArgs {
+            repo: repo.clone(),
+            changed_from: args.changed_from.clone(),
+            changed: args.changed.clone(),
+            out: args.witness.clone(),
+            md: None,
+        })?
+    };
+    let cfg = ProofbindConfig::load(&repo)?;
+    let report = obligations::build_obligations(&repo, &cfg, &witness);
+    write_json(&args.obligations, &report)?;
+    if let Some(md) = args.md {
+        write_text(&md, &render::obligations_markdown(&report))?;
+    }
+    if report.verdict == "fail" && cfg.mode != "advisory" {
+        anyhow::bail!("proofbind verification failed with {} issue(s)", report.issues.len());
+    }
+    Ok(report)
+}
+
+fn summarize(surfaces: &[Surface]) -> WitnessSummary {
+    WitnessSummary {
+        surface_count: surfaces.len(),
+        changed_surface_count: surfaces.iter().filter(|s| s.changed).count(),
+        high_risk_count: surfaces.iter().filter(|s| s.risk == "high").count(),
+        critical_risk_count: surfaces.iter().filter(|s| s.risk == "critical").count(),
+    }
+}
+
+fn dedup_surfaces(surfaces: &mut Vec<Surface>) {
+    let mut seen = BTreeMap::new();
+    for surface in std::mem::take(surfaces) {
+        seen.entry(surface.id.clone()).or_insert(surface);
+    }
+    *surfaces = seen.into_values().collect();
+}
+
+fn attach_owner_hints(repo: &Path, surfaces: &mut [Surface]) {
+    let owner_map_path = repo.join("agent/owner-map.json");
+    let Ok(text) = stdfs::read_to_string(owner_map_path) else {
+        return;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(owners) = value.get("owners").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for surface in surfaces {
+        surface.owner = owners
+            .iter()
+            .filter(|(prefix, _)| surface.path == **prefix || surface.path.starts_with(&format!("{}/", prefix.trim_matches('/'))))
+            .max_by_key(|(prefix, _)| prefix.matches('/').count())
+            .and_then(|(_, owner)| owner.as_str().map(str::to_string));
+    }
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        stdfs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(value)?;
+    stdfs::write(path, text)?;
+    Ok(())
+}
+
+fn write_text(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        stdfs::create_dir_all(parent)?;
+    }
+    stdfs::write(path, text)?;
+    Ok(())
+}
+
+pub fn content_sha256(text: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
+}
+```
+
+### 10.11 `crates/jankurai-proofbind/src/main.rs`
+
+```rust
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser)]
+#[command(name = "cargo-proofbind")]
+#[command(bin_name = "cargo proofbind")]
+#[command(about = "Bind changed Rust semantic surfaces to Jankurai proof obligations")]
+struct Cli {
+    #[command(subcommand)]
+    command: CargoOrCommand,
+}
+
+#[derive(Subcommand)]
+enum CargoOrCommand {
+    /// Cargo forwards `cargo proofbind ...` as `cargo-proofbind proofbind ...`.
+    Proofbind(Commands),
+    #[command(flatten)]
+    Direct(Commands),
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Map {
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        changed_from: Option<String>,
+        #[arg(long)]
+        changed: Vec<String>,
+        #[arg(long, default_value = "target/jankurai/proofbind/surface-witness.json")]
+        out: PathBuf,
+        #[arg(long)]
+        md: Option<PathBuf>,
+    },
+    Verify {
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        changed_from: Option<String>,
+        #[arg(long)]
+        changed: Vec<String>,
+        #[arg(long, default_value = "target/jankurai/proofbind/surface-witness.json")]
+        witness: PathBuf,
+        #[arg(long, default_value = "target/jankurai/proofbind/obligations.json")]
+        obligations: PathBuf,
+        #[arg(long, default_value = "target/jankurai/proofbind/proofbind.md")]
+        md: Option<PathBuf>,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let command = match cli.command {
+        CargoOrCommand::Proofbind(command) | CargoOrCommand::Direct(command) => command,
+    };
+    match command {
+        Commands::Map { repo, changed_from, changed, out, md } => {
+            jankurai_proofbind::map(jankurai_proofbind::MapArgs { repo, changed_from, changed, out, md })?;
+        }
+        Commands::Verify { repo, changed_from, changed, witness, obligations, md } => {
+            jankurai_proofbind::verify(jankurai_proofbind::VerifyArgs { repo, changed_from, changed, witness, obligations, md })?;
+        }
+    }
+    Ok(())
+}
+```
+
+### 10.12 Jankurai dependency patch: `crates/jankurai/Cargo.toml`
+
+```toml
+jankurai-proofbind = { path = "../jankurai-proofbind" }
+```
+
+Publish-time note: before publishing, this becomes `jankurai-proofbind = "0.1"` or the crate is kept workspace-local until the `jankurai` release that exposes `jankurai proofbind`.
+
+### 10.13 Jankurai command module: `crates/jankurai/src/commands/proofbind.rs`
+
+```rust
+use anyhow::Result;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct ProofbindMapArgs {
+    pub repo: PathBuf,
+    pub changed_from: Option<String>,
+    pub changed: Vec<String>,
+    pub out: PathBuf,
+    pub md: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProofbindVerifyArgs {
+    pub repo: PathBuf,
+    pub changed_from: Option<String>,
+    pub changed: Vec<String>,
+    pub witness: PathBuf,
+    pub obligations: PathBuf,
+    pub md: Option<PathBuf>,
+}
+
+pub fn run_map(args: ProofbindMapArgs) -> Result<()> {
+    jankurai_proofbind::map(jankurai_proofbind::MapArgs {
+        repo: args.repo,
+        changed_from: args.changed_from,
+        changed: args.changed,
+        out: args.out,
+        md: args.md,
+    })?;
+    Ok(())
+}
+
+pub fn run_verify(args: ProofbindVerifyArgs) -> Result<()> {
+    jankurai_proofbind::verify(jankurai_proofbind::VerifyArgs {
+        repo: args.repo,
+        changed_from: args.changed_from,
+        changed: args.changed,
+        witness: args.witness,
+        obligations: args.obligations,
+        md: args.md,
+    })?;
+    Ok(())
+}
+```
+
+### 10.14 Jankurai module patch: `crates/jankurai/src/commands.rs`
+
+```rust
+pub mod proofbind;
+```
+
+### 10.15 Jankurai CLI patch: `crates/jankurai/src/main.rs`
+
+Add a subcommand:
+
+```rust
+#[derive(Subcommand)]
+enum Commands {
+    // Insert this variant anywhere inside the existing `Commands` enum.
+    Proofbind {
+        #[command(subcommand)]
+        command: ProofbindCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProofbindCommand {
+    Map {
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        changed_from: Option<String>,
+        #[arg(long)]
+        changed: Vec<PathBuf>,
+        #[arg(long, default_value = "target/jankurai/proofbind/surface-witness.json")]
+        out: PathBuf,
+        #[arg(long)]
+        md: Option<PathBuf>,
+    },
+    Verify {
+        #[arg(default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        changed_from: Option<String>,
+        #[arg(long)]
+        changed: Vec<PathBuf>,
+        #[arg(long, default_value = "target/jankurai/proofbind/surface-witness.json")]
+        witness: PathBuf,
+        #[arg(long, default_value = "target/jankurai/proofbind/obligations.json")]
+        obligations: PathBuf,
+        #[arg(long, default_value = "target/jankurai/proofbind/proofbind.md")]
+        md: Option<PathBuf>,
+    },
+}
+```
+
+Add match arms:
+
+```rust
+Commands::Proofbind { command } => match command {
+    ProofbindCommand::Map { repo, changed_from, changed, out, md } => {
+        jankurai::commands::proofbind::run_map(jankurai::commands::proofbind::ProofbindMapArgs {
+            repo,
+            changed_from,
+            changed: changed.into_iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect(),
+            out,
+            md,
+        })?;
+    }
+    ProofbindCommand::Verify { repo, changed_from, changed, witness, obligations, md } => {
+        jankurai::commands::proofbind::run_verify(jankurai::commands::proofbind::ProofbindVerifyArgs {
+            repo,
+            changed_from,
+            changed: changed.into_iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect(),
+            witness,
+            obligations,
+            md,
+        })?;
+    }
+}
+```
+
+### 10.16 Validation patch: `crates/jankurai/src/validation.rs`
+
+Add enum variants:
+
+```rust
+ProofbindWitness,
+ProofbindObligations,
+```
+
+Add schema paths:
+
+```rust
+Self::ProofbindWitness => "proofbind-witness.schema.json",
+Self::ProofbindObligations => "proofbind-obligations.schema.json",
+```
+
+### 10.17 Audit artifact summary: `crates/jankurai/src/audit/proofbind_artifact.rs`
+
+```rust
+use serde::Serialize;
+use serde_json::Value;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProofbindReadinessSummary {
+    pub witness_path: String,
+    pub obligations_path: String,
+    pub changed_surface_count: u64,
+    pub high_risk_count: u64,
+    pub critical_risk_count: u64,
+    pub missing_obligation_count: usize,
+    pub verdict: String,
+}
+
+pub fn load_summary(root: &Path) -> Option<ProofbindReadinessSummary> {
+    let witness_path = root.join("target/jankurai/proofbind/surface-witness.json");
+    let obligations_path = root.join("target/jankurai/proofbind/obligations.json");
+    let witness: Value = serde_json::from_str(&fs::read_to_string(&witness_path).ok()?).ok()?;
+    let obligations: Value = serde_json::from_str(&fs::read_to_string(&obligations_path).ok()?).ok()?;
+    let summary = witness.get("summary")?;
+    let missing = obligations
+        .get("obligations")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter(|item| item.get("status").and_then(Value::as_str) == Some("missing")).count())
+        .unwrap_or(0);
+    Some(ProofbindReadinessSummary {
+        witness_path: "target/jankurai/proofbind/surface-witness.json".into(),
+        obligations_path: "target/jankurai/proofbind/obligations.json".into(),
+        changed_surface_count: summary.get("changed_surface_count").and_then(Value::as_u64).unwrap_or(0),
+        high_risk_count: summary.get("high_risk_count").and_then(Value::as_u64).unwrap_or(0),
+        critical_risk_count: summary.get("critical_risk_count").and_then(Value::as_u64).unwrap_or(0),
+        missing_obligation_count: missing,
+        verdict: obligations.get("verdict").and_then(Value::as_str).unwrap_or("unknown").into(),
+    })
+}
+```
+
+### 10.18 Model patch: `crates/jankurai/src/model.rs`
+
+Add:
+
+```rust
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ProofbindReadiness {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<crate::audit::proofbind_artifact::ProofbindReadinessSummary>,
+}
+```
+
+Add to `Report`:
+
+```rust
+pub proofbind: ProofbindReadiness,
+```
+
+Populate in `audit/mod.rs`:
+
+```rust
+proofbind: ProofbindReadiness {
+    artifact: proofbind_artifact::load_summary(root),
+},
+```
+
+Add module:
+
+```rust
+pub mod proofbind_artifact;
+```
+
+Add findings when ProofBind says fail:
+
+```rust
+if let Some(summary) = crate::audit::proofbind_artifact::load_summary(&ctx.root) {
+    if summary.missing_obligation_count > 0 || summary.verdict == "fail" {
+        b.add_with_rule(
+            "HLT-008-FALSE-GREEN-RISK",
+            &summary.obligations_path,
+            "changed semantic surface lacks required proof receipt",
+            "run `jankurai proofbind verify . --changed-from origin/main`, then run the required lanes and attach receipts",
+            vec![format!("{} missing obligation(s)", summary.missing_obligation_count)],
+            None,
+            None,
+            None,
+        );
+    }
+}
+```
+
+### 10.19 Init template patch: `crates/jankurai/src/init/templates.rs`
+
+Add template:
+
+```rust
+Template {
+    path: "agent/proofbind.toml",
+    body: include_str!("../../templates/agent/proofbind.toml"),
+},
+```
+
+Update `RUST_FULL_JUSTFILE`:
+
+```make
+proofbind:
+	jankurai proofbind verify . --changed-from origin/main --witness target/jankurai/proofbind/surface-witness.json --obligations target/jankurai/proofbind/obligations.json --md target/jankurai/proofbind/proofbind.md
+
+check: fast score security rust-map rust-witness rust-diagnose proofbind
+```
+
+Update `agent/tool-adoption.toml` template:
+
+```toml
+[[tools]]
+id = "proofbind"
+mode = "auto"
+```
+
+Update `agent/proof-lanes.toml` template with the lane shown above.
+
+### 10.20 Tests: `crates/jankurai-proofbind/tests/surface_smoke.rs`
+
+```rust
+use std::fs;
+use tempfile::tempdir;
+
+#[test]
+fn detects_authz_and_input_surfaces() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("crates/application/src")).unwrap();
+    fs::create_dir_all(dir.path().join("agent")).unwrap();
+    fs::write(dir.path().join("agent/owner-map.json"), r#"{"owners":{"crates/application":"application"}}"#).unwrap();
+    fs::write(dir.path().join("crates/application/src/lib.rs"), r#"
+        pub fn authorize_refund(tenant_id: String, role: String) -> bool {
+            tenant_id == "t1" && role == "admin"
+        }
+        pub fn parse_payload(raw: &str) -> serde_json::Value {
+            serde_json::from_str(raw).unwrap()
+        }
+    "#).unwrap();
+
+    let witness = jankurai_proofbind::map(jankurai_proofbind::MapArgs {
+        repo: dir.path().to_path_buf(),
+        changed_from: None,
+        changed: vec!["crates/application/src/lib.rs".into()],
+        out: dir.path().join("target/jankurai/proofbind/surface-witness.json"),
+        md: None,
+    }).unwrap();
+
+    assert!(witness.surfaces.iter().any(|s| s.kind == "authz_boundary"));
+    assert!(witness.surfaces.iter().any(|s| s.kind == "input_boundary"));
+    assert!(witness.summary.changed_surface_count > 0);
+}
+```
+
+### 10.21 Tests: `crates/jankurai-proofbind/tests/changed_verify.rs`
+
+```rust
+use std::fs;
+use tempfile::tempdir;
+
+#[test]
+fn verify_fails_changed_surface_without_receipt() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("crates/application/src")).unwrap();
+    fs::create_dir_all(dir.path().join("agent")).unwrap();
+    fs::write(dir.path().join("agent/proofbind.toml"), r#"mode = "standard""#).unwrap();
+    fs::write(dir.path().join("agent/owner-map.json"), r#"{"owners":{"crates/application":"application"}}"#).unwrap();
+    fs::write(dir.path().join("crates/application/src/lib.rs"), r#"
+        pub fn authorize_refund(tenant_id: String, role: String) -> bool {
+            tenant_id == "t1" && role == "admin"
+        }
+    "#).unwrap();
+
+    let result = jankurai_proofbind::verify(jankurai_proofbind::VerifyArgs {
+        repo: dir.path().to_path_buf(),
+        changed_from: None,
+        changed: vec!["crates/application/src/lib.rs".into()],
+        witness: dir.path().join("target/jankurai/proofbind/surface-witness.json"),
+        obligations: dir.path().join("target/jankurai/proofbind/obligations.json"),
+        md: None,
+    });
+
+    assert!(result.is_err(), "standard mode should fail without semantic receipts");
+}
+```
+
+### 10.22 Jankurai CLI smoke test: `crates/jankurai/tests/proofbind_cli_smoke.rs`
+
+```rust
+use std::process::Command;
+
+#[test]
+fn proofbind_help_is_registered() {
+    let output = Command::new(env!("CARGO_BIN_EXE_jankurai"))
+        .args(["proofbind", "--help"])
+        .output()
+        .expect("run jankurai proofbind --help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("map"));
+    assert!(stdout.contains("verify"));
+}
+```
+
+---
+
+## 11. How ProofBind reduces vibe coding
+
+### Before
+
+An agent says:
+
+> I changed `refunds.rs`. I ran `cargo test`. All good.
+
+But that does not answer:
+
+- Did the tests cover denied roles?
+- Did the tests cover cross-tenant access?
+- Did the public API or generated client change?
+- Did a mutation survive?
+- Did the proof receipt bind to the changed behavior?
+
+### After
+
+The agent says:
+
+> I changed `surface:authz_boundary:crates/application/src/refunds.rs:AuthorizeRefund`. ProofBind classified it as critical. It required `HLT-022` and `HLT-008`. I ran the authz matrix test and mutation lane. Receipts are `target/jankurai/proof-receipts/003-db-authz.json` and `004-mutation-refunds.json`.
+
+That is agent-first code design: stable IDs, exact ownership, exact proof, exact receipt.
+
+---
+
+## 12. How ProofBind improves testing
+
+ProofBind changes test selection from path-based to behavior-based.
+
+| Changed surface | Required proof upgrade |
+|---|---|
+| `authz_boundary` | Negative authorization matrix + tenant isolation + mutation proof |
+| `input_boundary` | Invalid/malformed input tests + fuzz target |
+| `rust_public_api` | API compatibility / generated client / contract proof |
+| `business_invariant` | Table/property tests + mutation proof |
+| `db_migration` | Forward apply + rollback/backfill + lock safety |
+| `mcp_tool` | Tool schema validation + permission/human confirmation proof |
+| `cli_command` | Invalid args + destructive confirmation + no unintended agent execution |
+
+The important shift is not “more tests.” It is **fewer irrelevant tests and more mandatory semantic tests**.
+
+---
+
+## 13. How ProofBind improves security
+
+ProofBind directly addresses high-risk surfaces in the Jankurai ruleset:
+
+- `HLT-021-DESTRUCTIVE-MIGRATION`: destructive SQL terms require DB safety evidence.
+- `HLT-022-AUTHZ-ISOLATION-GAP`: authz/tenant/role surfaces require negative tests.
+- `HLT-023-INPUT-BOUNDARY-GAP`: external inputs, dynamic JSON, env, process args, file paths, and URL-like boundaries require malformed-input proof.
+- `HLT-024-AGENT-TOOL-SUPPLY-GAP`: agent/MCP/tool surfaces require permissions, schema, and confirmation evidence.
+- `HLT-027-HUMAN-REVIEW-EVIDENCE-GAP`: review claims must attach reproducible receipts.
+
+A crucial security design choice: ProofBind never trusts self-reported MCP annotations by themselves. MCP annotations are still useful metadata, but ProofBind independently classifies tool risk from code and requires proof receipts for destructive/open-world/high-authority tools.
+
+---
+
+## 14. How it improves popular standard surfaces
+
+This crate makes common Rust surface crates safer without replacing them:
+
+- **`clap`**: command surfaces become proof-bound. Destructive admin commands require confirmation and invalid-args tests.
+- **`serde` / `serde_json`**: dynamic input surfaces require malformed-input and schema/validation proof.
+- **`axum` / routing code**: route handlers become authz/input surfaces rather than anonymous functions in a file.
+- **`sqlx`**: checked queries remain valuable, but ProofBind adds business/security obligations around tenant isolation and destructive migration safety.
+- **MCP Rust servers**: tool names, schemas, annotations, and call handlers become security surfaces requiring tool-authority receipts.
+
+That is a better target than inventing yet another linter: it strengthens the exact crates and patterns agents already touch.
+
+---
+
+## 15. Merge witness integration
+
+When `jankurai witness` emits a merge witness, add:
+
+```json
+"proofbind": {
+  "witness_path": "target/jankurai/proofbind/surface-witness.json",
+  "obligations_path": "target/jankurai/proofbind/obligations.json",
+  "changed_surface_count": 3,
+  "missing_obligation_count": 0,
+  "verdict": "pass"
+}
+```
+
+This lets humans and agents answer:
+
+> Did we prove the changed behavior, or only prove that something passed?
+
+---
+
+## 16. Rollout plan
+
+### Phase 1: advisory MVP
+
+- Add crate and CLI.
+- Generate witness and obligations artifacts.
+- Add `jankurai proofbind map` and `verify`.
+- Add schemas.
+- Add init template in advisory mode.
+- Add audit summary only; do not block.
+
+### Phase 2: standard gate
+
+- Include ProofBind in full Rust profile by default.
+- Convert missing high/critical obligations into findings.
+- Enrich `jankurai proof` plans with semantic obligations.
+- Add receipt matching by `rules_covered` and lane.
+
+### Phase 3: stronger Rust intelligence
+
+- Add rustdoc JSON public API diff support.
+- Add `cargo-public-api` / `cargo-semver-checks` receipt parsers.
+- Add `cargo-mutants` JSON parser.
+- Add `cargo-nextest` JUnit parser.
+- Add SQL migration analyzer with lock/backfill/rollback evidence parsing.
+
+### Phase 4: MCP/tool authority hardening
+
+- Detect MCP tool registries more deeply.
+- Emit tool authority matrix:
+  - read-only
+  - destructive
+  - idempotent
+  - open-world
+  - requires human confirmation
+  - allowed roots
+  - allowed env vars
+  - allowed subprocesses
+- Require receipts for every destructive/open-world tool.
+
+---
+
+## 17. Definition of done
+
+The feature is done when these commands pass in the Jankurai repo:
+
+```bash
+cargo test -p jankurai-proofbind
+cargo test -p jankurai proofbind_cli_smoke
+jankurai proofbind map . --changed crates/jankurai/src/commands/proof.rs --md target/jankurai/proofbind/surface-witness.md
+jankurai proofbind verify . --changed crates/jankurai/src/commands/proof.rs --md target/jankurai/proofbind/proofbind.md || true
+jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md
+```
+
+And these fixture cases are covered:
+
+1. A public Rust API change emits a `rust_public_api` obligation.
+2. A function named `authorize_*` emits `HLT-022` and `HLT-008` obligations.
+3. A `serde_json::from_str(...).unwrap()` boundary emits `HLT-023`.
+4. A destructive SQL migration emits `HLT-021`.
+5. An MCP tool surface emits `HLT-024` and requires security evidence.
+6. A matching proof receipt changes an obligation from `missing` to `satisfied`.
+7. Advisory mode reports but does not fail.
+8. Standard mode fails high/critical missing obligations.
+
+---
+
+## 18. Why this beats alternative crate ideas
+
+### Better than “Jankurai security scanner”
+
+Jankurai already has security lanes and security evidence. A new scanner would duplicate cargo-deny, cargo-audit, RustSec, gitleaks, Scorecard, and SAST tools. ProofBind instead decides when those tools are mandatory and binds them to exact changed surfaces.
+
+### Better than “Jankurai test generator”
+
+Agents can generate tests, but generated tests can be shallow. ProofBind does not claim to write the perfect test. It tells the agent what behavior class must be proven and rejects unreceipted claims.
+
+### Better than “Jankurai MCP guard”
+
+MCP/tool security is important, but Jankurai’s scope is broader than MCP. ProofBind includes MCP tools as one surface kind while also covering authz, DB, APIs, CLI, SQL, and input boundaries.
+
+### Better than “Jankurai SemVer tool”
+
+Public API compatibility matters, but it is only one proof surface. Most product failures happen in authz, data isolation, migrations, command handlers, and input handling. ProofBind includes SemVer as one obligation type.
+
+### Better than “Jankurai mutation wrapper”
+
+Mutation testing is powerful but expensive. ProofBind routes mutation testing only to changed business/authz surfaces where it delivers high signal.
+
+---
+
+## 19. Final recommendation
+
+Build `jankurai-proofbind` first.
+
+It is the highest-leverage crate because it turns Jankurai from a path-and-lane conformance standard into a **semantic proof standard**. It preserves the current stack, uses existing proof lanes, improves popular Rust surfaces, hardens agent tools, catches false-green tests, and gives coding agents a concrete, machine-readable answer to the most important merge question:
+
+> What exactly changed, and what proof is required before anyone should trust it?
+
+That is the most direct possible reduction in vibe coding.
+
+---
+
+## 20. Source notes used for this proposal
+
+- Jankurai repository README, paper sources, standard docs, Rust source tree, proof planner, catalog loader, validation system, rules registry, and init templates.
+- Cargo Vet documentation: <https://mozilla.github.io/cargo-vet/>
+- Cargo Deny documentation: <https://embarkstudios.github.io/cargo-deny/checks/index.html>
+- Cargo Nextest documentation: <https://nexte.st/>
+- Cargo Mutants documentation: <https://mutants.rs/>
+- Rust Fuzz Book / cargo-fuzz: <https://rust-fuzz.github.io/book/cargo-fuzz.html>
+- Cargo SemVer compatibility guidance: <https://doc.rust-lang.org/cargo/reference/semver.html>
+- SQLx documentation/README notes: <https://github.com/launchbadge/sqlx>
+- OpenSSF Scorecard: <https://openssf.org/projects/scorecard/>
+- NIST Secure Software Development Framework: <https://csrc.nist.gov/projects/ssdf>
+- OWASP Top 10 for Large Language Model Applications / GenAI Security Project: <https://owasp.org/www-project-top-10-for-large-language-model-applications/>
+- Model Context Protocol tools and tool annotations specification: <https://modelcontextprotocol.io/specification/2025-06-18/server/tools>

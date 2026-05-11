@@ -1,0 +1,2431 @@
+## Phase name
+
+**Phase 10: Reuse Registry Certified Cells**
+
+I would treat this as the **Phase 10 hardening/closeout slice**: certify the next high-value reusable primitive, **`auth-session`**, and add invariant tests so Phase 10 is not just “more catalog entries,” but a registry that proves certified cells are evidence-bound. This fits the repo’s moonshot loop of “intent → bounded agents → proof lanes → evidence → expired exceptions → reusable primitives,” and it directly advances the Phase 10 goal of preventing teams and agents from rebuilding common primitives badly. ([GitHub][1])
+
+The repo’s router already says Phase 10 is the next priority when named by the user, and the current Phase 10 receipt explicitly names **auth/session shell** as the next registry cell after `audit-log`, `crud-resource`, and `rbac`. ([GitHub][2])
+
+Copy-paste this as one shell script from the repo root.
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+PHASE_LOG="tips/phases/logs/10-reuse-registry-certified-cells.log"
+START_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+START_TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+mkdir -p target/jankurai
+
+printf '%s | gpt-5.5-pro | 10 | start | crates/jankurai/src/commands/cell_catalog.rs;crates/jankurai/tests/command_surface_smoke.rs;examples/perfect-web-api-db/backend/src/domain.rs;examples/perfect-web-api-db/backend/src/application.rs;examples/perfect-web-api-db/backend/src/adapters.rs;examples/perfect-web-api-db/contracts/openapi.json;examples/perfect-web-api-db/db/migrations/001_init.sql;examples/perfect-web-api-db/db/constraints/001_accounts.sql;examples/perfect-web-api-db/frontend/src/App.tsx;examples/perfect-web-api-db/ops/security.md;examples/perfect-web-api-db/ux/routes.md;examples/perfect-web-api-db/docs/architecture.md;examples/perfect-web-api-db/docs/exceptions.md;examples/perfect-web-api-db/README.md;tips/phases/10-reuse-registry-certified-cells.md;tips/phases/00-phase-index.md;tips/phases/logs/10-reuse-registry-certified-cells.log | not-run | none | %s | harden Phase 10 by certifying auth-session and enforcing evidence-bound certified-cell invariants\n' "$START_TS" "$START_SHA" >> "$PHASE_LOG"
+
+cat > examples/perfect-web-api-db/backend/src/domain.rs <<'EOF'
+// Domain layer: pure logic, typed IDs, invariants, no IO.
+// Owns: identity types, business rules, authorization decisions, error shapes.
+// Never owns: database access, HTTP, env, time, random, filesystem.
+
+use std::fmt;
+
+// ---------------------------------------------------------------------------
+// Typed identifiers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AccountId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrganizationId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResourceId(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionId(pub String);
+
+impl fmt::Display for AccountId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for OrganizationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for ResourceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Domain errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainError {
+    EmptyEmail,
+    InvalidEmail,
+    AccountInactive,
+    EmptySessionId,
+    EmptyTokenHash,
+    SessionRevoked { id: SessionId },
+    SessionNotFound { id: SessionId },
+    SessionNotFoundByToken,
+    PersistenceFailure { reason: String },
+    PermissionDenied { actor: AccountId, action: String },
+    ResourceNotFound { id: ResourceId },
+    DuplicateResource { id: ResourceId },
+    OrganizationLimitReached {
+        org_id: OrganizationId,
+        limit: usize,
+    },
+}
+
+impl fmt::Display for DomainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyEmail => write!(f, "email must not be empty"),
+            Self::InvalidEmail => write!(f, "email must contain @"),
+            Self::AccountInactive => write!(f, "account is inactive"),
+            Self::EmptySessionId => write!(f, "session id must not be empty"),
+            Self::EmptyTokenHash => write!(f, "session token hash must not be empty"),
+            Self::SessionRevoked { id } => write!(f, "session {} is revoked", id),
+            Self::SessionNotFound { id } => write!(f, "session {} not found", id),
+            Self::SessionNotFoundByToken => write!(f, "session token did not resolve to an active session"),
+            Self::PersistenceFailure { reason } => write!(f, "persistence failure: {}", reason),
+            Self::PermissionDenied { actor, action } => {
+                write!(f, "account {} denied action: {}", actor, action)
+            }
+            Self::ResourceNotFound { id } => write!(f, "resource {} not found", id),
+            Self::DuplicateResource { id } => write!(f, "resource {} already exists", id),
+            Self::OrganizationLimitReached { org_id, limit } => {
+                write!(f, "organization {} reached member limit {}", org_id, limit)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Role-based access control
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Owner,
+    Admin,
+    Member,
+    Viewer,
+}
+
+impl Role {
+    /// Returns true if this role can perform write operations.
+    pub fn can_write(&self) -> bool {
+        matches!(self, Role::Owner | Role::Admin | Role::Member)
+    }
+
+    /// Returns true if this role can manage organization membership.
+    pub fn can_manage_members(&self) -> bool {
+        matches!(self, Role::Owner | Role::Admin)
+    }
+
+    /// Returns true if this role can view the admin dashboard.
+    pub fn can_view_admin(&self) -> bool {
+        matches!(self, Role::Owner | Role::Admin)
+    }
+
+    /// Returns true if this role can delete resources.
+    pub fn can_delete(&self) -> bool {
+        matches!(self, Role::Owner | Role::Admin)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Account aggregate
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub id: AccountId,
+    pub email: String,
+    pub active: bool,
+    pub role: Role,
+    pub organization_id: Option<OrganizationId>,
+}
+
+impl Account {
+    /// Create a new account with validated email.
+    pub fn new(
+        id: impl Into<String>,
+        email: impl Into<String>,
+        role: Role,
+    ) -> Result<Self, DomainError> {
+        let email = email.into();
+
+        if email.is_empty() {
+            return Err(DomainError::EmptyEmail);
+        }
+
+        if !email.contains('@') {
+            return Err(DomainError::InvalidEmail);
+        }
+
+        Ok(Self {
+            id: AccountId(id.into()),
+            email,
+            active: true,
+            role,
+            organization_id: None,
+        })
+    }
+
+    /// Deactivate the account. Idempotent.
+    pub fn deactivate(&mut self) {
+        self.active = false;
+    }
+
+    /// Pure authorization check: can this account perform the named action?
+    pub fn authorize(&self, action: &str) -> Result<(), DomainError> {
+        if !self.active {
+            return Err(DomainError::AccountInactive);
+        }
+
+        let allowed = match action {
+            "view_admin" => self.role.can_view_admin(),
+            "manage_members" => self.role.can_manage_members(),
+            "write" => self.role.can_write(),
+            "delete" => self.role.can_delete(),
+            "read" => true,
+            _ => false,
+        };
+
+        if allowed {
+            Ok(())
+        } else {
+            Err(DomainError::PermissionDenied {
+                actor: self.id.clone(),
+                action: action.to_string(),
+            })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Organization aggregate
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Organization {
+    pub id: OrganizationId,
+    pub name: String,
+    pub member_limit: usize,
+    pub member_count: usize,
+}
+
+impl Organization {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, member_limit: usize) -> Self {
+        Self {
+            id: OrganizationId(id.into()),
+            name: name.into(),
+            member_limit,
+            member_count: 0,
+        }
+    }
+
+    /// Check whether a new member can be added. Pure invariant.
+    pub fn can_add_member(&self) -> Result<(), DomainError> {
+        if self.member_count >= self.member_limit {
+            Err(DomainError::OrganizationLimitReached {
+                org_id: self.id.clone(),
+                limit: self.member_limit,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource (CRUD example entity)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resource {
+    pub id: ResourceId,
+    pub title: String,
+    pub body: String,
+    pub owner_id: AccountId,
+}
+
+impl Resource {
+    pub fn new(
+        id: impl Into<String>,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        owner_id: AccountId,
+    ) -> Self {
+        Self {
+            id: ResourceId(id.into()),
+            title: title.into(),
+            body: body.into(),
+            owner_id,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Auth/session shell
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    pub id: SessionId,
+    pub account_id: AccountId,
+    /// Hash or digest only. Raw bearer tokens never belong in domain state.
+    pub token_hash: String,
+    pub revoked: bool,
+}
+
+impl Session {
+    pub fn new(
+        id: impl Into<String>,
+        account_id: AccountId,
+        token_hash: impl Into<String>,
+    ) -> Result<Self, DomainError> {
+        let id = id.into();
+        let token_hash = token_hash.into();
+
+        if id.trim().is_empty() {
+            return Err(DomainError::EmptySessionId);
+        }
+
+        if token_hash.trim().is_empty() {
+            return Err(DomainError::EmptyTokenHash);
+        }
+
+        Ok(Self {
+            id: SessionId(id),
+            account_id,
+            token_hash,
+            revoked: false,
+        })
+    }
+
+    pub fn revoke(&mut self) {
+        self.revoked = true;
+    }
+
+    pub fn assert_active(&self) -> Result<(), DomainError> {
+        if self.revoked {
+            Err(DomainError::SessionRevoked {
+                id: self.id.clone(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Audit log event (domain-level, no IO)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEvent {
+    pub actor_id: AccountId,
+    pub action: String,
+    pub target_kind: String,
+    pub target_id: String,
+    pub outcome: AuditOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditOutcome {
+    Success,
+    Denied,
+    Error(String),
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_account_validates_email() {
+        assert!(Account::new("a1", "", Role::Member).is_err());
+        assert!(Account::new("a1", "nope", Role::Member).is_err());
+        assert!(Account::new("a1", "alice@example.com", Role::Member).is_ok());
+    }
+
+    #[test]
+    fn authorization_respects_role() {
+        let admin = Account::new("a1", "admin@example.com", Role::Admin).unwrap();
+        let viewer = Account::new("a2", "viewer@example.com", Role::Viewer).unwrap();
+
+        assert!(admin.authorize("view_admin").is_ok());
+        assert!(admin.authorize("write").is_ok());
+        assert!(admin.authorize("delete").is_ok());
+        assert!(viewer.authorize("read").is_ok());
+        assert!(viewer.authorize("view_admin").is_err());
+        assert!(viewer.authorize("write").is_err());
+        assert!(viewer.authorize("delete").is_err());
+    }
+
+    #[test]
+    fn inactive_account_denied_all_actions() {
+        let mut account = Account::new("a1", "user@example.com", Role::Owner).unwrap();
+        account.deactivate();
+
+        assert_eq!(account.authorize("read"), Err(DomainError::AccountInactive));
+    }
+
+    #[test]
+    fn organization_member_limit_enforced() {
+        let mut org = Organization::new("org1", "Acme", 2);
+
+        assert!(org.can_add_member().is_ok());
+
+        org.member_count = 2;
+        assert!(org.can_add_member().is_err());
+    }
+
+    #[test]
+    fn session_requires_id_and_token_hash() {
+        let account_id = AccountId("a1".to_string());
+
+        assert_eq!(
+            Session::new("", account_id.clone(), "sha256:abc").unwrap_err(),
+            DomainError::EmptySessionId
+        );
+
+        assert_eq!(
+            Session::new("s1", account_id.clone(), "").unwrap_err(),
+            DomainError::EmptyTokenHash
+        );
+
+        assert!(Session::new("s1", account_id, "sha256:abc").is_ok());
+    }
+
+    #[test]
+    fn revoked_session_is_not_active() {
+        let mut session = Session::new(
+            "s1",
+            AccountId("a1".to_string()),
+            "sha256:session-token-digest",
+        )
+        .unwrap();
+
+        assert!(session.assert_active().is_ok());
+
+        session.revoke();
+
+        assert_eq!(
+            session.assert_active(),
+            Err(DomainError::SessionRevoked {
+                id: SessionId("s1".to_string())
+            })
+        );
+    }
+}
+EOF
+
+cat > examples/perfect-web-api-db/backend/src/application.rs <<'EOF'
+// Application layer: commands, authorization, idempotency, audit events.
+// Owns: use-case orchestration, authorization enforcement, transactional boundaries.
+// Never owns: UI, external protocol details, raw SQL, domain rules.
+
+use crate::domain::{
+    Account, AccountId, AuditEvent, AuditOutcome, DomainError, Resource, ResourceId, Session,
+    SessionId,
+};
+
+// ---------------------------------------------------------------------------
+// Port traits (adapter contracts — implemented in adapters layer, not here)
+// ---------------------------------------------------------------------------
+
+/// Repository port for Account persistence.
+pub trait AccountRepository {
+    fn find_by_id(&self, id: &AccountId) -> Result<Option<Account>, String>;
+    fn save(&self, account: &Account) -> Result<(), String>;
+}
+
+/// Repository port for Resource persistence.
+pub trait ResourceRepository {
+    fn find_by_id(&self, id: &ResourceId) -> Result<Option<Resource>, String>;
+    fn save(&self, resource: &Resource) -> Result<(), String>;
+    fn delete(&self, id: &ResourceId) -> Result<(), String>;
+    fn list_by_owner(&self, owner_id: &AccountId) -> Result<Vec<Resource>, String>;
+}
+
+/// Repository port for session persistence.
+///
+/// This is deliberately provider-agnostic. OAuth, SSO, password login, and API-key
+/// providers belong at the API edge or adapter boundary. The application layer only
+/// sees a resolved active account and an opaque token hash.
+pub trait SessionRepository {
+    fn find_by_id(&self, id: &SessionId) -> Result<Option<Session>, String>;
+    fn find_active_by_token_hash(&self, token_hash: &str) -> Result<Option<Session>, String>;
+    fn save(&self, session: &Session) -> Result<(), String>;
+    fn revoke(&self, id: &SessionId) -> Result<(), String>;
+}
+
+/// Port for emitting audit events.
+pub trait AuditLog {
+    fn record(&self, event: AuditEvent) -> Result<(), String>;
+}
+
+// ---------------------------------------------------------------------------
+// Auth/session commands
+// ---------------------------------------------------------------------------
+
+/// Start a session for an account that has already been authenticated by the edge.
+///
+/// Non-goals:
+/// - no password, OAuth, SAML, or provider logic here
+/// - no raw bearer token storage
+/// - no authorization decisions in adapters or UI
+pub fn start_session(
+    account: &Account,
+    session_id: impl Into<String>,
+    token_hash: impl Into<String>,
+    sessions: &impl SessionRepository,
+    audit_log: &impl AuditLog,
+) -> Result<Session, DomainError> {
+    account.authorize("read")?;
+
+    let session = Session::new(session_id, account.id.clone(), token_hash)?;
+
+    sessions
+        .save(&session)
+        .map_err(|reason| DomainError::PersistenceFailure { reason })?;
+
+    let _ = audit_log.record(AuditEvent {
+        actor_id: account.id.clone(),
+        action: "session.started".to_string(),
+        target_kind: "Session".to_string(),
+        target_id: session.id.0.clone(),
+        outcome: AuditOutcome::Success,
+    });
+
+    Ok(session)
+}
+
+/// Resolve a token hash to the account that owns the active session.
+pub fn authenticate_session(
+    token_hash: &str,
+    sessions: &impl SessionRepository,
+) -> Result<AccountId, DomainError> {
+    if token_hash.trim().is_empty() {
+        return Err(DomainError::EmptyTokenHash);
+    }
+
+    let session = sessions
+        .find_active_by_token_hash(token_hash)
+        .map_err(|reason| DomainError::PersistenceFailure { reason })?
+        .ok_or(DomainError::SessionNotFoundByToken)?;
+
+    session.assert_active()?;
+
+    Ok(session.account_id)
+}
+
+/// Revoke an active session and emit durable audit evidence.
+pub fn revoke_session(
+    actor: &Account,
+    session_id: &SessionId,
+    sessions: &impl SessionRepository,
+    audit_log: &impl AuditLog,
+) -> Result<(), DomainError> {
+    actor.authorize("read")?;
+
+    let existing = sessions
+        .find_by_id(session_id)
+        .map_err(|reason| DomainError::PersistenceFailure { reason })?
+        .ok_or_else(|| DomainError::SessionNotFound {
+            id: session_id.clone(),
+        })?;
+
+    existing.assert_active()?;
+
+    sessions
+        .revoke(session_id)
+        .map_err(|reason| DomainError::PersistenceFailure { reason })?;
+
+    let _ = audit_log.record(AuditEvent {
+        actor_id: actor.id.clone(),
+        action: "session.revoked".to_string(),
+        target_kind: "Session".to_string(),
+        target_id: session_id.0.clone(),
+        outcome: AuditOutcome::Success,
+    });
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Resource commands
+// ---------------------------------------------------------------------------
+
+/// Create a new resource, enforcing authorization and emitting an audit event.
+pub fn create_resource(
+    actor: &Account,
+    resource_id: impl Into<String>,
+    title: impl Into<String>,
+    body: impl Into<String>,
+    resources: &impl ResourceRepository,
+    audit_log: &impl AuditLog,
+) -> Result<Resource, DomainError> {
+    actor.authorize("write")?;
+
+    let resource = Resource::new(resource_id, title, body, actor.id.clone());
+
+    if let Ok(Some(_)) = resources.find_by_id(&resource.id) {
+        return Err(DomainError::DuplicateResource {
+            id: resource.id.clone(),
+        });
+    }
+
+    resources
+        .save(&resource)
+        .map_err(|e| DomainError::ResourceNotFound { id: ResourceId(e) })?;
+
+    let _ = audit_log.record(AuditEvent {
+        actor_id: actor.id.clone(),
+        action: "resource.created".to_string(),
+        target_kind: "Resource".to_string(),
+        target_id: resource.id.0.clone(),
+        outcome: AuditOutcome::Success,
+    });
+
+    Ok(resource)
+}
+
+/// Delete a resource, enforcing delete authorization and emitting an audit event.
+pub fn delete_resource(
+    actor: &Account,
+    resource_id: &ResourceId,
+    resources: &impl ResourceRepository,
+    audit_log: &impl AuditLog,
+) -> Result<(), DomainError> {
+    actor.authorize("delete")?;
+
+    match resources.find_by_id(resource_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err(DomainError::ResourceNotFound {
+                id: resource_id.clone(),
+            })
+        }
+        Err(e) => {
+            return Err(DomainError::ResourceNotFound {
+                id: ResourceId(e),
+            })
+        }
+    }
+
+    resources
+        .delete(resource_id)
+        .map_err(|e| DomainError::ResourceNotFound { id: ResourceId(e) })?;
+
+    let _ = audit_log.record(AuditEvent {
+        actor_id: actor.id.clone(),
+        action: "resource.deleted".to_string(),
+        target_kind: "Resource".to_string(),
+        target_id: resource_id.0.clone(),
+        outcome: AuditOutcome::Success,
+    });
+
+    Ok(())
+}
+
+/// Check admin dashboard access — pure authorization, no side effects.
+pub fn can_view_admin_dashboard(account: &Account) -> bool {
+    account.authorize("view_admin").is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::Role;
+    use std::cell::RefCell;
+
+    // Minimal in-memory test doubles — adapters layer owns the real implementations.
+
+    struct FakeResources {
+        items: RefCell<Vec<Resource>>,
+    }
+
+    impl FakeResources {
+        fn new() -> Self {
+            Self {
+                items: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ResourceRepository for FakeResources {
+        fn find_by_id(&self, id: &ResourceId) -> Result<Option<Resource>, String> {
+            Ok(self.items.borrow().iter().find(|r| r.id == *id).cloned())
+        }
+
+        fn save(&self, resource: &Resource) -> Result<(), String> {
+            self.items.borrow_mut().push(resource.clone());
+            Ok(())
+        }
+
+        fn delete(&self, id: &ResourceId) -> Result<(), String> {
+            self.items.borrow_mut().retain(|r| r.id != *id);
+            Ok(())
+        }
+
+        fn list_by_owner(&self, owner_id: &AccountId) -> Result<Vec<Resource>, String> {
+            Ok(self
+                .items
+                .borrow()
+                .iter()
+                .filter(|r| r.owner_id == *owner_id)
+                .cloned()
+                .collect())
+        }
+    }
+
+    struct FakeSessions {
+        items: RefCell<Vec<Session>>,
+    }
+
+    impl FakeSessions {
+        fn new() -> Self {
+            Self {
+                items: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SessionRepository for FakeSessions {
+        fn find_by_id(&self, id: &SessionId) -> Result<Option<Session>, String> {
+            Ok(self.items.borrow().iter().find(|s| s.id == *id).cloned())
+        }
+
+        fn find_active_by_token_hash(&self, token_hash: &str) -> Result<Option<Session>, String> {
+            Ok(self
+                .items
+                .borrow()
+                .iter()
+                .find(|s| s.token_hash == token_hash && !s.revoked)
+                .cloned())
+        }
+
+        fn save(&self, session: &Session) -> Result<(), String> {
+            self.items.borrow_mut().push(session.clone());
+            Ok(())
+        }
+
+        fn revoke(&self, id: &SessionId) -> Result<(), String> {
+            let mut items = self.items.borrow_mut();
+            let session = items
+                .iter_mut()
+                .find(|s| s.id == *id)
+                .ok_or_else(|| id.0.clone())?;
+            session.revoke();
+            Ok(())
+        }
+    }
+
+    struct FakeAuditLog {
+        events: RefCell<Vec<AuditEvent>>,
+    }
+
+    impl FakeAuditLog {
+        fn new() -> Self {
+            Self {
+                events: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AuditLog for FakeAuditLog {
+        fn record(&self, event: AuditEvent) -> Result<(), String> {
+            self.events.borrow_mut().push(event);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn start_session_records_audit_event() {
+        let account = Account::new("a1", "admin@example.com", Role::Admin).unwrap();
+        let sessions = FakeSessions::new();
+        let audit = FakeAuditLog::new();
+
+        let result = start_session(
+            &account,
+            "s1",
+            "sha256:session-token-digest",
+            &sessions,
+            &audit,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(sessions.items.borrow().len(), 1);
+        assert_eq!(audit.events.borrow().len(), 1);
+        assert_eq!(audit.events.borrow()[0].action, "session.started");
+    }
+
+    #[test]
+    fn authenticate_session_returns_account_id() {
+        let account = Account::new("a1", "member@example.com", Role::Member).unwrap();
+        let sessions = FakeSessions::new();
+        let audit = FakeAuditLog::new();
+
+        let _ = start_session(&account, "s1", "sha256:token", &sessions, &audit);
+
+        let account_id = authenticate_session("sha256:token", &sessions).unwrap();
+
+        assert_eq!(account_id, account.id);
+    }
+
+    #[test]
+    fn revoked_session_no_longer_authenticates() {
+        let account = Account::new("a1", "member@example.com", Role::Member).unwrap();
+        let sessions = FakeSessions::new();
+        let audit = FakeAuditLog::new();
+
+        let session = start_session(&account, "s1", "sha256:token", &sessions, &audit).unwrap();
+        revoke_session(&account, &session.id, &sessions, &audit).unwrap();
+
+        let result = authenticate_session("sha256:token", &sessions);
+
+        assert_eq!(result, Err(DomainError::SessionNotFoundByToken));
+        assert_eq!(audit.events.borrow()[1].action, "session.revoked");
+    }
+
+    #[test]
+    fn inactive_account_cannot_start_session() {
+        let mut account = Account::new("a1", "inactive@example.com", Role::Member).unwrap();
+        account.deactivate();
+
+        let sessions = FakeSessions::new();
+        let audit = FakeAuditLog::new();
+
+        let result = start_session(&account, "s1", "sha256:token", &sessions, &audit);
+
+        assert_eq!(result, Err(DomainError::AccountInactive));
+        assert!(sessions.items.borrow().is_empty());
+    }
+
+    #[test]
+    fn create_resource_success() {
+        let actor = Account::new("a1", "admin@example.com", Role::Admin).unwrap();
+        let repo = FakeResources::new();
+        let log = FakeAuditLog::new();
+
+        let result = create_resource(&actor, "r1", "Title", "Body", &repo, &log);
+
+        assert!(result.is_ok());
+        assert_eq!(repo.items.borrow().len(), 1);
+        assert_eq!(log.events.borrow().len(), 1);
+        assert_eq!(log.events.borrow()[0].action, "resource.created");
+    }
+
+    #[test]
+    fn create_resource_denied_for_viewer() {
+        let viewer = Account::new("v1", "viewer@example.com", Role::Viewer).unwrap();
+        let repo = FakeResources::new();
+        let log = FakeAuditLog::new();
+
+        let result = create_resource(&viewer, "r1", "Title", "Body", &repo, &log);
+
+        assert!(matches!(
+            result,
+            Err(DomainError::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn create_resource_rejects_duplicate() {
+        let actor = Account::new("a1", "admin@example.com", Role::Admin).unwrap();
+        let repo = FakeResources::new();
+        let log = FakeAuditLog::new();
+
+        let _ = create_resource(&actor, "r1", "Title", "Body", &repo, &log);
+        let result = create_resource(&actor, "r1", "Title 2", "Body 2", &repo, &log);
+
+        assert!(matches!(result, Err(DomainError::DuplicateResource { .. })));
+    }
+
+    #[test]
+    fn delete_resource_denied_for_viewer() {
+        let viewer = Account::new("v1", "viewer@example.com", Role::Viewer).unwrap();
+        let repo = FakeResources::new();
+        let log = FakeAuditLog::new();
+
+        let result = delete_resource(&viewer, &ResourceId("r1".to_string()), &repo, &log);
+
+        assert!(matches!(
+            result,
+            Err(DomainError::PermissionDenied { .. })
+        ));
+    }
+
+    #[test]
+    fn delete_resource_not_found() {
+        let admin = Account::new("a1", "admin@example.com", Role::Admin).unwrap();
+        let repo = FakeResources::new();
+        let log = FakeAuditLog::new();
+
+        let result = delete_resource(&admin, &ResourceId("r1".to_string()), &repo, &log);
+
+        assert!(matches!(result, Err(DomainError::ResourceNotFound { .. })));
+    }
+
+    #[test]
+    fn admin_dashboard_access() {
+        let admin = Account::new("a1", "admin@example.com", Role::Admin).unwrap();
+        let viewer = Account::new("v1", "viewer@example.com", Role::Viewer).unwrap();
+        let mut inactive = Account::new("i1", "inactive@example.com", Role::Admin).unwrap();
+
+        inactive.deactivate();
+
+        assert!(can_view_admin_dashboard(&admin));
+        assert!(!can_view_admin_dashboard(&viewer));
+        assert!(!can_view_admin_dashboard(&inactive));
+    }
+}
+EOF
+
+cat > examples/perfect-web-api-db/backend/src/adapters.rs <<'EOF'
+// Adapters layer: database access, external API clients, queue/streaming clients.
+// Owns: SQL queries, connection pools, HTTP client calls, filesystem IO.
+// Never owns: domain invariants, authorization rules, business decisions.
+//
+// Production implementations of AccountRepository, ResourceRepository,
+// SessionRepository, and AuditLog (from the application layer) belong here.
+//
+// This scaffold does not include a running database. The adapters are documented
+// to show correct boundary placement. Real implementations would use sqlx,
+// diesel, or equivalent Rust DB crates.
+
+// ---------------------------------------------------------------------------
+// Example: PostgreSQL adapter for AccountRepository
+// ---------------------------------------------------------------------------
+//
+// ```rust
+// use sqlx::PgPool;
+// use crate::application::AccountRepository;
+// use crate::domain::{Account, AccountId};
+//
+// pub struct PgAccountRepository {
+//     pool: PgPool,
+// }
+//
+// impl AccountRepository for PgAccountRepository {
+//     fn find_by_id(&self, id: &AccountId) -> Result<Option<Account>, String> {
+//         // SELECT id, email, active, role, organization_id
+//         // FROM accounts WHERE id = $1
+//         todo!("implement with sqlx")
+//     }
+//
+//     fn save(&self, account: &Account) -> Result<(), String> {
+//         // INSERT INTO accounts (id, email, active, role, organization_id)
+//         // VALUES ($1, $2, $3, $4, $5)
+//         // ON CONFLICT (id) DO UPDATE SET ...
+//         todo!("implement with sqlx")
+//     }
+// }
+// ```
+//
+// The key boundary rules:
+//
+// 1. Raw SQL lives here, not in domain or application.
+// 2. The adapter maps between DB rows and domain types.
+// 3. Transaction boundaries are managed by the application layer through a
+//    unit-of-work or transaction port, not by raw adapter-level commit/rollback.
+// 4. The adapter never makes authorization decisions.
+// 5. The adapter never invents domain invariants.
+
+// ---------------------------------------------------------------------------
+// Example: SessionRepository for auth/session shell
+// ---------------------------------------------------------------------------
+//
+// ```rust
+// use sqlx::PgPool;
+// use crate::application::SessionRepository;
+// use crate::domain::{Session, SessionId};
+//
+// pub struct PgSessionRepository {
+//     pool: PgPool,
+// }
+//
+// impl SessionRepository for PgSessionRepository {
+//     fn find_by_id(&self, id: &SessionId) -> Result<Option<Session>, String> {
+//         // SELECT id, account_id, token_hash, revoked
+//         // FROM sessions WHERE id = $1
+//         todo!("implement with sqlx")
+//     }
+//
+//     fn find_active_by_token_hash(&self, token_hash: &str) -> Result<Option<Session>, String> {
+//         // SELECT id, account_id, token_hash, revoked
+//         // FROM sessions
+//         // WHERE token_hash = $1 AND revoked = FALSE
+//         todo!("implement with sqlx")
+//     }
+//
+//     fn save(&self, session: &Session) -> Result<(), String> {
+//         // INSERT INTO sessions (id, account_id, token_hash, revoked)
+//         // VALUES ($1, $2, $3, FALSE)
+//         // Raw bearer tokens are never persisted.
+//         todo!("implement with sqlx")
+//     }
+//
+//     fn revoke(&self, id: &SessionId) -> Result<(), String> {
+//         // UPDATE sessions
+//         // SET revoked = TRUE, revoked_at = now()
+//         // WHERE id = $1 AND revoked = FALSE
+//         todo!("implement with sqlx")
+//     }
+// }
+// ```
+
+// ---------------------------------------------------------------------------
+// Example: Audit log adapter for append-only event storage
+// ---------------------------------------------------------------------------
+//
+// ```rust
+// use sqlx::PgPool;
+// use crate::application::AuditLog;
+// use crate::domain::AuditEvent;
+//
+// pub struct PgAuditLog {
+//     pool: PgPool,
+// }
+//
+// impl AuditLog for PgAuditLog {
+//     fn record(&self, event: AuditEvent) -> Result<(), String> {
+//         // INSERT INTO audit_events (actor_id, action, target_kind,
+//         // target_id, outcome, created_at)
+//         // VALUES ($1, $2, $3, $4, $5, now())
+//         todo!("implement with sqlx")
+//     }
+// }
+// ```
+EOF
+
+cat > examples/perfect-web-api-db/db/migrations/001_init.sql <<'EOF'
+-- Migration 001: Initial schema for perfect-web-api-db reference platform.
+--
+-- Invariants enforced at DB level:
+-- - Account email must be unique and non-empty.
+-- - Account role must be one of the declared domain roles.
+-- - Session tokens are stored as hashes/digests only, never raw bearer tokens.
+-- - Resource ownership references a valid account.
+-- - Audit events are append-only by application policy.
+--
+-- Rollback:
+-- DROP TABLE audit_events, resources, sessions, organizations, accounts;
+-- DROP TYPE account_role;
+
+CREATE TYPE account_role AS ENUM ('owner', 'admin', 'member', 'viewer');
+
+CREATE TABLE accounts (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE CHECK (email <> '' AND email LIKE '%@%'),
+    active BOOLEAN NOT NULL DEFAULT TRUE,
+    role account_role NOT NULL DEFAULT 'member',
+    organization_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE organizations (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL CHECK (name <> ''),
+    member_limit INTEGER NOT NULL DEFAULT 50 CHECK (member_limit > 0),
+    member_count INTEGER NOT NULL DEFAULT 0 CHECK (member_count >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+ALTER TABLE accounts
+    ADD CONSTRAINT fk_accounts_organization
+    FOREIGN KEY (organization_id)
+    REFERENCES organizations(id);
+
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES accounts(id),
+    token_hash TEXT NOT NULL UNIQUE CHECK (token_hash <> ''),
+    revoked BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at TIMESTAMPTZ,
+    CHECK (
+        (revoked = FALSE AND revoked_at IS NULL)
+        OR
+        (revoked = TRUE AND revoked_at IS NOT NULL)
+    )
+);
+
+CREATE TABLE resources (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL CHECK (title <> ''),
+    body TEXT NOT NULL DEFAULT '',
+    owner_id TEXT NOT NULL REFERENCES accounts(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE audit_events (
+    id BIGSERIAL PRIMARY KEY,
+    actor_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('success', 'denied', 'error')),
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_accounts_org ON accounts(organization_id);
+CREATE INDEX idx_sessions_account ON sessions(account_id);
+CREATE INDEX idx_sessions_token_hash ON sessions(token_hash);
+CREATE INDEX idx_sessions_active ON sessions(account_id) WHERE revoked = FALSE;
+CREATE INDEX idx_resources_owner ON resources(owner_id);
+CREATE INDEX idx_audit_events_actor ON audit_events(actor_id);
+CREATE INDEX idx_audit_events_created ON audit_events(created_at);
+EOF
+
+cat > examples/perfect-web-api-db/db/constraints/001_accounts.sql <<'EOF'
+-- Constraint documentation for accounts, sessions, resources, and audit_events.
+--
+-- These constraints are enforced in the migration but documented here for agent
+-- visibility and audit-lane reference.
+
+-- 1. Email uniqueness: UNIQUE constraint on accounts.email.
+-- Domain invariant: no two accounts share an email address.
+-- Enforced: migration 001_init.sql + domain::Account::new() validation.
+
+-- 2. Email format: CHECK (email <> '' AND email LIKE '%@%').
+-- Domain invariant: email must be non-empty and contain @.
+-- Enforced: migration 001_init.sql + domain::Account::new() validation.
+
+-- 3. Role enum: account_role ENUM ('owner', 'admin', 'member', 'viewer').
+-- Domain invariant: role is one of the declared RBAC roles.
+-- Enforced: migration 001_init.sql + domain::Role enum.
+
+-- 4. Organization membership: FK accounts.organization_id -> organizations.id.
+-- Domain invariant: an account's organization must exist.
+-- Enforced: migration 001_init.sql foreign key.
+
+-- 5. Organization member limit: CHECK (member_limit > 0).
+-- Domain invariant: organizations must have a positive member limit.
+-- Enforced: migration 001_init.sql + domain::Organization::can_add_member().
+
+-- 6. Session token hash: UNIQUE non-empty token_hash.
+-- Domain invariant: auth/session shell stores token hashes/digests only.
+-- Enforced: migration 001_init.sql + domain::Session::new().
+
+-- 7. Session revocation: revoked sessions require revoked_at.
+-- Domain invariant: revoked sessions cannot authenticate.
+-- Enforced: migration 001_init.sql + domain::Session::assert_active().
+
+-- 8. Resource ownership: FK resources.owner_id -> accounts.id.
+-- Domain invariant: every resource has a valid owner account.
+-- Enforced: migration 001_init.sql foreign key.
+
+-- 9. Audit append-only: application-layer policy, no UPDATE/DELETE commands exist.
+-- Domain invariant: audit events are immutable once written.
+-- Enforced: application layer. Recommended: add RLS or trigger to prevent
+-- UPDATE/DELETE in production.
+EOF
+
+cat > examples/perfect-web-api-db/contracts/openapi.json <<'EOF'
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "perfect-web-api-db",
+    "version": "0.1.0",
+    "description": "Jankurai-native reference platform API. This contract is the source of truth for generated clients. Do not handwrite API mirrors."
+  },
+  "paths": {
+    "/session/current": {
+      "get": {
+        "operationId": "getCurrentSession",
+        "summary": "Resolve the current bearer token to the active session principal",
+        "tags": ["session"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Current session principal",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionPrincipal" }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked session",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "revokeCurrentSession",
+        "summary": "Revoke the current session",
+        "tags": ["session"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "204": {
+            "description": "Session revoked"
+          },
+          "401": {
+            "description": "Missing, invalid, or revoked session",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/accounts": {
+      "get": {
+        "operationId": "listAccounts",
+        "summary": "List all accounts (admin only)",
+        "tags": ["admin"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Account list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Account" }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — caller lacks admin role",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/resources": {
+      "get": {
+        "operationId": "listResources",
+        "summary": "List resources owned by the caller",
+        "tags": ["resources"],
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Resource list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Resource" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "createResource",
+        "summary": "Create a new resource",
+        "tags": ["resources"],
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateResourceRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Resource created",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Resource" }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — caller lacks write permission",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict — duplicate resource ID",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/resources/{resourceId}": {
+      "delete": {
+        "operationId": "deleteResource",
+        "summary": "Delete a resource",
+        "tags": ["resources"],
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "resourceId",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Resource deleted"
+          },
+          "403": {
+            "description": "Forbidden — caller lacks delete permission",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ProblemDetail" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque-or-jwt"
+      }
+    },
+    "schemas": {
+      "SessionPrincipal": {
+        "type": "object",
+        "required": ["accountId", "email", "role"],
+        "properties": {
+          "accountId": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "role": {
+            "type": "string",
+            "enum": ["owner", "admin", "member", "viewer"]
+          }
+        }
+      },
+      "Account": {
+        "type": "object",
+        "required": ["id", "email", "active", "role"],
+        "properties": {
+          "id": { "type": "string" },
+          "email": { "type": "string", "format": "email" },
+          "active": { "type": "boolean" },
+          "role": {
+            "type": "string",
+            "enum": ["owner", "admin", "member", "viewer"]
+          },
+          "organizationId": { "type": "string" }
+        }
+      },
+      "Resource": {
+        "type": "object",
+        "required": ["id", "title", "body", "ownerId"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "body": { "type": "string" },
+          "ownerId": { "type": "string" }
+        }
+      },
+      "CreateResourceRequest": {
+        "type": "object",
+        "required": ["title", "body"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 10000
+          }
+        }
+      },
+      "ProblemDetail": {
+        "type": "object",
+        "description": "RFC 9457 Problem Details for HTTP APIs",
+        "required": ["type", "title", "status"],
+        "properties": {
+          "type": { "type": "string", "format": "uri" },
+          "title": { "type": "string" },
+          "status": { "type": "integer" },
+          "detail": { "type": "string" },
+          "instance": { "type": "string", "format": "uri" }
+        }
+      }
+    }
+  }
+}
+EOF
+
+cat > examples/perfect-web-api-db/frontend/src/App.tsx <<'EOF'
+// Frontend skeleton for perfect-web-api-db reference platform.
+//
+// Boundary rules:
+// - UI owns: forms, generated clients, browser tests.
+// - UI never owns: secrets, durable truth, core authz, direct DB.
+//
+// All API calls should use the generated client from contracts/openapi.json.
+// Do not handwrite fetch() calls that mirror the contract.
+
+import { useEffect, useState } from "react";
+
+// ---------------------------------------------------------------------------
+// Types — these should come from a generated client in a real project.
+// Generated by: openapi-typescript-codegen (or equivalent)
+// Source: contracts/openapi.json
+// DO NOT maintain these by hand in production.
+// ---------------------------------------------------------------------------
+
+interface Account {
+  id: string;
+  email: string;
+  active: boolean;
+  role: "owner" | "admin" | "member" | "viewer";
+  organizationId?: string;
+}
+
+interface Resource {
+  id: string;
+  title: string;
+  body: string;
+  ownerId: string;
+}
+
+interface SessionPrincipal {
+  accountId: string;
+  email: string;
+  role: "owner" | "admin" | "member" | "viewer";
+}
+
+interface ProblemDetail {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+}
+
+// ---------------------------------------------------------------------------
+// UI States — loading, empty, error, success, permission-denied
+// ---------------------------------------------------------------------------
+
+type PageState =
+  | { kind: "loading" }
+  | { kind: "empty" }
+  | { kind: "error"; detail: ProblemDetail }
+  | { kind: "denied" }
+  | { kind: "success"; accounts: Account[] };
+
+type ResourceState =
+  | { kind: "loading" }
+  | { kind: "empty" }
+  | { kind: "error"; detail: ProblemDetail }
+  | { kind: "success"; resources: Resource[] };
+
+type SessionState =
+  | { kind: "loading" }
+  | { kind: "empty" }
+  | { kind: "error"; detail: ProblemDetail }
+  | { kind: "denied" }
+  | { kind: "success"; principal: SessionPrincipal };
+
+// ---------------------------------------------------------------------------
+// Components
+// ---------------------------------------------------------------------------
+
+function ErrorDisplay({ detail }: { detail: ProblemDetail }) {
+  return (
+    <section role="alert" aria-label="Error">
+      <h2>{detail.title}</h2>
+      <p>{detail.detail ?? `HTTP ${detail.status}`}</p>
+    </section>
+  );
+}
+
+function PermissionDenied() {
+  return (
+    <section role="alert" aria-label="Permission denied">
+      <h2>Access Denied</h2>
+      <p>You do not have permission to view this page.</p>
+    </section>
+  );
+}
+
+function EmptyState({ message }: { message: string }) {
+  return <p>{message}</p>;
+}
+
+function LoadingSpinner() {
+  return (
+    <p aria-busy="true" aria-live="polite">
+      Loading…
+    </p>
+  );
+}
+
+function AccountList({ accounts }: { accounts: Account[] }) {
+  return (
+    <table aria-label="Accounts">
+      <thead>
+        <tr>
+          <th scope="col">Email</th>
+          <th scope="col">Role</th>
+          <th scope="col">Active</th>
+        </tr>
+      </thead>
+      <tbody>
+        {accounts.map((account) => (
+          <tr key={account.id}>
+            <td>{account.email}</td>
+            <td>{account.role}</td>
+            <td>{account.active ? "Yes" : "No"}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function ResourceList({ resources }: { resources: Resource[] }) {
+  return (
+    <table aria-label="Resources">
+      <thead>
+        <tr>
+          <th scope="col">Title</th>
+          <th scope="col">Body</th>
+        </tr>
+      </thead>
+      <tbody>
+        {resources.map((resource) => (
+          <tr key={resource.id}>
+            <td>{resource.title}</td>
+            <td>{resource.body}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function SessionPrincipalCard({ principal }: { principal: SessionPrincipal }) {
+  return (
+    <section aria-label="Current session">
+      <h3>Signed in</h3>
+      <dl>
+        <dt>Email</dt>
+        <dd>{principal.email}</dd>
+        <dt>Role</dt>
+        <dd>{principal.role}</dd>
+      </dl>
+      <button id="revoke-session-button" type="button">
+        Revoke current session
+      </button>
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+function SessionShell() {
+  const [state, setState] = useState<SessionState>({ kind: "loading" });
+
+  useEffect(() => {
+    // In production, use the generated API client:
+    // import { SessionApi } from "../generated/client";
+    // const api = new SessionApi();
+    // api.getCurrentSession().then(...)
+    //
+    // Simulated for scaffold — no real API call.
+    setState({
+      kind: "success",
+      principal: {
+        accountId: "a1",
+        email: "admin@example.com",
+        role: "admin",
+      },
+    });
+  }, []);
+
+  switch (state.kind) {
+    case "loading":
+      return <LoadingSpinner />;
+    case "empty":
+      return <EmptyState message="No active session." />;
+    case "error":
+      return <ErrorDisplay detail={state.detail} />;
+    case "denied":
+      return <PermissionDenied />;
+    case "success":
+      return <SessionPrincipalCard principal={state.principal} />;
+  }
+}
+
+function AdminDashboard() {
+  const [state, setState] = useState<PageState>({ kind: "loading" });
+
+  useEffect(() => {
+    // In production, use the generated API client:
+    // import { AdminApi } from "../generated/client";
+    // const api = new AdminApi();
+    // api.listAccounts().then(...)
+    //
+    // Simulated for scaffold — no real API call.
+    setState({ kind: "empty" });
+  }, []);
+
+  switch (state.kind) {
+    case "loading":
+      return <LoadingSpinner />;
+    case "empty":
+      return <EmptyState message="No accounts yet." />;
+    case "error":
+      return <ErrorDisplay detail={state.detail} />;
+    case "denied":
+      return <PermissionDenied />;
+    case "success":
+      return <AccountList accounts={state.accounts} />;
+  }
+}
+
+function ResourceDashboard() {
+  const [state, setState] = useState<ResourceState>({ kind: "loading" });
+
+  useEffect(() => {
+    setState({ kind: "empty" });
+  }, []);
+
+  switch (state.kind) {
+    case "loading":
+      return <LoadingSpinner />;
+    case "empty":
+      return <EmptyState message="No resources yet." />;
+    case "error":
+      return <ErrorDisplay detail={state.detail} />;
+    case "success":
+      return <ResourceList resources={state.resources} />;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// App root
+// ---------------------------------------------------------------------------
+
+export function App() {
+  return (
+    <main>
+      <h1>perfect-web-api-db</h1>
+      <nav aria-label="Primary navigation">
+        <ul>
+          <li>
+            <a href="#session">Session</a>
+          </li>
+          <li>
+            <a href="#admin">Admin Dashboard</a>
+          </li>
+          <li>
+            <a href="#resources">Resources</a>
+          </li>
+        </ul>
+      </nav>
+
+      <section id="session">
+        <h2>Session</h2>
+        <SessionShell />
+      </section>
+
+      <section id="admin">
+        <h2>Admin Dashboard</h2>
+        <AdminDashboard />
+      </section>
+
+      <section id="resources">
+        <h2>Resources</h2>
+        <ResourceDashboard />
+      </section>
+    </main>
+  );
+}
+EOF
+
+cat > examples/perfect-web-api-db/ops/security.md <<'EOF'
+# Security
+
+## Secret Management
+
+- No secrets in source code, config files, or fixtures.
+- Environment variables for database URLs, JWT signing keys, session signing keys, and API keys.
+- `.env` files must be `.gitignore`-d.
+- `gitleaks` scans on every commit.
+
+## Dependency Review
+
+| Tool | Scope | Frequency |
+|------|-------|-----------|
+| `cargo audit` | Rust advisories | Every PR, nightly |
+| `npm audit` | JS advisories | Every PR, nightly |
+| `cargo deny` | License + source policy | Release |
+| `syft` | SBOM generation | Release |
+
+## Authentication
+
+- Bearer token required for all non-public endpoints.
+- Token validation is an API-edge concern, not domain logic.
+- The auth/session shell stores token hashes or digests only; raw bearer tokens are never persisted.
+- Session revocation updates `sessions.revoked`, sets `revoked_at`, and emits `session.revoked` audit evidence.
+- Authorization (RBAC) is a domain concern enforced by `Account::authorize()`.
+
+## Auth/Session Shell Threat Boundaries
+
+- Provider-backed login, OAuth, SAML, password reset, MFA, and key rotation are explicitly outside this shell.
+- The shell proves session identity shape, active/revoked checks, persistence boundary, contract shape, UX state coverage, audit events, and proof lanes.
+- Production providers must be added behind the API-edge and adapter boundaries without moving durable auth truth into UI code.
+- Session tokens must be high entropy and compared by hash/digest. Logs and audit events must never include raw tokens.
+
+## CI Hardening
+
+- GitHub Actions workflows pin action versions by SHA.
+- `GITHUB_TOKEN` permissions are minimized to required scopes.
+- No `pull_request_target` with untrusted code checkout.
+- `actionlint` and `zizmor` run in the security lane.
+
+## Prompt Injection Defense
+
+- Agent instruction files (`AGENTS.md`, adapter files) are trusted sources.
+- Issue text, PR comments, and tool output are untrusted content.
+- Trusted files never instruct agents to ignore higher-priority instructions.
+- No broad "allow all tools" language in any policy file.
+
+## Compliance Posture
+
+This reference platform provides **SOC-ready engineering evidence**, not SOC 2 certification.
+
+Evidence categories:
+
+- **Change management**: audit events + PR-based deployment
+- **Access control**: RBAC with domain-enforced roles + auth/session shell
+- **Vulnerability management**: dependency scans + SBOM
+- **Logging**: append-only audit events + structured logs
+- **Vendor risk**: dependency review + license policy
+EOF
+
+cat > examples/perfect-web-api-db/ux/routes.md <<'EOF'
+# UX Routes
+
+## Route Matrix
+
+| Route | Component | States | Auth Required | Critical Path |
+|-------|-----------|--------|--------------|---------------|
+| `/session/current` | SessionShell | loading, empty, error, denied, success | Yes | Yes |
+| `/admin/accounts` | AdminDashboard | loading, empty, error, denied, success | Yes (admin+) | Yes |
+| `/resources` | ResourceDashboard | loading, empty, error, success | Yes (member+) | Yes |
+
+## State Coverage
+
+Every route must handle these UI states:
+
+1. **Loading** — shown while API call is in flight.
+2. **Empty** — shown when the response is empty or the user has no active session.
+3. **Error** — shown when the API returns a non-2xx response using ProblemDetail.
+4. **Permission Denied** — shown when the caller lacks the required role or active session.
+5. **Success** — shown with the data rendered.
+
+## Auth/Session UX Contract
+
+- The session shell displays the currently resolved principal, not raw tokens.
+- The revoke action calls the generated `revokeCurrentSession` client operation.
+- Logged-out, revoked, expired, and invalid-token states are rendered as empty, error, or denied states, not silent fallbacks.
+- UI code never decides authorization. It only renders server/domain decisions.
+
+## Accessibility
+
+- All interactive elements have unique `id` attributes.
+- Tables use `aria-label` and `scope` attributes.
+- Navigation uses `aria-label="Primary navigation"`.
+- Error states use `role="alert"`.
+- Loading states use `aria-busy="true"`.
+
+## Generated Client Policy
+
+Frontend API calls must use generated clients from `contracts/openapi.json`. Do not handwrite `fetch()` calls that mirror the contract schema.
+
+The scaffold currently uses inline types as a placeholder; production must replace these with generated types from `openapi-typescript-codegen` or equivalent tooling declared in `agent/generated-zones.toml`.
+EOF
+
+cat > examples/perfect-web-api-db/docs/architecture.md <<'EOF'
+# Architecture Decisions
+
+## ADR-001: Domain Layer Purity
+
+**Decision**: Domain layer has zero IO dependencies.
+
+**Context**: The Jankurai standard requires that domain code owns IDs, invariants, and pure decisions but never owns IO, env, time, random, DB, or framework types.
+
+**Consequences**:
+
+- All persistence is abstracted through repository port traits in application.
+- Domain tests require no database, network, or filesystem.
+- Authorization decisions are pure functions on `Account` and `Role`.
+
+## ADR-002: Contract-First API Design
+
+**Decision**: `contracts/openapi.json` is the source of truth for all API endpoints and request/response shapes.
+
+**Context**: The Jankurai standard forbids handwritten DTO mirrors when generated clients exist. The contract file drives client generation, server stub generation, and documentation.
+
+**Consequences**:
+
+- Frontend types must come from generated clients, not hand-maintained interfaces.
+- Backend response shapes must match the contract schemas.
+- Contract drift is detected by the contract proof lane.
+
+## ADR-003: Database Constraints Mirror Domain Invariants
+
+**Decision**: Critical domain invariants are enforced at both the domain layer and the database layer.
+
+**Context**: Defense in depth. If a bug bypasses domain validation, the database provides a safety net. If the database constraint is too coarse, the domain provides precise error messages.
+
+**Consequences**:
+
+- Email uniqueness: domain `Account::new()` + DB `UNIQUE` constraint.
+- Role validity: domain `Role` enum + DB `account_role` ENUM type.
+- Session revocation: domain `Session::assert_active()` + DB revoked/revoked_at constraint.
+- Resource ownership: domain `Resource.owner_id` + DB FK.
+- Constraint documentation lives in `db/constraints/` for agent visibility.
+
+## ADR-004: Audit Events Are Append-Only
+
+**Decision**: The `audit_events` table has no UPDATE or DELETE operations.
+
+**Context**: Compliance and observability require immutable audit trails. The application layer emits audit events through the `AuditLog` port trait; the adapter writes to PostgreSQL.
+
+**Consequences**:
+
+- No `update_audit_event` or `delete_audit_event` commands exist.
+- Session start/revoke and resource create/delete emit audit evidence.
+- The table grows over time; archival is an ops concern, not a domain concern.
+- Production should add RLS or triggers to prevent accidental mutation.
+
+## ADR-005: RFC 9457 Problem Details For Errors
+
+**Decision**: All API error responses use the RFC 9457 Problem Details shape.
+
+**Context**: Typed, machine-readable errors make agent-driven repair possible. String-only error messages require human interpretation.
+
+**Consequences**:
+
+- `ProblemDetail` schema is defined in `contracts/openapi.json`.
+- Frontend error display uses the `detail` and `title` fields.
+- Agents can parse error responses and map them to repair actions.
+
+## ADR-006: Auth/Session Boundary
+
+**Decision**: The auth/session shell owns session identity shape, active/revoked checks, persistence ports, contract shape, UX state coverage, and audit events, but does not own provider-backed login.
+
+**Context**: Session primitives are common sources of agent mistakes. The reusable cell must prove the safe shell first: no raw token persistence, no UI-owned authz, no adapter-owned authorization, and no hidden provider assumptions.
+
+**Consequences**:
+
+- API edge validates bearer tokens and passes token hashes/digests to application ports.
+- Domain owns `Session`, `SessionId`, token-hash validation, and revoked-session checks.
+- Application owns `start_session`, `authenticate_session`, and `revoke_session`.
+- Adapters own SQL and token-hash lookup mechanics.
+- Provider-backed login, OAuth, SAML, MFA, password reset, and key rotation stay behind explicit future cells or provider adapters.
+EOF
+
+cat > examples/perfect-web-api-db/docs/exceptions.md <<'EOF'
+# Exception Inventory
+
+## Current Exceptions
+
+| Exception | Owner | Reason | Expiry | Migration Path |
+|-----------|-------|--------|--------|---------------|
+| Inline TypeScript types in `App.tsx` | frontend | Generated client tooling not yet integrated | When `openapi-typescript-codegen` or equivalent is added to build pipeline | Replace inline interfaces with generated imports from `contracts/openapi.json` |
+| Adapter layer is documentation-only | backend | Reference scaffold does not ship a running database | When a running integration test is added | Implement `PgAccountRepository`, `PgResourceRepository`, `PgSessionRepository`, and `PgAuditLog` with sqlx |
+| Auth provider is not integrated | backend | Phase 10 certifies the provider-agnostic auth/session shell only | When OAuth/SAML/password/MFA provider work is selected | Add provider adapter at the API edge; keep session token hashes in `sessions` and keep RBAC in domain |
+| No Playwright E2E tests | frontend | Scaffold does not run a dev server | When Vite build pipeline is added | Add critical path E2E tests per `ux/routes.md` state matrix |
+
+## Exception Policy
+
+Every exception must have:
+
+1. **Owner** — the team or layer responsible for resolving it.
+2. **Reason** — why the exception exists today.
+3. **Expiry** — the condition under which the exception should be resolved.
+4. **Migration path** — how to fix it when the expiry condition is met.
+
+Exceptions without expiry are rejected by the Jankurai standard.
+EOF
+
+cat > examples/perfect-web-api-db/README.md <<'EOF'
+# perfect-web-api-db
+
+Jankurai-native reference platform proving the COLD stack end to end.
+
+## What This Proves
+
+This scaffold demonstrates the Jankurai agent-native engineering standard applied to a real fullstack SaaS skeleton:
+
+- **Contracts**: OpenAPI 3.1 source of truth at `contracts/openapi.json` drives generated clients. No handwritten DTO mirrors.
+- **Ownership**: Every layer has declared boundaries: domain, application, adapters, API edge, frontend, DB, ops, and UX.
+- **Lanes**: Proof routing maps changed paths to the smallest credible test commands.
+- **Durability**: Domain invariants are enforced at two levels: Rust types and PostgreSQL constraints.
+- **Auditability**: Audit events are append-only by application policy.
+- **Auth/session shell**: Bearer-token sessions are modeled as token hashes/digests, active/revoked checks, contract paths, UX states, audit events, and DB constraints without provider-specific login.
+
+## Stack
+
+| Layer | Technology | Owns | Never Owns |
+|-------|------------|------|------------|
+| Domain | Rust | IDs, invariants, RBAC, sessions, errors | IO, DB, HTTP, env |
+| Application | Rust | Commands, authz, session orchestration, audit events | UI, raw SQL |
+| Adapters | Rust/sqlx shell | DB queries, external APIs | Domain rules |
+| API | Rust/axum shell | HTTP edge, token extraction, mapping | Domain rules, raw SQL |
+| Frontend | TypeScript/React/Vite | UI, forms, generated clients | Secrets, DB, authz |
+| Database | PostgreSQL | Migrations, constraints, indexes | App logic |
+| Contracts | OpenAPI 3.1 | API shape, generated clients | Handwritten drift |
+
+## File Layout
+
+```text
+backend/
+  src/
+    lib.rs          — module root with layer documentation
+    domain.rs       — pure domain: typed IDs, invariants, RBAC, sessions, audit events
+    application.rs  — commands, authorization, session orchestration, port traits, audit emission
+    adapters.rs     — DB adapter contracts and boundary documentation
+contracts/
+  openapi.json      — OpenAPI 3.1 source of truth for API contract
+db/
+  migrations/
+    001_init.sql    — production-grade schema with ENUMs, FKs, indexes, sessions
+  constraints/
+    001_accounts.sql — constraint-to-invariant documentation
+docs/
+  architecture.md   — architecture decision records
+  exceptions.md     — time-bounded exception inventory
+frontend/
+  src/
+    App.tsx         — React app with all UI states, ARIA, generated client slots
+ops/
+  observability.md  — trace IDs, structured logging, metrics, health check
+  security.md       — secrets, dependencies, auth/session, CI hardening, compliance
+ux/
+  routes.md         — route matrix, state coverage, accessibility, client policy
+````
+
+## Running The Scaffold
+
+This scaffold is intentionally a file-layout reference, not a running application. To build a running version:
+
+1. `cargo init --lib backend` and add the domain/application/adapters code.
+2. Add `axum` for the API edge layer.
+3. Run `openapi-typescript-codegen` to generate the frontend client.
+4. Add `sqlx` for PostgreSQL adapters.
+5. Run `jankurai init --profile rust-ts-postgres` for agent routing files.
+6. Run `jankurai audit` to verify the score.
+
+## Proof Lanes
+
+| Changed Surface              | Proof Command                              |
+| ---------------------------- | ------------------------------------------ |
+| `backend/src/domain.rs`      | `cargo test -p perfect-web-api-db`         |
+| `backend/src/application.rs` | `cargo test -p perfect-web-api-db`         |
+| `contracts/openapi.json`     | Contract drift check + client regeneration |
+| `db/migrations/`             | Migration review + constraint verification |
+| `frontend/src/`              | `npm run build && npm run test`            |
+| `ops/`                       | `just score`                               |
+| `docs/`                      | `just score`                               |
+
+## Exceptions
+
+See `docs/exceptions.md` for the current exception inventory. All exceptions have an owner, expiry condition, and migration path.
+
+## Architecture Decisions
+
+See `docs/architecture.md` for the key design choices and their relationship to the Jankurai standard.
+EOF
+
+python3 <<'PY'
+from pathlib import Path
+import re
+
+def must_sub(pattern: str, repl, text: str, label: str, flags: int = 0) -> str:
+new, count = re.subn(pattern, repl, text, count=1, flags=flags)
+if count != 1:
+raise SystemExit(f"expected exactly one replacement for {label}; found {count}")
+return new
+
+# ---------------------------------------------------------------------------
+
+# Add auth-session certified manifest to the built-in cell catalog.
+
+# ---------------------------------------------------------------------------
+
+catalog_path = Path("crates/jankurai/src/commands/cell_catalog.rs")
+catalog = catalog_path.read_text()
+
+if "auth_session_manifest(repo, catalog)" not in catalog:
+catalog = must_sub(
+r"(rbac_manifest(repo,\s*catalog),)(\s*])",
+lambda m: f"{m.group(1)}\n        auth_session_manifest(repo, catalog),{m.group(2)}",
+catalog,
+"built_in_manifests auth-session insertion",
+flags=re.S,
+)
+
+AUTH_SESSION_MANIFEST = r'''
+fn auth_session_manifest(repo: &Path, catalog: &RepoCatalog) -> CellManifest {
+let source_paths = strings(&[
+"examples/perfect-web-api-db/backend/src/domain.rs",
+"examples/perfect-web-api-db/backend/src/application.rs",
+"examples/perfect-web-api-db/backend/src/adapters.rs",
+"examples/perfect-web-api-db/frontend/src/App.tsx",
+"examples/perfect-web-api-db/ops/security.md",
+"examples/perfect-web-api-db/docs/architecture.md",
+"examples/perfect-web-api-db/docs/exceptions.md",
+"examples/perfect-web-api-db/README.md",
+]);
+let contract_paths = strings(&["examples/perfect-web-api-db/contracts/openapi.json"]);
+let migration_paths = strings(&[
+"examples/perfect-web-api-db/db/migrations/001_init.sql",
+"examples/perfect-web-api-db/db/constraints/001_accounts.sql",
+]);
+let ui_routes = strings(&["examples/perfect-web-api-db/ux/routes.md"]);
+let proof_lanes = strings(&[
+"test-cli",
+"audit",
+"db-migration-analyze",
+"ux-qa",
+"security",
+]);
+
+```
+certified_manifest(
+    repo,
+    catalog,
+    CellManifest {
+        cell_id: "auth-session".to_string(),
+        version: "0.1.0".to_string(),
+        category: "identity-session".to_string(),
+        lifecycle: "certified".to_string(),
+        supported_profiles: strings(&["perfect-web-api-db"]),
+        dependencies: strings(&["rbac", "audit-log"]),
+        source_paths,
+        generated_paths: Vec::new(),
+        contract_paths,
+        migration_paths,
+        ui_routes,
+        proof_lanes,
+        proof_commands: Vec::new(),
+        security_assumptions: strings(&[
+            "bearer-token validation is an API-edge concern and raw tokens are never stored",
+            "session state stores token hashes or digests only",
+            "revoked or inactive sessions cannot authenticate application commands",
+            "authorization remains domain-owned through Account::authorize and Role",
+            "session start and revoke paths emit audit events through the audit-log cell",
+        ]),
+        observability_events: strings(&[
+            "session.started",
+            "session.revoked",
+            "authorization.denied",
+        ]),
+        docs: strings(&[
+            "examples/perfect-web-api-db/ops/security.md",
+            "examples/perfect-web-api-db/docs/architecture.md",
+            "examples/perfect-web-api-db/docs/exceptions.md",
+            "examples/perfect-web-api-db/ux/routes.md",
+        ]),
+        upgrade_notes: strings(&[
+            "add provider-backed login only behind the API-edge and adapter boundaries",
+            "persist opaque token hashes or digests rather than raw token secrets",
+            "generate OpenAPI session clients before exposing production UI login",
+            "keep token verification at the edge and keep authorization in the domain layer",
+        ]),
+        rollback_notes: strings(&[
+            "dry-run install writes no files",
+            "revoke active sessions before deleting a provider or backing store",
+            "reverse session tables only through reviewed migrations",
+        ]),
+        certification_status: "candidate".to_string(),
+        certification_evidence: Vec::new(),
+        install_strategy: "dry-run-plan".to_string(),
+        conflict_policy: "never-overwrite".to_string(),
+    },
+)
+```
+
+}
+'''
+
+if "fn auth_session_manifest" not in catalog:
+if "\nfn certified_manifest(" in catalog:
+catalog = catalog.replace("\nfn certified_manifest(", "\n" + AUTH_SESSION_MANIFEST + "\nfn certified_manifest(", 1)
+else:
+catalog = catalog.replace("fn certified_manifest(", AUTH_SESSION_MANIFEST + "\nfn certified_manifest(", 1)
+
+catalog_path.write_text(catalog)
+
+# ---------------------------------------------------------------------------
+
+# Harden command-surface tests: fourth cell, evidence invariants, dependency order.
+
+# ---------------------------------------------------------------------------
+
+test_path = Path("crates/jankurai/tests/command_surface_smoke.rs")
+test = test_path.read_text()
+
+if "use std::collections::BTreeSet;" not in test:
+test = test.replace("use std::fs;", "use std::collections::BTreeSet;\nuse std::fs;", 1)
+
+INVARIANT_BLOCK = r'''
+assert_eq!(registry["certified_cell_count"].as_u64(), Some(4));
+assert_eq!(registry["candidate_cell_count"].as_u64(), Some(0));
+
+```
+let ordered_ids: Vec<&str> = cells
+    .iter()
+    .map(|cell| cell["cell_id"].as_str().expect("cell id string"))
+    .collect();
+let mut seen_cell_ids = BTreeSet::new();
+
+for (idx, cell) in cells.iter().enumerate() {
+    let id = cell["cell_id"].as_str().expect("cell id string");
+
+    assert!(seen_cell_ids.insert(id.to_string()), "duplicate cell id {id}");
+    assert_eq!(cell["lifecycle"], "certified", "{id} lifecycle");
+    assert_eq!(cell["certification_status"], "certified", "{id} certification");
+    assert_eq!(cell["install_strategy"], "dry-run-plan", "{id} install strategy");
+    assert_eq!(cell["conflict_policy"], "never-overwrite", "{id} conflict policy");
+    assert!(
+        !cell["source_paths"].as_array().expect("source paths").is_empty(),
+        "{id} has no source paths"
+    );
+    assert!(
+        !cell["proof_lanes"].as_array().expect("proof lanes").is_empty(),
+        "{id} has no proof lanes"
+    );
+    assert!(
+        !cell["proof_commands"].as_array().expect("proof commands").is_empty(),
+        "{id} has no proof commands"
+    );
+
+    for evidence in cell["certification_evidence"]
+        .as_array()
+        .expect("certification evidence")
+    {
+        if evidence["required"].as_bool().unwrap_or(false) {
+            assert_eq!(
+                evidence["status"],
+                "present",
+                "{id} has missing required evidence: {evidence:?}"
+            );
+        }
+    }
+
+    for dependency in cell["dependencies"]
+        .as_array()
+        .expect("dependencies array")
+        .iter()
+        .filter_map(|dependency| dependency.as_str())
+    {
+        if let Some(dep_index) = ordered_ids
+            .iter()
+            .position(|candidate| *candidate == dependency)
+        {
+            assert!(
+                dep_index < idx,
+                "{id} depends on {dependency}, but dependency appears later in the catalog"
+            );
+        }
+    }
+}
+```
+
+'''
+
+if 'registry["certified_cell_count"].as_u64(), Some(4)' not in test:
+needle = 'let cells = registry["cells"].as_array().unwrap();'
+if needle not in test:
+raise SystemExit("could not find cells binding in command_surface_smoke.rs")
+test = test.replace(needle, needle + INVARIANT_BLOCK, 1)
+
+if 'expect("auth-session cell")' not in test:
+test = must_sub(
+r'(let rbac = cells\s*.iter()\s*.find(|cell| cell["cell_id"] == "rbac")\s*.expect("rbac cell");)',
+lambda m: m.group(1) + '\n    let auth_session = cells\n        .iter()\n        .find(|cell| cell["cell_id"] == "auth-session")\n        .expect("auth-session cell");',
+test,
+"auth-session lookup",
+flags=re.S,
+)
+
+AUTH_ASSERTIONS = r'''
+assert_eq!(auth_session["certification_status"], "certified");
+assert_eq!(
+auth_session["dependencies"].as_array().unwrap()[0].as_str(),
+Some("rbac")
+);
+assert!(auth_session["dependencies"]
+.as_array()
+.unwrap()
+.iter()
+.any(|dependency| dependency.as_str() == Some("audit-log")));
+assert!(auth_session["security_assumptions"]
+.as_array()
+.unwrap()
+.iter()
+.any(|assumption| assumption
+.as_str()
+.unwrap()
+.contains("raw tokens are never stored")));
+assert!(auth_session["observability_events"]
+.as_array()
+.unwrap()
+.iter()
+.any(|event| event.as_str() == Some("session.revoked")));
+'''
+
+if 'raw tokens are never stored' not in test:
+test = must_sub(
+r'(assert_eq!(\s*rbac["dependencies"].as_array().unwrap()[0],\s*"crud-resource"\s*);)',
+lambda m: m.group(1) + AUTH_ASSERTIONS,
+test,
+"auth-session assertions",
+flags=re.S,
+)
+
+AUTH_PROVE_ASSERTIONS = r'''
+let (auth_prove, _auth_md) = run_command(
+&repo,
+&["cell", "--cell-id", "auth-session", "--mode", "prove"],
+);
+validation::validate_value(&repo, ArtifactSchema::CellManifest, &auth_prove["manifest"])
+.unwrap();
+assert_eq!(auth_prove["manifest"]["cell_id"], "auth-session");
+assert_eq!(
+auth_prove["manifest"]["certification_status"],
+"certified"
+);
+assert!(!auth_prove["certification_evidence"]
+.as_array()
+.unwrap()
+.is_empty());
+assert!(!auth_prove["proof_commands"].as_array().unwrap().is_empty());
+assert!(auth_prove["install_plan"]["forbidden_overwrites"]
+.as_array()
+.unwrap()
+.iter()
+.any(|path| path.as_str()
+== Some("examples/perfect-web-api-db/contracts/openapi.json")));
+'''
+
+if 'let (auth_prove, _auth_md)' not in test:
+test = must_sub(
+r'(assert_eq!(\s*rbac_prove["manifest"]["certification_status"],\s*"certified"\s*);)',
+lambda m: m.group(1) + AUTH_PROVE_ASSERTIONS,
+test,
+"auth-session prove assertions",
+flags=re.S,
+)
+
+test_path.write_text(test)
+
+# ---------------------------------------------------------------------------
+
+# Phase docs/router: mark Phase 10 hardened and remove auth-session from queue.
+
+# ---------------------------------------------------------------------------
+
+phase_path = Path("tips/phases/10-reuse-registry-certified-cells.md")
+phase = phase_path.read_text()
+
+phase = re.sub(
+r"Status:\s+complete\b",
+"Status: hardened",
+phase,
+count=1,
+)
+
+if "`auth-session`" not in phase:
+phase = phase.replace(
+"  * `rbac` (depends on `crud-resource`; sources and proof lanes tied to `examples/perfect-web-api-db/` authorization surface)\n",
+"  * `rbac` (depends on `crud-resource`; sources and proof lanes tied to `examples/perfect-web-api-db/` authorization surface)\n"
+"  * `auth-session` (depends on `rbac` and `audit-log`; sources and proof lanes tied to the reference platform session identity, token-hash, revoke, UX, DB, and audit surfaces)\n",
+)
+
+phase = phase.replace(
+"4. auth/session shell",
+"4. auth/session shell — certified as registry cell `auth-session`",
+)
+
+phase = phase.replace(
+"Phase status: complete; **three** certified cells (`audit-log`, `crud-resource`, `rbac`)",
+"Phase status: hardened; **four** certified cells (`audit-log`, `crud-resource`, `rbac`, `auth-session`)",
+)
+
+if "Files changed (auth/session hardening, 2026-05-03)" not in phase:
+phase = phase.replace(
+"  * Files changed (rbac slice, 2026-05-03):",
+"  * Files changed (auth/session hardening, 2026-05-03): `crates/jankurai/src/commands/cell_catalog.rs`, `crates/jankurai/tests/command_surface_smoke.rs`, `examples/perfect-web-api-db/backend/src/domain.rs`, `examples/perfect-web-api-db/backend/src/application.rs`, `examples/perfect-web-api-db/backend/src/adapters.rs`, `examples/perfect-web-api-db/contracts/openapi.json`, `examples/perfect-web-api-db/db/migrations/001_init.sql`, `examples/perfect-web-api-db/db/constraints/001_accounts.sql`, `examples/perfect-web-api-db/frontend/src/App.tsx`, `examples/perfect-web-api-db/ops/security.md`, `examples/perfect-web-api-db/ux/routes.md`, `examples/perfect-web-api-db/docs/architecture.md`, `examples/perfect-web-api-db/docs/exceptions.md`, `examples/perfect-web-api-db/README.md`, `tips/phases/10-reuse-registry-certified-cells.md`, `tips/phases/00-phase-index.md`, `tips/phases/logs/10-reuse-registry-certified-cells.log`\n"
+"  * Files changed (rbac slice, 2026-05-03):",
+)
+
+phase = phase.replace(
+"Follow-up phases: next registry cell **auth/session shell** (Initial Cell Order item 4); phases 11–13 as before",
+"Follow-up phases: next registry cell **organization/team shell** (Initial Cell Order item 5) only if Phase 10 expansion is requested; otherwise Phase 12 public evidence and Phase 13 mutation gates remain the next leverage",
+)
+
+phase_path.write_text(phase)
+
+phase00_path = Path("tips/phases/00-phase-index.md")
+phase00 = phase00_path.read_text()
+
+phase00 = phase00.replace(
+"| 10 | complete-with-deferred-work | certified cells exist; mutating/provider-backed cells remain deferred |",
+"| 10 | hardened | four certified cells exist through auth/session; mutating/provider-backed cells remain deferred |",
+)
+
+phase00 = phase00.replace(
+"Prefer work in this order when nothing is named: Phase 10 auth/session or cell hardening, then Phase 12 public evidence, then Phase 13 real mutation gates.",
+"Prefer work in this order when nothing is named: Phase 12 public evidence, then Phase 13 real mutation gates, then Phase 10 organization/team cell expansion only if a reusable-cell expansion is named.",
+)
+
+phase00_path.write_text(phase00)
+PY
+
+cargo fmt -p jankurai
+
+git diff --check -- 
+crates/jankurai/src/commands/cell_catalog.rs 
+crates/jankurai/tests/command_surface_smoke.rs 
+examples/perfect-web-api-db/backend/src/domain.rs 
+examples/perfect-web-api-db/backend/src/application.rs 
+examples/perfect-web-api-db/backend/src/adapters.rs 
+examples/perfect-web-api-db/contracts/openapi.json 
+examples/perfect-web-api-db/db/migrations/001_init.sql 
+examples/perfect-web-api-db/db/constraints/001_accounts.sql 
+examples/perfect-web-api-db/frontend/src/App.tsx 
+examples/perfect-web-api-db/ops/security.md 
+examples/perfect-web-api-db/ux/routes.md 
+examples/perfect-web-api-db/docs/architecture.md 
+examples/perfect-web-api-db/docs/exceptions.md 
+examples/perfect-web-api-db/README.md 
+tips/phases/10-reuse-registry-certified-cells.md 
+tips/phases/00-phase-index.md 
+tips/phases/logs/10-reuse-registry-certified-cells.log
+
+cargo test -p jankurai
+
+cargo run -p jankurai -- lane . 
+--changed crates/jankurai/src/commands/cell_catalog.rs 
+--changed crates/jankurai/tests/command_surface_smoke.rs 
+--changed examples/perfect-web-api-db/backend/src/domain.rs 
+--changed examples/perfect-web-api-db/backend/src/application.rs 
+--changed examples/perfect-web-api-db/contracts/openapi.json 
+--changed examples/perfect-web-api-db/db/migrations/001_init.sql 
+--changed examples/perfect-web-api-db/frontend/src/App.tsx 
+--changed tips/phases/10-reuse-registry-certified-cells.md 
+--out target/jankurai/p10-auth-session-hardening-lane.json 
+--md target/jankurai/p10-auth-session-hardening-lane.md
+
+cargo run -p jankurai -- registry . 
+--out target/jankurai/p10-cell-registry.json 
+--md target/jankurai/p10-cell-registry.md
+
+cargo run -p jankurai -- cell . 
+--cell-id auth-session 
+--mode prove 
+--out target/jankurai/p10-auth-session-prove.json 
+--md target/jankurai/p10-auth-session-prove.md
+
+just fast
+just score
+
+FINISH_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+FINISH_TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+printf '%s | gpt-5.5-pro | 10 | finish | crates/jankurai/src/commands/cell_catalog.rs;crates/jankurai/tests/command_surface_smoke.rs;examples/perfect-web-api-db/backend/src/domain.rs;examples/perfect-web-api-db/backend/src/application.rs;examples/perfect-web-api-db/backend/src/adapters.rs;examples/perfect-web-api-db/contracts/openapi.json;examples/perfect-web-api-db/db/migrations/001_init.sql;examples/perfect-web-api-db/db/constraints/001_accounts.sql;examples/perfect-web-api-db/frontend/src/App.tsx;examples/perfect-web-api-db/ops/security.md;examples/perfect-web-api-db/ux/routes.md;examples/perfect-web-api-db/docs/architecture.md;examples/perfect-web-api-db/docs/exceptions.md;examples/perfect-web-api-db/README.md;tips/phases/10-reuse-registry-certified-cells.md;tips/phases/00-phase-index.md;tips/phases/logs/10-reuse-registry-certified-cells.log | git diff --check;cargo test -p jankurai;cargo run -p jankurai -- lane . --changed crates/jankurai/src/commands/cell_catalog.rs --changed crates/jankurai/tests/command_surface_smoke.rs --changed examples/perfect-web-api-db/backend/src/domain.rs --changed examples/perfect-web-api-db/backend/src/application.rs --changed examples/perfect-web-api-db/contracts/openapi.json --changed examples/perfect-web-api-db/db/migrations/001_init.sql --changed examples/perfect-web-api-db/frontend/src/App.tsx --changed tips/phases/10-reuse-registry-certified-cells.md --out target/jankurai/p10-auth-session-hardening-lane.json --md target/jankurai/p10-auth-session-hardening-lane.md;cargo run -p jankurai -- registry . --out target/jankurai/p10-cell-registry.json --md target/jankurai/p10-cell-registry.md;cargo run -p jankurai -- cell . --cell-id auth-session --mode prove --out target/jankurai/p10-auth-session-prove.json --md target/jankurai/p10-auth-session-prove.md;just fast;just score | target/jankurai/p10-auth-session-hardening-lane.json;target/jankurai/p10-auth-session-hardening-lane.md;target/jankurai/p10-cell-registry.json;target/jankurai/p10-cell-registry.md;target/jankurai/p10-auth-session-prove.json;target/jankurai/p10-auth-session-prove.md;target/jankurai/fast-score.json;target/jankurai/fast-score.md;agent/repo-score.json;agent/repo-score.md | %s | mutating installs remain dry-run-only; provider-backed auth remains explicit future adapter work; Phase 10 now hardened with four evidence-bound certified cells\n' "$FINISH_TS" "$FINISH_SHA" >> "$PHASE_LOG"
+
+echo "Phase 10 hardened: auth-session certified, registry invariant tests added, proof artifacts emitted."
+
+```
+
+What this completes:
+
+1. **Adds a real `auth-session` reusable cell**, not just a registry label. It includes domain session identity, app-layer session commands, adapter contracts, SQL constraints, OpenAPI session operations, UX route/state coverage, frontend shell, security notes, architecture ADR, exception expiry, and README routing.
+
+2. **Registers `auth-session` as the fourth certified cell** after `audit-log`, `crud-resource`, and `rbac`. It depends on `rbac` and `audit-log`, which keeps identity/session work downstream of authorization and audit evidence.
+
+3. **Hardens the registry tests** so every certified cell must have:
+   - unique cell ID,
+   - `certified` lifecycle/status,
+   - dry-run install strategy,
+   - `never-overwrite` conflict policy,
+   - source paths,
+   - proof lanes,
+   - proof commands,
+   - all required evidence present,
+   - dependencies ordered earlier in the built-in catalog.
+
+4. **Updates Phase 10 from complete to hardened** and updates the Phase 00 router so the next default leverage moves to Phase 12 public evidence and Phase 13 mutation gates, with Phase 10 organization/team shell only if further cell expansion is explicitly requested.
+
+I could not run the validation commands from this environment because cloning the repo over `git` failed on DNS resolution, but the script above includes the validation receipt commands that should pass in the repository workspace.
+::contentReference[oaicite:2]{index=2}
+```
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/00-phase-index.md "raw.githubusercontent.com"
+

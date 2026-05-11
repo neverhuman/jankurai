@@ -1,0 +1,30 @@
+-- Constraint map for the organization/team certified cell.
+--
+-- Domain invariant -> database evidence:
+--
+-- TeamMembershipPolicy::max_teams_per_organization
+--   Application-level quota check before insert. DB enforces tenant-scoped
+--   uniqueness, while policy-specific limits stay in the Rust application layer
+--   because plan tiers can vary by organization.
+--
+-- TeamMembershipPolicy::max_members_per_team
+--   Application-level quota check before insert. DB enforces one membership per
+--   (team_id, account_id) pair so duplicate grants cannot drift silently.
+--
+-- Team tenant isolation
+--   organization_teams.organization_id REFERENCES organizations(id), plus
+--   idx_organization_teams_org for scoped lookups.
+--
+-- Membership identity
+--   organization_team_memberships.team_id REFERENCES organization_teams(id)
+--   organization_team_memberships.account_id REFERENCES accounts(id)
+--   PRIMARY KEY (team_id, account_id)
+--
+-- Role vocabulary
+--   organization_team_role ENUM mirrors the Rust TeamRole and the OpenAPI
+--   TeamRole enum.
+--
+-- Archive semantics
+--   organization_teams.archived is soft-state. Application code refuses new
+--   memberships for archived teams; hard deletion remains out of scope so audit
+--   history remains explainable.

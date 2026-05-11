@@ -1,0 +1,523 @@
+Below is a **production Postgres / SQL “no-excuses” ban list**. I treated X/Twitter, Reddit, GitHub/GitLab, and community anti-pattern lists as pattern discovery, but I weighted **PostgreSQL docs, OWASP/CWE, GitLab’s database-review docs, and established SQL anti-pattern catalogs** more heavily. GitLab’s own process is a good bar: schema changes, data migrations, non-obvious queries, bulk updates/deletes, and raw SQL require database review artifacts such as migration output, rollback output, raw SQL, and query plans. ([GitLab Docs][1])
+
+The framing: some techniques are not inherently bad—JSONB, denormalization, soft deletes, triggers, stored procedures, materialized views, natural keys, partitioning, raw SQL—but it is **never justified** to use them without correctness, safety, review, constraints, observability, and rollback.
+
+## 1. Vibe-coding / AI-generated SQL behavior that is never justified
+
+1. Accepting AI-generated SQL, DDL, migrations, triggers, functions, or RLS policies without reading every line.
+2. Letting an LLM execute SQL directly against production or enterprise data without deterministic validation, catalog binding, permissions checks, risk checks, and audit logs.
+3. Treating “the query ran” as proof that the query is correct.
+4. Prompting an AI with partial schema context and trusting it not to hallucinate tables, columns, joins, constraints, or relationships.
+5. Not specifying **PostgreSQL**, version, extensions, timezone assumptions, tenant model, and relevant schema in database-related prompts.
+6. Copying generated SQL from another dialect—MySQL, SQL Server, SQLite, Oracle—into Postgres without dialect review.
+7. Accepting generated joins without verifying cardinality and whether the relationship is actually enforced by a foreign key or unique constraint.
+8. Accepting generated aggregates without hand-checking grouping, deduplication, time filters, and tenant filters.
+9. Running generated migrations without a rollback/roll-forward plan.
+10. Running generated DDL against production before trying it on a production-like copy.
+11. Using an AI-generated migration that says “drop and recreate” when the table contains real data.
+12. Using AI to “fix” a failing migration by deleting constraints, dropping data, disabling triggers, or disabling foreign keys.
+13. Letting an LLM choose indexes without checking real query plans and real workload.
+14. Letting an LLM choose data types without validating domain semantics.
+15. Letting an LLM invent business rules that are not encoded in product requirements.
+16. Treating generated tests that only cover the happy path as sufficient for SQL correctness.
+17. Failing to test generated SQL against edge cases: no rows, duplicate rows, NULLs, multiple tenants, daylight saving time, concurrent writes, deleted rows, and unexpected cardinality.
+18. Allowing natural-language-to-SQL systems to touch sensitive data without a policy layer.
+19. Allowing read-only LLM SQL to bypass tenant, row-level, purpose-of-use, or sensitive-field policies.
+20. Failing to log who requested generated SQL, what SQL was generated, what policies were applied, and why the query was allowed or denied.
+
+Recent writing on vibe coding and databases specifically calls out hallucinated schema, logic-based hallucinations, cross-database syntax confusion, N+1 generation, and semantically wrong queries that pass quick tests. ([Redgate Software][2]) Security commentary on vibe coding also notes that generated code can appear correct while hiding SQL injection, broad permissions, credential leakage, and unsafe handling. ([Retool][3]) For Text-to-SQL, the safer production pattern is that the model proposes SQL, while deterministic controls validate dialect, catalog, permissions, sensitive fields, query risk, and auditability before execution. ([DPRiver][4])
+
+## 2. Security behavior that is never justified
+
+1. Concatenating user input into SQL strings.
+2. Using string interpolation, f-strings, template literals, `format()`, or ORM raw fragments with untrusted values.
+3. Treating escaping as the primary SQL injection defense instead of parameterized queries.
+4. Parameterizing values but still allowing users to control table names, column names, sort direction, operators, or raw predicates without an allowlist.
+5. Building `ORDER BY`, `LIMIT`, `OFFSET`, `WHERE`, `JOIN`, or `SELECT` clauses from untrusted strings.
+6. Exposing a “run SQL” endpoint to users, support agents, admins, or AI agents without strong sandboxing, allowlists, row limits, timeouts, and audit.
+7. Running the application as a database superuser.
+8. Running normal app traffic as the schema owner.
+9. Running app traffic with migration privileges.
+10. Granting broad privileges to `PUBLIC` by accident.
+11. Granting `ALL` when the app only needs `SELECT`, `INSERT`, `UPDATE`, or `DELETE`.
+12. Sharing one database user across unrelated applications, services, jobs, and humans.
+13. Using one role for migrations, app writes, app reads, analytics, support tools, and admin tasks.
+14. Hardcoding database passwords, URLs, API keys, or service credentials in source code.
+15. Committing `.env`, SQL dumps, connection strings, or credentials to Git.
+16. Logging full SQL statements with secrets or sensitive parameter values.
+17. Storing user passwords in plaintext.
+18. Storing user passwords with reversible encryption when authentication only needs password verification.
+19. Storing weak password hashes without per-password salts and a modern password-hashing scheme.
+20. Letting production credentials appear in screenshots, bug reports, prompts, notebooks, traces, crash reports, or CI logs.
+21. Disabling RLS to “make it work.”
+22. Using a role with `BYPASSRLS` for ordinary application traffic.
+23. Assuming RLS protects you when the table owner or superuser is the role executing the query.
+24. Writing RLS policies that filter `SELECT` but forget `WITH CHECK` for `INSERT` and `UPDATE`.
+25. Writing tenant policies that allow users to move rows into another tenant.
+26. Creating `SECURITY DEFINER` functions without a locked-down `search_path`.
+27. Creating `SECURITY DEFINER` functions owned by overly privileged roles.
+28. Letting untrusted users create functions, triggers, views, operators, or schemas that privileged code might execute.
+29. Relying on `search_path` in privileged functions instead of schema-qualifying trusted objects.
+30. Creating untrusted procedural-language functions outside tightly controlled superuser-only administration.
+31. Letting AI or user-generated SQL reveal schema, sensitive table names, or hidden business structure unnecessarily.
+32. Using production data in local dev, CI, demos, or AI prompts without masking or authorization.
+33. Backing up sensitive databases to unencrypted, public, or loosely permissioned storage.
+34. Granting analysts direct access to production OLTP tables when governed views or replicas are required.
+35. Assuming “read-only” means “safe”; read-only queries can still leak sensitive fields, scan too much data, or produce misleading business results.
+
+OWASP’s SQL Injection Prevention Cheat Sheet says injection arises when dynamic queries use string concatenation with user input and explicitly says to stop writing dynamic queries that way. ([OWASP Cheat Sheet Series][5]) CWE-89 also recommends prepared statements, parameterized queries, or properly designed stored procedures and warns that SQL injection can read, modify, delete, bypass authentication, or gain privileges. ([CWE][6]) CWE-798 recommends keeping credentials outside code in strongly protected storage, and using one-way password hashes with salts for inbound passwords. ([CWE][7]) PostgreSQL’s function-security docs warn that functions, triggers, and RLS policies can Trojan-horse other users, and recommend tight control over who can define objects plus removing untrusted schemas from `search_path`. ([PostgreSQL][8])
+
+## 3. Data-integrity and schema-design behavior that is never justified
+
+1. Creating a persistent, mutable business table with no way to uniquely identify a row.
+2. Omitting a primary key or equivalent unique, non-null identifier because “the app knows.”
+3. Allowing duplicate logical rows when the business domain says duplicates are impossible.
+4. Relying on application code alone for uniqueness.
+5. Relying on application code alone for referential integrity.
+6. Omitting foreign keys for real relationships without another explicit, tested integrity mechanism.
+7. Allowing orphan rows accidentally.
+8. Creating foreign-key-looking columns such as `user_id`, `account_id`, or `tenant_id` that do not actually reference anything.
+9. Using `text` or `integer` for relationship fields that should be foreign keys.
+10. Using polymorphic references like `(entity_type, entity_id)` without enforceable integrity rules.
+11. Creating many-to-many relationships without a junction table or equivalent relational structure.
+12. Storing comma-separated IDs in one column.
+13. Storing arrays of IDs as a substitute for a relationship table when those IDs must be joined, constrained, searched, or deleted safely.
+14. Storing stable, queryable business attributes only inside unvalidated JSONB.
+15. Using JSONB as a dumping ground because schema design is hard.
+16. Using EAV for stable, known attributes that need constraints, joins, indexes, and readable queries.
+17. Creating `field1`, `field2`, `field3`, `phone_1`, `phone_2`, `tag_1`, `tag_2` instead of a child table.
+18. Creating one column per month, year, status, region, or category instead of modeling the value as data.
+19. Creating one table per customer, tenant, month, year, or status without a real partitioning/sharding design.
+20. Encoding data in object names: `orders_2025`, `orders_2026`, `paid_users`, `unpaid_users`, `tenant_123_orders`.
+21. Using nullable columns where the value is required for a valid row.
+22. Using `NOT NULL` where missingness is meaningful and should be represented.
+23. Using sentinel values such as `0`, `-1`, `9999-12-31`, `'N/A'`, `'unknown'`, or empty string instead of modeling NULL or a domain value correctly.
+24. Treating NULL as false, zero, empty string, or “not applicable” without distinction.
+25. Creating nullable booleans when the domain is only two-state.
+26. Creating non-null booleans when the domain actually has “unknown,” “not asked,” or “not applicable.”
+27. Failing to add `CHECK` constraints for obvious ranges: nonnegative prices, valid percentages, valid time intervals, valid quantities.
+28. Using `float`, `real`, or `double precision` for money or exact accounting values.
+29. Storing dates as strings.
+30. Storing prices as strings.
+31. Storing numeric values with currency symbols in the same column.
+32. Splitting dates into `year`, `month`, `day` integers when a date type is required.
+33. Storing absolute instants as `timestamp without time zone` without a strong reason.
+34. Assuming `timestamptz` stores the original timezone name. It stores an instant and displays it according to session timezone.
+35. Using `time with time zone` for real-world scheduling without understanding that timezones need dates for DST rules.
+36. Using quoted mixed-case identifiers everywhere.
+37. Naming columns with reserved words like `user`, `order`, `select`, or `group`.
+38. Using generic columns like `data`, `info`, `value`, `type`, `status`, or `metadata` without constraints or documented meaning.
+39. Using free-text status fields where only a controlled set of statuses is valid.
+40. Using an enum for business values that change frequently, without a migration plan.
+41. Duplicating derived data without declaring the source of truth.
+42. Denormalizing without tests or constraints that detect drift.
+43. Maintaining totals, counters, balances, or inventory quantities without transactional correctness.
+44. Storing balances as mutable facts instead of deriving from or reconciling with ledger-like events where correctness matters.
+45. Updating audit/history tables in app code only, with no transactional guarantee.
+46. Soft-deleting rows without deciding what happens to uniqueness, foreign keys, cascades, restores, retention, and legal deletion.
+47. Hard-deleting rows where audit, compliance, restore, or downstream references require a retention model.
+48. Cascading deletes without knowing the blast radius.
+49. Refusing cascade/delete rules and then leaving manual cleanup to hope.
+50. Treating lookup/reference data as magic constants scattered through application code.
+51. Creating tenant-scoped tables without including tenant identity in keys, uniqueness rules, RLS, indexes, and tests.
+52. Allowing cross-tenant joins or references unless they are explicitly part of the model.
+53. Using `ctid`, `xmin`, physical row order, sequence gaps, or insertion order as durable business identity.
+54. Assuming sequence values are gapless or rollback on transaction abort.
+55. Relying on implicit casts for important semantics.
+56. Allowing invalid states temporarily and never cleaning them up.
+57. Designing the schema only around one screen or one API response instead of the underlying facts.
+58. Allowing “schema later” for data that already has known relational structure.
+59. Creating wide sparse tables because “joins are bad.”
+60. Using database comments, docs, and diagrams nowhere for a complex domain.
+
+PostgreSQL documents primary keys as unique and non-null identifiers and notes that relational theory says every table should have a primary key, even though PostgreSQL does not enforce that rule. It also documents foreign keys as the mechanism that maintains referential integrity between related tables. ([PostgreSQL][9]) The GitHub SQL anti-pattern catalog flags multi-valued attributes, missing primary keys, missing foreign keys, EAV, metadata-in-column-names, imprecise data types, too many indexes, `SELECT *`, NULL misuse, and readable passwords as common SQL anti-patterns. ([GitHub][10]) PostgreSQL’s JSONB docs explicitly say JSON and relational approaches can coexist, but even flexible JSON documents should have a somewhat fixed structure, and large JSON documents increase row-level lock contention on updates. ([PostgreSQL][11]) PostgreSQL’s date/time docs note that `timestamp with time zone` values are converted to UTC and the originally stated timezone is not retained. ([PostgreSQL][12])
+
+## 4. Migration and DDL behavior that is never justified
+
+1. Making manual production schema changes that are not captured in version-controlled migrations.
+2. Editing an already-applied migration as if history can be rewritten.
+3. Letting environments drift with different migration histories.
+4. Auto-syncing ORM models to production schema.
+5. Running destructive DDL without a backup and restore plan.
+6. Running destructive DDL without knowing all application versions that still read or write the old schema.
+7. Dropping a table, column, index, constraint, enum value, or trigger because “nothing seems to use it.”
+8. Renaming a table or column in one step while old code may still be deployed.
+9. Changing column meaning without changing column name, constraints, documentation, and dependent code.
+10. Adding a `NOT NULL` constraint to a large existing table without a backfill/validation/lock plan.
+11. Adding a foreign key to a large existing table without a validation and locking strategy.
+12. Adding a unique constraint to dirty data without finding and resolving duplicates first.
+13. Creating a normal index on a large production table when writes cannot be blocked.
+14. Forgetting to clean up invalid indexes after failed `CREATE INDEX CONCURRENTLY`.
+15. Creating indexes during peak traffic without understanding extra CPU and I/O load.
+16. Backfilling a large table in one transaction.
+17. Updating millions of rows without batching, throttling, monitoring, and retry.
+18. Deleting millions of rows in one transaction when batching or partition drop is appropriate.
+19. Migrating data without idempotency.
+20. Migrating data without recording progress.
+21. Migrating data without safe retry behavior.
+22. Disabling triggers or constraints for a migration and not revalidating.
+23. Disabling foreign keys because the import is “trusted.”
+24. Using `DROP CASCADE` casually.
+25. Running `TRUNCATE` on production tables without understanding locks, foreign keys, replicas, and audit requirements.
+26. Running `VACUUM FULL`, `CLUSTER`, or table rewrites on production without understanding blocking.
+27. Changing column types on large tables without checking whether it rewrites the table.
+28. Adding defaults, generated columns, or expressions without understanding rewrite and lock behavior.
+29. Adding volatile defaults during large migrations without cost analysis.
+30. Creating enum changes with no downgrade path.
+31. Shipping app code that writes new columns before the column exists everywhere.
+32. Dropping old columns before all deployed code has stopped reading them.
+33. Adding required columns before all deployed code writes them.
+34. Failing to use expand/contract migrations for incompatible app/schema changes.
+35. Running migrations without `lock_timeout` and `statement_timeout` policies.
+36. Running migrations from a laptop against production.
+37. Running migrations without CI on a clean database and an upgraded realistic database.
+38. Running migrations without rollback output or roll-forward remediation.
+39. Running migrations without reviewing generated SQL.
+40. Running migrations without query plans for new nontrivial queries.
+41. Running migrations without database-owner review for high-risk schema changes.
+42. Hiding data migrations inside app startup.
+43. Hiding schema mutations inside request paths.
+44. Creating triggers/functions/views in production manually because “the migration tool is annoying.”
+45. Using migrations to repair data silently without audit.
+46. Treating staging success on tiny data as proof a production migration is safe.
+47. Applying migrations out of order.
+48. Skipping migrations in one environment and “catching up” manually.
+49. Making irreversible migrations for convenience when a reversible design is practical.
+50. Forgetting replicas, logical replication, downstream warehouses, CDC, and backup tooling when changing schema.
+
+PostgreSQL notes that ordinary index builds can lock out writers for unacceptably long periods on production systems, while `CREATE INDEX CONCURRENTLY` allows normal operations to continue at the cost of more work and longer build time. ([PostgreSQL][13]) GitLab’s foreign-key docs require indexes for foreign keys and warn that unindexed foreign keys can force full table scans during deletes, causing timeouts. ([GitLab Docs][14]) GitLab’s database-review process requires review artifacts for migrations and query plans for new or changed raw SQL. ([GitLab Docs][1])
+
+## 5. Query-correctness behavior that is never justified
+
+1. Shipping `SELECT *` in application contracts, APIs, jobs, views, or migrations where columns should be explicit.
+2. Shipping `INSERT INTO table VALUES (...)` without an explicit column list.
+3. Running `UPDATE` or `DELETE` without a deliberate predicate, row-count expectation, transaction boundary, and review.
+4. Using `LIMIT` without `ORDER BY` when the result needs to be deterministic.
+5. Assuming row order without `ORDER BY`.
+6. Using `DISTINCT` to hide duplicate rows caused by a bad join.
+7. Joining tables without understanding cardinality.
+8. Using comma joins accidentally.
+9. Forgetting a join predicate and creating a Cartesian product.
+10. Counting rows after a join without checking duplication.
+11. Summing money after a join without checking duplication.
+12. Grouping by the wrong column and trusting plausible totals.
+13. Selecting non-aggregated columns that are not functionally determined by the group.
+14. Filtering on the wrong side of an outer join and accidentally turning it into an inner join.
+15. Using `WHERE` conditions that accidentally remove NULL-extended rows from a left join.
+16. Using `NOT IN` with nullable subqueries without understanding NULL behavior.
+17. Comparing to NULL with `= NULL` or `<> NULL`.
+18. Treating `NULL`, `false`, `0`, `''`, and missing row as interchangeable.
+19. Using `BETWEEN` for timestamp date ranges without checking inclusive end behavior.
+20. Filtering a “day” as midnight-to-midnight in the wrong timezone.
+21. Forgetting tenant, organization, account, or authorization filters.
+22. Applying tenant filters in application code after fetching cross-tenant data.
+23. Paginating with unstable ordering.
+24. Assuming offset pagination is stable while rows are being inserted or deleted.
+25. Using cursors or keyset pagination without a stable unique ordering.
+26. Doing read-modify-write outside a transaction.
+27. Doing `SELECT` then `INSERT` for uniqueness instead of using a unique constraint and `INSERT ... ON CONFLICT`.
+28. Doing `SELECT` then `UPDATE` without row locks when concurrent updates matter.
+29. Ignoring lost-update scenarios.
+30. Assuming `READ COMMITTED` gives repeatable results inside a transaction.
+31. Ignoring serialization failures and deadlocks instead of retrying.
+32. Leaving transactions idle and open.
+33. Holding locks while making network calls.
+34. Calling external services from inside database transactions through app code.
+35. Writing triggers that perform surprising extra writes.
+36. Using triggers to hide business behavior that the application team does not know exists.
+37. Marking a function `IMMUTABLE` when it reads tables, settings, time, random values, or anything that can change.
+38. Marking functions `PARALLEL SAFE` or `LEAKPROOF` without proving it.
+39. Using functions in predicates that defeat indexes without an expression index or rewrite.
+40. Using `LOWER(column) = ...` repeatedly without an expression index or normalized/search column.
+41. Using leading-wildcard `LIKE '%term%'` on large tables without trigram/full-text/search design.
+42. Using regex filters on large unindexed data as normal product behavior.
+43. Using `ORDER BY random()` on large tables.
+44. Using unbounded recursive CTEs.
+45. Using unbounded `SELECT`, export, or report queries against OLTP primaries.
+46. Querying replicas for fresh writes without understanding replication lag.
+47. Writing queries that are only correct for current sample data.
+48. Writing queries that rely on undocumented uniqueness.
+49. Writing queries that rely on soft-deleted rows being absent when they are present.
+50. Writing queries that silently include test, archived, deleted, draft, or future-effective rows.
+51. Using implicit time zone/session settings for business logic.
+52. Using session-local temp state in connection pools without cleanup.
+53. Depending on `search_path` to resolve production objects in app SQL.
+54. Returning sensitive columns because they happened to be in `SELECT *`.
+55. Adding `LIMIT 1` to hide data-model ambiguity.
+56. Adding `MAX(id)` or latest timestamp as a proxy for “current” without a current-state rule.
+57. Treating an empty result as proof that no data exists when the query might be wrong.
+58. Treating a non-empty result as proof that the query is semantically correct.
+
+PostgreSQL’s isolation docs show that `READ COMMITTED` can see different data across successive `SELECT`s in one transaction and that serialization anomalies are only ruled out at `SERIALIZABLE`. ([PostgreSQL][15]) PostgreSQL also says every database-application developer should understand concurrency control because its goal is efficient access while maintaining strict data integrity. ([PostgreSQL][16]) PostgreSQL’s function-volatility docs define volatility as a promise to the optimizer and say functions with side effects must be `VOLATILE`. ([PostgreSQL][17])
+
+## 6. Performance and operability behavior that is never justified
+
+1. Shipping a nontrivial query without looking at `EXPLAIN` or `EXPLAIN ANALYZE` in a safe environment.
+2. Assuming a query plan on tiny dev data predicts production behavior.
+3. Creating indexes “just in case.”
+4. Refusing indexes because “indexes slow writes” without measuring read/write tradeoffs.
+5. Indexing every column.
+6. Creating duplicate indexes.
+7. Creating overlapping indexes without proving they are needed.
+8. Creating multicolumn indexes with the wrong leading column.
+9. Creating indexes that no query can use.
+10. Leaving unused indexes forever.
+11. Not indexing foreign-key columns used by deletes, cascades, or joins.
+12. Indexing low-cardinality columns blindly.
+13. Creating huge GIN indexes on JSONB columns without query evidence.
+14. Creating expression indexes whose expressions do not match queries.
+15. Creating partial indexes whose predicates do not match queries.
+16. Forgetting that partial indexes cannot serve every query shape.
+17. Using `OR` chains when a clearer `IN`, `UNION ALL`, or query rewrite is appropriate.
+18. Using `UNION` when `UNION ALL` is correct and duplicates do not matter.
+19. Using `DISTINCT` as a performance-insensitive cleanup step.
+20. Creating N+1 query patterns.
+21. Running per-row queries in loops instead of set-based operations.
+22. Running per-row updates without batching.
+23. Pulling huge result sets into the application to filter, join, or aggregate.
+24. Using the database as a dumb key-value store while reimplementing constraints in app code.
+25. Using the application as a join engine for data already in Postgres.
+26. Running heavy analytics on the OLTP primary without workload isolation.
+27. Running reports with no time window, no tenant filter, no limit, and no timeout.
+28. Letting BI tools generate arbitrary SQL against production tables.
+29. Letting dashboards refresh expensive queries too frequently.
+30. Not setting statement timeouts for application roles.
+31. Not setting lock timeouts for migrations.
+32. Not using connection pooling and opening unbounded database connections.
+33. Creating one database connection per request without limits.
+34. Letting background jobs overwhelm the database.
+35. Ignoring `pg_stat_statements`, slow query logs, lock monitoring, and wait events.
+36. Ignoring stale statistics.
+37. Disabling autovacuum globally.
+38. Disabling autovacuum on busy tables without a replacement maintenance plan.
+39. Ignoring bloat.
+40. Ignoring long-running transactions that prevent vacuum cleanup.
+41. Ignoring transaction ID wraparound risk.
+42. Ignoring disk growth from WAL, temp files, indexes, and bloat.
+43. Ignoring replication lag.
+44. Ignoring invalid indexes.
+45. Ignoring dead tuples and table/index bloat after mass updates/deletes.
+46. Keeping huge append-only tables forever without retention or partitioning.
+47. Deleting old data row-by-row forever when partitioning/drop-detach is the right lifecycle.
+48. Using materialized views without a refresh strategy.
+49. Using caches without invalidation, TTL, ownership, and consistency expectations.
+50. Caching raw SQL results with no dependency tracking or invalidation.
+51. Storing large files externally with only paths in Postgres and no transactional cleanup/story.
+52. Storing huge blobs in Postgres with no backup, restore, TOAST, bandwidth, or access-pattern plan.
+53. Using advisory locks without namespacing, timeout, and release discipline.
+54. Using `SELECT ... FOR UPDATE` over too many rows.
+55. Holding locks while waiting on humans, queues, APIs, or slow I/O.
+56. Failing to load-test the actual high-cardinality, high-concurrency path.
+57. Failing to test the slow path: empty cache, large tenant, largest customer, month-end, year-end.
+58. Assuming the optimizer is wrong before checking statistics, indexes, query shape, and data distribution.
+59. Forcing planner settings globally to fix one query.
+60. Treating performance as a one-time activity instead of a monitored production property.
+
+PostgreSQL’s `EXPLAIN` docs say the planner chooses a plan for each query and that the right plan is critical for performance. ([PostgreSQL][18]) PostgreSQL planner statistics are updated by `VACUUM`, `ANALYZE`, and some DDL, and the planner uses those statistics to estimate row counts and choose plans. ([PostgreSQL][19]) PostgreSQL also warns multicolumn indexes should be used sparingly and that indexes with more than three columns are unlikely to help unless the table usage is highly stylized. ([PostgreSQL][20]) PostgreSQL’s `VACUUM` docs warn that if index cleanup is not performed regularly, performance can suffer as dead tuples accumulate. ([PostgreSQL][21])
+
+## 7. Backup, recovery, and durability behavior that is never justified
+
+1. Having valuable production data with no backups.
+2. Having backups that nobody has restored.
+3. Treating an untested backup as a backup.
+4. Storing backups only on the same machine.
+5. Storing backups only in the same account/project with the same compromised credentials.
+6. Storing backups unencrypted when they contain sensitive data.
+7. Failing to define RPO and RTO.
+8. Failing to know how much data the business can lose.
+9. Failing to know how long restore can take.
+10. Assuming `pg_dump` alone is enough for point-in-time recovery.
+11. Deleting WAL archives without understanding backup windows and PITR.
+12. Performing destructive migrations without a fresh backup or restore point.
+13. Not testing restore after major version upgrades.
+14. Not testing restore after backup-tool changes.
+15. Not monitoring backup success.
+16. Not alerting on backup failure.
+17. Not alerting on WAL archiving failure.
+18. Not documenting restore runbooks.
+19. Keeping restore knowledge in one person’s head.
+20. Failing to test accidental `DELETE`, `DROP TABLE`, bad migration, region loss, and credential compromise scenarios.
+21. Backing up logical dumps but not roles, grants, extensions, ownership, and required server settings.
+22. Backing up data without schema, or schema without data, accidentally.
+23. Assuming replication is backup.
+24. Assuming high availability is backup.
+25. Assuming snapshots are restorable without testing.
+26. Letting backups retain data that should be deleted under policy forever.
+27. Letting backups expire before legal or business requirements.
+28. Letting CI/dev systems use production backup data without masking controls.
+
+PostgreSQL’s continuous archiving docs distinguish logical dumps from file-system-level backup/PITR and state that successful recovery requires a continuous sequence of archived WAL files extending back at least to the start of the backup. ([PostgreSQL][22])
+
+## 8. Privacy, compliance, and multi-tenant behavior that is never justified
+
+1. Mixing tenants in the same tables without tenant keys, constraints, policies, indexes, and tests.
+2. Trusting application code alone to enforce tenant isolation where the database can enforce or help enforce it.
+3. Allowing support/admin queries without audit logs.
+4. Allowing privileged staff to query sensitive data without purpose and approval controls.
+5. Copying production PII into dev laptops.
+6. Copying production PII into AI prompts.
+7. Copying production PII into analytics sandboxes without masking or authorization.
+8. Logging PII unnecessarily.
+9. Logging full query parameters when they contain secrets, tokens, emails, phone numbers, addresses, or health/financial data.
+10. Storing secrets in ordinary business tables without access separation.
+11. Failing to classify sensitive columns.
+12. Failing to know where sensitive data is duplicated.
+13. Failing to delete or anonymize data according to retention policy.
+14. Soft-deleting data that policy requires to be purged.
+15. Hard-deleting data that policy requires to be retained or auditable.
+16. Not modeling consent, retention, jurisdiction, or data subject rights where required.
+17. Giving analytics roles access to raw customer identifiers when aggregates or masked views would do.
+18. Allowing ad hoc joins that re-identify masked data.
+19. Treating backups, replicas, logs, exports, and data warehouses as outside privacy scope.
+20. Creating “temporary” exports that become permanent uncontrolled datasets.
+
+## 9. Maintainability behavior that is never justified
+
+1. No naming convention.
+2. No migration convention.
+3. No index naming convention.
+4. No foreign-key naming convention.
+5. No ownership for schema changes.
+6. No database review for dangerous changes.
+7. No comments or docs for non-obvious constraints, partial indexes, triggers, RLS, partitioning, or materialized views.
+8. Unreadable 400-line queries with no decomposition, tests, or explanation.
+9. Business logic scattered randomly across app code, triggers, functions, jobs, and reports.
+10. Hidden trigger side effects that surprise normal writers.
+11. Silent trigger failures or swallowed exceptions.
+12. Views that look like tables but hide expensive or security-sensitive logic.
+13. Materialized views that look fresh but are stale.
+14. Columns whose names no longer match their meaning.
+15. Tables whose names no longer match their contents.
+16. Keeping dead tables, dead columns, and dead indexes forever because nobody knows whether they are used.
+17. No dependency tracking for downstream reports, jobs, exports, or APIs.
+18. No ERD or schema map for a complex domain.
+19. No glossary for overloaded words like account, user, customer, tenant, organization, subscription, status, active, deleted, archived.
+20. Abbreviations only the original developer understands.
+21. Inconsistent singular/plural naming.
+22. Inconsistent timestamp names and meanings.
+23. Inconsistent timezone policy.
+24. Inconsistent ID types across related tables.
+25. Inconsistent soft-delete columns: `deleted`, `is_deleted`, `deleted_at`, `archived`, `active`.
+26. Inconsistent audit columns.
+27. Unversioned SQL files.
+28. SQL embedded in many places with no tests.
+29. SQL generated by string builders that nobody can inspect.
+30. SQL hidden behind ORM calls where the generated SQL is never reviewed.
+
+## 10. Postgres-specific footguns that are never justified to ignore
+
+1. Using app roles as superusers.
+2. Using schema-owner roles for app traffic.
+3. Forgetting default privileges for future tables, sequences, and functions.
+4. Forgetting sequence privileges.
+5. Assuming `SERIAL`/sequence increments roll back.
+6. Assuming sequence values prove creation order under concurrency.
+7. Assuming `now` string literals in stored definitions behave like `now()` calls.
+8. Using `'tomorrow'::date`, `'today'::date`, or `'now'::timestamp` in stored definitions where a function should be used.
+9. Marking table-reading functions `IMMUTABLE`.
+10. Marking time-dependent functions `IMMUTABLE`.
+11. Marking random or side-effect functions non-volatile.
+12. Using `SECURITY DEFINER` without fixed `search_path`.
+13. Relying on RLS while app role owns the table or bypasses RLS.
+14. Writing RLS policies without `WITH CHECK`.
+15. Forgetting that `TRUNCATE` is not subject to row-level security.
+16. Leaving invalid indexes after failed concurrent index creation.
+17. Creating foreign keys and forgetting supporting indexes.
+18. Creating partial indexes and assuming all queries can use them.
+19. Creating multicolumn B-tree indexes while ignoring leading-column rules.
+20. Creating indexes concurrently inside a transaction block.
+21. Running ordinary `CREATE INDEX` on a write-heavy production table.
+22. Ignoring `ANALYZE` after large data changes.
+23. Disabling autovacuum.
+24. Letting long transactions prevent vacuum.
+25. Ignoring wraparound warnings.
+26. Relying on `search_path` for object resolution in production-critical SQL.
+27. Using `ctid` as a permanent identifier.
+28. Using physical tuple order as business order.
+29. Using table inheritance as partitioning without understanding constraint and FK implications.
+30. Using JSONB for frequently updated large documents that could be normalized.
+31. Using GIN indexes casually on write-heavy JSONB workloads.
+32. Using `text` for everything because Postgres can store it.
+33. Using `varchar(n)` limits that have no business meaning.
+34. Using `money`/locale-sensitive formatting without understanding behavior.
+35. Using `timestamp without time zone` for cross-timezone event instants.
+36. Assuming `timestamptz` preserves the original timezone name.
+37. Assuming `time with time zone` solves scheduling.
+38. Using advisory locks as security controls.
+39. Creating extensions in production migrations without privilege, version, and environment checks.
+40. Depending on a local extension existing in production without migration-managed installation.
+41. Ignoring logical replication identity when tables are replicated and updated/deleted.
+42. Running bulk jobs on primary without `statement_timeout`, batching, and monitoring.
+43. Letting `idle in transaction` sessions persist.
+44. Ignoring lock waits during migrations.
+45. Using `DROP CASCADE` instead of understanding dependencies.
+
+PostgreSQL’s RLS docs state that superusers and roles with `BYPASSRLS` bypass row security, table owners normally bypass it, and operations like `TRUNCATE` are not subject to row security. ([PostgreSQL][23]) PostgreSQL’s date/time docs warn that strings such as `now`, `today`, and `tomorrow` can be converted to a fixed value when stored in prepared statements, views, or function definitions, so SQL functions are safer in those contexts. ([PostgreSQL][12])
+
+## 11. Testing and review failures that are never justified
+
+1. No SQL tests for critical business logic.
+2. No migration tests.
+3. No rollback or roll-forward tests.
+4. No tests for constraints.
+5. No tests for RLS policies.
+6. No tests for tenant isolation.
+7. No tests for soft-delete behavior.
+8. No tests for cascade behavior.
+9. No tests for duplicate prevention.
+10. No tests for NULL behavior.
+11. No tests for timezone boundaries.
+12. No tests for daylight saving time.
+13. No tests for month-end, quarter-end, and year-end.
+14. No tests for concurrent updates.
+15. No tests for retryable transaction failures.
+16. No tests for largest tenant/customer/account.
+17. No tests on production-like row counts.
+18. No tests for slow queries.
+19. No query-plan review for nontrivial query changes.
+20. No review of generated ORM SQL.
+21. No review of raw SQL.
+22. No review of triggers/functions.
+23. No review of RLS.
+24. No review of privileges.
+25. No review of migrations by someone who understands locks.
+26. No review of destructive changes.
+27. No restore drill.
+28. No backup failure drill.
+29. No monitoring/alert tests.
+30. No data-quality checks after migration.
+
+## 12. The “ban list” in one sentence
+
+For Postgres and SQL design, the core inexcusable behavior is this: **shipping database code that can silently corrupt meaning, leak data, lose data, block production, violate integrity, bypass authorization, or become unmaintainable—without constraints, review, tests, query plans, timeouts, observability, backups, and a rollback/repair path.**
+
+[1]: https://docs.gitlab.com/development/database_review/ "Database Review Guidelines | GitLab Docs"
+[2]: https://www.red-gate.com/simple-talk/ai/vibe-coding-and-databases-the-hidden-risks-of-ai-generated-database-code/ "Vibe coding and databases: the hidden risk of AI-generated database code"
+[3]: https://retool.com/blog/vibe-coding-risks "Retool Blog | The Risks of Vibe Coding: Security Vulnerabilities and Enterprise Pitfalls"
+[4]: https://www.dpriver.com/blog/why-enterprises-should-not-let-llms-execute-sql-directly/ "Why Enterprises Should Not Let LLMs Execute SQL Directly"
+[5]: https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html "SQL Injection Prevention - OWASP Cheat Sheet Series"
+[6]: https://cwe.mitre.org/data/definitions/89.html "CWE -
+
+    CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection') (4.20)
+    "
+[7]: https://cwe.mitre.org/data/definitions/798.html "CWE -
+
+    CWE-798: Use of Hard-coded Credentials (4.20)
+    "
+[8]: https://www.postgresql.org/docs/current/perm-functions.html "PostgreSQL: Documentation: 18: 21.6. Function Security"
+[9]: https://www.postgresql.org/docs/current/ddl-constraints.html "PostgreSQL: Documentation: 18: 5.5. Constraints"
+[10]: https://github.com/boralp/sql-anti-patterns "GitHub - boralp/sql-anti-patterns: List of anti patterns in SQL · GitHub"
+[11]: https://www.postgresql.org/docs/current/datatype-json.html "PostgreSQL: Documentation: 18: 8.14. JSON Types"
+[12]: https://www.postgresql.org/docs/current/datatype-datetime.html "PostgreSQL: Documentation: 18: 8.5. Date/Time Types"
+[13]: https://www.postgresql.org/docs/current/sql-createindex.html "PostgreSQL: Documentation: 18: CREATE INDEX"
+[14]: https://docs.gitlab.com/development/database/foreign_keys/ "Foreign keys and associations | GitLab Docs"
+[15]: https://www.postgresql.org/docs/current/transaction-iso.html "PostgreSQL: Documentation: 18: 13.2. Transaction Isolation"
+[16]: https://www.postgresql.org/docs/current/mvcc.html "PostgreSQL: Documentation: 18: Chapter 13. Concurrency Control"
+[17]: https://www.postgresql.org/docs/current/xfunc-volatility.html "PostgreSQL: Documentation: 18: 36.7. Function Volatility Categories"
+[18]: https://www.postgresql.org/docs/current/using-explain.html "PostgreSQL: Documentation: 18: 14.1. Using EXPLAIN"
+[19]: https://www.postgresql.org/docs/current/planner-stats.html "PostgreSQL: Documentation: 18: 14.2. Statistics Used by the Planner"
+[20]: https://www.postgresql.org/docs/current/indexes-multicolumn.html "PostgreSQL: Documentation: 18: 11.3. Multicolumn Indexes"
+[21]: https://www.postgresql.org/docs/current/sql-vacuum.html "PostgreSQL: Documentation: 18: VACUUM"
+[22]: https://www.postgresql.org/docs/current/continuous-archiving.html "PostgreSQL: Documentation: 18: 25.3. Continuous Archiving and Point-in-Time Recovery (PITR)"
+[23]: https://www.postgresql.org/docs/current/ddl-rowsecurity.html "PostgreSQL: Documentation: 18: 5.9. Row Security Policies"
+

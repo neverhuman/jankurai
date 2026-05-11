@@ -1,0 +1,223 @@
+I treated official Git, GitHub, GitLab, Bitbucket, and tool docs as the authority, and community sources such as Reddit/GitHub discussions as weak-signal evidence for common pain points. The strongest alignment is: **local hooks are for fast feedback; CI, protected branches, rulesets, and server-side hooks are for enforcement**. Git’s own docs say client-side hooks are not copied when a repo is cloned, and bypassable hooks such as `pre-commit` / `commit-msg` can be skipped with `--no-verify`; the Git book explicitly points policy enforcement toward server-side hooks. ([Git][1]) Community threads line up with that: teams run into bypasses, deleted hooks, slow hooks, and over-rigid message hooks that developers disable. ([Reddit][2])
+
+“Always bad” below means the behavior creates false confidence, hidden policy, bypassable security, corrupted history, leaked secrets, or developer-hostile friction. “Always good” means the behavior is a durable best practice **when that feature/tool is relevant to the repo**.
+
+---
+
+## 1. Universal BAD / GOOD behavior
+
+| Area              | BAD behavior — always bad                                                                        | GOOD behavior — always good                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Enforcement model | Treating local hooks as the source of truth.                                                     | Use local hooks for speed, but enforce in CI, protected branches, rulesets, or server-side hooks. |
+| Bypass culture    | Normalizing `--no-verify` as part of daily workflow.                                             | Allow emergency bypasses only when CI/server checks still protect the main branch.                |
+| Hidden policy     | Putting important rules only in untracked `.git/hooks`.                                          | Version hook config and document how developers install or update it.                             |
+| Slow hooks        | Running the full test suite, huge scans, or network-heavy jobs on every commit.                  | Use fast staged-file checks in `pre-commit`; put heavier tests in `pre-push` or CI.               |
+| False positives   | Blocking commits for unrelated files, unstaged files, or flaky external services.                | Check the staged snapshot for commit hooks; keep checks deterministic and explain failures.       |
+| Silent mutation   | Hooks that rewrite unrelated files, restage surprises, or alter commit messages without clarity. | Format only intended files, show diffs, and make message automation predictable.                  |
+| Security          | Letting secrets, tokens, private keys, or credentials enter Git history.                         | Scan locally, scan in CI, use push protection where available, and rotate/remediate immediately.  |
+| Ownership         | Letting sensitive code merge without required review.                                            | Use CODEOWNERS, required reviews, and branch protection for critical paths.                       |
+| History safety    | Force-pushing protected branches, deleting release refs, or rewriting shared history casually.   | Disable force pushes/deletions on protected refs; use explicit exception processes.               |
+| Developer trust   | Hooks that fail with vague “policy failed” messages.                                             | Print exact failure, file/line when possible, and the command to reproduce.                       |
+
+---
+
+## 2. Native Git hooks
+
+Git hooks are executable scripts. They live in `$GIT_DIR/hooks` by default, or another directory if `core.hooksPath` is configured. Non-executable hook files are ignored. ([Git][3])
+
+### Commit and patch workflow hooks
+
+| Hook                 | BAD behavior                                                                                                                                                                                                                                     | GOOD behavior                                                                                                                                                              |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pre-commit`         | Using it as the only gate for secrets, lint, tests, or policy. Making it slow, flaky, or dependent on network access. Checking unstaged files and blocking unrelated work.                                                                       | Run fast, deterministic checks on staged content: format, lint, conflict markers, huge files, obvious secrets, debug statements. Mirror important checks in CI.            |
+| `prepare-commit-msg` | Using it as a replacement for `pre-commit`, or destructively overwriting the author’s message. Git docs specifically warn that this hook is not suppressed by `--no-verify` and should not be used as a replacement for `pre-commit`. ([Git][3]) | Insert helpful context: branch name, issue ID, template hints, ticket metadata. Keep it predictable and non-destructive.                                                   |
+| `commit-msg`         | Enforcing vague, undocumented, or over-rigid rules that block valid messages, URLs, trailers, or signed-off lines. Relying on it only locally.                                                                                                   | Enforce clear message rules: Conventional Commits, DCO `Signed-off-by`, ticket IDs, subject length, and breaking-change footers. Mirror in CI/server rules where possible. |
+| `pre-merge-commit`   | Assuming it covers every merge scenario, including manual conflict resolution that later becomes a normal commit.                                                                                                                                | Re-run fast commit-quality checks before Git creates an automatic merge commit.                                                                                            |
+| `post-commit`        | Trying to block or repair a bad commit after it already exists.                                                                                                                                                                                  | Notify, update metrics, trigger local reminders. Git docs note `post-commit` cannot affect the outcome of `git commit`. ([Git][3])                                         |
+| `applypatch-msg`     | Allowing emailed patch workflows to bypass normal commit-message policy.                                                                                                                                                                         | Apply the same message checks used by `commit-msg`.                                                                                                                        |
+| `pre-applypatch`     | Trusting patch application without scans or quick tests.                                                                                                                                                                                         | Run quick validation after a patch is applied but before the commit is finalized.                                                                                          |
+| `post-applypatch`    | Treating it as a blocking quality gate.                                                                                                                                                                                                          | Use for notification or bookkeeping after patch application.                                                                                                               |
+
+### Rewrite, checkout, merge, and index hooks
+
+| Hook                | BAD behavior                                                                                        | GOOD behavior                                                                                       |
+| ------------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `pre-rebase`        | Blanket-banning all rebases, including safe private-branch cleanup.                                 | Prevent rebasing protected, public, or release branches; warn before rewriting shared history.      |
+| `post-checkout`     | Silently installing dependencies, changing tracked files, or running unsafe scripts after checkout. | Restore local-only state, warn about missing tools, or print setup instructions.                    |
+| `post-merge`        | Modifying tracked files without telling the developer.                                              | Reinstall dependencies, refresh generated local caches, or remind after lockfile/toolchain changes. |
+| `post-rewrite`      | Automatically force-pushing or rewriting more history after amend/rebase.                           | Warn after amend/rebase, update local metadata, or audit rewritten commits.                         |
+| `post-index-change` | Running heavy jobs every time the index changes.                                                    | Use only for lightweight cache, IDE, or file-watch integration.                                     |
+
+### Push and server-side hooks
+
+Server-side hooks are the authoritative Git-native place to reject bad pushes. Git’s `pre-receive` hook can inspect all pushed refs and reject the push with a non-zero exit; `update` can enforce per-ref policy such as fast-forward-only; `post-receive` and `post-update` run after acceptance and are not blocking gates. ([Git][3])
+
+| Hook                    | BAD behavior                                                                              | GOOD behavior                                                                                                                                               |
+| ----------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pre-push`              | Running a huge, flaky, or slow suite that makes developers habitually skip it.            | Run broader but bounded checks before code leaves the laptop: typecheck, build, focused tests, secret scan.                                                 |
+| `pre-receive`           | Depending on flaky networks or long-running jobs; rejecting pushes with unclear messages. | Hard-block organization-wide invariants: protected refs, unsigned commits where required, secrets, forbidden file types, oversized blobs, invalid metadata. |
+| `update`                | Duplicating global policy badly for every ref or ignoring multi-ref transaction behavior. | Enforce per-branch/per-tag policy: fast-forward-only, no tag rewrites, protected release naming, branch-specific rules.                                     |
+| `proc-receive`          | Using advanced ref policy without careful testing and transaction semantics.              | Use for complex server-side reference workflows where normal `pre-receive` / `update` is insufficient.                                                      |
+| `reference-transaction` | Creating risky side effects in committed/aborted transaction states.                      | Audit ref transactions or enforce deterministic ref policy during preparing/prepared states.                                                                |
+| `post-receive`          | Treating deployment/notification as a security gate after the push is already accepted.   | Deploy, notify, mirror, or index after accepted pushes.                                                                                                     |
+| `post-update`           | Trying to validate old/new object state after the fact.                                   | Run simple post-update tasks such as repository info updates or notifications.                                                                              |
+| `push-to-checkout`      | Updating a dirty production worktree from arbitrary pushes.                               | Use only for controlled push-to-deploy flows with clean worktree checks and strict ref policy.                                                              |
+
+### Maintenance and special workflow hooks
+
+| Hook                    | BAD behavior                                                         | GOOD behavior                                                                           |
+| ----------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `pre-auto-gc`           | Blocking normal Git maintenance without reason.                      | Suppress or defer auto-GC only when a known local condition requires it.                |
+| `fsmonitor-watchman`    | Returning an incomplete changed-file set and causing missed changes. | Use conservative filesystem monitoring; false positives are safer than false negatives. |
+| `sendemail-validate`    | Sending broken, malformed, or policy-violating patch series.         | Validate patch emails before `git send-email`.                                          |
+| `p4-changelist`         | Letting Git-p4 commit metadata bypass normal policy.                 | Apply the same commit-message and metadata standards to Git-p4 changelists.             |
+| `p4-prepare-changelist` | Destructively rewriting changelist text.                             | Pre-fill helpful Perforce metadata.                                                     |
+| `p4-post-changelist`    | Treating post-submit notification as enforcement.                    | Notify or audit after changelist creation.                                              |
+| `p4-pre-submit`         | Allowing Git-p4 submits without final validation.                    | Run final quality/security checks before submitting to Perforce.                        |
+
+---
+
+## 3. Hook distribution tools
+
+The repeated failure mode is relying on manually edited `.git/hooks`, because those files are not versioned with the repository by default. Git supports `core.hooksPath`, and hook managers such as pre-commit, Husky, Lefthook, Overcommit, and CaptainHook give teams a repeatable installation/configuration layer. ([Git][4])
+
+| Tool/setup                                 | BAD behavior                                                                                        | GOOD behavior                                                                                                                                  |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Raw `.git/hooks/*`                         | Putting team policy only in local untracked hook files.                                             | Use for personal experiments or one-off local automation only.                                                                                 |
+| Checked-in `.githooks/` + `core.hooksPath` | Assuming every clone automatically uses it without setup.                                           | Version hooks, make them executable, add bootstrap/setup commands, and mirror important checks in CI.                                          |
+| `init.templateDir`                         | Assuming it updates existing clones or serves as repo policy.                                       | Seed personal or organization defaults into newly initialized repos.                                                                           |
+| `pre-commit`                               | Leaving hook versions unpinned, never running all-files after adding a hook, or skipping CI parity. | Pin hook revisions, store `.pre-commit-config.yaml`, run `pre-commit install`, run all-files during onboarding, and run the same checks in CI. |
+| Husky                                      | Using it as hidden Node-only magic in repos where contributors do not have the Node toolchain.      | Use for Node/JS repos with clear `prepare` setup, simple POSIX hook scripts, and CI equivalents.                                               |
+| `lint-staged`                              | Running commands that ignore staged filenames and accidentally lint/build the whole repo.           | Run formatters/linters only against staged globs, keeping commit feedback fast.                                                                |
+| Lefthook                                   | Parallelizing dependent jobs that race over the same files.                                         | Use parallel jobs for independent checks; keep file-mutating jobs ordered and predictable.                                                     |
+| Overcommit                                 | Forgetting Ruby/tool dependencies and leaving hooks broken for new contributors.                    | Use in Ruby-heavy repos or teams that accept the dependency; document install/update flow.                                                     |
+| CaptainHook                                | Assuming PHP/Composer hooks fit every repo.                                                         | Use for PHP/Composer projects that want versioned commit-message, test, and quality hooks.                                                     |
+
+---
+
+## 4. Commit-quality checks
+
+Secrets are the clearest “always bad” category: Gitleaks is designed to detect API keys, tokens, and passwords; GitHub push protection can block supported secrets before they enter a repo, but it only covers identifiable supported patterns, so it should not be the only layer. ([GitHub][5]) Conventional Commits and DCO are examples of message standards that are machine-checkable and widely used. ([Conventional Commits][6])
+
+| Check                  | BAD behavior                                                                                                  | GOOD behavior                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Formatting             | Debating formatting in PRs; allowing inconsistent style churn.                                                | Auto-format staged files with the repo’s chosen formatter.                                                  |
+| Linting                | Letting preventable syntax/style bugs reach CI or review.                                                     | Run fast linters locally; run full lint in CI.                                                              |
+| Type checks            | Shipping commits that obviously break static type checks.                                                     | Run focused type checks in `pre-push` or CI; use lighter checks in `pre-commit` only when fast.             |
+| Tests                  | Requiring the full suite on every commit, causing bypasses; or running no tests until after merge.            | Run fast unit tests locally; full suite in CI; flaky tests should not block without triage.                 |
+| Secret scanning        | Committing keys, tokens, passwords, certificates, or `.env` secrets.                                          | Scan staged changes, push events, and CI; rotate and purge leaked secrets immediately.                      |
+| Commit messages        | Accepting `wip`, `fix stuff`, `changes`, or untraceable messages on shared branches.                          | Enforce meaningful, traceable messages with examples and exceptions for reverts/squashes.                   |
+| Huge files             | Letting large binaries bloat Git history.                                                                     | Enforce size limits and route approved large assets to Git LFS or artifact storage.                         |
+| Generated/vendor files | Accidentally committing `dist/`, `build/`, `.next/`, `node_modules/`, vendored blobs, or generated noise.     | Block by default; allow explicit, reviewed exceptions when generated artifacts are intentionally versioned. |
+| Debug code             | Shipping `debugger`, `pdb.set_trace`, `console.log` spam, `dbg!`, temporary prints, or “TODO remove” markers. | Block known debug patterns, while allowing documented test fixtures/examples.                               |
+| Conflict markers       | Committing `<<<<<<<`, `=======`, `>>>>>>>`.                                                                   | Always scan for merge/rebase conflict markers.                                                              |
+| Permissions            | Accidentally changing executable bits on scripts or non-scripts.                                              | Detect permission-only changes and require intent.                                                          |
+| Line endings           | Letting every developer’s OS rewrite line endings.                                                            | Normalize with `.gitattributes`; use CRLF safety checks as a backup.                                        |
+| Whitespace             | Allowing trailing whitespace, blank-at-EOL churn, or patch whitespace errors.                                 | Use editor/formatter rules and Git whitespace checks.                                                       |
+| Dependencies           | Changing dependency manifests without lockfiles, audits, or review.                                           | Require lockfile consistency, security scans, license checks, and dependency review.                        |
+| Docs                   | Merging broken links, invalid Markdown, or docs that no longer build.                                         | Lint Markdown, check links, and build docs in CI.                                                           |
+| Migrations             | Shipping irreversible or backward-incompatible migrations accidentally.                                       | Lint migrations and test upgrade/rollback compatibility where applicable.                                   |
+| API/schema             | Breaking OpenAPI, GraphQL, protobuf, or database schema compatibility unintentionally.                        | Run compatibility checks and require explicit breaking-change markers.                                      |
+| IaC                    | Committing unformatted Terraform/Kubernetes/cloud config or risky defaults.                                   | Run format, validate, lint, and security checks for infrastructure code.                                    |
+| Containers             | Shipping weak Dockerfiles or known-vulnerable images.                                                         | Lint Dockerfiles and scan images or lockfiles.                                                              |
+| License/SBOM           | Pulling dependencies with incompatible licenses or no provenance tracking.                                    | Generate SBOMs where needed and run license/vulnerability checks.                                           |
+
+---
+
+## 5. Repo-level files and project hygiene
+
+`.gitignore` is for intentionally untracked files, but it does not fix files that are already tracked. `.gitattributes` can normalize line endings and path behavior consistently for all contributors, and EditorConfig standardizes editor-level style across tools. ([Git][7]) `.mailmap` canonicalizes identities, and Git blame can ignore known formatting-only revisions. ([Git][8])
+
+| File/config                              | BAD behavior                                                                                           | GOOD behavior                                                                                  |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `.gitignore`                             | Using it to hide secrets or assuming it removes already-tracked files.                                 | Ignore generated, local, cache, build, and environment-specific untracked files.               |
+| `.gitattributes`                         | Leaving line endings, binary detection, diff drivers, and LFS rules to individual machines.            | Normalize text, mark binaries, configure LFS, and define useful diff/merge behavior by path.   |
+| `.editorconfig`                          | Letting it conflict with the formatter or leaving style to individual editors.                         | Use it for basic universal settings: indentation, final newline, charset, trimming whitespace. |
+| `.pre-commit-config.yaml`                | Unpinned hooks, stale versions, no onboarding command, no CI parity.                                   | Pin versions, document install/update, run all-files on adoption, and mirror in CI.            |
+| `.husky/`                                | Shell scripts that assume unavailable binaries or hidden environment state.                            | Keep hooks small, POSIX-friendly, and delegated to package scripts.                            |
+| `lefthook.yml`                           | Unclear parallel jobs or file-mutating race conditions.                                                | Separate fast/slow hooks and define jobs clearly.                                              |
+| `.lintstagedrc` / `lint-staged` config   | Globs that miss important files or commands that ignore passed filenames.                              | Run targeted staged-file format/lint commands.                                                 |
+| `commitlint.config.*`                    | Rules nobody understands or that reject valid release/revert/signed-off messages.                      | Enforce a documented convention with examples and exceptions.                                  |
+| `.gitmessage`                            | A giant template that produces noisy commits.                                                          | Provide concise prompts for subject, body, issue ID, breaking change, and sign-off.            |
+| `.mailmap`                               | Letting duplicate identities fragment authorship and ownership history.                                | Canonicalize names/emails for clean history and reporting.                                     |
+| `.git-blame-ignore-revs`                 | Hiding meaningful logic changes from blame.                                                            | Include only mechanical formatting/refactor commits and document why.                          |
+| `.lfsconfig` + `.gitattributes`          | Accidentally storing large binary assets in normal Git objects.                                        | Route approved large files to LFS and enforce file-size policy.                                |
+| `CODEOWNERS`                             | Stale owners, impossible review requirements, or unprotected branches where ownership is not enforced. | Keep ownership current and combine with protected branches / required owner review.            |
+| `.github/workflows/*`                    | CI that differs from local checks or can be skipped for protected branches.                            | Run authoritative tests, lint, build, security, and docs checks as required status checks.     |
+| `.gitlab-ci.yml`                         | Optional pipelines for critical branches.                                                              | Make required gates explicit through GitLab approvals/status checks/protected branches.        |
+| `bitbucket-pipelines.yml`                | Pipelines that report results but do not block bad merges.                                             | Combine pipelines with required merge checks.                                                  |
+| `renovate.json` / `dependabot.yml`       | Auto-merge dependency changes without tests, review, or lockfile consistency.                          | Automate dependency PRs with CI, grouping, review, and security prioritization.                |
+| `SECURITY.md`                            | No private reporting path for vulnerabilities.                                                         | Provide a clear vulnerability reporting and response process.                                  |
+| `CONTRIBUTING.md`                        | Tribal-knowledge contribution rules.                                                                   | Document setup, hooks, test commands, commit rules, PR expectations, and bypass policy.        |
+| `LICENSE`                                | Ambiguous legal terms.                                                                                 | Include a clear license appropriate to the project.                                            |
+| `Makefile` / `justfile` / `Taskfile.yml` | Many undocumented quality commands that differ between local and CI.                                   | Provide one-command local checks that match CI as closely as possible.                         |
+
+---
+
+## 6. Git config hardening
+
+Git documents `push.default=simple` as a safer default than broad push behavior, while `push.default=nothing` forces explicit refspecs. Git also supports `core.safecrlf`, `core.whitespace`, `apply.whitespace`, `commit.template`, `commit.gpgSign`, and `core.hooksPath`. ([Git][4])
+
+| Config                   | BAD behavior                                                                                         | GOOD behavior                                                                          |
+| ------------------------ | ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `core.hooksPath`         | Pointing to missing hooks, `/dev/null`, or undocumented global hooks that surprise contributors.     | Use repo-local shared hooks or a documented organization hook path.                    |
+| `commit.template`        | Templates that encourage boilerplate instead of meaningful messages.                                 | Use concise prompts that improve subject/body/trailer quality.                         |
+| `commit.gpgSign`         | Requiring signed commits without onboarding, bot strategy, key rotation, or recovery instructions.   | Enable where identity verification is required; document signing setup and automation. |
+| `push.default`           | Using broad defaults such as `matching` in shared central repos, which can push unintended branches. | Use `simple` for normal safety or `nothing` for strict explicit pushes.                |
+| `core.safecrlf`          | Ignoring line-ending conversion warnings, especially in cross-platform repos.                        | Use `.gitattributes` first; use `safecrlf` warnings/errors as an extra guard.          |
+| `core.whitespace`        | Letting whitespace rules vary by developer.                                                          | Define common whitespace problems consistently and surface them in diffs/checks.       |
+| `apply.whitespace=error` | Applying patches that introduce whitespace damage.                                                   | Reject whitespace errors when applying patches in quality-sensitive repos.             |
+
+---
+
+## 7. Server-side and repo-host enforcement
+
+GitHub branch protection can require PR reviews, status checks, signed commits, linear history, merge queues, and block force pushes/deletions. GitHub rulesets can also constrain branches/tags and push rules such as file paths, extensions, and file sizes. ([GitHub Docs][9]) GitHub code scanning merge protection can prevent merges when required tools report alerts or analysis is pending; GitLab and Bitbucket have similar concepts through approval rules, external status checks, branch restrictions, and merge checks. ([GitHub Docs][10])
+
+| Enforcement layer      | BAD behavior                                                                  | GOOD behavior                                                                                            |
+| ---------------------- | ----------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Protected branches     | Allowing direct pushes to `main`, `release/*`, or production branches.        | Require PRs/MRs for protected branches.                                                                  |
+| Force-push policy      | Allowing force pushes on shared protected refs.                               | Disable force pushes except for tightly controlled admin exceptions.                                     |
+| Branch deletion        | Allowing deletion of release/prod/main refs.                                  | Block deletion of protected branches and important tags.                                                 |
+| Required PR reviews    | Allowing self-merge of risky changes.                                         | Require one or more approvals before merge.                                                              |
+| CODEOWNERS             | Listing owners but not requiring their approval.                              | Require owner review for sensitive paths.                                                                |
+| Required status checks | Letting red, missing, skipped, or stale checks merge.                         | Require passing tests, lint, typecheck, build, security, and docs checks.                                |
+| Strict freshness       | Merging old green builds after the base branch changed.                       | Use strict required checks or a merge queue for high-change repos.                                       |
+| Signed commits         | Enforcing signing inconsistently or without bot support.                      | Require verified signatures where identity/provenance matters and support humans plus automation.        |
+| Linear history         | Accidentally mixing merge strategies that confuse release/blame workflows.    | Choose the history policy deliberately and enforce it consistently.                                      |
+| Merge queue            | Letting many individually green PRs race into `main` and break together.      | Use a merge queue for busy protected branches.                                                           |
+| Secret push protection | Assuming it catches every secret type.                                        | Enable it as one layer, plus local/CI secret scanning and incident response.                             |
+| Code scanning gate     | Treating security alerts as advisory only for critical repos.                 | Block merges on required high-confidence alerts or pending required analysis.                            |
+| Server-side hooks      | Writing slow, opaque, non-deterministic hooks that block developers randomly. | Keep server hooks fast, deterministic, auditable, and specific.                                          |
+| Rulesets / push rules  | Applying hidden restrictions with no developer feedback.                      | Use transparent rules for file size, forbidden paths, protected tags, branch names, and required checks. |
+| Deployment gates       | Deploying directly from unreviewed pushes.                                    | Require environments, approvals, status checks, and audit logs for production deploys.                   |
+
+---
+
+## 8. Recommended “good default” stack
+
+For most repos, the best-practice shape is:
+
+| Layer                 | Good default                                                                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Local commit feedback | `pre-commit` or Lefthook with format, lint, conflict markers, secret scan, large-file check.                                                   |
+| Commit messages       | `commit-msg` with Conventional Commits or a simpler documented standard; DCO/sign-off only when the project requires it.                       |
+| Pre-push              | Typecheck, build, focused tests, and a second secret scan.                                                                                     |
+| CI                    | Full test suite, lint, typecheck, docs build, dependency/security scans, artifact/build validation.                                            |
+| Repository hygiene    | `.gitignore`, `.gitattributes`, `.editorconfig`, `.gitmessage`, `.git-blame-ignore-revs`, CODEOWNERS, CONTRIBUTING, SECURITY.                  |
+| Hosted enforcement    | Protected `main`, no direct pushes, required reviews, required status checks, CODEOWNERS review, no force-push/delete, secret push protection. |
+| High-risk repos       | Add server-side hooks, signed commits, merge queue, SBOM/provenance, deployment approvals, audit logging, and stricter rulesets.               |
+
+The durable rule is: **make the right thing fast locally, make the wrong thing impossible remotely, and make every failure understandable.**
+
+[1]: https://git-scm.com/book/en/v2/Customizing-Git-Git-Hooks "Git - Git Hooks"
+[2]: https://www.reddit.com/r/git/comments/bt02uj/why_dont_precommit_hooks_run_before_the_creation/?utm_source=chatgpt.com "Why don't pre-commit hooks run before the creation of ..."
+[3]: https://git-scm.com/docs/githooks "Git - githooks Documentation"
+[4]: https://git-scm.com/docs/git-config "Git - git-config Documentation"
+[5]: https://github.com/gitleaks/gitleaks?utm_source=chatgpt.com "Find secrets with Gitleaks"
+[6]: https://www.conventionalcommits.org/en/v1.0.0/?utm_source=chatgpt.com "Conventional Commits"
+[7]: https://git-scm.com/docs/gitignore/2.16.6?utm_source=chatgpt.com "Git - gitignore Documentation"
+[8]: https://git-scm.com/docs/gitmailmap?utm_source=chatgpt.com "gitmailmap Documentation"
+[9]: https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches "About protected branches - GitHub Docs"
+[10]: https://docs.github.com/en/code-security/concepts/code-scanning/merge-protection "Code scanning merge protection - GitHub Docs"
+

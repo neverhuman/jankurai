@@ -1,0 +1,1717 @@
+Below is a practical “exhaustive taxonomy” of bad CI agent behavior: the recurring failure classes that show up across GitHub Actions, GitLab CI, Bitbucket Pipelines, Jenkins/GitBucket-style integrations, and AI/code agents that modify or operate inside CI. New one-off mistakes are always possible, but these categories cover the major security, performance, reliability, and test-design failure modes.
+
+I could not directly verify Quora posts because access was blocked, so I did **not** rely on Quora as a cited source. I used official GitHub/GitLab/Bitbucket/Jenkins docs, OWASP CI/CD, OpenSSF/SLSA/NIST guidance, USENIX/arXiv research, GitHub Security Lab, Reddit/X community reports, and related project documentation.
+
+---
+
+# 1. The big picture: CI is remote code execution
+
+The most important mental model: **CI is an automation system that runs attacker-influenced code with credentials, network access, source access, artifact access, and often deployment authority.** GitLab’s runner security documentation states this very directly: CI/CD jobs are remote code execution, and non-ephemeral shared runners can let malicious jobs compromise other projects, steal variables, or abuse `CI_JOB_TOKEN`. ([GitLab Docs][1])
+
+OWASP’s CI/CD Top 10 frames the main risk families as insufficient flow control, weak identity/access management, dependency chain abuse, poisoned pipeline execution, poor pipeline-based access control, credential hygiene failures, insecure configuration, ungoverned third-party services, missing artifact integrity validation, and insufficient logging/visibility. ([OWASP Foundation][2])
+
+A USENIX Security study of GitHub CI workflows found that CI systems execute arbitrary code and often have access to secrets or infrastructure; in its large dataset, 99.8% of workflows were overprivileged/read-write, 23.7% were triggerable by pull requests and used repository code, and 99.7% of repositories used external Actions. ([USENIX][3])
+
+---
+
+# 2. Exhaustive list of bad CI agent behavior: security
+
+## A. Bad identity, permissions, and privilege behavior
+
+1. **Running all CI jobs with write permissions by default.**
+   Bad agents use broad repository, package, issue, pull-request, or deployment permissions even when tests only need read access. In GitHub Actions this often appears as missing `permissions:` or `permissions: write-all`; in GitLab it appears as broadly trusted project/group tokens; in Bitbucket it appears as overly broad access tokens or workspace/repository variables available to too many writers. GitHub recommends granting the `GITHUB_TOKEN` the minimum permissions needed, and OpenSSF identifies overprivileged workflows as a major attack vector. ([GitHub Docs][4])
+
+2. **Sharing one powerful token across unrelated steps.**
+   A test step, formatter, linter, third-party action, package installer, Docker build, and deployment step should not all inherit the same write token. GitHub documents that jobs in a workflow can interact through shared workspace, filesystem, Docker socket, and environment files, so one compromised action can affect later steps or access secrets/tokens available to the job. ([GitHub Docs][5])
+
+3. **Allowing CI agents to approve, merge, or create privileged PRs.**
+   A bot that can modify workflows, approve its own PRs, or merge code after passing tests is a self-escalation risk. GitHub explicitly recommends preventing GitHub Actions from creating or approving pull requests where possible. ([GitHub Docs][4])
+
+4. **Using long-lived personal access tokens instead of short-lived scoped credentials.**
+   Static PATs, cloud keys, Docker registry passwords, SSH private keys, and npm tokens embedded as CI secrets are high-value targets. GitHub recommends OIDC for cloud resources to avoid long-lived credentials, and SLSA requires secure secret management and access controls in build platforms. ([GitHub Docs][4])
+
+5. **Using personal SSH keys in CI.**
+   This is especially bad in Bitbucket Pipelines and shell runners. Bitbucket warns that repository/workspace users with write access can retrieve secured variables and specifically advises against passing a personal SSH key as a repository variable. ([Atlassian Support][6])
+
+6. **Giving untrusted contributors access to protected variables or protected runners.**
+   Bad behavior includes running fork/MR code on protected runners, letting untrusted branches access protected variables, or allowing non-protected refs to use deployment secrets. GitLab recommends protecting runners so they only run jobs on protected branches/tags, with careful handling for merge request pipelines. ([GitLab Docs][7])
+
+7. **Disabling token allowlists or broadening job-token access.**
+   GitLab warns that leaked job tokens can access private data and recommends limiting cross-project job-token access through allowlists; disabling these controls increases risk. ([GitLab Docs][8])
+
+8. **Letting CI tokens push code without strong controls.**
+   A CI job that can push to the repo can rewrite code, tags, generated files, release manifests, or workflow files. GitLab documents that `CI_JOB_TOKEN` push access gives the same access as the triggering user and warns not to enable it in unsafe mirror/pipeline patterns. ([GitLab Docs][8])
+
+9. **Using global credentials instead of scoped credentials.**
+   In Jenkins, global credentials can be exposed to too many jobs. Jenkins documents credential scopes and warns that malicious pipelines can still disclose credentials even when masking is enabled. ([Jenkins][9])
+
+10. **Allowing anyone with write access to change CI behavior without review.**
+    CI YAML is executable infrastructure. Workflow changes should require review, CODEOWNERS, and branch protection. GitHub recommends CODEOWNERS for workflows, environment protection, and least-privilege workflow permissions. ([GitHub Docs][4])
+
+---
+
+## B. Bad trigger behavior and poisoned pipeline execution
+
+11. **Running privileged workflows on untrusted pull requests.**
+    The classic dangerous pattern is `pull_request_target` plus checking out and executing untrusted PR code. GitHub and OpenSSF both warn that privileged triggers such as `pull_request_target` and `workflow_run` are dangerous when combined with untrusted checkout, untrusted artifacts, or user-controlled input. ([GitHub Docs][5])
+
+12. **Confusing `pull_request` and `pull_request_target`.**
+    `pull_request` runs in the context of the merge/ref and is safer for forked PR testing because secrets are not normally exposed to external forks; `pull_request_target` runs in the context of the base repository and can have access to secrets/write tokens. GitHub Security Lab and GitHub docs repeatedly warn about this class of mistake. ([The GitHub Blog][10])
+
+13. **Running `workflow_run` on artifacts produced by untrusted code.**
+    A bad agent runs an unprivileged PR workflow, uploads a script/binary/artifact, then a privileged `workflow_run` workflow downloads and executes it. GitHub cautions against using artifacts from untrusted workflows in privileged contexts. ([GitHub Docs][5])
+
+14. **Trusting PR titles, branch names, issue bodies, labels, comments, commit messages, or usernames inside shell scripts.**
+    GitHub Security Lab shows that user-controlled inputs such as issue titles or PR metadata can become command injection when inserted directly into `run:` scripts through `${{ }}` interpolation. ([The GitHub Blog][10])
+
+15. **Letting comments trigger privileged commands.**
+    Patterns like `/deploy`, `/run-tests`, `/approve`, `/release`, or `/benchmark` are bad when any commenter can trigger them, when membership is not verified at execution time, or when the command executes untrusted branch code with secrets.
+
+16. **Using broad event triggers.**
+    Bad YAML uses `on: [push, pull_request, pull_request_target, workflow_run, issue_comment, schedule, workflow_dispatch]` without separating trust boundaries. Each trigger has different trust assumptions, and combining them in one job often accidentally exposes secrets or write tokens.
+
+17. **Using scheduled workflows that run mutable external code.**
+    A nightly job that pulls `main`, installs floating dependencies, downloads scripts from the internet, and has write/deploy credentials is an ideal supply-chain target.
+
+18. **Allowing `workflow_dispatch` inputs to become shell commands.**
+    Inputs such as `branch`, `command`, `environment`, `package`, or `version` must be allowlisted and quoted. Passing `github.event.inputs.command` into `sh`, `bash`, `python -c`, `npm run`, or `make` without validation is command injection.
+
+19. **Using labels as authorization.**
+    A label like `safe-to-test` is not authorization unless the actor who applied it is checked and the label cannot be spoofed by automation or lower-privileged users.
+
+20. **Trusting fork branch names.**
+    Branch names are attacker-controlled strings. Bad agents embed them in shell, Docker tags, artifact names, cache keys, or cloud resource names without normalization.
+
+21. **Triggering deployment or release jobs from test events.**
+    Test events should not deploy production. A CI agent that deploys on `pull_request`, `merge_request_event`, or any branch pattern like `release/*` without protected-branch controls violates pipeline flow control. OWASP calls insufficient flow control a CI/CD risk because attackers can push malicious code or artifacts through the pipeline without appropriate approvals. ([OWASP Foundation][11])
+
+---
+
+## C. Bad command execution and injection behavior
+
+22. **Interpolating untrusted expressions directly into `run:`.**
+    Bad GitHub Actions example:
+
+    ```yaml
+    - run: echo "${{ github.event.pull_request.title }}"
+    ```
+
+    Safer behavior is to pass values through environment variables, quote them, validate them, and avoid constructing commands. GitHub Security Lab explicitly recommends avoiding direct `${{ }}` expression interpolation inside shell scripts. ([The GitHub Blog][10])
+
+23. **Executing arbitrary package scripts from untrusted PRs with secrets present.**
+    `npm install`, `pip install .`, `bundle install`, `go generate`, `cargo build`, Gradle plugins, Maven plugins, Makefiles, and post-install hooks can execute code. Running them with secrets, write tokens, Docker socket access, or internal network access is bad.
+
+24. **Using `eval`, `bash -c`, `sh -c`, `python -c`, or dynamic command construction from CI variables.**
+    CI variables are data, not code. Treating them as commands turns branch names, commit messages, PR bodies, matrix values, or workflow inputs into code execution.
+
+25. **Running `curl | bash` or `wget | sh` in CI.**
+    This bypasses review, pinning, integrity checks, and provenance. If the remote changes, the build changes.
+
+26. **Executing downloaded artifacts without checksum/signature verification.**
+    SLSA emphasizes provenance and integrity; bad agents download installers, scanners, CLIs, build tools, or artifacts and execute them without digest or signature verification. ([SLSA][12])
+
+27. **Using mutable tags for tools and scripts.**
+    `action@main`, `image: latest`, `plugin: latest`, `curl https://.../install.sh`, or `uses: org/action@v1` without pinning can change under the build. GitHub recommends pinning third-party Actions to a full-length commit SHA. ([GitHub Docs][5])
+
+28. **Executing untrusted artifacts in privileged follow-up jobs.**
+    A compiled binary from a PR test should not be executed in a release, deploy, signing, or publish job.
+
+29. **Allowing test code to alter CI control files.**
+    A malicious test that writes to `$GITHUB_ENV`, `$GITHUB_PATH`, `.npmrc`, Maven settings, Docker config, SSH config, Gradle init scripts, or shell rc files can poison later steps.
+
+30. **Writing untrusted multiline content to CI environment files.**
+    In GitHub Actions, writing attacker-controlled content to environment/output files can affect subsequent steps if not correctly delimited, escaped, and validated.
+
+---
+
+## D. Bad secrets behavior
+
+31. **Printing secrets to logs.**
+    This includes `echo $TOKEN`, `set -x`, verbose HTTP clients, debug package managers, `env`, `printenv`, stack traces, test snapshots, command history, and framework debug output. Secret masking reduces accidental leakage but is not a complete protection; Jenkins explicitly warns that masking does not stop malicious pipelines from disclosing credentials. ([Jenkins][13])
+
+32. **Logging transformed secrets.**
+    Base64, URL-encoded, JSON-escaped, truncated, split, compressed, or hashed secrets can evade masking. GitHub recommends registering transformed secrets for masking and avoiding structured secrets where possible. ([GitHub Docs][4])
+
+33. **Putting secrets directly in YAML.**
+    Hard-coded credentials in `.github/workflows/*.yml`, `.gitlab-ci.yml`, `bitbucket-pipelines.yml`, Jenkinsfile, Dockerfiles, test configs, or repo files are bad. GitLab recommends using CI/CD variables rather than hard-coding values in `.gitlab-ci.yml`, while also warning that variables are less secure than external secret managers. ([GitLab Docs][14])
+
+34. **Using CI/CD variables as a full secret manager.**
+    GitLab explicitly says the most sensitive secrets should be stored outside GitLab in a secrets manager, and that CI/CD variables have risks such as accidental exposure, overriding, and UI access. ([GitLab Docs][15])
+
+35. **Making secrets available to all jobs.**
+    Secrets should be scoped to the one job or environment that needs them. Bad agents set secrets at top-level `env:` or group/workspace scope where tests, linters, third-party actions, and untrusted code can read them.
+
+36. **Using `secrets: inherit` casually in reusable workflows.**
+    This can pass more secrets than intended into another workflow. Recent workflow-scanner research explicitly identifies inherited secrets as a secrets exposure weakness. ([arXiv][16])
+
+37. **Passing secrets to child pipelines or shared pipeline variables that log plain text.**
+    Bitbucket documents that shared pipeline variable values and child pipeline input variables are logged in plain text and are not intended for secure variables. ([Atlassian Support][17])
+
+38. **Assuming “secured variable” means safe from malicious code.**
+    Bitbucket warns that users with write access can retrieve secured variables, and Jenkins warns malicious pipelines can still disclose credentials. ([Atlassian Support][6])
+
+39. **Caching secrets.**
+    Bad caches include `.npmrc`, `.pypirc`, `.docker/config.json`, `.aws`, `.gcloud`, `.ssh`, Maven settings, Gradle credentials, package-manager auth files, test databases with production-like credentials, or generated `.env` files. GitHub warns not to store sensitive information in caches because PRs and forks may access caches. ([GitHub Docs][18])
+
+40. **Publishing secrets in artifacts.**
+    Artifacts often outlive jobs and may be downloadable by broader audiences. Bad artifacts include logs, coverage reports, test snapshots, `.env`, build directories, dependency caches, Docker layers, crash dumps, and browser traces containing tokens.
+
+41. **Leaking secrets through AI-agent logs.**
+    Research on LLM agent skills found credential leakage issues, with debug logging and `print`/`console.log`-style output being major leak paths. This maps directly to CI agents that summarize logs, paste failing commands, or upload debug artifacts. ([arXiv][19])
+
+42. **Storing production secrets in test environments.**
+    Tests should use isolated credentials with minimal scope. Production secrets in CI test jobs create a direct path from test compromise to production compromise.
+
+43. **Using the same secret across dev, staging, CI, and production.**
+    Reuse prevents containment and makes rotation painful.
+
+44. **Not rotating secrets after CI compromise.**
+    If a runner, job, action, artifact, cache, or log might have exposed a secret, the correct assumption is compromise.
+
+---
+
+## E. Bad runner/agent isolation behavior
+
+45. **Running untrusted jobs on persistent self-hosted runners.**
+    Persistent runners can retain files, processes, containers, credentials, caches, Docker layers, SSH agents, package-manager state, and malware from previous jobs. GitLab calls non-ephemeral multi-project runners an acute risk. ([GitLab Docs][1])
+
+46. **Using shell executors for untrusted code.**
+    GitLab warns that shell executors are high-security risk and should run only trusted builds. ([GitLab Docs][1])
+
+47. **Mounting the Docker socket into CI jobs.**
+    Docker socket access is often equivalent to host root. A malicious test can start privileged containers, mount the host filesystem, read runner secrets, or tamper with other jobs.
+
+48. **Using Docker-in-Docker privileged mode for untrusted builds.**
+    GitLab documents that Docker build methods often require privileged mode and warns about root-like permissions; it also recommends pinning specific Docker image versions rather than `latest`. ([GitLab Docs][20])
+
+49. **Adding CI users to the Docker group on shared machines.**
+    GitLab notes that adding `gitlab-runner` to the Docker group grants root-like permissions. ([GitLab Docs][20])
+
+50. **Using the same runner for public forks, internal repos, and release jobs.**
+    A runner that builds untrusted fork code should not also sign releases, access internal networks, or deploy.
+
+51. **No network segmentation.**
+    Bad CI can reach metadata services, production databases, Kubernetes APIs, cloud control planes, internal package registries, staging admin panels, or source-control admin APIs.
+
+52. **Allowing arbitrary outbound egress.**
+    Exfiltration becomes trivial if every job can `curl` any endpoint. Bad agents do not restrict outbound network access for untrusted jobs.
+
+53. **No cleanup between jobs.**
+    Leaving workspaces, containers, volumes, credentials, SSH agents, language caches, build outputs, browser profiles, or Docker layers behind enables cross-job compromise.
+
+54. **Running as root unnecessarily.**
+    Tests rarely need host root. Running containers as root and mounting the workspace read-write increases blast radius.
+
+55. **Using broad runner labels/tags.**
+    Bad labels like `self-hosted`, `linux`, `deploy`, or `prod` let unrelated jobs land on sensitive runners. GitLab recommends using runner tags to control runner selection. ([GitLab Docs][7])
+
+56. **Allowing untagged jobs on sensitive runners.**
+    A privileged runner that accepts untagged jobs can be selected accidentally by any job.
+
+57. **No resource limits.**
+    A bad agent can consume CPU, memory, disk, network, cache storage, artifact storage, or runner concurrency.
+
+58. **No timeout.**
+    GitHub’s workflow syntax has a default job timeout of 360 minutes, which is too high for many tests. Long defaults can turn hung tests into capacity and cost problems. ([GitHub Docs][21])
+
+---
+
+## F. Bad dependency and supply-chain behavior
+
+59. **Using unpinned third-party Actions, includes, pipes, plugins, or Docker images.**
+    Mutable references let upstream changes alter your CI. GitHub recommends pinning Actions to full-length commit SHA, and scanner research identifies unpinned dependencies as a common workflow weakness. ([GitHub Docs][5])
+
+60. **Trusting third-party CI components with secrets.**
+    GitHub warns that third-party Actions can compromise secrets and tokens available to the job. ([GitHub Docs][5])
+
+61. **Installing dependencies without lockfiles.**
+    Bad test jobs use `npm install`, `pip install -U`, `bundle update`, `go get latest`, floating Maven versions, or unconstrained Docker tags.
+
+62. **Running package-manager lifecycle scripts from untrusted branches.**
+    Install scripts can execute arbitrary code before tests begin.
+
+63. **Using dependency caches as trust anchors.**
+    A cache is not a verified artifact. OpenSSF identifies unsafe caches as an attack vector, and GitHub cautions that caches may be accessible across PR/fork boundaries depending on branch relationships. ([OpenSSF][22])
+
+64. **Ignoring vulnerable Actions/plugins.**
+    The USENIX GitHub CI study found broad use of external Actions, including Actions from unverified creators and Actions missing security updates. ([USENIX][3])
+
+65. **No dependency review or SBOM.**
+    GitHub recommends dependency review, Dependabot, advisory workflows, and SBOM use for GitHub-hosted runners; SLSA emphasizes provenance identifying build outputs by digest and how they were produced. ([GitHub Docs][4])
+
+66. **Building release artifacts from untrusted or non-reviewed code paths.**
+    Release artifacts should come from protected refs, reviewed commits, and reproducible/promoted build outputs—not PR jobs.
+
+67. **Using public package registries directly in release jobs without pinning, lockfiles, or integrity checks.**
+
+68. **Using remote CI templates from mutable branches.**
+    GitLab `include: remote` or project includes, Bitbucket pipes, Jenkins shared libraries, and GitHub reusable workflows become supply-chain dependencies.
+
+69. **Not scanning CI configuration itself.**
+    ARGUS research found thousands of vulnerable workflows/actions through code-injection analysis; OpenSSF Scorecard includes checks for dangerous workflows, pinned dependencies, token permissions, and branch protection. ([USENIX][23])
+
+---
+
+## G. Bad artifact, cache, and provenance behavior
+
+70. **Treating artifacts as trusted just because CI produced them.**
+    An artifact generated by untrusted PR code is attacker-controlled.
+
+71. **Promoting artifacts without integrity checks.**
+    SLSA requires provenance that identifies outputs by digest and describes how they were produced; consumers should validate provenance authenticity and integrity. ([SLSA][12])
+
+72. **Rebuilding separately for test and release.**
+    Bad pipelines test one artifact and release another. The better pattern is build once, test that artifact, sign/provenance it, and promote the same artifact.
+
+73. **No artifact retention policy.**
+    Old artifacts may contain secrets, vulnerabilities, or outdated binaries.
+
+74. **Uploading entire workspaces as artifacts.**
+    This often includes source, secrets, `.git`, caches, configs, logs, and generated files.
+
+75. **Using broad artifact names that collide across parallel jobs.**
+    Bitbucket documents that artifacts generated in parallel steps can conflict; naming collisions cause nondeterministic output and incorrect downstream behavior. ([Atlassian Support][24])
+
+76. **Using broad cache restore keys.**
+    Overly broad cache keys can restore incompatible or poisoned dependencies. GitHub documents cache-key and restore-key behavior, including fallback matches. ([GitHub Docs][18])
+
+77. **Sharing caches between protected and unprotected branches.**
+    GitLab notes that protected and non-protected branches do not share cache by default; weakening that separation is bad. ([GitLab Docs][25])
+
+78. **Caching build outputs instead of dependencies.**
+    This can hide stale state, flaky build logic, and malicious injected artifacts.
+
+---
+
+## H. Bad test design behavior with security impact
+
+79. **Skipping security tests on PRs.**
+    A bad agent runs unit tests but skips SAST, dependency review, secret scanning, IaC scanning, container scanning, or policy checks on changed code.
+
+80. **Marking security scans as advisory forever.**
+    `continue-on-error: true`, `allow_failure: true`, or “non-blocking” security checks are bad when no process converts findings into enforcement.
+
+81. **Running security scanners after deployment.**
+    Late failures slow response and allow bad artifacts to progress. GitLab’s pipeline-efficiency docs identify late failures as a lifecycle bottleneck. ([GitLab Docs][26])
+
+82. **Testing with production data.**
+    Production-like datasets in CI may expose regulated data, credentials, customer information, or internal business logic.
+
+83. **Using live production services in tests.**
+    CI tests should not mutate production systems, call production payment/email/SMS APIs, or consume production quotas.
+
+84. **Test fixtures containing real secrets.**
+    “Fake” fixtures often become real credentials copied from local dev.
+
+85. **Snapshot tests capturing secrets.**
+
+86. **Browser/end-to-end tests saving auth tokens in screenshots, videos, traces, HAR files, or artifacts.**
+
+87. **Not isolating test tenants/accounts.**
+
+88. **Granting test credentials admin permissions.**
+
+89. **Allowing tests to create public cloud resources without cleanup.**
+
+90. **Using CI to run destructive tests against shared environments.**
+
+91. **Letting tests mutate shared package registries, tags, images, or release channels.**
+
+92. **Running fuzzers or load tests without resource quotas.**
+
+---
+
+## I. Bad observability and incident-response behavior
+
+93. **No audit logs for workflow edits, runner registration, secret changes, token use, or deployment approvals.**
+    OWASP identifies insufficient logging and visibility as a CI/CD security risk because attackers can operate undetected. ([OWASP Foundation][27])
+
+94. **No alerting on unusual CI behavior.**
+    Examples: new workflow added, permissions changed to write-all, self-hosted runner added, secret accessed by unusual job, unexpected network egress, release job from unusual ref, large artifact upload, or cache miss storm.
+
+95. **No provenance logs.**
+    You cannot confidently answer “which source produced this binary?” or “which workflow signed this image?”
+
+96. **No retention for relevant logs.**
+
+97. **Over-retention of sensitive logs.**
+    Keeping logs forever increases exposure.
+
+98. **No emergency kill switch for compromised workflows/runners.**
+
+99. **No runbook for rotating CI secrets.**
+
+100. **No way to quarantine compromised artifacts or packages.**
+
+---
+
+# 3. Exhaustive list of bad CI agent behavior: performance and reliability
+
+## A. Bad pipeline structure
+
+101. **Long serial pipelines with no DAG.**
+     Bad CI waits for lint, build, unit tests, integration tests, packaging, and scans sequentially even when they can run in parallel. GitLab recommends analyzing critical path and using pipeline efficiency features. ([GitLab Docs][26])
+
+102. **No parallelization for independent tests.**
+     Bitbucket recommends using parallel steps to reduce build time, commonly building once and then running tests in parallel. ([Atlassian Support][24])
+
+103. **Over-parallelization that starves runners.**
+     Spawning hundreds of jobs can increase queue time, cache contention, cloud cost, rate limits, and flakiness.
+
+104. **No path filters.**
+     Running the entire monorepo pipeline for documentation-only, frontend-only, backend-only, or config-only changes wastes time.
+
+105. **No change-based test selection.**
+
+106. **No smoke tests before expensive tests.**
+
+107. **Running slow integration/e2e tests before fast unit/lint checks.**
+
+108. **No fail-fast behavior.**
+     Bitbucket provides fail-fast controls for parallel groups; failing early avoids wasting capacity after a decisive failure. ([Atlassian Support][24])
+
+109. **Failing late because quality gates are placed after expensive jobs.**
+
+110. **Rebuilding the same artifact in every job.**
+
+111. **Downloading dependencies separately in every job.**
+
+112. **No dependency cache, or a cache key that never hits.**
+
+113. **Cache keys that are too broad and restore stale/incompatible dependencies.**
+
+114. **Cache keys that are too narrow and create a new cache every run.**
+
+115. **Caching huge directories with little reuse value.**
+
+116. **Uploading/download large artifacts unnecessarily.**
+
+117. **Using artifacts where caches should be used, or caches where artifacts should be used.**
+     GitLab distinguishes caches, which accelerate later jobs, from artifacts, which pass job output to later stages. ([GitLab Docs][25])
+
+118. **No timeout on jobs or steps.**
+
+119. **Timeouts set so low that normal work flakes.**
+
+120. **No cancellation of superseded runs.**
+     GitHub concurrency groups can ensure only one matching workflow/job runs and can cancel in-progress work, which is useful for staging deploys and waste reduction. ([GitHub Docs][28])
+
+121. **No interruptible/cancel behavior for obsolete branches.**
+
+122. **Running full CI on every push to a branch while a PR is already open.**
+
+123. **Duplicated pipelines for push and PR/MR events.**
+
+124. **Scheduled jobs running during peak developer hours.**
+
+125. **Cron storms.**
+     Many repos scheduling jobs at the same minute causes runner contention.
+
+---
+
+## B. Bad runner/resource behavior
+
+126. **Using undersized runners for heavy builds.**
+
+127. **Using oversized runners for small lint/test jobs.**
+     GitLab recommends analyzing runner cost and resource mismatch. ([GitLab Docs][26])
+
+128. **Not separating CPU-bound, memory-bound, IO-bound, and network-bound jobs.**
+
+129. **No memory limits for service containers.**
+     Bitbucket documents service memory defaults and configurable limits; ignoring this leads to unstable test services. ([Atlassian Support][29])
+
+130. **Running Docker builds and test suites on the same small runner.**
+
+131. **No disk cleanup.**
+
+132. **Persistent runners accumulating stale state.**
+
+133. **Cold-starting large images repeatedly.**
+
+134. **Using bloated CI images.**
+
+135. **Installing system packages every run instead of using maintained base images.**
+
+136. **Pulling large Docker images without layer caching.**
+
+137. **Using `latest` images that break unpredictably.**
+
+138. **No runner autoscaling or poor autoscaling.**
+
+139. **Using one shared runner pool for all priorities.**
+
+140. **Allowing low-priority jobs to block release/hotfix jobs.**
+
+141. **No concurrency limits for expensive jobs.**
+
+142. **No resource locks for shared environments.**
+     GitLab resource groups prevent concurrent deployment jobs from corrupting shared infrastructure while letting other jobs stay parallel. ([GitLab Docs][30])
+
+---
+
+## C. Bad test behavior
+
+143. **Flaky tests left in the main gate.**
+     GitLab identifies flaky tests as a contributor to slow software lifecycles. ([GitLab Docs][26])
+
+144. **Retries hiding real failures.**
+
+145. **No quarantine process for flaky tests.**
+
+146. **No test timing data.**
+
+147. **No test sharding by historical duration.**
+
+148. **Naive alphabetical sharding that creates imbalanced workers.**
+
+149. **Stateful tests that depend on order.**
+
+150. **Tests depending on wall-clock time, time zones, random seeds, external APIs, or shared mutable environments.**
+
+151. **No deterministic seed capture for randomized tests.**
+
+152. **Running e2e tests against unstable shared environments.**
+
+153. **No service readiness checks.**
+
+154. **Fixed sleeps instead of health checks.**
+
+155. **Integration tests that leak resources and slow later tests.**
+
+156. **Using production-size datasets for ordinary PR tests.**
+
+157. **No distinction between PR, merge, nightly, release, and soak test suites.**
+
+158. **No local reproduction command.**
+
+159. **Tests produce massive logs by default.**
+
+160. **Coverage collection on every job even when only needed once.**
+
+161. **Uploading coverage from every shard without merging discipline.**
+
+162. **No performance budget or regression gate for critical paths.**
+
+163. **Benchmark jobs running on noisy shared runners without baselines.**
+
+164. **Benchmark results treated as deterministic when runner noise dominates.**
+
+---
+
+## D. Bad dependency/install behavior
+
+165. **Re-resolving dependencies every run.**
+
+166. **No lockfiles.**
+
+167. **Using `npm install` instead of `npm ci` in deterministic CI contexts.**
+
+168. **Updating dependencies during tests.**
+
+169. **Downloading build tools from slow external URLs every run.**
+
+170. **No internal mirrors for heavy dependencies.**
+
+171. **No retry/backoff for transient package registry failures.**
+
+172. **Retrying too aggressively and amplifying outages.**
+
+173. **No offline mode for stable dependency sets.**
+
+174. **Mixing build tool installation with test execution so failures are hard to classify.**
+
+---
+
+## E. Bad feedback and developer-experience behavior
+
+175. **CI reports one giant failure instead of actionable job-level failures.**
+
+176. **Logs are too noisy to find the failing test.**
+
+177. **Logs are too sparse to reproduce the failure.**
+
+178. **Failures do not include test artifacts where safe.**
+
+179. **Artifacts are retained too briefly to debug.**
+
+180. **Artifacts are retained too long when sensitive.**
+
+181. **No ownership routing for failed jobs.**
+
+182. **No flaky-test dashboard.**
+
+183. **No pipeline duration SLO.**
+
+184. **No cost visibility.**
+
+185. **No per-team or per-job runner usage visibility.**
+
+186. **No periodic cleanup of obsolete workflows.**
+
+187. **No review of slowest jobs.**
+
+188. **No enforcement against adding very slow PR gates.**
+
+---
+
+# 4. Bad AI/code-agent behavior in CI
+
+This section is important because “agent” increasingly means an AI coding agent that edits code, opens PRs, runs tests, or modifies CI.
+
+189. **Agent modifies CI YAML to make tests pass instead of fixing code.**
+
+190. **Agent disables failing tests, scanners, linters, or type checks.**
+
+191. **Agent adds `continue-on-error: true` or `allow_failure: true` to bypass gates.**
+
+192. **Agent broadens permissions to fix an auth error.**
+
+193. **Agent adds a PAT or secret to workflow files.**
+
+194. **Agent prints environment variables while debugging.**
+
+195. **Agent uploads full logs/artifacts containing secrets.**
+
+196. **Agent summarizes secret-containing logs into PR comments.**
+
+197. **Agent uses untrusted PR text, issue comments, or README instructions as operational instructions.**
+     This is a prompt-injection analogue inside CI: the agent reads attacker-controlled text and then changes code, commands, permissions, or secrets handling.
+
+198. **Agent runs arbitrary shell commands suggested by failing logs or external content.**
+
+199. **Agent installs tools using `curl | bash` because it is expedient.**
+
+200. **Agent pins nothing and uses `latest`.**
+
+201. **Agent adds external GitHub Actions/Pipes/plugins without review.**
+
+202. **Agent changes lockfiles opportunistically.**
+
+203. **Agent updates dependencies to silence failures without assessing security/license impact.**
+
+204. **Agent generates fake tests that assert implementation details but not behavior.**
+
+205. **Agent deletes slow tests to improve CI time.**
+
+206. **Agent writes non-deterministic tests.**
+
+207. **Agent retries flaky tests until green and reports success.**
+
+208. **Agent auto-merges its own PR.**
+
+209. **Agent approves workflow changes it authored.**
+
+210. **Agent comments secrets, internal URLs, or stack traces into public PRs.**
+
+211. **Agent uses production credentials to reproduce test failures.**
+
+212. **Agent opens network egress to arbitrary hosts.**
+
+213. **Agent weakens branch protection or required checks.**
+
+214. **Agent creates backdoor maintenance workflows.**
+
+215. **Agent rewrites release scripts or signing steps without human review.**
+
+216. **Agent fabricates benchmark improvements by changing measurement conditions.**
+
+217. **Agent treats CI pass as proof of correctness/security.**
+
+218. **Agent ignores failing security checks as “unrelated.”**
+
+219. **Agent changes generated files or vendored code without provenance.**
+
+220. **Agent does not produce an audit trail of what commands it ran and why.**
+
+---
+
+# 5. Bad behavior in `.git*.yml` and CI config files
+
+## A. GitHub Actions: `.github/workflows/*.yml`
+
+### Dangerous security anti-patterns
+
+221. **`pull_request_target` plus checkout of PR head.**
+
+```yaml
+on: pull_request_target
+
+jobs:
+  test:
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - run: npm install
+      - run: npm test
+```
+
+This runs attacker-controlled code in a privileged context. GitHub and OpenSSF explicitly warn against this pattern. ([GitHub Docs][5])
+
+222. **`workflow_run` executing untrusted artifacts.**
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["PR Tests"]
+    types: [completed]
+
+steps:
+  - uses: actions/download-artifact@v4
+  - run: ./artifact/test-output/script.sh
+```
+
+Bad because the artifact may have been produced by untrusted PR code. GitHub cautions against trusting artifacts from untrusted workflows. ([GitHub Docs][5])
+
+223. **No explicit permissions.**
+
+```yaml
+jobs:
+  test:
+    steps:
+      - run: npm test
+```
+
+Bad because permissions may be broader than the job needs. Prefer top-level read-only or no token, then escalate per job.
+
+224. **`permissions: write-all`.**
+
+```yaml
+permissions: write-all
+```
+
+Bad unless the workflow is a tightly protected release workflow and every step is trusted.
+
+225. **Third-party actions pinned to mutable tags.**
+
+```yaml
+- uses: some-org/some-action@main
+- uses: some-org/some-action@v1
+```
+
+GitHub recommends pinning third-party actions to a full-length commit SHA. ([GitHub Docs][5])
+
+226. **Untrusted expression injection in `run:`.**
+
+```yaml
+- run: echo "PR title: ${{ github.event.pull_request.title }}"
+```
+
+GitHub Security Lab documents this as a command-injection class and recommends avoiding direct expression interpolation inside scripts. ([The GitHub Blog][10])
+
+227. **Using issue comments as commands without authorization.**
+
+```yaml
+on: issue_comment
+steps:
+  - run: deploy ${{ github.event.comment.body }}
+```
+
+228. **Passing `workflow_dispatch` inputs to shell.**
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        required: true
+
+steps:
+  - run: ${{ github.event.inputs.command }}
+```
+
+229. **Using secrets in top-level `env:`.**
+
+```yaml
+env:
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+```
+
+Bad because every job/step/action may inherit it.
+
+230. **`secrets: inherit` in reusable workflows without strict boundaries.**
+
+```yaml
+jobs:
+  call:
+    uses: org/repo/.github/workflows/reusable.yml@main
+    secrets: inherit
+```
+
+231. **Caching secret-bearing directories.**
+
+```yaml
+- uses: actions/cache@v4
+  with:
+    path: |
+      ~/.npm
+      ~/.ssh
+      ~/.docker
+      .env
+```
+
+GitHub warns not to store sensitive information in caches. ([GitHub Docs][18])
+
+232. **Broad cache keys and restore keys.**
+
+```yaml
+key: deps-${{ runner.os }}
+restore-keys: |
+  deps-
+```
+
+Bad because stale or attacker-influenced dependencies may be restored.
+
+233. **No `timeout-minutes`.**
+
+234. **No `concurrency` for expensive or deployment workflows.**
+
+235. **No branch/path filtering.**
+
+236. **Security checks marked non-blocking.**
+
+```yaml
+continue-on-error: true
+```
+
+237. **Auto-committing from CI to protected branches.**
+
+238. **Auto-approving PRs from CI.**
+
+239. **Release jobs triggered by tags that anyone can create.**
+
+240. **Publishing packages from non-protected branches.**
+
+241. **Using self-hosted runners with broad labels.**
+
+```yaml
+runs-on: self-hosted
+```
+
+242. **Mounting Docker socket or privileged containers in test jobs.**
+
+243. **Using `docker://image:latest` or unpinned container images.**
+
+244. **Uploading entire workspace as artifact.**
+
+245. **Downloading artifacts from PR jobs into release jobs.**
+
+246. **No CODEOWNERS protection for workflow changes.**
+     GitHub recommends CODEOWNERS for workflow files. ([GitHub Docs][4])
+
+247. **Not using Dependabot/dependency review for Actions.**
+     GitHub recommends Dependabot for Actions and dependency review for pull requests. ([GitHub Docs][4])
+
+248. **Not using workflow/code scanning.**
+     GitHub recommends code scanning and related supply-chain security features. ([GitHub Docs][4])
+
+---
+
+## B. GitLab CI: `.gitlab-ci.yml`
+
+### Dangerous security anti-patterns
+
+249. **Secrets hard-coded in YAML.**
+
+```yaml
+variables:
+  AWS_SECRET_ACCESS_KEY: "real-secret"
+```
+
+GitLab recommends variables instead of hard-coding in YAML, but also warns that highly sensitive secrets should live in an external secrets manager. ([GitLab Docs][14])
+
+250. **Unquoted variables causing YAML parsing surprises.**
+
+```yaml
+variables:
+  VERSION: 012345
+```
+
+GitLab warns that YAML parsers can transform unquoted values, including octal-like values. ([GitLab Docs][14])
+
+251. **Pipeline variables overriding safer values.**
+     GitLab warns that variables can be overridden and recommends typed CI/CD inputs for safer, validated pipeline inputs. ([GitLab Docs][15])
+
+252. **Unprotected variables used in MR pipelines.**
+
+253. **Protected runners accepting untrusted jobs.**
+
+254. **Sensitive runners accepting untagged jobs.**
+     GitLab recommends protected runners and runner tags to control which jobs run where. ([GitLab Docs][7])
+
+255. **Shell executor for untrusted builds.**
+     GitLab says shell executors are high-security risk and should only run trusted builds. ([GitLab Docs][1])
+
+256. **Privileged Docker-in-Docker for untrusted branches.**
+
+```yaml
+services:
+  - docker:dind
+variables:
+  DOCKER_HOST: tcp://docker:2375
+```
+
+GitLab warns privileged Docker configurations and Docker group access can be root-like; it also recommends TLS for Docker-in-Docker and pinning images rather than using `latest`. ([GitLab Docs][20])
+
+257. **Using `image: latest`.**
+
+```yaml
+image: node:latest
+```
+
+258. **Remote includes from mutable refs.**
+
+```yaml
+include:
+  - remote: https://example.com/template.yml
+```
+
+259. **Security scans allowed to fail.**
+
+```yaml
+sast:
+  allow_failure: true
+```
+
+260. **Deploy jobs missing `environment`, approvals, or protected branch rules.**
+
+261. **No `resource_group` for shared deployment targets.**
+     GitLab resource groups prevent concurrent deployments from corrupting shared environments. ([GitLab Docs][30])
+
+262. **Using `CI_JOB_TOKEN` broadly across projects.**
+     GitLab recommends job-token allowlists and warns leaked tokens can access private data. ([GitLab Docs][8])
+
+263. **Allowing `CI_JOB_TOKEN` to push without strict controls.**
+
+264. **Shared caches across trust boundaries.**
+
+265. **Cache keys too broad.**
+
+```yaml
+cache:
+  key: default
+  paths:
+    - node_modules/
+```
+
+266. **Artifacts include secrets.**
+
+```yaml
+artifacts:
+  paths:
+    - .
+```
+
+267. **Artifacts have no expiry.**
+
+268. **Dynamic child pipelines using unvalidated inputs.**
+
+269. **Passing secrets through child pipeline variables.**
+
+270. **`rules:` that accidentally run deploys on merge requests.**
+
+271. **Old `only/except` rules with ambiguous behavior.**
+
+272. **No `needs:` DAG; everything waits stage-by-stage.**
+
+273. **No `interruptible: true` for obsolete branch pipelines.**
+
+274. **No `timeout`.**
+
+275. **No separation of PR/MR tests, protected-branch tests, release, and deploy workflows.**
+
+---
+
+## C. Bitbucket Pipelines: `bitbucket-pipelines.yml`
+
+### Dangerous security anti-patterns
+
+276. **Secrets in plain pipeline variables.**
+     Bitbucket documents that shared pipeline variables and child pipeline input variables are logged in plain text and are not for secure variables. ([Atlassian Support][17])
+
+277. **Personal SSH keys as repository variables.**
+     Bitbucket explicitly warns against passing personal SSH private keys as repository variables and recommends generating dedicated keys and using deployment variables/permissions. ([Atlassian Support][6])
+
+278. **Assuming secured variables are safe from all writers.**
+     Bitbucket warns users with write access can retrieve secured variables. ([Atlassian Support][6])
+
+279. **Using repository variables where deployment variables should be used.**
+     Deployment variables are scoped to environments and support environment permissions; repository variables are broader. ([Atlassian Support][17])
+
+280. **Passing secrets to child pipelines.**
+
+281. **Using secured variables in YAML templating.**
+     Bitbucket notes secured variables are not supported in YAML templating. ([Atlassian Support][17])
+
+282. **No `known_hosts` verification for SSH.**
+     Bitbucket’s shell runner docs emphasize known-hosts handling for SSH connections. ([Atlassian Support][31])
+
+283. **Broad repository access tokens.**
+     Repository access tokens should be single-purpose, scoped, encrypted, and expire where appropriate. ([Atlassian Support][32])
+
+284. **Deployment steps without environment permissions.**
+
+285. **Parallel artifacts with conflicting names.**
+     Bitbucket documents parallel artifact conflict behavior. ([Atlassian Support][24])
+
+286. **No fail-fast on parallel groups.**
+
+287. **No parallelization for independent test suites.**
+
+288. **Improper service memory sizing.**
+     Bitbucket documents default and configurable memory limits for services such as Docker. ([Atlassian Support][29])
+
+289. **Using `latest` images.**
+
+290. **Installing all dependencies in every step.**
+
+291. **No dependency cache or poor cache scoping.**
+
+292. **Deployment reruns relying on expired artifacts.**
+     Bitbucket notes deployment-stage reruns depend on artifact availability. ([Atlassian Support][33])
+
+---
+
+## D. Jenkinsfile and GitBucket/Jenkins-style integrations
+
+293. **Jenkinsfile not stored in source control.**
+     Jenkins recommends using a Jenkinsfile in source control for code review, audit trail, and a single source of truth. ([Jenkins][13])
+
+294. **Untrusted jobs using trusted credentials.**
+     Jenkins warns not to allow untrusted jobs to use trusted credentials because masking is not a full defense. ([Jenkins][13])
+
+295. **Groovy string interpolation with secrets.**
+
+```groovy
+sh "curl -H 'Authorization: Bearer $TOKEN' https://example.com"
+```
+
+Jenkins recommends safer credential handling patterns and notes quoting matters because interpolation can expose secrets. ([Jenkins][13])
+
+296. **Global credentials available to too many jobs.**
+
+297. **Unsafe Jenkins authorization settings.**
+     Jenkins warns that unsafe settings such as “logged-in users can do anything” or “anyone can do anything” can let users add/configure credentials. ([Jenkins][9])
+
+298. **Static cloud keys in Jenkins credentials instead of instance roles/federation.**
+     Jenkins docs note static AWS-style credentials are not as secure as IAM-role approaches. ([Jenkins][13])
+
+299. **Using experimental or weakly maintained CI plugins for production.**
+     The GitBucket CI plugin documentation says it is experimental, lacks flexibility/scalability, has a security issue, and recommends Jenkins or another CI service for actual projects. ([GitHub][34])
+
+300. **Ignoring plugin vulnerabilities.**
+     A Jenkins GitBucket plugin advisory reports an unresolved stored XSS vulnerability, illustrating the need to track CI/plugin security advisories. ([Jenkins Plugins][35])
+
+---
+
+# 6. Community-observed bad behavior patterns
+
+Community reports are not substitutes for official docs, but they are useful because they reveal what practitioners repeatedly see exploited or misconfigured.
+
+301. **Public repos running fork PR code with secrets because `pull_request_target` was misunderstood.**
+     Reddit and X discussions repeatedly call out `pull_request_target` plus untrusted checkout as a real-world footgun, matching the official GitHub/OpenSSF guidance. ([Reddit][36])
+
+302. **Attackers submitting PRs that alter CI to exfiltrate secrets.**
+     Community discussions emphasize reviewing workflow changes, using CODEOWNERS, and requiring approval for first-time contributors. ([Reddit][36])
+
+303. **Third-party actions treated as harmless utilities.**
+     Community discussions repeatedly recommend pinning actions, avoiding broad token permissions, and scanning workflows; this aligns with GitHub’s official guidance. ([Reddit][37])
+
+304. **Using CI bots/PATs with excessive permissions.**
+     Reports around exploited workflows and bot tokens show how a workflow mistake can become token theft or repo compromise. ([X (formerly Twitter)][38])
+
+---
+
+# 7. Best practices: very detailed CI security design
+
+## A. Treat CI as a production security boundary
+
+1. **Threat-model CI as privileged remote code execution.**
+   Assume every PR, branch name, issue comment, dependency, test fixture, and artifact can be attacker-controlled. This aligns with GitLab’s runner model and OWASP’s CI/CD Top 10 framing. ([GitLab Docs][1])
+
+2. **Separate workflows by trust level.**
+   Use different workflows for:
+
+   * untrusted PR/MR tests,
+   * trusted branch tests,
+   * release builds,
+   * deployments,
+   * scheduled maintenance,
+   * dependency updates,
+   * security scans,
+   * AI-agent automation.
+
+3. **Never mix untrusted code execution and privileged credentials in the same job.**
+
+4. **Build once, test once, promote the same artifact.**
+   SLSA requires provenance identifying outputs by digest and how they were produced. ([SLSA][12])
+
+5. **Use protected environments for deployment.**
+   GitHub recommends environment secrets with required reviewers, and GitLab/Bitbucket provide protected/deployment environment mechanisms. ([GitHub Docs][4])
+
+---
+
+## B. Use least privilege everywhere
+
+6. **Set default token permissions to read-only or none.**
+
+GitHub Actions pattern:
+
+```yaml
+permissions:
+  contents: read
+
+jobs:
+  test:
+    permissions:
+      contents: read
+```
+
+Escalate only for jobs that need it:
+
+```yaml
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+```
+
+GitHub recommends minimum `GITHUB_TOKEN` permissions and OIDC where possible. ([GitHub Docs][4])
+
+7. **Do not use `write-all`.**
+
+8. **Use job-level permissions, not workflow-wide write permissions.**
+
+9. **Use separate credentials for separate systems.**
+
+10. **Use short-lived credentials.**
+
+11. **Prefer OIDC/federated identity to static cloud keys.**
+
+12. **Use token allowlists/scopes.**
+    In GitLab, configure job-token allowlists; in Bitbucket, use repository access tokens with narrow scopes and expiration; in Jenkins, scope credentials tightly. ([GitLab Docs][8])
+
+13. **Prevent CI from approving or merging its own changes.**
+
+14. **Require human review for CI config changes.**
+
+15. **Use CODEOWNERS for workflow files.**
+
+Example:
+
+```text
+.github/workflows/* @security-team @platform-team
+.gitlab-ci.yml @security-team @platform-team
+bitbucket-pipelines.yml @security-team @platform-team
+Jenkinsfile @security-team @platform-team
+```
+
+GitHub recommends CODEOWNERS for workflow protection. ([GitHub Docs][4])
+
+---
+
+## C. Handle untrusted PRs/MRs safely
+
+16. **Use unprivileged PR workflows for fork code.**
+
+GitHub safer pattern:
+
+```yaml
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@<full-sha>
+      - run: npm ci
+      - run: npm test
+```
+
+17. **Avoid `pull_request_target` unless you fully understand the trust boundary.**
+
+18. **Never checkout and execute PR head code inside `pull_request_target`.**
+
+19. **Do not expose secrets to fork PR jobs.**
+
+20. **Do not run release, deploy, package publish, or signing jobs on PR events.**
+
+21. **If a trusted maintainer must trigger extra tests, check the actor at runtime.**
+
+22. **Treat labels/comments as requests, not authorization.**
+
+23. **Validate branch names, labels, comments, PR titles, and workflow inputs.**
+
+24. **Use allowlists for manually supplied inputs.**
+
+Example:
+
+```bash
+case "$TARGET_ENV" in
+  staging|preview) ;;
+  *) echo "Invalid environment"; exit 1 ;;
+esac
+```
+
+25. **Avoid direct interpolation in shell.**
+
+Bad:
+
+```yaml
+- run: echo "${{ github.event.pull_request.title }}"
+```
+
+Better:
+
+```yaml
+- env:
+    PR_TITLE: ${{ github.event.pull_request.title }}
+  run: |
+    printf '%s\n' "$PR_TITLE"
+```
+
+GitHub Security Lab recommends avoiding direct expression interpolation in `run:` scripts. ([The GitHub Blog][10])
+
+---
+
+## D. Secrets management best practices
+
+26. **Keep the most sensitive secrets outside the CI platform.**
+    GitLab explicitly recommends storing the most sensitive secrets in a secrets manager outside GitLab. ([GitLab Docs][15])
+
+27. **Use OIDC or workload identity for cloud auth.**
+
+28. **Use environment-scoped secrets.**
+
+29. **Use protected/masked/hidden variables where supported.**
+    GitLab recommends masking, hiding, and protecting sensitive variables. ([GitLab Docs][15])
+
+30. **Avoid structured secrets when masking is weak.**
+    GitHub recommends avoiding structured secrets and masking transformed values when needed. ([GitHub Docs][4])
+
+31. **Never print all environment variables.**
+
+32. **Disable shell tracing around secrets.**
+
+```bash
+set +x
+# secret-using commands here
+```
+
+33. **Do not store secrets in caches or artifacts.**
+
+34. **Do not pass secrets through Bitbucket shared pipeline variables or child pipeline inputs.**
+    Bitbucket states those values are logged in plain text. ([Atlassian Support][17])
+
+35. **Use file-type variables for tools that expect files.**
+    GitLab supports file-type variables, where the variable value is stored in a temporary file and the variable contains the path. ([GitLab Docs][14])
+
+36. **Rotate secrets after suspicious CI behavior.**
+
+37. **Use secret scanning on commits, logs where possible, and artifacts where feasible.**
+
+38. **Use separate low-privilege test credentials.**
+
+39. **Never use personal SSH keys in CI.**
+    Bitbucket explicitly recommends dedicated keys and environment-scoped deployment variables/permissions. ([Atlassian Support][6])
+
+---
+
+## E. Runner hardening best practices
+
+40. **Use ephemeral runners for untrusted code.**
+
+41. **Do not use shell executors for untrusted jobs.**
+    GitLab warns shell executors should only run trusted builds. ([GitLab Docs][1])
+
+42. **Use separate runner pools by trust level.**
+
+Recommended pools:
+
+* public fork PR pool,
+* internal branch test pool,
+* protected branch build pool,
+* release/signing pool,
+* deployment pool,
+* security scanning pool.
+
+43. **Protect sensitive runners.**
+    GitLab supports protected runners and runner tags for controlling job placement. ([GitLab Docs][7])
+
+44. **Disable untagged jobs on sensitive runners.**
+
+45. **Avoid privileged Docker for untrusted jobs.**
+
+46. **Avoid Docker socket mounts.**
+
+47. **Pin runner images and base images.**
+
+48. **Run jobs as non-root where possible.**
+
+49. **Apply network egress controls.**
+
+50. **Block access to cloud metadata endpoints from untrusted jobs.**
+
+51. **Isolate caches by trust boundary.**
+
+52. **Clean workspaces, containers, and credentials after every job.**
+
+53. **Set CPU, memory, disk, and timeout limits.**
+
+54. **Monitor runner registration and runner label changes.**
+
+55. **Patch runners and CI plugins quickly.**
+    SLSA requires build platforms to use access controls, secure communications, proper secrets management, frequent updates, and prompt vulnerability fixes. ([SLSA][12])
+
+---
+
+## F. Dependency, action, pipe, plugin, and image best practices
+
+56. **Pin third-party Actions to full commit SHA.**
+    GitHub recommends full-length commit SHA pinning for third-party Actions. ([GitHub Docs][5])
+
+57. **Pin Docker images by digest where practical.**
+
+58. **Avoid `latest`.**
+
+59. **Use verified/maintained actions and plugins.**
+
+60. **Use Dependabot or equivalent for Actions and dependencies.**
+    GitHub recommends Dependabot for Actions and dependency management. ([GitHub Docs][4])
+
+61. **Use dependency review on PRs.**
+
+62. **Use SBOMs and provenance for release artifacts.**
+
+63. **Use lockfiles and deterministic install commands.**
+
+64. **Avoid lifecycle script execution in untrusted contexts where possible.**
+
+65. **Mirror critical tools internally or verify checksums/signatures.**
+
+66. **Scan CI YAML.**
+    OpenSSF Scorecard includes checks for dangerous workflows, pinned dependencies, token permissions, and branch protection; ARGUS research shows workflow injection vulnerabilities can be detected at scale. ([undefined][39])
+
+Recommended tools/classes:
+
+* GitHub code scanning / CodeQL for workflow-relevant code,
+* OpenSSF Scorecard,
+* actionlint for GitHub Actions syntax,
+* zizmor or similar workflow security scanners,
+* GitLab CI linting and pipeline editor validation,
+* secret scanning,
+* IaC/container/dependency scanners.
+
+---
+
+## G. Cache and artifact best practices
+
+67. **Cache dependencies, not secrets or build outputs.**
+
+68. **Use lockfile-derived cache keys.**
+    GitHub documents using OS plus lockfile hashes for cache keys. ([GitHub Docs][18])
+
+69. **Separate caches by OS, architecture, language version, lockfile, and trust boundary.**
+
+70. **Do not let fork PRs poison protected-branch caches.**
+
+71. **Do not execute files restored from cache unless integrity is independently verified.**
+
+72. **Use artifacts only for explicit outputs.**
+
+73. **Name artifacts uniquely per job/shard.**
+
+74. **Set artifact retention intentionally.**
+
+75. **Exclude `.git`, credentials, `.env`, test traces with tokens, and package auth files from artifacts.**
+
+76. **Sign release artifacts.**
+
+77. **Generate and validate provenance.**
+    SLSA defines build provenance as identifying the output artifact by digest and describing how it was produced. ([SLSA][12])
+
+---
+
+## H. Pipeline performance best practices
+
+78. **Measure before optimizing.**
+    GitLab recommends analyzing workloads, bottlenecks, architecture, runner availability, runner resources, dependency install time, image size, network latency, flaky tests, and late failures. ([GitLab Docs][26])
+
+79. **Track pipeline duration, queue time, failure rate, retry rate, and slowest jobs.**
+
+80. **Use a DAG/`needs` model instead of pure stage serialization.**
+
+81. **Run fast checks first.**
+
+82. **Separate PR, merge, nightly, release, and deployment pipelines.**
+
+83. **Use path/change filters.**
+
+84. **Parallelize independent tests.**
+    Bitbucket recommends building first, then running tests in parallel and caching dependencies in the first step. ([Atlassian Support][24])
+
+85. **Shard tests by historical runtime.**
+
+86. **Use fail-fast for decisive parallel jobs.**
+
+87. **Use timeouts on every job.**
+
+88. **Cancel superseded runs.**
+    GitHub concurrency groups can ensure only one workflow/job with a matching key runs and can cancel in-progress jobs. ([GitHub Docs][28])
+
+89. **Use resource groups/locks for shared environments.**
+    GitLab resource groups prevent concurrent deployment jobs from corrupting shared targets. ([GitLab Docs][30])
+
+90. **Right-size runners.**
+
+91. **Use lean base images.**
+
+92. **Prebuild CI images for stable toolchains.**
+
+93. **Cache package-manager directories carefully.**
+
+94. **Avoid unnecessary artifact upload/download.**
+
+95. **Retry only transient operations, with bounded backoff.**
+
+96. **Quarantine flaky tests with ownership and deadlines.**
+
+97. **Make failures reproducible locally.**
+
+98. **Keep logs useful but not excessive.**
+
+99. **Do not run full e2e/load/soak tests on every PR unless necessary.**
+
+100. **Use nightly or scheduled jobs for expensive suites, but keep the release gate meaningful.**
+
+---
+
+## I. Deployment and release best practices
+
+101. **Deploy only from protected refs.**
+
+102. **Use environment approvals.**
+
+103. **Use separate deploy credentials per environment.**
+
+104. **Use deployment locks/concurrency controls.**
+
+105. **Do not rebuild at deploy time. Promote a tested artifact.**
+
+106. **Use signed artifacts/images.**
+
+107. **Use provenance and SBOMs.**
+
+108. **Never deploy from fork PRs.**
+
+109. **Never publish packages from untrusted PRs.**
+
+110. **Require manual approval or policy approval for production.**
+
+111. **Keep rollback artifacts available and verified.**
+
+112. **Audit release workflow changes.**
+
+---
+
+## J. AI-agent guardrails for CI
+
+113. **Default AI agents to read-only repository permissions.**
+
+114. **Do not give agents production secrets.**
+
+115. **Do not let agents modify CI workflows without human review.**
+
+116. **Do not let agents approve or merge their own PRs.**
+
+117. **Block agents from weakening required checks.**
+
+118. **Require agents to explain CI config changes in PR descriptions.**
+
+119. **Treat issue/PR text as untrusted input to the agent.**
+
+120. **Never let agent instructions from repo text override security policy.**
+
+121. **Redact secrets from logs before agent summarization.**
+
+122. **Do not let agents upload full raw logs to public comments.**
+
+123. **Give agents resource quotas and command allowlists where possible.**
+
+124. **Require deterministic tests and local reproduction commands.**
+
+125. **Require security review for agent-added dependencies, Actions, Pipes, plugins, or Docker images.**
+
+126. **Record agent commands and tool calls as audit data.**
+
+127. **Prevent agents from editing release/signing/deploy workflows without protected review.**
+
+---
+
+# 8. Concrete “good” templates
+
+## GitHub: safe PR test baseline
+
+```yaml
+name: pr-test
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@<full-length-commit-sha>
+
+      - uses: actions/setup-node@<full-length-commit-sha>
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+      - run: npm test
+```
+
+Key properties: no secrets, read-only token, timeout, concurrency cancellation, deterministic install, pinned actions, and no privileged trigger. GitHub recommends least privilege, pinning third-party actions, and safe handling of untrusted workflows. ([GitHub Docs][4])
+
+---
+
+## GitHub: safer privileged release baseline
+
+```yaml
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  release:
+    if: github.repository == 'ORG/REPO'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production
+
+    steps:
+      - uses: actions/checkout@<full-length-commit-sha>
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: ./scripts/build-release.sh
+
+      - name: Publish with OIDC
+        run: ./scripts/publish.sh
+```
+
+Key properties: protected tag policy still needed, environment approval, OIDC instead of static cloud secret, minimal permissions, pinned actions, and no PR trigger.
+
+---
+
+## GitLab: safer MR test baseline
+
+```yaml
+stages:
+  - test
+
+default:
+  image: node:20.11.1
+  timeout: 20m
+  interruptible: true
+
+test:
+  stage: test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  tags:
+    - untrusted-linux
+  cache:
+    key:
+      files:
+        - package-lock.json
+    paths:
+      - .npm/
+  script:
+    - npm ci --cache .npm --prefer-offline
+    - npm test
+```
+
+Key properties: MR-specific rule, untrusted runner tag, timeout, interruptible pipeline, deterministic install, lockfile-derived cache key. GitLab recommends runner protection/tags, cache key strategies, and pipeline-efficiency analysis. ([GitLab Docs][7])
+
+---
+
+## GitLab: serialized deployment
+
+```yaml
+deploy_production:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+  environment:
+    name: production
+  resource_group: production
+  tags:
+    - protected-deploy
+  script:
+    - ./scripts/deploy.sh
+```
+
+Key property: `resource_group` prevents concurrent deployment corruption. ([GitLab Docs][30])
+
+---
+
+## Bitbucket: safer pipeline baseline
+
+```yaml
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: Test
+          image: node:20.11.1
+          caches:
+            - node
+          script:
+            - npm ci
+            - npm test
+
+  branches:
+    main:
+      - step:
+          name: Build
+          image: node:20.11.1
+          script:
+            - npm ci
+            - npm run build
+          artifacts:
+            - dist/**
+      - step:
+          name: Deploy staging
+          deployment: staging
+          script:
+            - ./scripts/deploy-staging.sh
+```
+
+Key properties: PR tests separated from branch deploys, deployment variables scoped to deployment environments, no child-pipeline plaintext secret passing, and no personal SSH key. Bitbucket documents secured variables, deployment variables, and the risks of repository SSH-key variables. ([Atlassian Support][17])
+
+---
+
+# 9. Audit checklist: highest-value searches
+
+Use these searches across repositories:
+
+```bash
+# GitHub dangerous triggers
+grep -R "pull_request_target\|workflow_run\|issue_comment" .github/workflows
+
+# Broad permissions
+grep -R "write-all\|contents: write\|pull-requests: write\|id-token: write" .github/workflows
+
+# Mutable actions/images
+grep -R "uses: .*@main\|uses: .*@master\|:latest" .github/workflows .gitlab-ci.yml bitbucket-pipelines.yml Jenkinsfile
+
+# Direct interpolation into shell
+grep -R "\${{ github.event\|\${{ inputs\|\${{ github.head_ref" .github/workflows
+
+# Failure bypasses
+grep -R "continue-on-error: true\|allow_failure: true" .github/workflows .gitlab-ci.yml bitbucket-pipelines.yml
+
+# Secret-prone debug
+grep -R "printenv\|env\|set -x\|echo .*TOKEN\|echo .*SECRET\|echo .*PASSWORD" .github/workflows .gitlab-ci.yml bitbucket-pipelines.yml Jenkinsfile
+
+# Broad artifacts/caches
+grep -R "path: \.\|paths:.*\.\|\.ssh\|\.docker\|\.aws\|\.env" .github/workflows .gitlab-ci.yml bitbucket-pipelines.yml
+```
+
+---
+
+# 10. Minimum policy baseline
+
+A strong CI policy should say:
+
+1. CI YAML changes require code-owner review.
+2. PR/fork jobs run without secrets and with read-only tokens.
+3. `pull_request_target` is banned unless explicitly approved by security/platform owners.
+4. Third-party Actions/Pipes/plugins/images must be pinned and reviewed.
+5. Release/deploy/signing jobs run only from protected refs.
+6. Production deployments require protected environments and human/policy approval.
+7. Self-hosted runners are separated by trust level and are ephemeral for untrusted code.
+8. Docker privileged mode and Docker socket access are banned for untrusted jobs.
+9. Secrets are scoped, short-lived, masked/protected, and preferably brokered through OIDC or an external secret manager.
+10. Caches and artifacts must not contain secrets.
+11. Security scans cannot be permanently non-blocking.
+12. CI logs, workflow edits, runner changes, secret changes, and deployment approvals are auditable.
+13. AI agents cannot weaken CI, approve themselves, expose secrets, or modify release/deployment workflows without protected review.
+
+That baseline maps directly to OWASP CI/CD risks, GitHub/GitLab/Bitbucket/Jenkins official guidance, SLSA build integrity requirements, NIST SSDF secure-development practices, and OpenSSF Scorecard checks. ([OWASP Cheat Sheet Series][40])
+
+[1]: https://docs.gitlab.com/runner/security/ "Security for self-managed runners | GitLab Docs"
+[2]: https://owasp.org/www-project-top-10-ci-cd-security-risks/?utm_source=chatgpt.com "OWASP Top 10 CI/CD Security Risks"
+[3]: https://www.usenix.org/conference/usenixsecurity22/presentation/koishybayev "Characterizing the Security of Github CI Workflows | USENIX"
+[4]: https://docs.github.com/en/actions/reference/security/secure-use "Secure use reference - GitHub Docs"
+[5]: https://docs.github.com/en/enterprise-cloud%40latest/actions/reference/security/secure-use "Secure use reference - GitHub Enterprise Cloud Docs"
+[6]: https://support.atlassian.com/bitbucket-cloud/kb/recommended-practices-for-managing-secret-data-in-bitbucket-pipelines/ "Recommended practices for managing secret data in Bitbucket Pipelines | Bitbucket Cloud | Atlassian Support"
+[7]: https://docs.gitlab.com/ci/runners/configure_runners/ "Configuring runners | GitLab Docs"
+[8]: https://docs.gitlab.com/ci/jobs/ci_job_token/ "CI/CD job token | GitLab Docs"
+[9]: https://www.jenkins.io/doc/book/using/using-credentials/ "
+Using credentials
+"
+[10]: https://github.blog/security/supply-chain-security/four-tips-to-keep-your-github-actions-workflows-secure/ "How to secure GitHub Actions workflows: 4 tips to handle untrusted input and tighten permissions - The GitHub Blog"
+[11]: https://owasp.org/www-project-top-10-ci-cd-security-risks/CICD-SEC-01-Insufficient-Flow-Control-Mechanisms?utm_source=chatgpt.com "CICD-SEC-1: Insufficient Flow Control Mechanisms"
+[12]: https://slsa.dev/spec/v1.2/build-requirements "SLSA • Build: Requirements for producing artifacts"
+[13]: https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ "
+Using a Jenkinsfile
+"
+[14]: https://docs.gitlab.com/ci/variables/ "CI/CD variables | GitLab Docs"
+[15]: https://docs.gitlab.com/ci/pipeline_security/ "Pipeline security | GitLab Docs"
+[16]: https://arxiv.org/html/2601.14455v1 "Unpacking Security Scanners for GitHub Actions Workflows"
+[17]: https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/ "Variables and secrets | Bitbucket Cloud | Atlassian Support"
+[18]: https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching "Dependency caching reference - GitHub Docs"
+[19]: https://arxiv.org/abs/2604.03070?utm_source=chatgpt.com "Credential Leakage in LLM Agent Skills: A Large-Scale Empirical Study"
+[20]: https://docs.gitlab.com/ci/docker/using_docker_build/ "Use Docker to build Docker images | GitLab Docs"
+[21]: https://docs.github.com/actions/using-workflows/workflow-syntax-for-github-actions?utm_source=chatgpt.com "Workflow syntax for GitHub Actions"
+[22]: https://openssf.org/blog/2024/08/12/mitigating-attack-vectors-in-github-workflows/ "Mitigating Attack Vectors in GitHub Workflows – Open Source Security Foundation"
+[23]: https://www.usenix.org/conference/usenixsecurity23/presentation/muralee "ARGUS: A Framework for Staged Static Taint Analysis of GitHub Workflows and Actions | USENIX"
+[24]: https://support.atlassian.com/bitbucket-cloud/docs/parallel-step-options/ "Parallel step options | Bitbucket Cloud | Atlassian Support"
+[25]: https://docs.gitlab.com/ci/caching/ "Caching in GitLab CI/CD | GitLab Docs"
+[26]: https://docs.gitlab.com/ci/pipelines/pipeline_efficiency/ "Pipeline efficiency | GitLab Docs"
+[27]: https://owasp.org/www-project-top-10-ci-cd-security-risks/CICD-SEC-10-Insufficient-Logging-And-Visibility?utm_source=chatgpt.com "CICD-SEC-10: Insufficient Logging and Visibility"
+[28]: https://docs.github.com/enterprise-cloud%40latest/actions/using-jobs/using-concurrency?utm_source=chatgpt.com "Control the concurrency of workflows and jobs"
+[29]: https://support.atlassian.com/bitbucket-cloud/docs/databases-and-service-containers/ "Databases and service containers | Bitbucket Cloud | Atlassian Support"
+[30]: https://docs.gitlab.com/ci/resource_groups/ "Resource group | GitLab Docs"
+[31]: https://support.atlassian.com/bitbucket-cloud/docs/set-up-runners-for-linux-shell/ "Set up runners for Linux Shell | Bitbucket Cloud | Atlassian Support"
+[32]: https://support.atlassian.com/bitbucket-cloud/docs/repository-access-tokens/ "Access tokens for a repository | Bitbucket Cloud | Atlassian Support"
+[33]: https://support.atlassian.com/bitbucket-cloud/docs/stage-options/ "Stage options | Bitbucket Cloud | Atlassian Support"
+[34]: https://github.com/takezoe/gitbucket-ci-plugin?utm_source=chatgpt.com "takezoe/gitbucket-ci-plugin"
+[35]: https://plugins.jenkins.io/gitbucket?utm_source=chatgpt.com "GitBucket | Jenkins plugin"
+[36]: https://www.reddit.com/r/github/comments/1alewms/it_is_safe_to_use_secret_in_action_in_a_public/?utm_source=chatgpt.com "It is safe to use secret in Action in a public repo? : r/github"
+[37]: https://www.reddit.com/r/github/comments/1rmh3n8/someone_automated_the_process_of_scanning_every/?utm_source=chatgpt.com "Someone automated the process of scanning every public ..."
+[38]: https://x.com/ellen_in_sf/status/2039198772656496867?utm_source=chatgpt.com "let's guess how many @ycombinator P26 will pivot to AI security"
+[39]: https://scorecard.dev/ "OpenSSF Scorecard"
+[40]: https://cheatsheetseries.owasp.org/cheatsheets/CI_CD_Security_Cheat_Sheet.html?utm_source=chatgpt.com "CI CD Security - OWASP Cheat Sheet Series"
+

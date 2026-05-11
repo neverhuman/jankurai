@@ -1,0 +1,3498 @@
+## Phase name
+
+**Phase 04: Init Profiles And Golden Repos**
+
+This is the right phase to finish because the moonshot requires explicit intent, bounded agent authority, ownership/proof mapping, declared generated outputs, durable evidence, expiring exceptions, and reusable primitives. The Phase 04 target is exactly the creation-layer version of that loop: a robust generator contract, an excellent default profile, and golden fixtures that prove generated repos are audit-ready. ([GitHub][1])
+
+The repo already has a partial Phase 04 implementation: `init` supports profile/dry-run/diff/plan/apply flags, validates bundled profile manifests with `InitProfile`, and has golden tests for profile planning and generated repo audit/doctor behavior. ([GitHub][2]) The code has moved beyond the stale install docs: `profiles.rs` already references `rust-ts-postgres`, `rust-api`, `react-web`, and `b2b-saas`, while `docs/install.md` still describes only `rust-ts-postgres` as supported. ([GitHub][3])
+
+Below is a **single copy-pasteable implementation script**. It finishes Phase 04 by adding the remaining reserved profiles, deterministic composite profile selection, local repo profile loading, IDE/CI surface filtering, stricter manifest contract checks, generated-adapter refresh markers, safer merge-marker behavior, target-repo proof commands, richer golden tests, fixture repos, updated docs, and a validation-aware phase handoff.
+
+I could not run the repository tests in this environment, so keep the final receipt as “pending local validation” until `cargo test -p jankurai && just fast` passes locally.
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Run from the repository root.
+
+mkdir -p \
+  crates/jankurai/src/init \
+  crates/jankurai/templates/profiles \
+  crates/jankurai/templates/agent \
+  crates/jankurai/tests/fixtures/init/minimal-generated \
+  crates/jankurai/tests/fixtures/init/existing-partial/contracts \
+  schemas \
+  docs \
+  tips/phases/logs
+
+cat > crates/jankurai/src/init/adapters.rs <<'EOF_RUST'
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::fs;
+use std::path::Path;
+
+pub const GENERATED_MARKER: &str = "jankurai generated adapter";
+
+pub const SUPPORTED_IDES: &[&str] = &[
+    "all",
+    "none",
+    "cursor",
+    "copilot",
+    "claude",
+    "gemini",
+    "antigravity",
+    "aider",
+];
+
+pub const ADAPTER_PATHS: &[&str] = &[
+    "CLAUDE.md",
+    "GEMINI.md",
+    ".cursor/rules/jankurai.mdc",
+    ".github/copilot-instructions.md",
+    ".github/instructions/jankurai.instructions.md",
+    ".github/instructions/jankurai-rust.instructions.md",
+    ".github/instructions/jankurai-web.instructions.md",
+    ".github/instructions/jankurai-python-ai.instructions.md",
+    ".agents/agents.md",
+    ".agents/skills/jankurai/SKILL.md",
+    ".agents/workflows/jankurai-audit.md",
+    ".claude/skills/jankurai/SKILL.md",
+];
+
+pub fn canonical_pointer() -> &'static str {
+    "Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard."
+}
+
+pub fn master_plan_pointer() -> &'static str {
+    "agent/MASTER_PLAN.md"
+}
+
+pub fn planner_protocol_pointer() -> &'static str {
+    "agent/MASTER_PLAN.md#detailed-planner-protocol"
+}
+
+pub fn is_adapter_path(path: &str) -> bool {
+    ADAPTER_PATHS.contains(&path)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterAction {
+    pub path: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdapterFailure {
+    pub path: String,
+    pub problem: String,
+}
+
+pub fn adapter_plan(repo: &Path, ide: &str) -> Vec<AdapterAction> {
+    selected_adapter_paths(ide)
+        .into_iter()
+        .map(|path| AdapterAction {
+            path: path.into(),
+            action: if repo.join(path).exists() {
+                "keep-existing".into()
+            } else {
+                "create".into()
+            },
+        })
+        .collect()
+}
+
+pub fn write_adapters(repo: &Path, ide: &str, force_generated: bool) -> Result<Vec<AdapterAction>> {
+    let selected = selected_adapter_paths(ide);
+    let mut actions = Vec::new();
+
+    for template in crate::init::templates::TEMPLATES
+        .iter()
+        .filter(|template| selected.contains(&template.path))
+    {
+        let path = repo.join(template.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+
+        if path.exists() {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            if force_generated && text.contains(GENERATED_MARKER) {
+                fs::write(&path, template.body)
+                    .with_context(|| format!("write {}", path.display()))?;
+                actions.push(AdapterAction {
+                    path: template.path.into(),
+                    action: "overwrote-generated".into(),
+                });
+            } else {
+                actions.push(AdapterAction {
+                    path: template.path.into(),
+                    action: "keep-existing".into(),
+                });
+            }
+            continue;
+        }
+
+        fs::write(&path, template.body).with_context(|| format!("write {}", path.display()))?;
+        actions.push(AdapterAction {
+            path: template.path.into(),
+            action: "created".into(),
+        });
+    }
+
+    Ok(actions)
+}
+
+pub fn verify_adapters(repo: &Path) -> Result<Vec<AdapterFailure>> {
+    let mut failures = Vec::new();
+
+    for path in ADAPTER_PATHS {
+        let full = repo.join(path);
+        if !full.exists() {
+            continue;
+        }
+
+        let text = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;
+
+        if !text.contains("AGENTS.md")
+            || !text.contains("agent/JANKURAI_STANDARD.md")
+            || !text.contains(master_plan_pointer())
+            || !text.contains(planner_protocol_pointer())
+            || !text.contains("tips/phases/00-phase-index.md")
+            || !text.contains("tips/phases/logs/")
+        {
+            failures.push(AdapterFailure {
+                path: (*path).into(),
+                problem: "adapter lacks canonical AGENTS.md, standard, MASTER_PLAN, planner protocol, phase index, and phase log pointers".into(),
+            });
+        }
+
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("ignore agents.md")
+            || lower.contains("ignore `agents.md`")
+            || lower.contains("do not read agents.md")
+            || lower.contains("do not use agent/jankurai_standard.md")
+            || lower.contains("do not use agent/master_plan.md")
+        {
+            failures.push(AdapterFailure {
+                path: (*path).into(),
+                problem: "adapter contains contradictory command/path policy".into(),
+            });
+        }
+
+        if text.lines().count() > 90 {
+            failures.push(AdapterFailure {
+                path: (*path).into(),
+                problem: "adapter is too long; adapters must not duplicate the full standard".into(),
+            });
+        }
+    }
+
+    Ok(failures)
+}
+
+pub fn selected_adapter_paths(ide: &str) -> Vec<&'static str> {
+    let mut paths = Vec::new();
+    let mut none_selected = false;
+
+    for token in ide.split(',').map(str::trim).filter(|token| !token.is_empty()) {
+        match token {
+            "none" | "off" | "false" => {
+                none_selected = true;
+                paths.clear();
+            }
+            "all" => {
+                paths.extend_from_slice(ADAPTER_PATHS);
+                break;
+            }
+            "claude" => {
+                paths.push("CLAUDE.md");
+                paths.push(".claude/skills/jankurai/SKILL.md");
+            }
+            "cursor" => paths.push(".cursor/rules/jankurai.mdc"),
+            "copilot" | "github" => {
+                paths.push(".github/copilot-instructions.md");
+                paths.push(".github/instructions/jankurai.instructions.md");
+                paths.push(".github/instructions/jankurai-rust.instructions.md");
+                paths.push(".github/instructions/jankurai-web.instructions.md");
+                paths.push(".github/instructions/jankurai-python-ai.instructions.md");
+            }
+            "gemini" => paths.push("GEMINI.md"),
+            "antigravity" | "agents" => {
+                paths.push(".agents/agents.md");
+                paths.push(".agents/skills/jankurai/SKILL.md");
+                paths.push(".agents/workflows/jankurai-audit.md");
+            }
+            "aider" => {
+                // Reserved for future adapter support. Keep this token accepted so
+                // profile UX can evolve without breaking scripts.
+            }
+            _ => {}
+        }
+    }
+
+    if none_selected {
+        return Vec::new();
+    }
+
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+EOF_RUST
+
+cat > crates/jankurai/src/init/merge.rs <<'EOF_RUST'
+pub fn merge_marker(path: &str) -> String {
+    format!(
+        r#"
+
+<!-- jankurai merge marker: {path}
+This file existed before `jankurai init`.
+Jankurai did not overwrite it.
+
+Manual merge checklist:
+- Point fresh agents at `AGENTS.md`.
+- Point durable policy at `agent/JANKURAI_STANDARD.md`.
+- Route phase or moonshot work through `agent/MASTER_PLAN.md`, `tips/phases/00-phase-index.md`, and the active `tips/phases/*.md`.
+- Keep proof-lane routing in `agent/test-map.json`.
+- Remove this marker only after the existing file and scaffold policy are reconciled.
+-->
+"#
+    )
+}
+EOF_RUST
+
+cat > crates/jankurai/src/init/profiles.rs <<'EOF_RUST'
+use crate::validation::{self, ArtifactSchema};
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const RUST_TS_POSTGRES_JSON: &str =
+    include_str!("../../templates/profiles/rust-ts-postgres.json");
+const RUST_API_JSON: &str = include_str!("../../templates/profiles/rust-api.json");
+const REACT_WEB_JSON: &str = include_str!("../../templates/profiles/react-web.json");
+const B2B_SAAS_JSON: &str = include_str!("../../templates/profiles/b2b-saas.json");
+const AI_PRODUCT_JSON: &str = include_str!("../../templates/profiles/ai-product.json");
+const REGULATED_SAAS_JSON: &str =
+    include_str!("../../templates/profiles/regulated-saas.json");
+const MIGRATION_TARGET_JSON: &str =
+    include_str!("../../templates/profiles/migration-target.json");
+
+pub const DEFAULT_PROFILE: &str = "rust-ts-postgres";
+
+const CORE_CONTROL_PATHS: &[&str] = &[
+    "AGENTS.md",
+    "agent/JANKURAI_STANDARD.md",
+    "agent/MASTER_PLAN.md",
+    "agent/audit-policy.toml",
+    "agent/boundaries.toml",
+    "agent/generated-zones.toml",
+    "agent/owner-map.json",
+    "agent/proof-lanes.toml",
+    "agent/security-policy.toml",
+    "agent/standard-version.toml",
+    "agent/test-map.json",
+    "tools/security-lane.sh",
+];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileManifest {
+    pub profile_version: String,
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub target_stack_id: String,
+    pub generated_paths: Vec<String>,
+    pub generated_refresh_paths: Vec<String>,
+    pub reserved_paths: Vec<String>,
+    pub required_lanes: Vec<String>,
+    pub optional_lanes: Vec<String>,
+    pub agent_adapters: Vec<String>,
+    pub ci_templates: Vec<String>,
+    pub docs: Vec<String>,
+    pub security_controls: Vec<String>,
+    pub ux_controls: Vec<String>,
+    pub contract_system: Vec<String>,
+    pub db_policy: Vec<String>,
+    pub validation_commands: Vec<String>,
+    pub source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileManifestFile {
+    profile_version: String,
+    id: String,
+    display_name: String,
+    #[serde(default)]
+    description: String,
+    target_stack_id: String,
+    generated_paths: Vec<String>,
+    #[serde(default)]
+    generated_refresh_paths: Vec<String>,
+    #[serde(default)]
+    reserved_paths: Vec<String>,
+    required_lanes: Vec<String>,
+    optional_lanes: Vec<String>,
+    agent_adapters: Vec<String>,
+    ci_templates: Vec<String>,
+    docs: Vec<String>,
+    security_controls: Vec<String>,
+    ux_controls: Vec<String>,
+    contract_system: Vec<String>,
+    db_policy: Vec<String>,
+    validation_commands: Vec<String>,
+}
+
+impl ProfileManifestFile {
+    fn into_manifest(self, source: impl Into<String>) -> ProfileManifest {
+        ProfileManifest {
+            profile_version: self.profile_version,
+            id: self.id,
+            display_name: self.display_name,
+            description: self.description,
+            target_stack_id: self.target_stack_id,
+            generated_paths: sorted_dedup(self.generated_paths),
+            generated_refresh_paths: sorted_dedup(self.generated_refresh_paths),
+            reserved_paths: sorted_dedup(self.reserved_paths),
+            required_lanes: sorted_dedup(self.required_lanes),
+            optional_lanes: sorted_dedup(self.optional_lanes),
+            agent_adapters: sorted_dedup(self.agent_adapters),
+            ci_templates: sorted_dedup(self.ci_templates),
+            docs: sorted_dedup(self.docs),
+            security_controls: sorted_dedup(self.security_controls),
+            ux_controls: sorted_dedup(self.ux_controls),
+            contract_system: sorted_dedup(self.contract_system),
+            db_policy: sorted_dedup(self.db_policy),
+            validation_commands: sorted_dedup(self.validation_commands),
+            source: source.into(),
+        }
+    }
+}
+
+/// Resolves a bundled, local, or composite init profile.
+///
+/// Supported forms:
+/// - `rust-ts-postgres`
+/// - `rust-api,react-web`
+/// - `.jankurai/profiles/my-profile.json`
+/// - `my-profile` when `.jankurai/profiles/my-profile.json` exists.
+pub fn resolve_profile(repo: &Path, profile: &str) -> Result<ProfileManifest> {
+    resolve_profiles(repo, profile)
+}
+
+pub fn resolve_profiles(repo: &Path, selector: &str) -> Result<ProfileManifest> {
+    let tokens = split_profile_selector(selector);
+    if tokens.is_empty() {
+        bail!(
+            "empty init profile selector. supported: {}",
+            supported_profile_ids().join(", ")
+        );
+    }
+
+    if tokens.len() == 1 {
+        return resolve_one_profile(repo, &tokens[0]);
+    }
+
+    let mut manifests = Vec::new();
+    for token in &tokens {
+        manifests.push(resolve_one_profile(repo, token)?);
+    }
+
+    let combined = combine_profiles(&manifests)?;
+    validate_profile_manifest(&combined)?;
+    Ok(combined)
+}
+
+pub fn supported_profile_ids() -> Vec<&'static str> {
+    vec![
+        "rust-api",
+        "react-web",
+        "rust-ts-postgres",
+        "b2b-saas",
+        "ai-product",
+        "regulated-saas",
+        "migration-target",
+    ]
+}
+
+pub fn apply_init_options(mut manifest: ProfileManifest, ide: &str, ci: &str) -> ProfileManifest {
+    let selected_adapters = crate::init::adapters::selected_adapter_paths(ide);
+    let selected: BTreeSet<&str> = selected_adapters.into_iter().collect();
+
+    manifest.generated_paths.retain(|path| {
+        !crate::init::adapters::is_adapter_path(path) || selected.contains(path.as_str())
+    });
+    manifest.agent_adapters.retain(|path| selected.contains(path.as_str()));
+    manifest.generated_refresh_paths.retain(|path| {
+        !crate::init::adapters::is_adapter_path(path) || selected.contains(path.as_str())
+    });
+
+    if matches!(ci.trim(), "none" | "off" | "false") {
+        let ci_paths: BTreeSet<&str> = manifest.ci_templates.iter().map(String::as_str).collect();
+        manifest
+            .generated_paths
+            .retain(|path| !ci_paths.contains(path.as_str()));
+        manifest.ci_templates.clear();
+    }
+
+    sort_manifest_lists(&mut manifest);
+    manifest
+}
+
+fn resolve_one_profile(repo: &Path, profile: &str) -> Result<ProfileManifest> {
+    let raw = profile.trim();
+    let normalized = normalize_profile_id(raw);
+
+    if let Some(json) = bundled_profile_json(normalized) {
+        return load_profile(repo, json, format!("bundled:{normalized}"));
+    }
+
+    if let Some(path) = local_profile_path(repo, raw)? {
+        return load_profile_file(repo, &path);
+    }
+
+    bail!(
+        "unknown init profile `{raw}`. supported: {} (plus aliases). composite selectors may use commas, for example `rust-api,react-web`. local profile JSON may be supplied as `--profile .jankurai/profiles/<id>.json`",
+        supported_profile_ids().join(", ")
+    );
+}
+
+fn bundled_profile_json(profile: &str) -> Option<&'static str> {
+    match profile {
+        "rust-ts-postgres" => Some(RUST_TS_POSTGRES_JSON),
+        "rust-api" => Some(RUST_API_JSON),
+        "react-web" => Some(REACT_WEB_JSON),
+        "b2b-saas" => Some(B2B_SAAS_JSON),
+        "ai-product" => Some(AI_PRODUCT_JSON),
+        "regulated-saas" => Some(REGULATED_SAAS_JSON),
+        "migration-target" => Some(MIGRATION_TARGET_JSON),
+        _ => None,
+    }
+}
+
+fn local_profile_path(repo: &Path, profile: &str) -> Result<Option<PathBuf>> {
+    let candidate = Path::new(profile);
+    let path_like = profile.ends_with(".json") || profile.contains('/') || profile.contains('\\');
+
+    if path_like {
+        let path = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            repo.join(candidate)
+        };
+
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+
+        bail!("init profile file `{}` not found", path.display());
+    }
+
+    let path = repo
+        .join(".jankurai")
+        .join("profiles")
+        .join(format!("{profile}.json"));
+
+    if path.is_file() {
+        return Ok(Some(path));
+    }
+
+    Ok(None)
+}
+
+fn load_profile_file(repo: &Path, path: &Path) -> Result<ProfileManifest> {
+    let json = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    load_profile(repo, &json, format!("local:{}", path.display()))
+}
+
+fn load_profile(repo: &Path, json_str: &str, source: impl Into<String>) -> Result<ProfileManifest> {
+    let source = source.into();
+    let value: serde_json::Value = serde_json::from_str(json_str)
+        .with_context(|| format!("parse init profile manifest from {source}"))?;
+
+    validation::validate_value(repo, ArtifactSchema::InitProfile, &value)
+        .with_context(|| format!("validate init profile manifest from {source}"))?;
+
+    let file: ProfileManifestFile = serde_json::from_value(value)
+        .with_context(|| format!("deserialize init profile manifest from {source}"))?;
+
+    let manifest = file.into_manifest(source);
+    validate_profile_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn split_profile_selector(selector: &str) -> Vec<String> {
+    selector
+        .split(|ch| ch == ',' || ch == '+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn normalize_profile_id(profile: &str) -> &str {
+    match profile {
+        "default"
+        | "fullstack"
+        | "rust-ts-postgres"
+        | "rust-ts-vite-react-postgres"
+        | "rust-ts-vite-react-postgres-bounded-python" => "rust-ts-postgres",
+        "rust-api-postgres" => "rust-api",
+        "react" | "web" | "vite-react" | "react-vite" => "react-web",
+        "b2b" | "saas" | "b2b-fullstack" => "b2b-saas",
+        "ai" | "ai-python" | "eval-product" => "ai-product",
+        "regulated" | "compliance-saas" | "soc-saas" => "regulated-saas",
+        "migration" | "legacy-migration" | "migration-repo" => "migration-target",
+        other => other,
+    }
+}
+
+fn combine_profiles(manifests: &[ProfileManifest]) -> Result<ProfileManifest> {
+    if manifests.is_empty() {
+        bail!("cannot combine an empty profile set");
+    }
+
+    let mut combined = ProfileManifest {
+        profile_version: "1.0.0".into(),
+        id: format!(
+            "composite-{}",
+            manifests
+                .iter()
+                .map(|manifest| manifest.id.as_str())
+                .collect::<Vec<_>>()
+                .join("-")
+        ),
+        display_name: format!(
+            "Composite ({})",
+            manifests
+                .iter()
+                .map(|manifest| manifest.display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        ),
+        description: format!(
+            "Composite init profile selected from: {}",
+            manifests
+                .iter()
+                .map(|manifest| manifest.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        target_stack_id: manifests
+            .iter()
+            .map(|manifest| manifest.target_stack_id.as_str())
+            .collect::<Vec<_>>()
+            .join("+"),
+        generated_paths: Vec::new(),
+        generated_refresh_paths: Vec::new(),
+        reserved_paths: Vec::new(),
+        required_lanes: Vec::new(),
+        optional_lanes: Vec::new(),
+        agent_adapters: Vec::new(),
+        ci_templates: Vec::new(),
+        docs: Vec::new(),
+        security_controls: Vec::new(),
+        ux_controls: Vec::new(),
+        contract_system: Vec::new(),
+        db_policy: Vec::new(),
+        validation_commands: Vec::new(),
+        source: format!(
+            "composite:{}",
+            manifests
+                .iter()
+                .map(|manifest| manifest.source.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    };
+
+    for manifest in manifests {
+        extend_unique(&mut combined.generated_paths, &manifest.generated_paths);
+        extend_unique(
+            &mut combined.generated_refresh_paths,
+            &manifest.generated_refresh_paths,
+        );
+        extend_unique(&mut combined.reserved_paths, &manifest.reserved_paths);
+        extend_unique(&mut combined.required_lanes, &manifest.required_lanes);
+        extend_unique(&mut combined.optional_lanes, &manifest.optional_lanes);
+        extend_unique(&mut combined.agent_adapters, &manifest.agent_adapters);
+        extend_unique(&mut combined.ci_templates, &manifest.ci_templates);
+        extend_unique(&mut combined.docs, &manifest.docs);
+        extend_unique(
+            &mut combined.security_controls,
+            &manifest.security_controls,
+        );
+        extend_unique(&mut combined.ux_controls, &manifest.ux_controls);
+        extend_unique(&mut combined.contract_system, &manifest.contract_system);
+        extend_unique(&mut combined.db_policy, &manifest.db_policy);
+        extend_unique(
+            &mut combined.validation_commands,
+            &manifest.validation_commands,
+        );
+    }
+
+    let required: BTreeSet<String> = combined.required_lanes.iter().cloned().collect();
+    combined
+        .optional_lanes
+        .retain(|lane| !required.contains(lane));
+
+    sort_manifest_lists(&mut combined);
+    Ok(combined)
+}
+
+fn validate_profile_manifest(manifest: &ProfileManifest) -> Result<()> {
+    if manifest.id.trim().is_empty() {
+        bail!("init profile id may not be empty");
+    }
+    if manifest.display_name.trim().is_empty() {
+        bail!("init profile `{}` displayName may not be empty", manifest.id);
+    }
+    if manifest.target_stack_id.trim().is_empty() {
+        bail!(
+            "init profile `{}` targetStackId may not be empty",
+            manifest.id
+        );
+    }
+    if manifest.generated_paths.is_empty() {
+        bail!("init profile `{}` generatedPaths may not be empty", manifest.id);
+    }
+    if manifest.required_lanes.is_empty() {
+        bail!("init profile `{}` requiredLanes may not be empty", manifest.id);
+    }
+    if manifest.validation_commands.is_empty() {
+        bail!(
+            "init profile `{}` validationCommands may not be empty",
+            manifest.id
+        );
+    }
+
+    validate_path_list("generatedPaths", &manifest.generated_paths)?;
+    validate_path_list("generatedRefreshPaths", &manifest.generated_refresh_paths)?;
+    validate_path_list("reservedPaths", &manifest.reserved_paths)?;
+    validate_path_list("agentAdapters", &manifest.agent_adapters)?;
+    validate_path_list("ciTemplates", &manifest.ci_templates)?;
+    validate_path_list("docs", &manifest.docs)?;
+    validate_path_list("securityControls", &manifest.security_controls)?;
+    validate_path_list("uxControls", &manifest.ux_controls)?;
+    validate_path_list("contractSystem", &manifest.contract_system)?;
+    validate_path_list("dbPolicy", &manifest.db_policy)?;
+
+    let generated: BTreeSet<&str> = manifest.generated_paths.iter().map(String::as_str).collect();
+
+    for required in CORE_CONTROL_PATHS {
+        if !generated.contains(required) {
+            bail!(
+                "init profile `{}` must include core control path `{required}`",
+                manifest.id
+            );
+        }
+    }
+
+    require_subset(
+        &manifest.id,
+        "generatedRefreshPaths",
+        &manifest.generated_refresh_paths,
+        &generated,
+    )?;
+    require_subset(
+        &manifest.id,
+        "agentAdapters",
+        &manifest.agent_adapters,
+        &generated,
+    )?;
+    require_subset(&manifest.id, "ciTemplates", &manifest.ci_templates, &generated)?;
+    require_subset(&manifest.id, "docs", &manifest.docs, &generated)?;
+    require_subset(
+        &manifest.id,
+        "securityControls",
+        &manifest.security_controls,
+        &generated,
+    )?;
+    require_subset(&manifest.id, "uxControls", &manifest.ux_controls, &generated)?;
+    require_subset(
+        &manifest.id,
+        "contractSystem",
+        &manifest.contract_system,
+        &generated,
+    )?;
+    require_subset(&manifest.id, "dbPolicy", &manifest.db_policy, &generated)?;
+
+    let required_lanes: BTreeSet<&str> = manifest.required_lanes.iter().map(String::as_str).collect();
+    let optional_lanes: BTreeSet<&str> = manifest.optional_lanes.iter().map(String::as_str).collect();
+    for lane in required_lanes.intersection(&optional_lanes) {
+        bail!(
+            "init profile `{}` declares lane `{lane}` as both required and optional",
+            manifest.id
+        );
+    }
+
+    if required_lanes.contains("ux") && manifest.ux_controls.is_empty() {
+        bail!(
+            "init profile `{}` requires UX lane but declares no uxControls",
+            manifest.id
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_path_list(field: &str, paths: &[String]) -> Result<()> {
+    let mut seen = BTreeSet::new();
+
+    for path in paths {
+        validate_relative_path(field, path)?;
+
+        if !seen.insert(path.as_str()) {
+            bail!("{field} contains duplicate path `{path}`");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_relative_path(field: &str, path: &str) -> Result<()> {
+    if path.trim().is_empty() {
+        bail!("{field} contains an empty path");
+    }
+    if path.starts_with('/') {
+        bail!("{field} path `{path}` must be relative");
+    }
+    if path.contains('\\') {
+        bail!("{field} path `{path}` must use forward slashes");
+    }
+    if path == "."
+        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        bail!("{field} path `{path}` contains an unsafe segment");
+    }
+
+    for forbidden in ["reference", "target", ".git"] {
+        if path == forbidden || path.starts_with(&format!("{forbidden}/")) {
+            bail!("{field} path `{path}` is reserved and may not be generated by init");
+        }
+    }
+
+    Ok(())
+}
+
+fn require_subset(
+    profile_id: &str,
+    field: &str,
+    values: &[String],
+    generated: &BTreeSet<&str>,
+) -> Result<()> {
+    for value in values {
+        if !generated.contains(value.as_str()) {
+            bail!(
+                "init profile `{profile_id}` declares `{value}` in {field}, but it is absent from generatedPaths"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn sorted_dedup(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn sort_manifest_lists(manifest: &mut ProfileManifest) {
+    manifest.generated_paths = sorted_dedup(std::mem::take(&mut manifest.generated_paths));
+    manifest.generated_refresh_paths =
+        sorted_dedup(std::mem::take(&mut manifest.generated_refresh_paths));
+    manifest.reserved_paths = sorted_dedup(std::mem::take(&mut manifest.reserved_paths));
+    manifest.required_lanes = sorted_dedup(std::mem::take(&mut manifest.required_lanes));
+    manifest.optional_lanes = sorted_dedup(std::mem::take(&mut manifest.optional_lanes));
+    manifest.agent_adapters = sorted_dedup(std::mem::take(&mut manifest.agent_adapters));
+    manifest.ci_templates = sorted_dedup(std::mem::take(&mut manifest.ci_templates));
+    manifest.docs = sorted_dedup(std::mem::take(&mut manifest.docs));
+    manifest.security_controls = sorted_dedup(std::mem::take(&mut manifest.security_controls));
+    manifest.ux_controls = sorted_dedup(std::mem::take(&mut manifest.ux_controls));
+    manifest.contract_system = sorted_dedup(std::mem::take(&mut manifest.contract_system));
+    manifest.db_policy = sorted_dedup(std::mem::take(&mut manifest.db_policy));
+    manifest.validation_commands =
+        sorted_dedup(std::mem::take(&mut manifest.validation_commands));
+}
+
+fn extend_unique(target: &mut Vec<String>, source: &[String]) {
+    for item in source {
+        if !target.iter().any(|existing| existing == item) {
+            target.push(item.clone());
+        }
+    }
+}
+EOF_RUST
+
+cat > crates/jankurai/src/init/plan.rs <<'EOF_RUST'
+use anyhow::{bail, Result};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InitPlan {
+    pub profile: String,
+    pub profile_manifest: super::profiles::ProfileManifest,
+    pub ide: String,
+    pub mode: String,
+    pub ci: String,
+    pub issue_backend: String,
+    pub ux_qa: bool,
+    pub package_manager: String,
+    pub detected: Vec<String>,
+    pub actions: Vec<PlannedAction>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlannedAction {
+    pub path: String,
+    pub action: String,
+    pub merge_policy: String,
+    pub refreshable: bool,
+    pub detail: String,
+}
+
+pub fn build_plan(
+    repo: &Path,
+    profile: &str,
+    ide: &str,
+    mode: &str,
+    ci: &str,
+    issue_backend: &str,
+    ux_qa: bool,
+) -> Result<InitPlan> {
+    let existing = super::detect::existing_standard_files(repo);
+    let detected = super::detect::detect_surfaces(repo);
+    let mut profile_manifest = super::profiles::resolve_profile(repo, profile)?;
+    profile_manifest = super::profiles::apply_init_options(profile_manifest, ide, ci);
+
+    let mut paths = profile_manifest.generated_paths.clone();
+    paths.sort();
+
+    let refreshable: BTreeSet<&str> = profile_manifest
+        .generated_refresh_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut actions = Vec::new();
+
+    for path in &paths {
+        if super::templates::template_for_path(path).is_none() {
+            bail!(
+                "profile declares `{path}` but no init template is registered (see init/templates.rs)"
+            );
+        }
+
+        let exists = repo.join(path).exists();
+        let is_refreshable = refreshable.contains(path.as_str());
+
+        let (action, detail) = if exists {
+            if is_refreshable {
+                (
+                    "keep-existing",
+                    "existing generated adapter may be refreshed only when it carries the generated marker and --force-generated-adapters is used",
+                )
+            } else if should_mark_for_merge(path) {
+                (
+                    "keep-existing",
+                    "existing canonical guidance is preserved; init appends a merge marker only if it is not already jankurai-controlled",
+                )
+            } else {
+                ("keep-existing", "existing user-owned file is never overwritten")
+            }
+        } else {
+            ("create", "missing profile path will be created from a deterministic template")
+        };
+
+        actions.push(PlannedAction {
+            path: path.clone(),
+            action: action.into(),
+            merge_policy: merge_policy_for_path(path, is_refreshable).into(),
+            refreshable: is_refreshable,
+            detail: detail.into(),
+        });
+    }
+
+    let mut warnings = Vec::new();
+
+    if !existing.is_empty() {
+        warnings.push(format!(
+            "existing standard files left intact: {}",
+            existing.join(", ")
+        ));
+    }
+
+    let selected_adapters = super::adapters::selected_adapter_paths(ide);
+    if selected_adapters.is_empty() && !matches!(ide.trim(), "none" | "off" | "false") {
+        warnings.push(format!(
+            "ide selector `{ide}` did not match a supported adapter; no adapter files will be generated"
+        ));
+    }
+
+    if !matches!(ci.trim(), "github" | "none" | "off" | "false") {
+        warnings.push(format!(
+            "ci selector `{ci}` is not a bundled CI template; only `github` and `none` are currently supported"
+        ));
+    }
+
+    Ok(InitPlan {
+        profile: profile.into(),
+        profile_manifest,
+        ide: ide.into(),
+        mode: mode.into(),
+        ci: ci.into(),
+        issue_backend: issue_backend.into(),
+        ux_qa,
+        package_manager: super::package_manager::detect_package_manager(repo).to_string(),
+        detected,
+        actions,
+        warnings,
+    })
+}
+
+pub fn render_plan(plan: &InitPlan) -> String {
+    let mut out = String::new();
+    use std::fmt::Write;
+
+    let _ = writeln!(out, "Jankurai Init Plan");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- requested profile: `{}`", plan.profile);
+    let _ = writeln!(out, "- profile id: `{}`", plan.profile_manifest.id);
+    let _ = writeln!(
+        out,
+        "- profile display: `{}`",
+        plan.profile_manifest.display_name
+    );
+    let _ = writeln!(
+        out,
+        "- profile source: `{}`",
+        plan.profile_manifest.source
+    );
+    let _ = writeln!(
+        out,
+        "- target stack: `{}`",
+        plan.profile_manifest.target_stack_id
+    );
+    if !plan.profile_manifest.description.is_empty() {
+        let _ = writeln!(
+            out,
+            "- description: `{}`",
+            plan.profile_manifest.description
+        );
+    }
+    let _ = writeln!(out, "- ide: `{}`", plan.ide);
+    let _ = writeln!(out, "- mode: `{}`", plan.mode);
+    let _ = writeln!(out, "- ci: `{}`", plan.ci);
+    let _ = writeln!(out, "- issue backend: `{}`", plan.issue_backend);
+    let _ = writeln!(out, "- ux qa: `{}`", plan.ux_qa);
+    let _ = writeln!(out, "- package manager: `{}`", plan.package_manager);
+
+    if !plan.profile_manifest.required_lanes.is_empty() {
+        let _ = writeln!(
+            out,
+            "- required lanes: `{}`",
+            plan.profile_manifest.required_lanes.join(", ")
+        );
+    }
+
+    if !plan.profile_manifest.optional_lanes.is_empty() {
+        let _ = writeln!(
+            out,
+            "- optional lanes: `{}`",
+            plan.profile_manifest.optional_lanes.join(", ")
+        );
+    }
+
+    if !plan.detected.is_empty() {
+        let _ = writeln!(out, "- detected: `{}`", plan.detected.join(", "));
+    }
+
+    if !plan.profile_manifest.validation_commands.is_empty() {
+        let _ = writeln!(
+            out,
+            "- validation: `{}`",
+            plan.profile_manifest.validation_commands.join(" | ")
+        );
+    }
+
+    for warning in &plan.warnings {
+        let _ = writeln!(out, "- warning: `{warning}`");
+    }
+
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Planned file actions:");
+
+    for action in &plan.actions {
+        let refresh = if action.refreshable {
+            " refreshable"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            out,
+            " {}{} {} ({})",
+            action.action, refresh, action.path, action.merge_policy
+        );
+    }
+
+    out
+}
+
+fn should_mark_for_merge(path: &str) -> bool {
+    matches!(
+        path,
+        "AGENTS.md" | "agent/JANKURAI_STANDARD.md" | "agent/MASTER_PLAN.md"
+    )
+}
+
+fn merge_policy_for_path(path: &str, refreshable: bool) -> &'static str {
+    if refreshable {
+        "refresh-generated-marker-only"
+    } else if should_mark_for_merge(path) {
+        "append-merge-marker-if-user-owned"
+    } else {
+        "preserve-existing"
+    }
+}
+EOF_RUST
+
+cat > crates/jankurai/src/commands/init.rs <<'EOF_RUST'
+use anyhow::{Context, Result};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::validation::{self, ArtifactSchema};
+
+pub struct InitArgs {
+    pub repo: PathBuf,
+    pub apply: bool,
+    pub dry_run: bool,
+    pub yes: bool,
+    pub profile: String,
+    pub ide: String,
+    pub mode: String,
+    pub diff: bool,
+    pub ci: String,
+    pub issue_backend: String,
+    pub ux_qa: bool,
+    pub plan_json: Option<String>,
+    pub force_generated_adapters: bool,
+}
+
+pub fn run(args: InitArgs) -> Result<()> {
+    let plan = crate::init::plan::build_plan(
+        &args.repo,
+        &args.profile,
+        &args.ide,
+        &args.mode,
+        &args.ci,
+        &args.issue_backend,
+        args.ux_qa,
+    )?;
+
+    if let Some(path) = args.plan_json.as_deref() {
+        if args.dry_run || args.diff {
+            if let Some(parent) = Path::new(path).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, serde_json::to_string_pretty(&plan)?)?;
+        } else {
+            anyhow::bail!("--plan-json only writes during --dry-run or --diff");
+        }
+    }
+
+    println!("{}", crate::init::plan::render_plan(&plan));
+
+    if args.dry_run || args.diff {
+        if args.diff {
+            print_diff(&args.repo, &plan.profile_manifest);
+        }
+        return Ok(());
+    }
+
+    if !(args.apply || args.yes) {
+        anyhow::bail!("refusing to write without --yes or --apply");
+    }
+
+    let actions = apply_templates(
+        &args.repo,
+        &plan.profile_manifest,
+        args.force_generated_adapters,
+    )?;
+    write_receipt(&args.repo, "init", &plan.profile_manifest, &actions)?;
+
+    Ok(())
+}
+
+fn apply_templates(
+    repo: &Path,
+    manifest: &crate::init::profiles::ProfileManifest,
+    force_generated_adapters: bool,
+) -> Result<Vec<InitAction>> {
+    let mut paths = manifest.generated_paths.clone();
+    paths.sort();
+
+    let refreshable: BTreeSet<&str> = manifest
+        .generated_refresh_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    let mut actions = Vec::new();
+
+    for rel in paths {
+        let template = crate::init::templates::template_for_path(&rel)
+            .with_context(|| format!("no template registered for profile path `{rel}`"))?;
+
+        let path = repo.join(&rel);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+
+        if path.exists() {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let can_refresh = refreshable.contains(rel.as_str())
+                && crate::init::adapters::is_adapter_path(&rel);
+
+            if force_generated_adapters && can_refresh {
+                if text.contains(crate::init::adapters::GENERATED_MARKER) {
+                    fs::write(&path, template.body)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    maybe_make_executable(&path, &rel)?;
+                    actions.push(InitAction {
+                        path: rel,
+                        action: "refreshed-generated-adapter".into(),
+                        detail: Some("existing adapter carried the generated marker".into()),
+                    });
+                    continue;
+                }
+
+                actions.push(InitAction {
+                    path: rel,
+                    action: "kept-existing-unmarked-adapter".into(),
+                    detail: Some(
+                        "adapter was not refreshed because it lacks the generated marker".into(),
+                    ),
+                });
+                continue;
+            }
+
+            if should_mark_for_merge(&rel) {
+                if is_jankurai_controlled(&text) {
+                    actions.push(InitAction {
+                        path: rel,
+                        action: "kept-existing".into(),
+                        detail: Some("existing canonical file already points at jankurai".into()),
+                    });
+                } else {
+                    append_merge_marker(&path, &rel, &text)?;
+                    actions.push(InitAction {
+                        path: rel,
+                        action: "merge-marker".into(),
+                        detail: Some("existing user-owned file preserved with a merge marker".into()),
+                    });
+                }
+            } else {
+                actions.push(InitAction {
+                    path: rel,
+                    action: "kept-existing".into(),
+                    detail: Some("existing user-owned file preserved".into()),
+                });
+            }
+
+            continue;
+        }
+
+        fs::write(&path, template.body).with_context(|| format!("write {}", path.display()))?;
+        maybe_make_executable(&path, &rel)?;
+
+        actions.push(InitAction {
+            path: rel,
+            action: "created".into(),
+            detail: None,
+        });
+    }
+
+    Ok(actions)
+}
+
+fn print_diff(repo: &Path, manifest: &crate::init::profiles::ProfileManifest) {
+    let mut paths = manifest.generated_paths.clone();
+    paths.sort();
+
+    let refreshable: BTreeSet<&str> = manifest
+        .generated_refresh_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    for rel in paths {
+        let Some(template) = crate::init::templates::template_for_path(&rel) else {
+            println!("--- {} missing template", rel);
+            continue;
+        };
+
+        if repo.join(&rel).exists() {
+            if refreshable.contains(rel.as_str()) && crate::init::adapters::is_adapter_path(&rel) {
+                println!(
+                    "--- {} exists; no overwrite unless --force-generated-adapters and generated marker are present",
+                    rel
+                );
+            } else {
+                println!("--- {} exists; no overwrite", rel);
+            }
+        } else {
+            println!("--- /dev/null");
+            println!("+++ {}", rel);
+            for line in template.body.lines() {
+                println!("+{line}");
+            }
+        }
+    }
+}
+
+fn should_mark_for_merge(path: &str) -> bool {
+    matches!(
+        path,
+        "AGENTS.md" | "agent/JANKURAI_STANDARD.md" | "agent/MASTER_PLAN.md"
+    )
+}
+
+fn is_jankurai_controlled(text: &str) -> bool {
+    text.contains("agent/JANKURAI_STANDARD.md")
+        || text.contains("agent/MASTER_PLAN.md")
+        || text.contains("jankurai Standard Agent Bootstrap")
+        || (text.contains("Standard version:") && text.to_ascii_lowercase().contains("jankurai"))
+}
+
+fn append_merge_marker(path: &Path, rel: &str, text: &str) -> Result<()> {
+    if text.contains("jankurai merge marker") {
+        return Ok(());
+    }
+
+    fs::write(path, format!("{text}{}", crate::init::merge::merge_marker(rel)))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn maybe_make_executable(path: &Path, rel: &str) -> Result<()> {
+    if rel == "tools/security-lane.sh" {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn maybe_make_executable(_path: &Path, _rel: &str) -> Result<()> {
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct InitAction {
+    path: String,
+    action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+fn write_receipt(
+    repo: &Path,
+    action: &str,
+    manifest: &crate::init::profiles::ProfileManifest,
+    actions: &[InitAction],
+) -> Result<()> {
+    let dir = repo.join("target/jankurai/receipts");
+    fs::create_dir_all(&dir)?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let path = dir.join(format!("{action}-{now}.json"));
+    let payload = serde_json::json!({
+        "action": action,
+        "profile_id": manifest.id,
+        "profile_version": manifest.profile_version,
+        "created_at": now,
+        "actions": actions,
+    });
+
+    validation::validate_value(repo, ArtifactSchema::InitReceipt, &payload)?;
+    fs::write(path, serde_json::to_string_pretty(&payload)?)?;
+
+    Ok(())
+}
+EOF_RUST
+
+cat > crates/jankurai/src/init/templates.rs <<'EOF_RUST'
+pub struct Template {
+    pub path: &'static str,
+    pub body: &'static str,
+}
+
+pub fn template_for_path(path: &str) -> Option<&'static Template> {
+    TEMPLATES.iter().find(|template| template.path == path)
+}
+
+const ADAPTER_MARKER: &str =
+    "<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n";
+
+const ADAPTER_POINTER: &str = concat!(
+    "<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+    "Read `AGENTS.md` first.\n",
+    "Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+    "For MASTER_PLAN work, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.\n",
+    "Log phase work in `tips/phases/logs/`.\n",
+    "For planning work, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\n"
+);
+
+const PROOF_ADAPTER_POINTER: &str = concat!(
+    "# jankurai\n\n",
+    "<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+    "Read `AGENTS.md` first.\n",
+    "Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+    "For MASTER_PLAN work, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.\n",
+    "Log phase work in `tips/phases/logs/`.\n",
+    "For planning work, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\n",
+    "Run the proof lane in `agent/test-map.json` for changed paths.\n"
+);
+
+const AGENTS_MD: &str = r#"# Agent Instructions
+
+Read `agent/JANKURAI_STANDARD.md` first.
+
+For phase, roadmap, repair, or moonshot work, read:
+
+1. `agent/MASTER_PLAN.md`
+2. `tips/phases/00-phase-index.md`
+3. the active `tips/phases/*.md` phase file
+
+Rules:
+
+- Keep product truth in source, contracts, database migrations, and declared generated zones.
+- Do not hand-edit generated outputs.
+- Route every changed path through `agent/owner-map.json` and `agent/test-map.json`.
+- Leave durable evidence under `target/jankurai/` or the path named by the proof lane.
+- Temporary exceptions must have owner, expiry, and migration path.
+"#;
+
+const JANKURAI_STANDARD_MD: &str = r#"# jankurai Standard Agent Bootstrap
+
+Standard version: `0.4.0`
+
+This repository is agent-native. The repo should tell an agent:
+
+- what it owns
+- how to prove a change
+- where generated truth lives
+- when an exception expires
+- where evidence is recorded
+
+## Required read order
+
+1. `AGENTS.md`
+2. `agent/JANKURAI_STANDARD.md`
+3. `agent/MASTER_PLAN.md`
+4. `agent/owner-map.json`
+5. `agent/test-map.json`
+6. `agent/generated-zones.toml`
+7. `agent/proof-lanes.toml`
+8. `agent/boundaries.toml`
+
+## No-proof-no-merge rule
+
+A change is not ready until the smallest credible proof lane covering the changed paths has run and left evidence.
+
+Use `agent/test-map.json` to choose the lane. Use `agent/proof-lanes.toml` to understand the command and purpose.
+
+## Generated truth
+
+Generated files must have a source and command in `agent/generated-zones.toml`. Change the source and regenerate; do not patch generated output by hand.
+
+## Exceptions
+
+Exceptions must be dated, owned, scoped, and expired. Put durable exception notes under `docs/exceptions/`.
+"#;
+
+const MASTER_PLAN_MD: &str = r#"# jankurai Master Plan
+
+Read `agent/JANKURAI_STANDARD.md`, then this file, before phase or audit work.
+
+For phase work, read `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.
+
+Pick the earliest incomplete phase whose dependencies can be advanced unless the user names a phase.
+
+Keep proof receipts and generated evidence under `target/jankurai/`.
+
+Use `agent/test-map.json` to choose the smallest credible proof lane. For audit, run:
+
+```bash
+jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+````
+
+## Detailed Planner Protocol
+
+When asked for planning or implementation, produce a worker-ready packet:
+
+* objective
+* read-first files
+* ownership and forbidden paths
+* current state
+* implementation steps
+* hard parts and risks
+* validation commands
+* evidence and log paths
+* safe parallel split, if any
+
+Append phase work to `tips/phases/logs/` when this repo has phase files. In generated repos, use `target/jankurai/receipts/` unless a tracked phase log exists.
+"#;
+
+const ROOT_JUSTFILE: &str = r#"set shell := ["bash", "-lc"]
+
+default: fast
+
+fast:
+jankurai audit . --mode advisory --json target/jankurai/fast-score.json --md target/jankurai/fast-score.md
+
+score:
+jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+
+doctor:
+jankurai doctor . --fail-on high
+
+security:
+bash tools/security-lane.sh
+
+check: score doctor security
+
+generate-contracts:
+mkdir -p target/jankurai/generated-contracts
+printf '%s\n' 'scaffold: add real contract generation before production' > target/jankurai/generated-contracts/README.txt
+"#;
+
+const GITHUB_WORKFLOW: &str = r#"name: jankurai
+
+on:
+pull_request:
+push:
+branches: [main]
+
+jobs:
+audit:
+runs-on: ubuntu-latest
+steps:
+- uses: actions/checkout@v4
+- uses: dtolnay/rust-toolchain@stable
+- name: Install jankurai
+run: cargo install --git [https://github.com/jeppsontaylor/Jankurai](https://github.com/jeppsontaylor/Jankurai) --locked
+- name: Audit repository
+run: jankurai audit . --mode ratchet --json agent/repo-score.json --md agent/repo-score.md --sarif target/jankurai/jankurai.sarif --github-step-summary target/jankurai/summary.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+- name: Enforce score floor
+run: test "$(jq -r '.score' agent/repo-score.json)" -ge 85
+- name: Doctor
+run: jankurai doctor . --fail-on high --json target/jankurai/doctor.json --md target/jankurai/doctor.md
+- name: Security lane
+run: bash tools/security-lane.sh
+- uses: actions/upload-artifact@v4
+with:
+name: jankurai-evidence
+path: |
+agent/repo-score.json
+agent/repo-score.md
+target/jankurai/
+"#;
+
+const SECURITY_LANE: &str = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p target/jankurai/security
+
+cat > target/jankurai/security/scaffold-evidence.json <<'JSON'
+{
+"schema_version": "scaffold",
+"status": "advisory",
+"message": "Replace this scaffold with real secret, dependency, workflow, SBOM, and provenance checks before production."
+}
+JSON
+
+printf '%s\n' "security-lane scaffold: advisory evidence written to target/jankurai/security/scaffold-evidence.json"
+"#;
+
+const ROOT_CARGO_TOML: &str = r#"[workspace]
+members = ["crates/api"]
+resolver = "2"
+"#;
+
+const CARGO_LOCK: &str = r#"# This file is automatically @generated by Cargo.
+
+# It is not intended for manual editing.
+
+version = 4
+
+[[package]]
+name = "app-api"
+version = "0.1.0"
+"#;
+
+const API_CARGO_TOML: &str = r#"[package]
+name = "app-api"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#;
+
+const API_LIB_RS: &str = r#"//! Scaffold Rust API crate.
+//!
+//! Replace this with real product code. Keep durable truth in Rust, SQL,
+//! contracts, and declared generated zones.
+
+pub fn health() -> &'static str {
+"ok"
+}
+
+#[cfg(test)]
+mod tests {
+#[test]
+fn health_is_ok() {
+assert_eq!(super::health(), "ok");
+}
+}
+"#;
+
+const ROOT_PACKAGE_JSON: &str = r#"{
+"name": "jankurai-scaffold",
+"private": true,
+"version": "0.1.0",
+"workspaces": [
+"apps/web"
+],
+"scripts": {
+"build": "npm --workspace apps/web run build",
+"test": "npm --workspace apps/web run test"
+}
+}
+"#;
+
+const PACKAGE_LOCK_JSON: &str = r#"{
+"name": "jankurai-scaffold",
+"lockfileVersion": 3,
+"requires": true,
+"packages": {
+"": {
+"name": "jankurai-scaffold",
+"version": "0.1.0",
+"workspaces": [
+"apps/web"
+]
+},
+"apps/web": {
+"name": "web",
+"version": "0.1.0"
+}
+}
+}
+"#;
+
+const WEB_PACKAGE_JSON: &str = r#"{
+"name": "web",
+"private": true,
+"version": "0.1.0",
+"scripts": {
+"build": "node -e "console.log('web scaffold placeholder: add Vite/React dependencies before production')"",
+"test": "node -e "console.log('web scaffold placeholder tests')""
+}
+}
+"#;
+
+const WEB_README: &str = r#"# Web App Slot
+
+This is a placeholder for a React/Vite web surface.
+
+Before production:
+
+* install real React/Vite dependencies
+* add component tests and UX QA routes
+* declare generated clients in `agent/generated-zones.toml`
+* keep durable product truth out of handwritten UI mirrors
+  "#;
+
+const WEB_INDEX_HTML: &str = r#"<!doctype html>
+
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>jankurai scaffold</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+"#;
+
+const WEB_APP_TSX: &str = r#"export function App() {
+return ( <main> <h1>jankurai scaffold</h1> <p>Replace this placeholder before production.</p> </main>
+);
+}
+"#;
+
+const WEB_MAIN_TSX: &str = r#"import { App } from "./App";
+
+console.log(App);
+"#;
+
+const WEB_TSCONFIG_JSON: &str = r#"{
+"compilerOptions": {
+"target": "ES2022",
+"module": "ESNext",
+"jsx": "react-jsx",
+"strict": true,
+"moduleResolution": "Bundler",
+"skipLibCheck": true
+},
+"include": ["src"]
+}
+"#;
+
+const WEB_VITE_CONFIG: &str = r#"import { defineConfig } from "vite";
+
+export default defineConfig({
+server: {
+port: 5173
+}
+});
+"#;
+
+const PYPROJECT_TOML: &str = r#"[project]
+name = "ai-service"
+version = "0.1.0"
+description = "Bounded AI service scaffold. Replace before production."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.jankurai]
+truth_boundary = "AI service may score, classify, retrieve, or summarize; it must not own durable product truth."
+"#;
+
+const PYTHON_AI_README: &str = r#"# Bounded AI Service
+
+This directory is a containment boundary for AI/data work.
+
+Rules:
+
+* prompts are versioned under `prompts/`
+* evals are versioned under `evals/`
+* AI output may not silently own durable product truth
+* product state must be written through Rust, DB migrations, contracts, or explicitly reviewed boundaries
+  "#;
+
+pub const TEMPLATES: &[Template] = &[
+Template { path: "AGENTS.md", body: AGENTS_MD },
+Template { path: "Justfile", body: ROOT_JUSTFILE },
+Template { path: ".gitignore", body: "target/\nnode_modules/\n.DS_Store\n.env\n.env.*\n!.env.example\n" },
+Template { path: "Cargo.toml", body: ROOT_CARGO_TOML },
+Template { path: "Cargo.lock", body: CARGO_LOCK },
+Template { path: "package.json", body: ROOT_PACKAGE_JSON },
+Template { path: "package-lock.json", body: PACKAGE_LOCK_JSON },
+Template {
+path: ".cursor/rules/jankurai.mdc",
+body: concat!(
+"---\nalwaysApply: true\n---\n\n",
+"<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+"Read `AGENTS.md` first.\n",
+"Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+"For MASTER_PLAN work, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.\n",
+"Log phase work in `tips/phases/logs/`.\n",
+"For planning work, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\n"
+),
+},
+Template { path: "CLAUDE.md", body: ADAPTER_POINTER },
+Template { path: "GEMINI.md", body: ADAPTER_POINTER },
+Template { path: ".github/copilot-instructions.md", body: ADAPTER_POINTER },
+Template {
+path: ".github/instructions/jankurai.instructions.md",
+body: ADAPTER_POINTER,
+},
+Template {
+path: ".github/instructions/jankurai-rust.instructions.md",
+body: concat!(
+"---\napplyTo: "**/*.rs"\n---\n\n",
+"<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+"Read `AGENTS.md` first.\n",
+"Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+"For MASTER_PLAN work, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.\n",
+"Log phase work in `tips/phases/logs/`.\n",
+"For planning work, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\n"
+),
+},
+Template {
+path: ".github/instructions/jankurai-web.instructions.md",
+body: concat!(
+"---\napplyTo: "**/*.{ts,tsx,js,jsx,css}"\n---\n\n",
+"<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+"Read `AGENTS.md` first.\n",
+"Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+"For MASTER_PLAN work, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.\n",
+"Run UX proof when web behavior changes.\n"
+),
+},
+Template {
+path: ".github/instructions/jankurai-python-ai.instructions.md",
+body: concat!(
+"---\napplyTo: "python/ai-service/**/*.py"\n---\n\n",
+"<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+"Read `AGENTS.md` first.\n",
+"Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+"AI services may not silently own durable product truth.\n",
+"For planning work, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\n"
+),
+},
+Template { path: ".agents/agents.md", body: ADAPTER_POINTER },
+Template {
+path: ".agents/skills/jankurai/SKILL.md",
+body: PROOF_ADAPTER_POINTER,
+},
+Template {
+path: ".agents/workflows/jankurai-audit.md",
+body: concat!(
+"# jankurai audit\n\n",
+"<!-- jankurai generated adapter: safe to refresh with --force-generated-adapters -->\n\n",
+"Read `AGENTS.md` first.\n",
+"Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+"For MASTER_PLAN work, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file.\n",
+"Log phase work in `tips/phases/logs/`.\n",
+"For planning work, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\n",
+"Run `jankurai audit . --json agent/repo-score.json --md agent/repo-score.md` for audit.\n"
+),
+},
+Template {
+path: ".claude/skills/jankurai/SKILL.md",
+body: PROOF_ADAPTER_POINTER,
+},
+Template { path: ".github/workflows/jankurai.yml", body: GITHUB_WORKFLOW },
+Template { path: "agent/JANKURAI_STANDARD.md", body: JANKURAI_STANDARD_MD },
+Template { path: "agent/MASTER_PLAN.md", body: MASTER_PLAN_MD },
+Template { path: "agent/boundaries.toml", body: include_str!("../../templates/agent/boundaries.toml") },
+Template { path: "agent/generated-zones.toml", body: include_str!("../../templates/agent/generated-zones.toml") },
+Template { path: "agent/owner-map.json", body: include_str!("../../templates/agent/owner-map.json") },
+Template { path: "agent/proof-lanes.toml", body: include_str!("../../templates/agent/proof-lanes.toml") },
+Template {
+path: "agent/audit-policy.toml",
+body: "minimum_score = 85\nfail_on = ["critical", "high"]\nadvisory_on = ["medium", "low"]\n",
+},
+Template {
+path: "agent/security-policy.toml",
+body: "schema_version = "1.0.0"\nenabled_tools = ["gitleaks", "cargo audit", "npm audit", "syft", "zizmor"]\nrequired_tools = []\nadvisory_tools = ["gitleaks", "cargo audit", "npm audit", "syft", "zizmor"]\n\n[severity_thresholds]\nfail_lane_on = "high"\n",
+},
+Template { path: "agent/standard-version.toml", body: include_str!("../../templates/agent/standard-version.toml") },
+Template { path: "agent/test-map.json", body: include_str!("../../templates/agent/test-map.json") },
+Template {
+path: "agent/ux-qa.toml",
+body: "outputRoot = "."\nartifactRoot = "target/jankurai/ux-qa"\nreadyState = "domcontentloaded"\ntimeoutMs = 15000\nscreenshotRequired = true\nariaSnapshotRequired = true\naccessibilityScanRequired = true\nrequiredStates = ["loading", "empty", "error", "success", "permission-denied"]\nviewports = ["390x844", "768x1024", "1440x900"]\n",
+},
+Template {
+path: "README-jankurai-scaffold.md",
+body: "# Greenfield scaffold (non-production)\n\nThis tree was bootstrapped with `jankurai init`.\n\nReplace scaffold placeholders before production. The scaffold is intentionally explicit about what is real source, what is generated, and what still needs proof.\n",
+},
+Template {
+path: "docs/install.md",
+body: "# Using the jankurai Scaffold\n\nRun dry-run first:\n\n`bash\njankurai init --profile rust-ts-postgres --ide all --mode advisory --dry-run --plan-json target/jankurai/init-plan.json\n`\n\nApply only after reviewing the plan:\n\n`bash\njankurai init --profile rust-ts-postgres --ide all --mode advisory --yes\njankurai audit . --json agent/repo-score.json --md agent/repo-score.md\njankurai doctor . --fail-on high\n`\n\nExisting user files are preserved. Generated adapters refresh only when they carry the generated marker and `--force-generated-adapters` is used.\n",
+},
+Template {
+path: "docs/agent-native-standard.md",
+body: "# Agent-Native Standard\n\nKeep product truth in Rust, SQL, contracts, and declared generated zones. Python AI/data services may assist but may not silently own durable product truth.\n\nEvery changed path maps to an owner and proof lane.\n",
+},
+Template {
+path: "docs/ide-integrations.md",
+body: "# IDE Integrations\n\nIDE adapters are thin pointers to `AGENTS.md`, `agent/JANKURAI_STANDARD.md`, and `agent/MASTER_PLAN.md`.\n\nDo not duplicate the full standard inside tool-specific files.\n",
+},
+Template {
+path: "docs/exceptions/README.md",
+body: "# Exceptions\n\nDocument dated exceptions with owner, expiry, migration path, and proof lane.\n\nExceptions that do not expire become architecture by accident.\n",
+},
+Template {
+path: "contracts/README.md",
+body: "# Contracts\n\nPut OpenAPI, JSON Schema, protobuf, event schema, or other contract **sources** here.\n\nGenerated clients and bindings must live only under paths declared in `agent/generated-zones.toml`.\n",
+},
+Template {
+path: "db/README.md",
+body: "# Database\n\nMigrations live in `db/migrations/`.\n\nDatabase truth belongs in migrations, constraints, and schema policy—not in handwritten mirrors.\n",
+},
+Template {
+path: "db/migrations/README.md",
+body: "# Migrations\n\nAdd versioned SQL migrations.\n\nRegenerate any derived artifacts with the recorded command in `agent/generated-zones.toml`.\n",
+},
+Template {
+path: "db/constraints/README.md",
+body: "# Constraints\n\nDeclare durable database truth such as checks, FKs, uniqueness, and tenant isolation constraints here.\n",
+},
+Template {
+path: "docs/architecture/README.md",
+body: "# Architecture\n\nDocument boundaries, owners, proof lanes, data flow, and where product truth lives.\n\nThis stub is not production architecture.\n",
+},
+Template {
+path: "docs/decisions/README.md",
+body: "# Architecture Decision Records\n\nRecord significant decisions with date, status, context, decision, consequences, and proof lane.\n",
+},
+Template {
+path: "docs/auth/README.md",
+body: "# Authentication\n\nDocument authentication mechanisms, session lifecycles, token issuance boundaries, and proof lanes here.\n",
+},
+Template {
+path: "docs/orgs/README.md",
+body: "# Organizations And Tenancy\n\nDocument tenant isolation, RBAC, cross-organization boundaries, and audit proof here.\n",
+},
+Template {
+path: "docs/admin/README.md",
+body: "# Admin Tools\n\nDocument elevated privileges, support impersonation, internal operational routes, and proof lanes here.\n",
+},
+Template {
+path: "docs/observability/README.md",
+body: "# Observability\n\nDocument logs, metrics, traces, audit events, SLOs, and evidence retention boundaries here.\n",
+},
+Template {
+path: "docs/security/README.md",
+body: "# Security\n\nDocument threat model, secret policy, dependency scanning, provenance, SBOM, and security evidence here.\n",
+},
+Template {
+path: "docs/compliance/README.md",
+body: "# Compliance Evidence\n\nThis is an evidence shell, not a compliance claim.\n\nMap controls to durable, machine-readable evidence before claiming readiness.\n",
+},
+Template {
+path: "docs/privacy/README.md",
+body: "# Privacy And PII\n\nClassify data, document retention, access boundaries, deletion flows, and proof lanes here.\n",
+},
+Template {
+path: "docs/backups/README.md",
+body: "# Backup And Restore\n\nDocument backup scope, restore proof, retention, RPO/RTO targets, and test evidence here.\n",
+},
+Template {
+path: "docs/ai/README.md",
+body: "# AI Product Boundary\n\nAI services may classify, retrieve, rank, generate, summarize, or recommend.\n\nThey may not silently own durable product truth. Keep prompt versions and eval receipts attached to releases.\n",
+},
+Template {
+path: "docs/product/README.md",
+body: "# Product Intent\n\nDocument product intent, user-visible guarantees, non-goals, risk tolerance, and proof expectations here.\n",
+},
+Template {
+path: "docs/migration/README.md",
+body: "# Migration Plan\n\nDocument legacy inventory, boundary map, migration slices, equivalence proof, rollback, and containment policy here.\n",
+},
+Template {
+path: "docs/migration/boundary-map.md",
+body: "# Boundary Map\n\nMap legacy surfaces to target owners, contracts, databases, generated zones, and proof lanes.\n",
+},
+Template {
+path: "docs/migration/slices/README.md",
+body: "# Migration Slices\n\nEach slice needs intent, owner, changed paths, proof lane, equivalence evidence, rollback plan, and residual risk.\n",
+},
+Template { path: "tools/security-lane.sh", body: SECURITY_LANE },
+Template { path: "crates/api/Cargo.toml", body: API_CARGO_TOML },
+Template { path: "crates/api/src/lib.rs", body: API_LIB_RS },
+Template { path: "apps/web/package.json", body: WEB_PACKAGE_JSON },
+Template { path: "apps/web/README.md", body: WEB_README },
+Template { path: "apps/web/index.html", body: WEB_INDEX_HTML },
+Template { path: "apps/web/src/App.tsx", body: WEB_APP_TSX },
+Template { path: "apps/web/src/main.tsx", body: WEB_MAIN_TSX },
+Template { path: "apps/web/tsconfig.json", body: WEB_TSCONFIG_JSON },
+Template { path: "apps/web/vite.config.ts", body: WEB_VITE_CONFIG },
+Template { path: "python/ai-service/README.md", body: PYTHON_AI_README },
+Template { path: "python/ai-service/pyproject.toml", body: PYPROJECT_TOML },
+Template {
+path: "prompts/README.md",
+body: "# Prompts\n\nVersion prompts here. Each prompt change needs an eval note and owner.\n",
+},
+Template {
+path: "evals/README.md",
+body: "# Evals\n\nStore eval harness docs and receipt conventions here. Generated eval outputs belong under `target/jankurai/` unless explicitly declared.\n",
+},
+Template {
+path: "evals/golden/README.md",
+body: "# Golden Eval Cases\n\nKeep small, reviewed eval cases here. Do not store secrets or production data.\n",
+},
+];
+EOF_RUST
+
+cat > schemas/init-profile.schema.json <<'EOF_JSON'
+{
+"$schema": "[https://json-schema.org/draft/2020-12/schema](https://json-schema.org/draft/2020-12/schema)",
+"$id": "[https://jankurai.dev/schemas/init-profile.schema.json](https://jankurai.dev/schemas/init-profile.schema.json)",
+"title": "jankurai init profile manifest",
+"type": "object",
+"required": [
+"profileVersion",
+"id",
+"displayName",
+"targetStackId",
+"generatedPaths",
+"requiredLanes",
+"optionalLanes",
+"agentAdapters",
+"ciTemplates",
+"docs",
+"securityControls",
+"uxControls",
+"contractSystem",
+"dbPolicy",
+"validationCommands"
+],
+"properties": {
+"profileVersion": {
+"type": "string",
+"pattern": "^[0-9]+[.][0-9]+[.][0-9]+$"
+},
+"id": {
+"type": "string",
+"pattern": "^[a-z0-9][a-z0-9-]*$"
+},
+"displayName": {
+"type": "string"
+},
+"description": {
+"type": "string"
+},
+"targetStackId": {
+"type": "string",
+"pattern": "^[A-Za-z0-9.*+:-]+$"
+},
+"generatedPaths": {
+"$ref": "#/$defs/pathList"
+},
+"generatedRefreshPaths": {
+"$ref": "#/$defs/pathList"
+},
+"reservedPaths": {
+"$ref": "#/$defs/pathList"
+},
+"requiredLanes": {
+"$ref": "#/$defs/stringList"
+},
+"optionalLanes": {
+"$ref": "#/$defs/stringList"
+},
+"agentAdapters": {
+"$ref": "#/$defs/pathList"
+},
+"ciTemplates": {
+"$ref": "#/$defs/pathList"
+},
+"docs": {
+"$ref": "#/$defs/pathList"
+},
+"securityControls": {
+"$ref": "#/$defs/pathList"
+},
+"uxControls": {
+"$ref": "#/$defs/pathList"
+},
+"contractSystem": {
+"$ref": "#/$defs/pathList"
+},
+"dbPolicy": {
+"$ref": "#/$defs/pathList"
+},
+"validationCommands": {
+"$ref": "#/$defs/stringList"
+}
+},
+"additionalProperties": false,
+"$defs": {
+"path": {
+"type": "string",
+"pattern": "^[A-Za-z0-9.*@+:/-]+$"
+},
+"pathList": {
+"type": "array",
+"items": {
+"$ref": "#/$defs/path"
+}
+},
+"stringList": {
+"type": "array",
+"items": {
+"type": "string"
+}
+}
+}
+}
+EOF_JSON
+
+cat > schemas/init-receipt.schema.json <<'EOF_JSON'
+{
+"$schema": "[https://json-schema.org/draft/2020-12/schema](https://json-schema.org/draft/2020-12/schema)",
+"$id": "[https://jankurai.dev/schemas/init-receipt.schema.json](https://jankurai.dev/schemas/init-receipt.schema.json)",
+"title": "jankurai init receipt",
+"type": "object",
+"required": [
+"action",
+"profile_id",
+"profile_version",
+"created_at",
+"actions"
+],
+"properties": {
+"action": {
+"type": "string"
+},
+"profile_id": {
+"type": "string"
+},
+"profile_version": {
+"type": "string"
+},
+"created_at": {
+"type": "integer"
+},
+"actions": {
+"type": "array",
+"items": {
+"type": "object",
+"required": [
+"path",
+"action"
+],
+"properties": {
+"path": {
+"type": "string"
+},
+"action": {
+"type": "string"
+},
+"detail": {
+"type": "string"
+}
+},
+"additionalProperties": false
+}
+}
+},
+"additionalProperties": false
+}
+EOF_JSON
+
+cat > crates/jankurai/templates/agent/owner-map.json <<'EOF_JSON'
+{
+"workspace": "generated-jankurai-repo",
+"owners": {
+"AGENTS.md": "agent",
+"README.md": "workspace",
+"README-jankurai-scaffold.md": "workspace",
+"Justfile": "workspace",
+".gitignore": "workspace",
+".github/": "ops",
+".cursor/": "agent",
+".claude/": "agent",
+".agents/": "agent",
+"CLAUDE.md": "agent",
+"GEMINI.md": "agent",
+"agent/": "agent",
+"agent/MASTER_PLAN.md": "agent",
+"contracts/": "contracts",
+"crates/": "tools",
+"crates/api/": "api",
+"apps/web/": "web",
+"db/": "data",
+"db/migrations/": "data",
+"db/constraints/": "data",
+"docs/": "standard",
+"docs/auth/": "security",
+"docs/orgs/": "product",
+"docs/admin/": "ops",
+"docs/security/": "security",
+"docs/compliance/": "ops",
+"docs/privacy/": "security",
+"docs/backups/": "ops",
+"docs/ai/": "ai",
+"docs/migration/": "migration",
+"tools/": "tools",
+"python/ai-service/": "ai",
+"prompts/": "ai",
+"evals/": "ai",
+"package.json": "web",
+"package-lock.json": "web",
+"Cargo.toml": "tools",
+"Cargo.lock": "tools"
+}
+}
+EOF_JSON
+
+cat > crates/jankurai/templates/agent/test-map.json <<'EOF_JSON'
+{
+"workspace": "generated-jankurai-repo",
+"tests": {
+"AGENTS.md": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/agent-score.json --md target/jankurai/agent-score.md",
+"purpose": "verify root routing remains visible to the audit"
+},
+"agent/MASTER_PLAN.md": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/master-plan-score.json --md target/jankurai/master-plan-score.md",
+"purpose": "verify master plan routing remains visible to the audit"
+},
+"agent/": {
+"command": "jankurai doctor . --fail-on high",
+"purpose": "verify manifests remain parseable and authoritative"
+},
+"contracts/": {
+"command": "just generate-contracts && jankurai audit . --mode advisory --json target/jankurai/contracts-score.json --md target/jankurai/contracts-score.md",
+"purpose": "verify contract source guidance and generated-zone command remain visible"
+},
+"db/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/db-score.json --md target/jankurai/db-score.md",
+"purpose": "verify database policy and migration guidance remain routed"
+},
+"db/migrations/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/db-migrations-score.json --md target/jankurai/db-migrations-score.md",
+"purpose": "replace with migration safety checks before production"
+},
+"crates/": {
+"command": "cargo test",
+"purpose": "verify Rust behavior"
+},
+"apps/web/": {
+"command": "npm --workspace apps/web run test && npm --workspace apps/web run build",
+"purpose": "verify web placeholder; replace with real web tests before production"
+},
+"python/ai-service/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/ai-score.json --md target/jankurai/ai-score.md",
+"purpose": "verify AI service remains bounded and routed"
+},
+"prompts/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/prompts-score.json --md target/jankurai/prompts-score.md",
+"purpose": "verify prompt changes stay visible to proof lanes"
+},
+"evals/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/evals-score.json --md target/jankurai/evals-score.md",
+"purpose": "verify eval docs and cases stay visible to proof lanes"
+},
+"docs/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/docs-score.json --md target/jankurai/docs-score.md",
+"purpose": "verify agent-readable documentation remains routed"
+},
+"docs/migration/": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/migration-score.json --md target/jankurai/migration-score.md",
+"purpose": "verify migration containment docs remain visible"
+},
+".github/": {
+"command": "jankurai doctor . --fail-on high",
+"purpose": "verify CI and GitHub instruction surfaces"
+},
+".cursor/": {
+"command": "jankurai adapters verify .",
+"purpose": "verify thin Cursor adapter pointer"
+},
+".claude/": {
+"command": "jankurai adapters verify .",
+"purpose": "verify thin Claude adapter pointer"
+},
+".agents/": {
+"command": "jankurai adapters verify .",
+"purpose": "verify thin agent adapter pointer"
+},
+"CLAUDE.md": {
+"command": "jankurai adapters verify .",
+"purpose": "verify thin Claude adapter pointer"
+},
+"GEMINI.md": {
+"command": "jankurai adapters verify .",
+"purpose": "verify thin Gemini adapter pointer"
+},
+"tools/": {
+"command": "bash tools/security-lane.sh",
+"purpose": "verify tooling stubs execute"
+},
+"README-jankurai-scaffold.md": {
+"command": "jankurai audit . --mode advisory --json target/jankurai/scaffold-score.json --md target/jankurai/scaffold-score.md",
+"purpose": "verify scaffold marker remains visible"
+}
+}
+}
+EOF_JSON
+
+cat > crates/jankurai/templates/agent/proof-lanes.toml <<'EOF_TOML'
+[[lane]]
+name = "fast"
+command = "just fast"
+purpose = "small deterministic audit proof"
+
+[[lane]]
+name = "audit"
+command = "just score"
+purpose = "write canonical jankurai score artifacts"
+
+[[lane]]
+name = "doctor"
+command = "just doctor"
+purpose = "verify required control files, schemas, and local policy"
+
+[[lane]]
+name = "security"
+command = "just security"
+purpose = "secret, dependency, workflow, SBOM, and provenance proof; scaffold is advisory until replaced"
+
+[[lane]]
+name = "ux"
+command = "jankurai ux --help"
+purpose = "placeholder UX lane; replace with deterministic rendered UX proof when web is real"
+
+[[lane]]
+name = "release"
+command = "just check"
+purpose = "full merge gate"
+EOF_TOML
+
+cat > crates/jankurai/templates/agent/generated-zones.toml <<'EOF_TOML'
+[[zone]]
+path = "agent/repo-score.json"
+source = "repository"
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+read_only = false
+
+[[zone]]
+path = "agent/repo-score.md"
+source = "repository"
+command = "jankurai audit . --json agent/repo-score.json --md agent/repo-score.md"
+read_only = false
+
+[[zone]]
+path = "target/jankurai/"
+source = "proof lanes"
+command = "just check"
+read_only = false
+
+[[zone]]
+path = "target/jankurai/generated-contracts/"
+source = "contracts/"
+command = "just generate-contracts"
+read_only = true
+EOF_TOML
+
+python3 - <<'EOF_PY'
+from pathlib import Path
+import json
+
+out = Path("crates/jankurai/templates/profiles")
+out.mkdir(parents=True, exist_ok=True)
+
+adapters = [
+"CLAUDE.md",
+"GEMINI.md",
+".agents/agents.md",
+".agents/skills/jankurai/SKILL.md",
+".agents/workflows/jankurai-audit.md",
+".claude/skills/jankurai/SKILL.md",
+".cursor/rules/jankurai.mdc",
+".github/copilot-instructions.md",
+".github/instructions/jankurai.instructions.md",
+".github/instructions/jankurai-python-ai.instructions.md",
+".github/instructions/jankurai-rust.instructions.md",
+".github/instructions/jankurai-web.instructions.md",
+]
+
+core = [
+"AGENTS.md",
+"Justfile",
+"README-jankurai-scaffold.md",
+".gitignore",
+".github/workflows/jankurai.yml",
+"agent/JANKURAI_STANDARD.md",
+"agent/MASTER_PLAN.md",
+"agent/audit-policy.toml",
+"agent/boundaries.toml",
+"agent/security-policy.toml",
+"agent/generated-zones.toml",
+"agent/owner-map.json",
+"agent/proof-lanes.toml",
+"agent/standard-version.toml",
+"agent/test-map.json",
+"docs/agent-native-standard.md",
+"docs/architecture/README.md",
+"docs/decisions/README.md",
+"docs/exceptions/README.md",
+"docs/ide-integrations.md",
+"docs/install.md",
+"tools/security-lane.sh",
+]
+
+rust = [
+"Cargo.toml",
+"Cargo.lock",
+"crates/api/Cargo.toml",
+"crates/api/src/lib.rs",
+]
+
+web = [
+"package.json",
+"package-lock.json",
+"apps/web/package.json",
+"apps/web/README.md",
+"apps/web/index.html",
+"apps/web/src/App.tsx",
+"apps/web/src/main.tsx",
+"apps/web/tsconfig.json",
+"apps/web/vite.config.ts",
+"agent/ux-qa.toml",
+]
+
+db = [
+"db/README.md",
+"db/migrations/README.md",
+"db/constraints/README.md",
+]
+
+contracts = ["contracts/README.md"]
+
+b2b_docs = [
+"docs/auth/README.md",
+"docs/orgs/README.md",
+"docs/admin/README.md",
+"docs/observability/README.md",
+]
+
+regulated_docs = [
+"docs/security/README.md",
+"docs/compliance/README.md",
+"docs/privacy/README.md",
+"docs/backups/README.md",
+"docs/observability/README.md",
+]
+
+ai_paths = [
+"python/ai-service/README.md",
+"python/ai-service/pyproject.toml",
+"prompts/README.md",
+"evals/README.md",
+"evals/golden/README.md",
+"docs/ai/README.md",
+"docs/product/README.md",
+]
+
+migration_paths = [
+"docs/migration/README.md",
+"docs/migration/boundary-map.md",
+"docs/migration/slices/README.md",
+]
+
+validation = [
+"jankurai audit . --json agent/repo-score.json --md agent/repo-score.md",
+"jankurai doctor . --fail-on high",
+"bash tools/security-lane.sh",
+]
+
+def dedupe(items):
+return sorted(dict.fromkeys(items))
+
+def manifest(
+profile_id,
+display,
+stack,
+description,
+extra,
+required_lanes,
+optional_lanes=None,
+docs_extra=None,
+ux=False,
+db_policy=False,
+contract=True,
+):
+optional_lanes = optional_lanes or []
+docs_extra = docs_extra or []
+paths = dedupe(core + adapters + extra)
+
+```
+docs = dedupe([
+    "docs/install.md",
+    "docs/agent-native-standard.md",
+    "docs/ide-integrations.md",
+    "docs/exceptions/README.md",
+    "docs/architecture/README.md",
+    "docs/decisions/README.md",
+] + docs_extra)
+
+security_controls = dedupe([
+    "agent/audit-policy.toml",
+    "agent/boundaries.toml",
+    "agent/security-policy.toml",
+    "tools/security-lane.sh",
+])
+
+contract_system = dedupe([
+    "agent/owner-map.json",
+    "agent/test-map.json",
+    "agent/generated-zones.toml",
+    "agent/proof-lanes.toml",
+] + (contracts if contract else []))
+
+return {
+    "profileVersion": "1.0.0",
+    "id": profile_id,
+    "displayName": display,
+    "description": description,
+    "targetStackId": stack,
+    "generatedPaths": paths,
+    "generatedRefreshPaths": adapters,
+    "reservedPaths": ["reference/", "target/", ".git/"],
+    "requiredLanes": required_lanes,
+    "optionalLanes": optional_lanes,
+    "agentAdapters": adapters,
+    "ciTemplates": [".github/workflows/jankurai.yml"],
+    "docs": docs,
+    "securityControls": security_controls,
+    "uxControls": ["agent/ux-qa.toml"] if ux else [],
+    "contractSystem": contract_system,
+    "dbPolicy": ["agent/boundaries.toml"] + (db if db_policy else []),
+    "validationCommands": validation,
+}
+```
+
+profiles = [
+manifest(
+"rust-ts-postgres",
+"Rust + TypeScript + Postgres",
+"rust-ts-vite-react-postgres-bounded-python",
+"Default COLD-stack scaffold: Rust API, documented React/Vite web slot, Postgres policy, contracts, proof lanes, security evidence shell, and UX controls.",
+rust + web + db + contracts,
+["audit", "doctor", "security", "ux"],
+[],
+ux=True,
+db_policy=True,
+contract=True,
+),
+manifest(
+"rust-api",
+"Rust API",
+"rust-postgres",
+"Rust API scaffold with contracts, database policy, security evidence shell, and no web UX lane by default.",
+rust + db + contracts,
+["audit", "doctor", "security"],
+[],
+ux=False,
+db_policy=True,
+contract=True,
+),
+manifest(
+"react-web",
+"React Web",
+"ts-react-vite",
+"React/Vite web scaffold with contracts and UX controls, but no database ownership by default.",
+web + contracts,
+["audit", "doctor", "security", "ux"],
+[],
+ux=True,
+db_policy=False,
+contract=True,
+),
+manifest(
+"b2b-saas",
+"B2B SaaS Fullstack",
+"rust-ts-vite-react-postgres-b2b",
+"Fullstack B2B SaaS scaffold with auth, organizations, admin, observability, contracts, database policy, UX controls, and evidence shell.",
+rust + web + db + contracts + b2b_docs,
+["audit", "doctor", "security", "ux"],
+[],
+docs_extra=b2b_docs,
+ux=True,
+db_policy=True,
+contract=True,
+),
+manifest(
+"ai-product",
+"AI Product",
+"bounded-python-ai-product",
+"Bounded AI product scaffold with Python containment, prompts, evals, product intent docs, and no durable product truth in AI output.",
+ai_paths + contracts,
+["audit", "doctor", "security"],
+["eval"],
+docs_extra=["docs/ai/README.md", "docs/product/README.md"],
+ux=False,
+db_policy=False,
+contract=True,
+),
+manifest(
+"regulated-saas",
+"Regulated SaaS",
+"rust-ts-vite-react-postgres-regulated",
+"Stricter SaaS scaffold with security, privacy, compliance evidence shell, backup/restore docs, exception discipline, contracts, DB policy, UX, and observability.",
+rust + web + db + contracts + b2b_docs + regulated_docs,
+["audit", "doctor", "security", "ux"],
+["compliance"],
+docs_extra=b2b_docs + regulated_docs,
+ux=True,
+db_policy=True,
+contract=True,
+),
+manifest(
+"migration-target",
+"Migration Target",
+"migration-target",
+"Legacy migration containment scaffold with boundary map, slices, contract/source policy, proof lanes, and no product runtime assumptions.",
+contracts + migration_paths,
+["audit", "doctor", "security"],
+["migration"],
+docs_extra=migration_paths,
+ux=False,
+db_policy=False,
+contract=True,
+),
+]
+
+for data in profiles:
+(out / f"{data['id']}.json").write_text(json.dumps(data, indent=2) + "\n")
+EOF_PY
+
+cat > crates/jankurai/tests/init_golden.rs <<'EOF_RUST'
+use jankurai::commands::init;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tempfile::tempdir;
+
+const BUNDLED_PROFILES: &[&str] = &[
+"rust-api",
+"react-web",
+"rust-ts-postgres",
+"b2b-saas",
+"ai-product",
+"regulated-saas",
+"migration-target",
+];
+
+fn binary_path() -> &'static str {
+env!("CARGO_BIN_EXE_jankurai")
+}
+
+fn fixture_path(name: &str) -> PathBuf {
+PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+.join("tests/fixtures/init")
+.join(name)
+}
+
+fn copy_dir_all(from: &Path, to: &Path) {
+fs::create_dir_all(to).unwrap();
+
+```
+for entry in fs::read_dir(from).unwrap() {
+    let entry = entry.unwrap();
+    let ty = entry.file_type().unwrap();
+    let dest = to.join(entry.file_name());
+
+    if ty.is_dir() {
+        copy_dir_all(&entry.path(), &dest);
+    } else {
+        fs::copy(entry.path(), dest).unwrap();
+    }
+}
+```
+
+}
+
+fn run_init(
+repo: &Path,
+profile: &str,
+ide: &str,
+ci: &str,
+dry_run: bool,
+yes: bool,
+plan_json: Option<PathBuf>,
+force_generated_adapters: bool,
+) -> anyhow::Result<()> {
+init::run(init::InitArgs {
+repo: repo.to_path_buf(),
+apply: false,
+dry_run,
+yes,
+profile: profile.into(),
+ide: ide.into(),
+mode: "advisory".into(),
+diff: false,
+ci: ci.into(),
+issue_backend: "jsonl".into(),
+ux_qa: false,
+plan_json: plan_json.map(|path| path.to_string_lossy().into_owned()),
+force_generated_adapters,
+})
+}
+
+fn audit_and_doctor(repo: &Path) {
+let json = repo.join("agent/repo-score.json");
+let md = repo.join("agent/repo-score.md");
+
+```
+assert!(
+    Command::new(binary_path())
+        .arg("audit")
+        .arg(repo)
+        .arg("--json")
+        .arg(&json)
+        .arg("--md")
+        .arg(&md)
+        .status()
+        .unwrap()
+        .success()
+);
+
+assert!(
+    Command::new(binary_path())
+        .arg("doctor")
+        .arg(repo)
+        .arg("--fail-on")
+        .arg("high")
+        .status()
+        .unwrap()
+        .success()
+);
+```
+
+}
+
+#[test]
+fn init_unknown_profile_errors() {
+let dir = tempdir().unwrap();
+
+```
+let err = run_init(
+    dir.path(),
+    "not-a-real-profile",
+    "all",
+    "github",
+    true,
+    false,
+    None,
+    false,
+)
+.unwrap_err();
+
+let msg = format!("{err:#}");
+assert!(msg.contains("unknown init profile"), "{msg}");
+assert!(msg.contains("rust-ts-postgres"), "{msg}");
+```
+
+}
+
+#[test]
+fn init_all_bundled_profiles_parse_and_plan() {
+for profile in BUNDLED_PROFILES {
+let dir = tempdir().unwrap();
+let plan_path = dir.path().join(format!("{profile}-plan.json"));
+
+```
+    run_init(
+        dir.path(),
+        profile,
+        "all",
+        "github",
+        true,
+        false,
+        Some(plan_path.clone()),
+        false,
+    )
+    .unwrap();
+
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+    assert_eq!(value["profile_manifest"]["id"], *profile);
+
+    let mut expected: Vec<_> = value["profile_manifest"]["generated_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|path| path.as_str().map(String::from))
+        .collect();
+    expected.sort();
+
+    let mut create_paths: Vec<_> = value["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|action| {
+            if action["action"] == "create" {
+                action["path"].as_str().map(String::from)
+            } else {
+                None
+            }
+        })
+        .collect();
+    create_paths.sort();
+
+    assert_eq!(
+        create_paths, expected,
+        "all profile paths should be create actions in an empty repo for profile {profile}"
+    );
+}
+```
+
+}
+
+#[test]
+fn init_greenfield_apply_all_bundled_profiles_then_audit_and_doctor() {
+for profile in BUNDLED_PROFILES {
+let dir = tempdir().unwrap();
+
+```
+    run_init(
+        dir.path(),
+        profile,
+        "all",
+        "github",
+        false,
+        true,
+        None,
+        false,
+    )
+    .unwrap();
+
+    assert!(dir.path().join("AGENTS.md").exists());
+    assert!(dir.path().join("agent/JANKURAI_STANDARD.md").exists());
+    assert!(dir.path().join("agent/owner-map.json").exists());
+    assert!(dir.path().join("agent/test-map.json").exists());
+    assert!(dir.path().join("tools/security-lane.sh").exists());
+
+    if *profile == "react-web" {
+        assert!(
+            !dir.path().join("db/README.md").exists(),
+            "react-web should not claim DB ownership by default"
+        );
+    }
+
+    if *profile == "rust-api" || *profile == "ai-product" || *profile == "migration-target" {
+        assert!(
+            !dir.path().join("agent/ux-qa.toml").exists(),
+            "{profile} should not include UX QA by default"
+        );
+    }
+
+    if *profile == "ai-product" {
+        assert!(dir.path().join("python/ai-service/README.md").exists());
+        assert!(dir.path().join("evals/README.md").exists());
+        assert!(dir.path().join("prompts/README.md").exists());
+    }
+
+    if *profile == "migration-target" {
+        assert!(dir.path().join("docs/migration/boundary-map.md").exists());
+    }
+
+    audit_and_doctor(dir.path());
+}
+```
+
+}
+
+#[test]
+fn init_multi_profile_selection_combines_manifests() {
+let dir = tempdir().unwrap();
+let plan_path = dir.path().join("composite-plan.json");
+
+```
+run_init(
+    dir.path(),
+    "rust-api,react-web",
+    "all",
+    "github",
+    true,
+    false,
+    Some(plan_path.clone()),
+    false,
+)
+.unwrap();
+
+let value: serde_json::Value =
+    serde_json::from_str(&fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+assert_eq!(
+    value["profile_manifest"]["id"],
+    "composite-rust-api-react-web"
+);
+
+let paths: Vec<_> = value["profile_manifest"]["generated_paths"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter_map(|path| path.as_str())
+    .collect();
+
+assert!(paths.contains(&"db/README.md"));
+assert!(paths.contains(&"agent/ux-qa.toml"));
+assert!(paths.contains(&"crates/api/src/lib.rs"));
+assert!(paths.contains(&"apps/web/README.md"));
+```
+
+}
+
+#[test]
+fn init_ide_selection_filters_adapter_surface() {
+let dir = tempdir().unwrap();
+let plan_path = dir.path().join("claude-plan.json");
+
+```
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "claude",
+    "github",
+    true,
+    false,
+    Some(plan_path.clone()),
+    false,
+)
+.unwrap();
+
+let value: serde_json::Value =
+    serde_json::from_str(&fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+let paths: Vec<_> = value["profile_manifest"]["generated_paths"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter_map(|path| path.as_str())
+    .collect();
+
+assert!(paths.contains(&"CLAUDE.md"));
+assert!(paths.contains(&".claude/skills/jankurai/SKILL.md"));
+assert!(!paths.contains(&"GEMINI.md"));
+assert!(!paths.contains(&".cursor/rules/jankurai.mdc"));
+```
+
+}
+
+#[test]
+fn init_ci_none_filters_workflow() {
+let dir = tempdir().unwrap();
+let plan_path = dir.path().join("no-ci-plan.json");
+
+```
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "none",
+    "none",
+    true,
+    false,
+    Some(plan_path.clone()),
+    false,
+)
+.unwrap();
+
+let value: serde_json::Value =
+    serde_json::from_str(&fs::read_to_string(&plan_path).unwrap()).unwrap();
+
+let paths: Vec<_> = value["profile_manifest"]["generated_paths"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter_map(|path| path.as_str())
+    .collect();
+
+assert!(!paths.contains(&".github/workflows/jankurai.yml"));
+assert!(!paths.contains(&"CLAUDE.md"));
+```
+
+}
+
+#[test]
+fn init_existing_repo_fixture_preserves_user_contracts_and_marks_agents() {
+let dir = tempdir().unwrap();
+copy_dir_all(&fixture_path("existing-partial"), dir.path());
+
+```
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "all",
+    "github",
+    false,
+    true,
+    None,
+    false,
+)
+.unwrap();
+
+let contracts = fs::read_to_string(dir.path().join("contracts/README.md")).unwrap();
+assert!(
+    contracts.contains("legacy contract source"),
+    "existing contracts README must not be overwritten"
+);
+assert!(
+    !contracts.contains("Put OpenAPI"),
+    "contract scaffold must not replace existing content"
+);
+
+let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+assert!(
+    agents.contains("jankurai merge marker"),
+    "pre-existing AGENTS.md should receive merge marker rather than overwrite"
+);
+```
+
+}
+
+#[test]
+fn init_is_idempotent() {
+let dir = tempdir().unwrap();
+
+```
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "all",
+    "github",
+    false,
+    true,
+    None,
+    false,
+)
+.unwrap();
+
+let first = fs::read_to_string(dir.path().join("contracts/README.md")).unwrap();
+
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "all",
+    "github",
+    false,
+    true,
+    None,
+    false,
+)
+.unwrap();
+
+let second = fs::read_to_string(dir.path().join("contracts/README.md")).unwrap();
+assert_eq!(first, second, "init rerun must be idempotent");
+```
+
+}
+
+#[test]
+fn init_refreshes_generated_adapters_only_with_marker_and_flag() {
+let dir = tempdir().unwrap();
+
+```
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "claude",
+    "github",
+    false,
+    true,
+    None,
+    false,
+)
+.unwrap();
+
+let claude = dir.path().join("CLAUDE.md");
+let original = fs::read_to_string(&claude).unwrap();
+assert!(original.contains("jankurai generated adapter"));
+
+fs::write(
+    &claude,
+    "<!-- jankurai generated adapter: stale -->\n\nstale adapter body\n",
+)
+.unwrap();
+
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "claude",
+    "github",
+    false,
+    true,
+    None,
+    false,
+)
+.unwrap();
+
+let kept = fs::read_to_string(&claude).unwrap();
+assert!(kept.contains("stale adapter body"));
+
+run_init(
+    dir.path(),
+    "rust-ts-postgres",
+    "claude",
+    "github",
+    false,
+    true,
+    None,
+    true,
+)
+.unwrap();
+
+let refreshed = fs::read_to_string(&claude).unwrap();
+assert!(refreshed.contains("agent/JANKURAI_STANDARD.md"));
+assert!(!refreshed.contains("stale adapter body"));
+```
+
+}
+
+#[test]
+fn init_local_profile_can_load_by_id_and_path() {
+let dir = tempdir().unwrap();
+let profile_dir = dir.path().join(".jankurai/profiles");
+fs::create_dir_all(&profile_dir).unwrap();
+
+```
+let mut value: serde_json::Value =
+    serde_json::from_str(include_str!("../templates/profiles/rust-api.json")).unwrap();
+value["id"] = serde_json::Value::String("local-minimal".into());
+value["displayName"] = serde_json::Value::String("Local Minimal".into());
+
+let local_path = profile_dir.join("local-minimal.json");
+fs::write(&local_path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+run_init(
+    dir.path(),
+    "local-minimal",
+    "none",
+    "none",
+    true,
+    false,
+    Some(dir.path().join("local-id-plan.json")),
+    false,
+)
+.unwrap();
+
+run_init(
+    dir.path(),
+    ".jankurai/profiles/local-minimal.json",
+    "none",
+    "none",
+    true,
+    false,
+    Some(dir.path().join("local-path-plan.json")),
+    false,
+)
+.unwrap();
+```
+
+}
+
+#[test]
+fn init_rejects_local_profile_with_unsafe_generated_path() {
+let dir = tempdir().unwrap();
+let profile_dir = dir.path().join(".jankurai/profiles");
+fs::create_dir_all(&profile_dir).unwrap();
+
+```
+let mut value: serde_json::Value =
+    serde_json::from_str(include_str!("../templates/profiles/rust-api.json")).unwrap();
+value["id"] = serde_json::Value::String("bad-local".into());
+value["generatedPaths"]
+    .as_array_mut()
+    .unwrap()
+    .push(serde_json::json!("reference/bad.md"));
+
+fs::write(
+    profile_dir.join("bad-local.json"),
+    serde_json::to_string_pretty(&value).unwrap(),
+)
+.unwrap();
+
+let err = run_init(
+    dir.path(),
+    "bad-local",
+    "none",
+    "none",
+    true,
+    false,
+    None,
+    false,
+)
+.unwrap_err();
+
+let msg = format!("{err:#}");
+assert!(msg.contains("reference/bad.md"), "{msg}");
+```
+
+}
+EOF_RUST
+
+cat > crates/jankurai/tests/fixtures/init/minimal-generated/README.md <<'EOF_MD'
+
+# Minimal Fixture
+
+This fixture represents an otherwise empty repo that should receive every profile path as a create action.
+EOF_MD
+
+cat > crates/jankurai/tests/fixtures/init/existing-partial/AGENTS.md <<'EOF_MD'
+
+# Existing Agent File
+
+This is a user-owned agent file that predates jankurai.
+EOF_MD
+
+cat > crates/jankurai/tests/fixtures/init/existing-partial/contracts/README.md <<'EOF_MD'
+
+# Existing Contracts
+
+legacy contract source
+EOF_MD
+
+cat > docs/install.md <<'EOF_MD'
+
+# Installing and Bootstrapping jankurai
+
+## Init profiles
+
+Bundled init profiles are JSON manifests validated against `schemas/init-profile.schema.json`.
+
+Supported profiles:
+
+| Profile            | Use when                                              | Includes                                                           |
+| ------------------ | ----------------------------------------------------- | ------------------------------------------------------------------ |
+| `rust-api`         | Rust API with contracts and DB policy, no web surface | Rust workspace skeleton, contracts, DB docs, security lane         |
+| `react-web`        | Web-only React/Vite surface                           | web placeholder, UX policy, contracts, no DB ownership             |
+| `rust-ts-postgres` | Default fullstack COLD scaffold                       | Rust API, web slot, Postgres policy, contracts, UX, security       |
+| `b2b-saas`         | SaaS product foundation                               | default fullstack plus auth/org/admin/observability docs           |
+| `ai-product`       | Bounded AI product                                    | Python AI containment, prompts, evals, AI/product docs             |
+| `regulated-saas`   | Evidence-heavy SaaS                                   | fullstack plus security, privacy, compliance, backup/restore shell |
+| `migration-target` | Legacy modernization target                           | migration boundary map, slices, contracts, proof lanes             |
+
+Aliases:
+
+* `default`, `fullstack`, `rust-ts-vite-react-postgres`, and `rust-ts-vite-react-postgres-bounded-python` resolve to `rust-ts-postgres`.
+* `react`, `web`, and `vite-react` resolve to `react-web`.
+* `ai` resolves to `ai-product`.
+* `regulated` resolves to `regulated-saas`.
+* `migration` resolves to `migration-target`.
+
+## Dry-run first
+
+```bash
+jankurai init --profile rust-ts-postgres --ide all --mode advisory --dry-run --plan-json target/jankurai/init-plan.json
+```
+
+Review the plan. The planned actions are exactly the selected manifest paths after `--ide` and `--ci` filtering.
+
+## Apply
+
+```bash
+jankurai init --profile rust-ts-postgres --ide all --mode advisory --yes
+jankurai audit . --json agent/repo-score.json --md agent/repo-score.md
+jankurai doctor . --fail-on high
+```
+
+## Composite profiles
+
+Profiles can be composed with commas:
+
+```bash
+jankurai init --profile rust-api,react-web --dry-run
+```
+
+The generator unions paths, proof lanes, docs, controls, and validation commands. Required lanes win over optional lanes.
+
+## Local profile JSON
+
+A repo can carry a local profile:
+
+```bash
+mkdir -p .jankurai/profiles
+cp path/to/profile.json .jankurai/profiles/my-profile.json
+jankurai init --profile my-profile --dry-run
+```
+
+A direct path also works:
+
+```bash
+jankurai init --profile .jankurai/profiles/my-profile.json --dry-run
+```
+
+Local profiles are validated with the same schema and safety checks as bundled profiles. Unsafe paths such as `reference/`, `target/`, `.git/`, absolute paths, backslashes, or `..` segments are rejected.
+
+## IDE adapters
+
+Use `--ide` to control generated adapter files:
+
+```bash
+jankurai init --profile rust-ts-postgres --ide claude --dry-run
+jankurai init --profile rust-ts-postgres --ide cursor,copilot --dry-run
+jankurai init --profile rust-ts-postgres --ide none --dry-run
+```
+
+Generated adapters carry a marker. They are refreshed only when both conditions are true:
+
+1. the existing file contains `jankurai generated adapter`
+2. `--force-generated-adapters` is passed
+
+User-owned adapter files without the marker are preserved.
+
+## CI templates
+
+The bundled CI selector supports:
+
+```bash
+--ci github
+--ci none
+```
+
+`--ci none` omits `.github/workflows/jankurai.yml`.
+
+## Merge behavior
+
+`jankurai init` never overwrites existing user files.
+
+For canonical guidance files (`AGENTS.md`, `agent/JANKURAI_STANDARD.md`, `agent/MASTER_PLAN.md`), init appends a merge marker when the file exists but does not already point at jankurai. This makes adoption visible without destroying prior guidance.
+
+For all other paths, existing files are kept unchanged.
+
+## Generated versus source files
+
+Generated evidence belongs under `target/jankurai/` unless a generated zone declares another path.
+
+Source files include:
+
+* `contracts/`
+* `db/migrations/`
+* `docs/`
+* Rust source
+* web source
+* prompt and eval source
+
+Generated outputs must have a source and regeneration command in `agent/generated-zones.toml`.
+EOF_MD
+
+cat > tips/phases/04-init-profiles-golden-repos.md <<'EOF_MD'
+
+# Phase 04: Init Profiles And Golden Repos
+
+Status: implementation-ready; final local validation required
+Owner: tools
+Last reviewed: 2026-05-03
+Parallel MCP candidate: yes after generator contract is locked
+
+## Objective
+
+Turn `jankurai init` from a control-file installer into a profile-driven repo generator.
+
+The exit state is:
+
+* robust generator contract
+* excellent default profile
+* supported profile family
+* deterministic dry-run / diff / plan JSON
+* no-overwrite merge policy
+* generated adapter refresh policy
+* golden fixtures proving generated repos are audit-ready
+
+This phase is where Jankurai becomes a creation layer, not only an audit layer.
+
+## Moonshot fit
+
+Phase 04 supports the moonshot loop:
+
+```text
+intent -> bounded agents -> proof lanes -> evidence -> expired exceptions -> reusable primitives
+```
+
+Profiles encode intent. Adapter filtering bounds agents. Owner/test maps and proof lanes route changes. Init receipts and audit/doctor output become evidence. Exception docs and generated-zone manifests prevent scaffolds from becoming hidden architecture. Reusable profiles become primitive repo cells for later phases.
+
+## Completed implementation target
+
+`jankurai init` should support:
+
+```bash
+jankurai init --profile rust-api
+jankurai init --profile react-web
+jankurai init --profile rust-ts-postgres
+jankurai init --profile b2b-saas
+jankurai init --profile ai-product
+jankurai init --profile regulated-saas
+jankurai init --profile migration-target
+```
+
+It should also support composite selection:
+
+```bash
+jankurai init --profile rust-api,react-web
+```
+
+And local profile JSON:
+
+```bash
+jankurai init --profile .jankurai/profiles/my-profile.json
+jankurai init --profile my-profile
+```
+
+## Generator contract
+
+Profile manifest fields:
+
+* `profileVersion`
+* `id`
+* `displayName`
+* `description`
+* `targetStackId`
+* `generatedPaths`
+* `generatedRefreshPaths`
+* `reservedPaths`
+* `requiredLanes`
+* `optionalLanes`
+* `agentAdapters`
+* `ciTemplates`
+* `docs`
+* `securityControls`
+* `uxControls`
+* `contractSystem`
+* `dbPolicy`
+* `validationCommands`
+
+Contract rules:
+
+* Every profile is validated against `schemas/init-profile.schema.json`.
+* Every generated path must have a registered template.
+* Core control files are mandatory for every profile.
+* Category arrays must be subsets of `generatedPaths`.
+* Paths must be relative and may not target `reference/`, `target/`, `.git/`, absolute paths, backslashes, `.` segments, or `..`.
+* Required lanes and optional lanes may not overlap.
+* `--ide` filters adapter paths.
+* `--ci none` filters CI templates.
+* Composite profiles are deterministic unions.
+
+## Merge and refresh policy
+
+Existing user files are never overwritten.
+
+Canonical guidance files receive a merge marker if they are not already jankurai-controlled:
+
+* `AGENTS.md`
+* `agent/JANKURAI_STANDARD.md`
+* `agent/MASTER_PLAN.md`
+
+Generated adapters are refreshable only when:
+
+* their path is declared in `generatedRefreshPaths`
+* the existing file contains the generated adapter marker
+* `--force-generated-adapters` is passed
+
+Unmarked adapter files are preserved.
+
+## Golden fixtures
+
+Fixtures live under:
+
+```text
+crates/jankurai/tests/fixtures/init/
+```
+
+Required tests:
+
+* unknown profile error lists supported profiles
+* every bundled profile parses and plans
+* generated paths match create actions for empty repos
+* every bundled profile can be applied, audited, and doctored
+* composite profile selection unions path sets
+* IDE selector filters adapter paths
+* `--ci none` filters workflow template
+* existing partial repo preserves user contract files
+* canonical existing agent files receive merge marker
+* init rerun is idempotent
+* generated adapters refresh only with marker and flag
+* local profile can load by ID and path
+* unsafe local generated path is rejected
+
+## Validation
+
+Required after applying this implementation:
+
+```bash
+cargo test -p jankurai
+just fast
+```
+
+Profile smoke:
+
+```bash
+jankurai init --profile rust-ts-postgres --dry-run --plan-json target/jankurai/init-plan.json
+jankurai init --profile rust-api,react-web --dry-run
+jankurai init --profile ai-product --dry-run
+jankurai init --profile migration-target --dry-run
+```
+
+## Completion receipt
+
+Phase completed: pending local validation
+Files changed:
+
+* `crates/jankurai/src/init/adapters.rs`
+* `crates/jankurai/src/init/merge.rs`
+* `crates/jankurai/src/init/profiles.rs`
+* `crates/jankurai/src/init/plan.rs`
+* `crates/jankurai/src/init/templates.rs`
+* `crates/jankurai/src/commands/init.rs`
+* `crates/jankurai/templates/profiles/*.json`
+* `crates/jankurai/templates/agent/*`
+* `schemas/init-profile.schema.json`
+* `schemas/init-receipt.schema.json`
+* `crates/jankurai/tests/init_golden.rs`
+* `crates/jankurai/tests/fixtures/init/**`
+* `docs/install.md`
+* `tips/phases/04-init-profiles-golden-repos.md`
+* `tips/phases/logs/04-init-profiles-golden-repos.log`
+
+Public interfaces changed:
+
+* `--profile` now supports bundled IDs, aliases, comma-separated composites, local profile IDs, and local JSON paths.
+* `--ide` now filters adapter paths.
+* `--ci none` omits CI template paths.
+* `--force-generated-adapters` refreshes only marked generated adapters.
+
+Schemas changed:
+
+* `init-profile.schema.json` adds version, description, generated refresh paths, reserved paths, strict additional property policy.
+* `init-receipt.schema.json` records profile ID and version.
+
+Generated artifacts:
+
+* none by hand; templates define future generated repo outputs.
+
+Validation commands:
+
+```bash
+cargo test -p jankurai
+just fast
+```
+
+Results: pending local run
+Skipped validation: none intended
+Exceptions created: none
+Follow-up phases unblocked: Phase 05 UX proof platform, Phase 06 security evidence, Phase 07 contract/DB generated boundaries, Phase 09 reference product platform, Phase 10 reuse registry
+EOF_MD
+
+cat > tips/phases/logs/04-init-profiles-golden-repos.log <<'EOF_LOG'
+2026-05-02T19:50:23Z | agent | Phase 04 slice: bundled rust-ts-postgres.json + InitProfile schema validation; plan/apply only generatedPaths; unknown profile error; COLD scaffold (contracts/db/docs/tools); init_golden tests; owner/test-map/proof-lanes noop lane | cargo test -p jankurai; just fast | e4caa6623da4f43db3b98e121d623635767d9e43
+2026-05-02T20:38:00Z | agent | Phase 04 slice: added rust-api, react-web, and b2b-saas profiles; implemented conditional db/README.md doctor check; added and passed golden fixture tests for new profiles | cargo test -p jankurai | e4caa6623da4f43db3b98e121d623635767d9e43
+2026-05-02T21:11:06Z | codex | 04 | normalized future entries to canonical phase log format; prior entries preserved | tips/phases/logs/04-init-profiles-golden-repos.log | pending | none | e4caa6623da4f43db3b98e121d623635767d9e43 | prior entries use earlier compact format
+2026-05-03T00:00:00Z | codex | 04 | proposed complete Phase 04 implementation: seven bundled profiles, composite/local profiles, IDE/CI filtering, strict profile contract, adapter refresh markers, merge policy, golden fixtures, docs, receipt schema | crates/jankurai/src/init/*, crates/jankurai/src/commands/init.rs, crates/jankurai/templates/profiles/*.json, crates/jankurai/templates/agent/*, schemas/init-*.schema.json, crates/jankurai/tests/init_golden.rs, crates/jankurai/tests/fixtures/init/**, docs/install.md, tips/phases/04-init-profiles-golden-repos.md | cargo test -p jankurai; just fast pending local run | target/jankurai/init-plan.json expected from smoke | unknown | residual risk: validation not executed in this environment
+EOF_LOG
+
+printf '\nPhase 04 implementation files written.\n'
+printf 'Run validation now:\n\n'
+printf '  cargo test -p jankurai\n'
+printf '  just fast\n\n'
+
+```
+::contentReference[oaicite:3]{index=3}
+```
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/04-init-profiles-golden-repos.md "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/crates/jankurai/src/init/profiles.rs "raw.githubusercontent.com"
+

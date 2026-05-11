@@ -1,0 +1,1993 @@
+## Phase name
+
+**Phase 13: Autonomous Repair And Optimization — hardened real-repo mutation and draft PR creation gate**
+
+This is the right Phase 13 target because the moonshot is not “let agents freely edit repos.” It is **intent → bounded agents → proof lanes → evidence → expired exceptions → reusable primitives**, with explicit ownership, proof, generated-zone protection, durable evidence, expiring exceptions, and bounded authority. 
+
+The current router marks Phase 13 as **complete-with-deferred-work**, specifically because dry-run repair, optimization, and expiry exist while **real repo mutation and PR creation remain deferred**.  The Phase 13 document confirms the same gap: fixture-only patch execution exists, dry-run PR evidence exists, but real projects are not written, branches are not created, commits are not made, and GitHub PRs are not opened.  The current `repair` implementation also enforces that by bailing unless `--dry-run` or `--fixture-apply` is used. 
+
+The solution below finishes that deferred work without violating the standard’s hard blocks around generated files, proof routing, secret/prompt/permission safety, destructive changes, and evidence receipts.  It uses GitHub CLI for the actual draft PR, because `gh pr create` supports noninteractive draft PR creation with `--draft`, `--title`, `--body-file`, `--base`, and `--head`. ([GitHub CLI][1])
+
+The important design choice: **real mutation is not the default.** It requires all of this:
+
+`--apply --yes` plus `JANKURAI_ALLOW_REPAIR_APPLY=1`
+
+Real GitHub PR creation requires all of this:
+
+`--apply --yes --auto-pr --create-pr` plus `JANKURAI_ALLOW_REPAIR_APPLY=1` and `JANKURAI_ALLOW_GITHUB_PR=1`
+
+No auto-merge is introduced.
+
+---
+
+## Complete copy-paste patch
+
+Run this from the repository root.
+
+```bash
+cat > /tmp/jankurai-phase13-harden.patch <<'PATCH'
+diff --git a/crates/jankurai/src/commands.rs b/crates/jankurai/src/commands.rs
+index 72b0393..b6b1c45 100644
+--- a/crates/jankurai/src/commands.rs
++++ b/crates/jankurai/src/commands.rs
+@@ -15,6 +15,7 @@ pub mod registry;
+ pub mod release_data;
+ pub mod repair;
+ pub mod repair_apply;
++pub mod repair_git;
+ pub mod repair_plan;
+ pub mod repair_pr;
+ pub mod security;
+diff --git a/crates/jankurai/src/main.rs b/crates/jankurai/src/main.rs
+index bcec5ec..5e377f2 100644
+--- a/crates/jankurai/src/main.rs
++++ b/crates/jankurai/src/main.rs
+@@ -277,12 +277,25 @@ struct RepairArgs {
+     dry_run: bool,
+     #[arg(long)]
+     fixture_apply: bool,
++    /// Apply a bounded repair to a real git repository. Requires --yes and
++    /// JANKURAI_ALLOW_REPAIR_APPLY=1.
++    #[arg(long)]
++    apply: bool,
++    /// Confirm real repair mutation. Does not bypass risk, path, proof, or PR gates.
++    #[arg(long)]
++    yes: bool,
+     #[arg(long)]
+     auto_pr: bool,
++    /// Create a real GitHub draft PR using gh. Requires --apply, --auto-pr,
++    /// --yes, JANKURAI_ALLOW_REPAIR_APPLY=1, and JANKURAI_ALLOW_GITHUB_PR=1.
++    #[arg(long)]
++    create_pr: bool,
+     #[arg(long, value_name = "PATH")]
+     pr_draft_out: Option<String>,
+     #[arg(long, value_name = "PATH")]
+     pr_draft_md: Option<String>,
++    #[arg(long, value_name = "BRANCH")]
++    base: Option<String>,
++    #[arg(long, value_name = "REMOTE", default_value = "origin")]
++    remote: String,
+     #[arg(long, default_value = "low")]
+     max_risk: String,
+     #[arg(long, value_name = "PATH")]
+@@ -580,9 +593,14 @@ fn main() -> anyhow::Result<()> {
+                 plan: args.plan,
+                 dry_run: args.dry_run,
+                 fixture_apply: args.fixture_apply,
++                apply: args.apply,
++                yes: args.yes,
+                 auto_pr: args.auto_pr,
++                create_pr: args.create_pr,
+                 pr_draft_out: args.pr_draft_out,
+                 pr_draft_md: args.pr_draft_md,
++                base: args.base,
++                remote: args.remote,
+                 max_risk: args.max_risk,
+                 out: args.out,
+                 md: args.md,
+diff --git a/crates/jankurai/src/commands/repair.rs b/crates/jankurai/src/commands/repair.rs
+index 7e52e44..42a8945 100644
+--- a/crates/jankurai/src/commands/repair.rs
++++ b/crates/jankurai/src/commands/repair.rs
+@@ -1,5 +1,6 @@
+ use crate::audit::rules::{self, RepairEligibility, RepairRisk};
+ use crate::commands::repair_plan::RepairPlan;
++use crate::commands::repair_git::{GitMutationReceipt, GithubPrReceipt};
+ use crate::validation::{self, ArtifactSchema};
+ use anyhow::{bail, Context, Result};
+ use serde::Serialize;
+@@ -14,9 +15,14 @@ pub struct RepairArgs {
+     pub plan: String,
+     pub dry_run: bool,
+     pub fixture_apply: bool,
++    pub apply: bool,
++    pub yes: bool,
+     pub auto_pr: bool,
++    pub create_pr: bool,
+     pub pr_draft_out: Option<String>,
+     pub pr_draft_md: Option<String>,
++    pub base: Option<String>,
++    pub remote: String,
+     pub max_risk: String,
+     pub out: Option<String>,
+     pub md: Option<String>,
+@@ -46,6 +52,10 @@ pub struct RepairRun {
+     pub proof_evidence_index: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub auto_pr_draft: Option<AutoPrDraftSummary>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub git_mutation: Option<GitMutationReceipt>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub github_pr: Option<GithubPrReceipt>,
+     pub proof_lanes: Vec<String>,
+     pub notes: Vec<String>,
+ }
+@@ -61,6 +71,10 @@ pub struct AutoPrDraftSummary {
+     pub artifact_links: Vec<String>,
+     pub git_mutation_allowed: bool,
+     pub github_mutation_allowed: bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub git_head_sha: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub pr_url: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Default)]
+@@ -99,29 +113,53 @@ pub fn run(args: RepairArgs) -> Result<()> {
+     if args.dry_run && args.fixture_apply {
+         bail!("`--dry-run` cannot be combined with `--fixture-apply`");
+     }
++    let selected_modes = [args.dry_run, args.fixture_apply, args.apply]
++        .iter()
++        .filter(|enabled| **enabled)
++        .count();
++    if selected_modes > 1 {
++        bail!("choose exactly one repair execution mode: `--dry-run`, `--fixture-apply`, or `--apply`");
++    }
+     if args.auto_pr && args.fixture_apply {
+         bail!("`--auto-pr` cannot be combined with `--fixture-apply`");
+     }
++    if args.create_pr && !args.auto_pr {
++        bail!("`--create-pr` requires `--auto-pr`");
++    }
++    if args.create_pr && !args.apply {
++        bail!("`--create-pr` requires real repo apply mode (`--apply --yes`)");
++    }
+     if !args.auto_pr && (args.pr_draft_out.is_some() || args.pr_draft_md.is_some()) {
+         bail!("`--pr-draft-out` and `--pr-draft-md` require `--auto-pr`");
+     }
+-    if !args.dry_run && !args.fixture_apply {
++    if !args.dry_run && !args.fixture_apply && !args.apply {
+         bail!(
+-            "repair execution is dry-run only unless `--fixture-apply` is used with a fixture repo"
++            "repair execution is dry-run only unless `--fixture-apply` or `--apply --yes` is used"
+         );
+     }
++    if args.apply && !args.yes {
++        bail!("real repair apply requires `--apply --yes`; this flag is intentionally separate from dry-run planning");
++    }
++    if args.apply && !env_flag("JANKURAI_ALLOW_REPAIR_APPLY") {
++        bail!("real repair apply requires environment gate `JANKURAI_ALLOW_REPAIR_APPLY=1`");
++    }
++    if args.create_pr && !env_flag("JANKURAI_ALLOW_GITHUB_PR") {
++        bail!("real GitHub PR creation requires environment gate `JANKURAI_ALLOW_GITHUB_PR=1`");
++    }
+     if args.fixture_apply {
+         return crate::commands::repair_apply::run_fixture_apply(args, plan, max_risk);
+     }
++    if args.apply {
++        return crate::commands::repair_apply::run_repo_apply(args, plan, max_risk);
++    }
+ 
+     let mut risk_summary = RiskSummary::default();
+@@ -216,6 +254,8 @@ pub fn run(args: RepairArgs) -> Result<()> {
+         proof_evidence_index: None,
+         auto_pr_draft,
++        git_mutation: None,
++        github_pr: None,
+         proof_lanes,
+         notes: vec![
+             "repair execution is intentionally dry-run only in this workspace".to_string(),
+@@ -268,6 +308,20 @@ fn render_markdown(run: &RepairRun) -> String {
+         let _ = writeln!(out, "- auto-pr draft branch: `{}`", draft.branch_name);
+         let _ = writeln!(out, "- auto-pr draft title: `{}`", draft.pr_title);
+     }
++    if let Some(git) = &run.git_mutation {
++        let _ = writeln!(out, "- git mutation status: `{}`", git.status);
++        let _ = writeln!(out, "- git base branch: `{}`", git.base_branch);
++        let _ = writeln!(out, "- git head branch: `{}`", git.head_branch);
++        if let Some(commit_sha) = &git.commit_sha {
++            let _ = writeln!(out, "- git commit sha: `{}`", commit_sha);
++        }
++        let _ = writeln!(out, "- rollback command: `{}`", git.rollback_command);
++    }
++    if let Some(pr) = &run.github_pr {
++        let _ = writeln!(out, "- github pr status: `{}`", pr.status);
++        if let Some(url) = &pr.url {
++            let _ = writeln!(out, "- github pr url: `{}`", url);
++        }
++    }
+     let _ = writeln!(out, "- proof lanes: `{}`", run.proof_lanes.join(", "));
+     let _ = writeln!(out, "- notes: `{}`", run.notes.join(", "));
+     out
+@@ -335,3 +389,12 @@ pub(crate) fn now_string() -> String {
+         .as_secs()
+         .to_string()
+ }
++
++fn env_flag(name: &str) -> bool {
++    std::env::var(name)
++        .map(|value| {
++            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
++        })
++        .unwrap_or(false)
++}
+diff --git a/crates/jankurai/src/commands/repair_pr.rs b/crates/jankurai/src/commands/repair_pr.rs
+index 8123443..4457dd9 100644
+--- a/crates/jankurai/src/commands/repair_pr.rs
++++ b/crates/jankurai/src/commands/repair_pr.rs
+@@ -22,6 +22,18 @@ pub struct RepairPrDraft {
+     pub branch_name: String,
+     pub commit_title: String,
+     pub pr_title: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub git_base_branch: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub git_head_branch: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub git_base_sha: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub git_head_sha: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub commit_sha: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub pr_url: Option<String>,
+     pub pr_body: String,
+     pub planned_changed_paths: Vec<String>,
+     pub eligible_packets: Vec<DraftPacket>,
+@@ -183,6 +195,12 @@ pub fn build_auto_pr_draft(
+         branch_name: branch_name.clone(),
+         commit_title: commit_title.clone(),
+         pr_title: pr_title.clone(),
++        git_base_branch: None,
++        git_head_branch: None,
++        git_base_sha: None,
++        git_head_sha: None,
++        commit_sha: None,
++        pr_url: None,
+         pr_body: String::new(),
+         planned_changed_paths: planned_changed_paths.clone(),
+         eligible_packets,
+@@ -199,18 +217,7 @@ pub fn build_auto_pr_draft(
+         pr_body: pr_body.clone(),
+         ..draft
+     };
+-    let summary = AutoPrDraftSummary {
+-        status: draft.status.clone(),
+-        branch_name: draft.branch_name.clone(),
+-        commit_title: draft.commit_title.clone(),
+-        pr_title: draft.pr_title.clone(),
+-        planned_changed_paths: draft.planned_changed_paths.clone(),
+-        proof_lanes: draft.proof_lanes.clone(),
+-        artifact_links: draft.artifact_links.clone(),
+-        git_mutation_allowed: draft.git_mutation_allowed,
+-        github_mutation_allowed: draft.github_mutation_allowed,
+-    };
++    let summary = summary_from_draft(&draft);
+     Ok(AutoPrDraftResult {
+         draft,
+         summary,
+@@ -218,6 +225,21 @@ pub fn build_auto_pr_draft(
+     })
+ }
+ 
++pub fn summary_from_draft(draft: &RepairPrDraft) -> AutoPrDraftSummary {
++    AutoPrDraftSummary {
++        status: draft.status.clone(),
++        branch_name: draft.branch_name.clone(),
++        commit_title: draft.commit_title.clone(),
++        pr_title: draft.pr_title.clone(),
++        planned_changed_paths: draft.planned_changed_paths.clone(),
++        proof_lanes: draft.proof_lanes.clone(),
++        artifact_links: draft.artifact_links.clone(),
++        git_mutation_allowed: draft.git_mutation_allowed,
++        github_mutation_allowed: draft.github_mutation_allowed,
++        git_head_sha: draft.git_head_sha.clone(),
++        pr_url: draft.pr_url.clone(),
++    }
++}
++
+ fn planned_edit_map<'a>(plan: &'a RepairPlan) -> HashMap<String, &'a PlannedEdit> {
+     let mut map = HashMap::new();
+@@ -384,7 +406,7 @@ fn sha256_hex(text: &str) -> String {
+     format!("{:x}", digest)
+ }
+ 
+-fn render_markdown(draft: &RepairPrDraft) -> String {
++pub fn render_markdown(draft: &RepairPrDraft) -> String {
+     use std::fmt::Write;
+     let mut out = String::new();
+@@ -403,6 +425,24 @@ fn render_markdown(draft: &RepairPrDraft) -> String {
+     let _ = writeln!(out, "- branch name: `{}`", draft.branch_name);
+     let _ = writeln!(out, "- commit title: `{}`", draft.commit_title);
+     let _ = writeln!(out, "- pr title: `{}`", draft.pr_title);
++    if let Some(base_branch) = &draft.git_base_branch {
++        let _ = writeln!(out, "- git base branch: `{}`", base_branch);
++    }
++    if let Some(head_branch) = &draft.git_head_branch {
++        let _ = writeln!(out, "- git head branch: `{}`", head_branch);
++    }
++    if let Some(base_sha) = &draft.git_base_sha {
++        let _ = writeln!(out, "- git base sha: `{}`", base_sha);
++    }
++    if let Some(head_sha) = &draft.git_head_sha {
++        let _ = writeln!(out, "- git head sha: `{}`", head_sha);
++    }
++    if let Some(commit_sha) = &draft.commit_sha {
++        let _ = writeln!(out, "- commit sha: `{}`", commit_sha);
++    }
++    if let Some(pr_url) = &draft.pr_url {
++        let _ = writeln!(out, "- pr url: `{}`", pr_url);
++    }
+     let _ = writeln!(
+         out,
+         "- planned changed paths: `{}`",
+diff --git a/crates/jankurai/src/commands/repair_git.rs b/crates/jankurai/src/commands/repair_git.rs
+new file mode 100644
+index 0000000..8339f44
+--- /dev/null
++++ b/crates/jankurai/src/commands/repair_git.rs
+@@ -0,0 +1,284 @@
++use anyhow::{bail, Context, Result};
++use serde::Serialize;
++use std::ffi::OsStr;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::process::{Command, ExitStatus};
++
++#[derive(Debug, Clone)]
++pub struct GitBranchState {
++    pub base_branch: String,
++    pub head_branch: String,
++    pub base_sha: String,
++    pub remote: String,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub struct GitMutationReceipt {
++    pub status: String,
++    pub base_branch: String,
++    pub head_branch: String,
++    pub base_sha: String,
++    pub head_sha: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub commit_sha: Option<String>,
++    pub commit_title: String,
++    pub files_committed: Vec<String>,
++    pub rollback_command: String,
++    pub remote: String,
++    pub pushed: bool,
++}
++
++#[derive(Debug, Clone, Serialize)]
++pub struct GithubPrReceipt {
++    pub status: String,
++    pub draft: bool,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub url: Option<String>,
++    pub remote: String,
++    pub base_branch: String,
++    pub head_branch: String,
++    pub command: Vec<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub error: Option<String>,
++}
++
++pub fn preflight_git_repo(
++    repo: &Path,
++    remote: &str,
++    requested_base: Option<&str>,
++) -> Result<GitBranchState> {
++    let toplevel = git_output(repo, ["rev-parse", "--show-toplevel"])
++        .context("real repair apply requires a git repository")?;
++    let toplevel = toplevel.trim();
++    let canonical_repo =
++        fs::canonicalize(repo).with_context(|| format!("canonicalize {}", repo.display()))?;
++    let canonical_top = fs::canonicalize(toplevel)
++        .with_context(|| format!("canonicalize git root {}", toplevel))?;
++    if !canonical_repo.starts_with(&canonical_top) {
++        bail!(
++            "repair repo {} is not inside git root {}",
++            canonical_repo.display(),
++            canonical_top.display()
++        );
++    }
++
++    let current_branch = git_output(repo, ["symbolic-ref", "--short", "HEAD"])
++        .context("real repair apply requires a named branch, not detached HEAD")?;
++    let current_branch = current_branch.trim().to_string();
++    if current_branch.is_empty() {
++        bail!("real repair apply requires a non-empty current branch");
++    }
++    if let Some(base) = requested_base {
++        if base != current_branch {
++            bail!(
++                "`--base {}` must match the current branch `{}` before repair apply",
++                base,
++                current_branch
++            );
++        }
++    }
++
++    let status = git_output(repo, ["status", "--porcelain=v1", "--untracked-files=no"])
++        .context("read git worktree status")?;
++    if !status.trim().is_empty() {
++        bail!(
++            "real repair apply requires a clean tracked git worktree before mutation; tracked changes:\n{}",
++            status
++        );
++    }
++
++    let base_sha = git_output(repo, ["rev-parse", "HEAD"])
++        .context("read git HEAD")?
++        .trim()
++        .to_string();
++    if remote.trim().is_empty() {
++        bail!("remote name must not be empty");
++    }
++
++    Ok(GitBranchState {
++        base_branch: current_branch,
++        head_branch: String::new(),
++        base_sha,
++        remote: remote.to_string(),
++    })
++}
++
++pub fn is_path_tracked(repo: &Path, path: &str) -> Result<bool> {
++    let status = git_status(repo, ["ls-files", "--error-unmatch", "--", path])
++        .with_context(|| format!("check git tracking for `{path}`"))?;
++    Ok(status.success())
++}
++
++pub fn create_repair_branch(
++    repo: &Path,
++    state: &GitBranchState,
++    branch: &str,
++) -> Result<GitBranchState> {
++    validate_branch_name(repo, branch)?;
++    let ref_name = format!("refs/heads/{branch}");
++    if git_status(repo, ["show-ref", "--verify", "--quiet", &ref_name])?.success() {
++        bail!("repair branch `{branch}` already exists");
++    }
++    git_output(repo, ["switch", "-c", branch])
++        .with_context(|| format!("create repair branch `{branch}`"))?;
++    let mut next = state.clone();
++    next.head_branch = branch.to_string();
++    Ok(next)
++}
++
++pub fn commit_repair(
++    repo: &Path,
++    state: &GitBranchState,
++    files: &[String],
++    title: &str,
++    body: &str,
++) -> Result<GitMutationReceipt> {
++    if files.is_empty() {
++        bail!("cannot commit repair with no files");
++    }
++
++    let mut add = Command::new("git");
++    add.arg("-C").arg(repo).arg("add").arg("--").args(files);
++    command_output(&mut add, "git add repair files")?;
++
++    if git_status(repo, ["diff", "--cached", "--quiet"])?.success() {
++        bail!("repair apply produced no staged changes");
++    }
++
++    let mut commit = Command::new("git");
++    commit
++        .arg("-C")
++        .arg(repo)
++        .arg("commit")
++        .arg("-m")
++        .arg(title)
++        .arg("-m")
++        .arg(body);
++    command_output(&mut commit, "git commit repair")?;
++
++    let head_sha = git_output(repo, ["rev-parse", "HEAD"])?
++        .trim()
++        .to_string();
++    Ok(GitMutationReceipt {
++        status: "committed".to_string(),
++        base_branch: state.base_branch.clone(),
++        head_branch: state.head_branch.clone(),
++        base_sha: state.base_sha.clone(),
++        head_sha: head_sha.clone(),
++        commit_sha: Some(head_sha),
++        commit_title: title.to_string(),
++        files_committed: files.to_vec(),
++        rollback_command: rollback_command(repo, state),
++        remote: state.remote.clone(),
++        pushed: false,
++    })
++}
++
++pub fn rollback_repair_branch(repo: &Path, state: &GitBranchState) -> Result<GitMutationReceipt> {
++    let mut errors = Vec::new();
++    if let Err(error) = git_output(repo, ["reset", "--hard", &state.base_sha]) {
++        errors.push(format!("reset failed: {error}"));
++    }
++    if let Err(error) = git_output(repo, ["switch", &state.base_branch]) {
++        errors.push(format!("switch failed: {error}"));
++    }
++    if !state.head_branch.is_empty() {
++        if let Err(error) = git_output(repo, ["branch", "-D", &state.head_branch]) {
++            errors.push(format!("delete branch failed: {error}"));
++        }
++    }
++    if !errors.is_empty() {
++        bail!("repair rollback failed: {}", errors.join("; "));
++    }
++    Ok(GitMutationReceipt {
++        status: "rolled-back".to_string(),
++        base_branch: state.base_branch.clone(),
++        head_branch: state.head_branch.clone(),
++        base_sha: state.base_sha.clone(),
++        head_sha: state.base_sha.clone(),
++        commit_sha: None,
++        commit_title: "rolled back repair before commit".to_string(),
++        files_committed: Vec::new(),
++        rollback_command: rollback_command(repo, state),
++        remote: state.remote.clone(),
++        pushed: false,
++    })
++}
++
++pub fn push_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
++    git_output(repo, ["push", "-u", remote, branch])
++        .with_context(|| format!("push repair branch `{branch}` to `{remote}`"))?;
++    Ok(())
++}
++
++pub fn create_github_draft_pr(
++    repo: &Path,
++    remote: &str,
++    base_branch: &str,
++    head_branch: &str,
++    title: &str,
++    body_file: &Path,
++) -> GithubPrReceipt {
++    let command = vec![
++        "gh".to_string(),
++        "pr".to_string(),
++        "create".to_string(),
++        "--draft".to_string(),
++        "--base".to_string(),
++        base_branch.to_string(),
++        "--head".to_string(),
++        head_branch.to_string(),
++        "--title".to_string(),
++        title.to_string(),
++        "--body-file".to_string(),
++        body_file.display().to_string(),
++    ];
++
++    let mut process = Command::new("gh");
++    process
++        .current_dir(repo)
++        .arg("pr")
++        .arg("create")
++        .arg("--draft")
++        .arg("--base")
++        .arg(base_branch)
++        .arg("--head")
++        .arg(head_branch)
++        .arg("--title")
++        .arg(title)
++        .arg("--body-file")
++        .arg(body_file);
++
++    match process.output() {
++        Ok(output) if output.status.success() => {
++            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
++            let url = stdout
++                .lines()
++                .rev()
++                .find(|line| line.trim_start().starts_with("http"))
++                .map(|line| line.trim().to_string())
++                .or_else(|| (!stdout.is_empty()).then_some(stdout));
++            GithubPrReceipt {
++                status: "created".to_string(),
++                draft: true,
++                url,
++                remote: remote.to_string(),
++                base_branch: base_branch.to_string(),
++                head_branch: head_branch.to_string(),
++                command,
++                error: None,
++            }
++        }
++        Ok(output) => GithubPrReceipt {
++            status: "failed".to_string(),
++            draft: true,
++            url: None,
++            remote: remote.to_string(),
++            base_branch: base_branch.to_string(),
++            head_branch: head_branch.to_string(),
++            command,
++            error: Some(String::from_utf8_lossy(&output.stderr).trim().to_string()),
++        },
++        Err(error) => GithubPrReceipt {
++            status: "failed".to_string(),
++            draft: true,
++            url: None,
++            remote: remote.to_string(),
++            base_branch: base_branch.to_string(),
++            head_branch: head_branch.to_string(),
++            command,
++            error: Some(error.to_string()),
++        },
++    }
++}
++
++pub fn write_pr_body(repo: &Path, body: &str) -> Result<PathBuf> {
++    let path = repo.join("target/jankurai/repair-pr-body.md");
++    if let Some(parent) = path.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    fs::write(&path, body)?;
++    Ok(path)
++}
++
++fn validate_branch_name(repo: &Path, branch: &str) -> Result<()> {
++    if !branch.starts_with("jankurai/repair/") {
++        bail!("repair branch `{branch}` must start with `jankurai/repair/`");
++    }
++    if branch.contains(char::is_whitespace)
++        || branch.contains("..")
++        || branch.contains("@{")
++        || branch.ends_with('/')
++        || branch.starts_with('-')
++    {
++        bail!("repair branch `{branch}` is not safe");
++    }
++    if !git_status(repo, ["check-ref-format", "--branch", branch])?.success() {
++        bail!("repair branch `{branch}` is not a valid git branch name");
++    }
++    Ok(())
++}
++
++fn rollback_command(repo: &Path, state: &GitBranchState) -> String {
++    format!(
++        "git -C {} reset --hard {} && git -C {} switch {} && git -C {} branch -D {}",
++        repo.display(),
++        state.base_sha,
++        repo.display(),
++        state.base_branch,
++        repo.display(),
++        state.head_branch
++    )
++}
++
++fn git_output<I, S>(repo: &Path, args: I) -> Result<String>
++where
++    I: IntoIterator<Item = S>,
++    S: AsRef<OsStr>,
++{
++    let args_vec = args
++        .into_iter()
++        .map(|arg| arg.as_ref().to_string_lossy().to_string())
++        .collect::<Vec<_>>();
++    let mut command = Command::new("git");
++    command.arg("-C").arg(repo).args(&args_vec);
++    command_output(&mut command, &format!("git {}", args_vec.join(" ")))
++}
++
++fn git_status<I, S>(repo: &Path, args: I) -> Result<ExitStatus>
++where
++    I: IntoIterator<Item = S>,
++    S: AsRef<OsStr>,
++{
++    let args_vec = args
++        .into_iter()
++        .map(|arg| arg.as_ref().to_string_lossy().to_string())
++        .collect::<Vec<_>>();
++    Command::new("git")
++        .arg("-C")
++        .arg(repo)
++        .args(&args_vec)
++        .status()
++        .with_context(|| format!("git {}", args_vec.join(" ")))
++}
++
++fn command_output(command: &mut Command, label: &str) -> Result<String> {
++    let output = command.output().with_context(|| label.to_string())?;
++    if !output.status.success() {
++        bail!(
++            "{} failed with status {}: {}",
++            label,
++            output.status,
++            String::from_utf8_lossy(&output.stderr).trim()
++        );
++    }
++    Ok(String::from_utf8_lossy(&output.stdout).to_string())
++}
+diff --git a/crates/jankurai/src/commands/repair_apply.rs b/crates/jankurai/src/commands/repair_apply.rs
+index 4a657b2..a46be9d 100644
+--- a/crates/jankurai/src/commands/repair_apply.rs
++++ b/crates/jankurai/src/commands/repair_apply.rs
+@@ -1,4 +1,6 @@
+ use super::proof;
++use super::repair_git;
++use super::repair_pr;
+ use super::repair::{
+     increment_risk_summary, now_string, packet_eligibility, packet_risk, proof_lanes, push_unique,
+     AppliedEdit, BlockedPacket, RepairArgs, RepairRun, RiskSummary, SkippedEdit,
+@@ -6,7 +8,7 @@ use super::repair::{
+ use crate::audit::rules::{RepairEligibility, RepairRisk};
+ use crate::commands::context_data::RepoCatalog;
+ use crate::commands::repair_plan::{PlannedEdit, RepairPacket, RepairPlan};
+ use crate::validation::{self, ArtifactSchema};
+-use anyhow::{bail, Context, Result};
++use anyhow::{anyhow, bail, Context, Result};
+ use serde::Deserialize;
+ use sha2::{Digest, Sha256};
+ use std::collections::HashMap;
+@@ -138,6 +140,8 @@ pub fn run_fixture_apply(args: RepairArgs, plan: RepairPlan, max_risk: RepairRis
+         proof_evidence_index,
+         auto_pr_draft: None,
++        git_mutation: None,
++        github_pr: None,
+         proof_lanes: proof_lanes(&plan),
+         notes,
+     };
+@@ -157,6 +161,250 @@ pub fn run_fixture_apply(args: RepairArgs, plan: RepairPlan, max_risk: RepairRis
+     Ok(())
+ }
+ 
++pub fn run_repo_apply(args: RepairArgs, plan: RepairPlan, max_risk: RepairRisk) -> Result<()> {
++    let proof_lanes_for_run = proof_lanes(&plan);
++    let (risk_summary, mut blocked_packets) = risk_summary_and_blocked(&plan, max_risk);
++    let mut draft = repair_pr::build_auto_pr_draft(
++        &args,
++        &plan,
++        max_risk,
++        args.out.as_deref(),
++        args.md.as_deref(),
++        args.pr_draft_out.as_deref(),
++        args.pr_draft_md.as_deref(),
++    )?
++    .draft;
++    draft.execution_mode = "repo-apply".to_string();
++    draft.git_mutation_allowed = true;
++    draft.github_mutation_allowed = args.create_pr;
++    draft.safety_notes = repo_apply_safety_notes(args.create_pr);
++    draft.pr_body = repair_pr::render_markdown(&draft);
++
++    if draft.status != "draft-only" {
++        blocked_packets.extend(blocked_from_draft(&draft.blocked_packets));
++        let run = RepairRun {
++            schema_version: "1.0.0".to_string(),
++            repo: args.repo.display().to_string(),
++            plan: args.plan.clone(),
++            generated_at: now_string(),
++            status: "blocked".to_string(),
++            execution_mode: "repo-apply".to_string(),
++            dry_run: false,
++            auto_pr_requested: args.auto_pr,
++            auto_pr_status: if args.auto_pr { "blocked" } else { "not-requested" }.to_string(),
++            max_risk: max_risk.as_str().to_string(),
++            planned_packets: plan.packets.len(),
++            risk_summary,
++            blocked_packets,
++            applied_edits: Vec::new(),
++            skipped_edits: skipped_from_draft(&draft.blocked_packets),
++            files_written: Vec::new(),
++            proof_evidence_index: None,
++            auto_pr_draft: args.auto_pr.then(|| repair_pr::summary_from_draft(&draft)),
++            git_mutation: None,
++            github_pr: None,
++            proof_lanes: proof_lanes_for_run,
++            notes: vec![
++                "real repo apply refused before mutation because at least one packet was blocked"
++                    .to_string(),
++                "no branch, commit, push, or PR was created".to_string(),
++            ],
++        };
++        write_draft_if_requested(&args, &draft)?;
++        write_run(&args, &run)?;
++        return Ok(());
++    }
++
++    let base_state =
++        repair_git::preflight_git_repo(&args.repo, &args.remote, args.base.as_deref())?;
++    let tracking_skips = repo_tracking_skips(&args.repo, &plan)?;
++    if !tracking_skips.is_empty() {
++        let run = RepairRun {
++            schema_version: "1.0.0".to_string(),
++            repo: args.repo.display().to_string(),
++            plan: args.plan.clone(),
++            generated_at: now_string(),
++            status: "blocked".to_string(),
++            execution_mode: "repo-apply".to_string(),
++            dry_run: false,
++            auto_pr_requested: args.auto_pr,
++            auto_pr_status: if args.auto_pr { "blocked" } else { "not-requested" }.to_string(),
++            max_risk: max_risk.as_str().to_string(),
++            planned_packets: plan.packets.len(),
++            risk_summary,
++            blocked_packets,
++            applied_edits: Vec::new(),
++            skipped_edits: tracking_skips,
++            files_written: Vec::new(),
++            proof_evidence_index: None,
++            auto_pr_draft: args.auto_pr.then(|| repair_pr::summary_from_draft(&draft)),
++            git_mutation: None,
++            github_pr: None,
++            proof_lanes: proof_lanes_for_run,
++            notes: vec![
++                "real repo apply refused before mutation because a non-create target was not tracked by git"
++                    .to_string(),
++                "no branch, commit, push, or PR was created".to_string(),
++            ],
++        };
++        write_draft_if_requested(&args, &draft)?;
++        write_run(&args, &run)?;
++        return Ok(());
++    }
++
++    let branch_state =
++        repair_git::create_repair_branch(&args.repo, &base_state, &draft.branch_name)?;
++    draft.git_base_branch = Some(branch_state.base_branch.clone());
++    draft.git_head_branch = Some(branch_state.head_branch.clone());
++    draft.git_base_sha = Some(branch_state.base_sha.clone());
++
++    let catalog = RepoCatalog::load(&args.repo)?;
++    let packets = packet_map(&plan);
++    let mut applied_edits = Vec::new();
++    let mut skipped_edits = Vec::new();
++    let mut files_written = Vec::new();
++    let mut terminal_error: Option<anyhow::Error> = None;
++
++    for edit in &plan.planned_edits {
++        match apply_planned_edit(&args.repo, &catalog, &packets, edit, max_risk) {
++            Ok(EditOutcome::Applied(applied)) => {
++                push_unique(&mut files_written, applied.path.clone());
++                applied_edits.push(applied);
++            }
++            Ok(EditOutcome::Skipped(skipped)) => skipped_edits.push(skipped),
++            Err(error) => {
++                terminal_error = Some(error);
++                break;
++            }
++        }
++    }
++
++    let mut rollback_reason = None;
++    if terminal_error.is_none() && !skipped_edits.is_empty() {
++        rollback_reason = Some("repo apply produced skipped edits".to_string());
++    }
++    if terminal_error.is_none() && rollback_reason.is_none() && files_written.is_empty() {
++        rollback_reason = Some("repo apply wrote no files".to_string());
++    }
++
++    let proof_evidence_index =
++        if terminal_error.is_none() && rollback_reason.is_none() && !files_written.is_empty() {
++            let receipt_dir = args.repo.join("target/jankurai/p13-repo-proof-receipts");
++            let evidence_index_path = args
++                .repo
++                .join("target/jankurai/p13-repo-evidence-index.json");
++            let proof_args = proof::ProveArgs {
++                repo: args.repo.clone(),
++                plan: None,
++                changed: files_written.iter().map(PathBuf::from).collect(),
++                changed_from: None,
++                plan_out: args
++                    .repo
++                    .join("target/jankurai/p13-repo-proof-plan.json")
++                    .display()
++                    .to_string(),
++                plan_md: args
++                    .repo
++                    .join("target/jankurai/p13-repo-proof-plan.md")
++                    .display()
++                    .to_string(),
++                out_dir: receipt_dir.display().to_string(),
++                evidence_index: evidence_index_path.display().to_string(),
++                continue_on_error: false,
++                allow_unsigned_commands: false,
++            };
++            if let Err(error) = proof::run_prove(proof_args) {
++                terminal_error = Some(error.context("repo proof verification failed"));
++            }
++            Some(relative_repo_path(&args.repo, &evidence_index_path))
++        } else {
++            None
++        };
++
++    if terminal_error.is_some() || rollback_reason.is_some() {
++        let rollback_receipt = repair_git::rollback_repair_branch(&args.repo, &branch_state)?;
++        let status = if terminal_error.is_some() { "failed" } else { "blocked" };
++        draft.status = status.to_string();
++        draft.git_head_sha = Some(rollback_receipt.head_sha.clone());
++        draft.pr_body = repair_pr::render_markdown(&draft);
++        let run = RepairRun {
++            schema_version: "1.0.0".to_string(),
++            repo: args.repo.display().to_string(),
++            plan: args.plan.clone(),
++            generated_at: now_string(),
++            status: status.to_string(),
++            execution_mode: "repo-apply".to_string(),
++            dry_run: false,
++            auto_pr_requested: args.auto_pr,
++            auto_pr_status: if args.auto_pr { status } else { "not-requested" }.to_string(),
++            max_risk: max_risk.as_str().to_string(),
++            planned_packets: plan.packets.len(),
++            risk_summary,
++            blocked_packets,
++            applied_edits,
++            skipped_edits,
++            files_written,
++            proof_evidence_index,
++            auto_pr_draft: args.auto_pr.then(|| repair_pr::summary_from_draft(&draft)),
++            git_mutation: Some(rollback_receipt),
++            github_pr: None,
++            proof_lanes: proof_lanes_for_run,
++            notes: repo_apply_notes(
++                rollback_reason.as_deref(),
++                terminal_error.as_ref().map(|error| error.to_string()),
++                false,
++            ),
++        };
++        write_draft_if_requested(&args, &draft)?;
++        write_run(&args, &run)?;
++        if let Some(error) = terminal_error {
++            return Err(error);
++        }
++        return Ok(());
++    }
++
++    let commit_body = repo_apply_commit_body(&draft, proof_evidence_index.as_deref());
++    let mut git_receipt = match repair_git::commit_repair(
++        &args.repo,
++        &branch_state,
++        &files_written,
++        &draft.commit_title,
++        &commit_body,
++    ) {
++        Ok(receipt) => receipt,
++        Err(error) => {
++            let rollback_receipt = repair_git::rollback_repair_branch(&args.repo, &branch_state)?;
++            draft.status = "failed".to_string();
++            draft.git_head_sha = Some(rollback_receipt.head_sha.clone());
++            draft.pr_body = repair_pr::render_markdown(&draft);
++            let run = RepairRun {
++                schema_version: "1.0.0".to_string(),
++                repo: args.repo.display().to_string(),
++                plan: args.plan.clone(),
++                generated_at: now_string(),
++                status: "failed".to_string(),
++                execution_mode: "repo-apply".to_string(),
++                dry_run: false,
++                auto_pr_requested: args.auto_pr,
++                auto_pr_status: if args.auto_pr { "failed" } else { "not-requested" }
++                    .to_string(),
++                max_risk: max_risk.as_str().to_string(),
++                planned_packets: plan.packets.len(),
++                risk_summary,
++                blocked_packets,
++                applied_edits,
++                skipped_edits,
++                files_written,
++                proof_evidence_index,
++                auto_pr_draft: args.auto_pr.then(|| repair_pr::summary_from_draft(&draft)),
++                git_mutation: Some(rollback_receipt),
++                github_pr: None,
++                proof_lanes: proof_lanes_for_run,
++                notes: repo_apply_notes(
++                    None,
++                    Some(format!("git commit failed after proof: {error}")),
++                    false,
++                ),
++            };
++            write_draft_if_requested(&args, &draft)?;
++            write_run(&args, &run)?;
++            return Err(error.context("git commit failed after repo repair proof"));
++        }
++    };
++
++    draft.git_head_sha = Some(git_receipt.head_sha.clone());
++    draft.commit_sha = git_receipt.commit_sha.clone();
++
++    let mut github_pr = None;
++    let mut auto_pr_status = if args.auto_pr { "draft-only" } else { "not-requested" }.to_string();
++    let mut final_error: Option<anyhow::Error> = None;
++    if args.create_pr {
++        if let Err(error) =
++            repair_git::push_branch(&args.repo, &args.remote, &draft.branch_name)
++        {
++            final_error = Some(error);
++            auto_pr_status = "failed".to_string();
++        } else {
++            git_receipt.pushed = true;
++            draft.pr_body = repair_pr::render_markdown(&draft);
++            match repair_git::write_pr_body(&args.repo, &draft.pr_body) {
++                Ok(body_path) => {
++                    let receipt = repair_git::create_github_draft_pr(
++                        &args.repo,
++                        &args.remote,
++                        &branch_state.base_branch,
++                        &draft.branch_name,
++                        &draft.pr_title,
++                        &body_path,
++                    );
++                    if receipt.status == "created" {
++                        draft.status = "created".to_string();
++                        draft.pr_url = receipt.url.clone();
++                        auto_pr_status = "created".to_string();
++                    } else {
++                        auto_pr_status = "failed".to_string();
++                        final_error = Some(anyhow!(
++                            "GitHub PR creation failed: {}",
++                            receipt.error.clone().unwrap_or_else(|| "unknown error".to_string())
++                        ));
++                        draft.status = "failed".to_string();
++                    }
++                    github_pr = Some(receipt);
++                }
++                Err(error) => {
++                    auto_pr_status = "failed".to_string();
++                    draft.status = "failed".to_string();
++                    final_error = Some(error.context("write repair PR body"));
++                }
++            }
++        }
++    }
++
++    draft.pr_body = repair_pr::render_markdown(&draft);
++    let run_status = if final_error.is_some() { "failed" } else { "complete" };
++    let run = RepairRun {
++        schema_version: "1.0.0".to_string(),
++        repo: args.repo.display().to_string(),
++        plan: args.plan.clone(),
++        generated_at: now_string(),
++        status: run_status.to_string(),
++        execution_mode: "repo-apply".to_string(),
++        dry_run: false,
++        auto_pr_requested: args.auto_pr,
++        auto_pr_status,
++        max_risk: max_risk.as_str().to_string(),
++        planned_packets: plan.packets.len(),
++        risk_summary,
++        blocked_packets,
++        applied_edits,
++        skipped_edits,
++        files_written,
++        proof_evidence_index,
++        auto_pr_draft: args.auto_pr.then(|| repair_pr::summary_from_draft(&draft)),
++        git_mutation: Some(git_receipt),
++        github_pr,
++        proof_lanes: proof_lanes_for_run,
++        notes: repo_apply_notes(None, final_error.as_ref().map(|error| error.to_string()), args.create_pr),
++    };
++    write_draft_if_requested(&args, &draft)?;
++    write_run(&args, &run)?;
++    if let Some(error) = final_error {
++        return Err(error);
++    }
++    Ok(())
++}
++
+ fn apply_planned_edit(
+     repo: &Path,
+@@ -203,7 +451,7 @@ fn apply_planned_edit(
+     ) || packet.human_review_required
+     {
+         return Ok(EditOutcome::Skipped(SkippedEdit {
+             finding_fingerprint: edit.finding_fingerprint.clone(),
+             path,
+-            reason: "packet is not eligible for fixture apply".to_string(),
++            reason: "packet is not eligible for bounded apply".to_string(),
+         }));
+     }
+@@ -493,6 +741,128 @@ fn relative_repo_path(repo: &Path, path: &Path) -> String {
+         .replace('\\', "/")
+ }
+ 
++fn risk_summary_and_blocked(
++    plan: &RepairPlan,
++    max_risk: RepairRisk,
++) -> (RiskSummary, Vec<BlockedPacket>) {
++    let mut risk_summary = RiskSummary::default();
++    let mut blocked_packets = Vec::new();
++    for packet in &plan.packets {
++        let risk = packet_risk(packet);
++        let eligibility = packet_eligibility(packet);
++        increment_risk_summary(&mut risk_summary, risk);
++        let mut reasons = Vec::new();
++        if !risk.is_allowed_by(max_risk) {
++            reasons.push(format!(
++                "risk {} exceeds max {}",
++                risk.as_str(),
++                max_risk.as_str()
++            ));
++        }
++        if packet.human_review_required {
++            reasons.push("packet requires human review".to_string());
++        }
++        if !eligibility.allows_auto_pr() {
++            reasons.push(format!("repair eligibility is {}", eligibility.as_str()));
++        }
++        if !reasons.is_empty() {
++            blocked_packets.push(BlockedPacket {
++                finding_fingerprint: packet.finding_fingerprint.clone(),
++                rule_id: packet.rule_id.clone(),
++                risk_level: risk.as_str().to_string(),
++                repair_eligibility: eligibility.as_str().to_string(),
++                reason: reasons.join("; "),
++            });
++        }
++    }
++    (risk_summary, blocked_packets)
++}
++
++fn repo_tracking_skips(repo: &Path, plan: &RepairPlan) -> Result<Vec<SkippedEdit>> {
++    let mut skipped = Vec::new();
++    for edit in &plan.planned_edits {
++        let path = normalize_edit_path(&edit.path)?;
++        if matches!(edit.apply_strategy.as_str(), "append-text" | "replace-exact")
++            && !repair_git::is_path_tracked(repo, &path)?
++        {
++            skipped.push(SkippedEdit {
++                finding_fingerprint: edit.finding_fingerprint.clone(),
++                path,
++                reason: "repo apply requires append/replace targets to be tracked by git"
++                    .to_string(),
++            });
++        }
++    }
++    Ok(skipped)
++}
++
++fn blocked_from_draft(
++    blocked: &[repair_pr::DraftBlockedPacket],
++) -> Vec<BlockedPacket> {
++    blocked
++        .iter()
++        .map(|packet| BlockedPacket {
++            finding_fingerprint: packet.finding_fingerprint.clone(),
++            rule_id: packet.rule_id.clone(),
++            risk_level: packet.risk_level.clone(),
++            repair_eligibility: packet.repair_eligibility.clone(),
++            reason: packet.reason.clone(),
++        })
++        .collect()
++}
++
++fn skipped_from_draft(
++    blocked: &[repair_pr::DraftBlockedPacket],
++) -> Vec<SkippedEdit> {
++    blocked
++        .iter()
++        .map(|packet| SkippedEdit {
++            finding_fingerprint: packet.finding_fingerprint.clone(),
++            path: packet.path.clone(),
++            reason: packet.reason.clone(),
++        })
++        .collect()
++}
++
++fn write_draft_if_requested(
++    args: &RepairArgs,
++    draft: &repair_pr::RepairPrDraft,
++) -> Result<()> {
++    if !args.auto_pr {
++        return Ok(());
++    }
++    if let Some(path) = args.pr_draft_out.as_deref() {
++        validation::write_json(&args.repo, ArtifactSchema::RepairPrDraft, path, draft)?;
++    } else {
++        validation::validate_serializable(&args.repo, ArtifactSchema::RepairPrDraft, draft)?;
++    }
++    if let Some(path) = args.pr_draft_md.as_deref() {
++        crate::render::write_markdown(path, &draft.pr_body)?;
++    }
++    Ok(())
++}
++
++fn write_run(args: &RepairArgs, run: &RepairRun) -> Result<()> {
++    if let Some(path) = args.out.as_deref() {
++        validation::write_json(&args.repo, ArtifactSchema::RepairRun, path, run)?;
++    } else {
++        validation::validate_serializable(&args.repo, ArtifactSchema::RepairRun, run)?;
++        println!("{}", serde_json::to_string_pretty(run)?);
++    }
++    if let Some(path) = args.md.as_deref() {
++        crate::render::write_markdown(path, &render_markdown(run))?;
++    }
++    Ok(())
++}
++
++fn repo_apply_safety_notes(create_pr: bool) -> Vec<String> {
++    let mut notes = vec![
++        "real repo apply requires --apply --yes and JANKURAI_ALLOW_REPAIR_APPLY=1".to_string(),
++        "all packets must be eligible before any file mutation starts".to_string(),
++        "generated zones, reference, paper, and target remain protected".to_string(),
++        "proof receipts are required before commit".to_string(),
++        "auto-merge is not implemented".to_string(),
++    ];
++    if create_pr {
++        notes.push("GitHub draft PR creation requires JANKURAI_ALLOW_GITHUB_PR=1".to_string());
++    }
++    notes
++}
++
++fn repo_apply_notes(
++    rollback_reason: Option<&str>,
++    error: Option<String>,
++    create_pr: bool,
++) -> Vec<String> {
++    let mut notes = repo_apply_safety_notes(create_pr);
++    if let Some(reason) = rollback_reason {
++        notes.push(format!("rollback reason: {reason}"));
++    }
++    if let Some(error) = error {
++        notes.push(format!("terminal error: {error}"));
++    }
++    notes
++}
++
++fn repo_apply_commit_body(
++    draft: &repair_pr::RepairPrDraft,
++    proof_evidence_index: Option<&str>,
++) -> String {
++    let mut body = String::new();
++    body.push_str("Jankurai bounded repair commit.\n\n");
++    body.push_str(&format!("Source plan: {}\n", draft.source_plan));
++    body.push_str(&format!("Max risk: {}\n", draft.max_risk));
++    body.push_str(&format!(
++        "Planned changed paths: {}\n",
++        draft.planned_changed_paths.join(", ")
++    ));
++    body.push_str(&format!("Proof lanes: {}\n", draft.proof_lanes.join(", ")));
++    if let Some(path) = proof_evidence_index {
++        body.push_str(&format!("Proof evidence index: {path}\n"));
++    }
++    body.push_str("\nThis commit was created by `jankurai repair --apply --yes` after bounded path checks and proof execution.\n");
++    body
++}
++
+ fn fixture_notes(
+     applied_edits: &[AppliedEdit],
+diff --git a/schemas/repair-run.schema.json b/schemas/repair-run.schema.json
+index acad79c..7eb371e 100644
+--- a/schemas/repair-run.schema.json
++++ b/schemas/repair-run.schema.json
+@@ -2,7 +2,7 @@
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "$id": "https://jankurai.dev/schemas/repair-run.schema.json",
+   "title": "jankurai repair run",
+-  "description": "Dry-run or fixture-apply repair execution receipt emitted by jankurai repair.",
++  "description": "Dry-run, fixture-apply, or gated real-repo repair execution receipt emitted by jankurai repair.",
+   "type": "object",
+@@ -31,11 +31,11 @@
+     "generated_at": { "type": "string" },
+     "status": { "enum": ["complete", "blocked", "failed"] },
+-    "execution_mode": { "enum": ["dry-run", "fixture-apply"] },
++    "execution_mode": { "enum": ["dry-run", "fixture-apply", "repo-apply"] },
+     "dry_run": { "type": "boolean" },
+     "auto_pr_requested": { "type": "boolean" },
+     "auto_pr_status": {
+-      "enum": ["not-requested", "eligible-dry-run-only", "blocked"]
++      "enum": ["not-requested", "eligible-dry-run-only", "draft-only", "created", "blocked", "failed"]
+     },
+@@ -134,7 +134,7 @@
+         "github_mutation_allowed"
+       ],
+       "properties": {
+-        "status": { "enum": ["draft-only", "blocked", "failed"] },
++        "status": { "enum": ["draft-only", "created", "blocked", "failed"] },
+         "branch_name": { "type": "string" },
+         "commit_title": { "type": "string" },
+         "pr_title": { "type": "string" },
+@@ -143,11 +143,68 @@
+         "proof_lanes": { "type": "array", "items": { "type": "string" } },
+         "artifact_links": { "type": "array", "items": { "type": "string" } },
+         "git_mutation_allowed": { "type": "boolean" },
+-        "github_mutation_allowed": { "type": "boolean" }
++        "github_mutation_allowed": { "type": "boolean" },
++        "git_head_sha": { "type": "string" },
++        "pr_url": { "type": "string" }
+       },
+       "additionalProperties": false
+     },
++    "git_mutation": {
++      "type": "object",
++      "required": [
++        "status",
++        "base_branch",
++        "head_branch",
++        "base_sha",
++        "head_sha",
++        "commit_title",
++        "files_committed",
++        "rollback_command",
++        "remote",
++        "pushed"
++      ],
++      "properties": {
++        "status": { "enum": ["committed", "rolled-back"] },
++        "base_branch": { "type": "string" },
++        "head_branch": { "type": "string" },
++        "base_sha": { "type": "string" },
++        "head_sha": { "type": "string" },
++        "commit_sha": { "type": "string" },
++        "commit_title": { "type": "string" },
++        "files_committed": { "type": "array", "items": { "type": "string" } },
++        "rollback_command": { "type": "string" },
++        "remote": { "type": "string" },
++        "pushed": { "type": "boolean" }
++      },
++      "additionalProperties": false
++    },
++    "github_pr": {
++      "type": "object",
++      "required": [
++        "status",
++        "draft",
++        "remote",
++        "base_branch",
++        "head_branch",
++        "command"
++      ],
++      "properties": {
++        "status": { "enum": ["created", "failed"] },
++        "draft": { "type": "boolean" },
++        "url": { "type": "string" },
++        "remote": { "type": "string" },
++        "base_branch": { "type": "string" },
++        "head_branch": { "type": "string" },
++        "command": { "type": "array", "items": { "type": "string" } },
++        "error": { "type": "string" }
++      },
++      "additionalProperties": false
++    },
+     "proof_lanes": { "type": "array", "items": { "type": "string" } },
+     "notes": { "type": "array", "items": { "type": "string" } }
+   },
+diff --git a/schemas/repair-pr-draft.schema.json b/schemas/repair-pr-draft.schema.json
+index 1266458..ea471cc 100644
+--- a/schemas/repair-pr-draft.schema.json
++++ b/schemas/repair-pr-draft.schema.json
+@@ -2,7 +2,7 @@
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "$id": "https://jankurai.dev/schemas/repair-pr-draft.schema.json",
+   "title": "jankurai repair pr draft",
+-  "description": "Dry-run auto-PR draft emitted by jankurai repair.",
++  "description": "Dry-run or real-repo-apply draft PR evidence emitted by jankurai repair.",
+   "type": "object",
+@@ -38,8 +38,8 @@
+     "source_plan": { "type": "string" },
+     "source_repair_run": { "type": "string" },
+     "generated_at": { "type": "string" },
+-    "status": { "enum": ["draft-only", "blocked", "failed"] },
+-    "execution_mode": { "enum": ["dry-run"] },
++    "status": { "enum": ["draft-only", "created", "blocked", "failed"] },
++    "execution_mode": { "enum": ["dry-run", "repo-apply"] },
+     "max_risk": { "enum": ["low", "medium", "high", "critical"] },
+     "branch_name": { "type": "string" },
+     "commit_title": { "type": "string" },
+@@ -48,6 +48,12 @@
+     "planned_changed_paths": { "type": "array", "items": { "type": "string" } },
++    "git_base_branch": { "type": "string" },
++    "git_head_branch": { "type": "string" },
++    "git_base_sha": { "type": "string" },
++    "git_head_sha": { "type": "string" },
++    "commit_sha": { "type": "string" },
++    "pr_url": { "type": "string" },
+     "eligible_packets": {
+       "type": "array",
+diff --git a/crates/jankurai/tests/phase_13_real_repo_apply.rs b/crates/jankurai/tests/phase_13_real_repo_apply.rs
+new file mode 100644
+index 0000000..3281e36
+--- /dev/null
++++ b/crates/jankurai/tests/phase_13_real_repo_apply.rs
+@@ -0,0 +1,337 @@
++use jankurai::validation::{self, ArtifactSchema};
++use serde_json::json;
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output};
++use tempfile::tempdir;
++
++fn binary_path() -> PathBuf {
++    PathBuf::from(env!("CARGO_BIN_EXE_jankurai"))
++}
++
++fn run_git(repo: &Path, args: &[&str]) {
++    let status = Command::new("git")
++        .arg("-C")
++        .arg(repo)
++        .args(args)
++        .status()
++        .unwrap();
++    assert!(status.success(), "git {:?} failed", args);
++}
++
++fn git_output(repo: &Path, args: &[&str]) -> String {
++    let output = Command::new("git")
++        .arg("-C")
++        .arg(repo)
++        .args(args)
++        .output()
++        .unwrap();
++    assert!(output.status.success(), "git {:?} failed", args);
++    String::from_utf8_lossy(&output.stdout).trim().to_string()
++}
++
++fn seed_repo(repo: &Path, proof_command: &str) {
++    fs::create_dir_all(repo.join("agent")).unwrap();
++    fs::create_dir_all(repo.join("docs")).unwrap();
++    fs::write(
++        repo.join("agent/owner-map.json"),
++        r#"{"workspace":"fixture","owners":{"agent/":"agent","docs/":"standard","paper/":"paper","reference/":"read-only","target/":"workspace","crates/":"tools"}}"#,
++    )
++    .unwrap();
++    fs::write(
++        repo.join("agent/test-map.json"),
++        format!(
++            r#"{{"workspace":"fixture","tests":{{"docs/":{{"command":"{}","purpose":"fixture docs proof"}},"agent/":{{"command":"true","purpose":"fixture agent proof"}}}}}}"#,
++            proof_command
++        ),
++    )
++    .unwrap();
++    fs::write(
++        repo.join("agent/proof-lanes.toml"),
++        format!(
++            r#"[[lane]]
++name = "audit"
++command = "{}"
++purpose = "fixture proof"
++"#,
++            proof_command
++        ),
++    )
++    .unwrap();
++    fs::write(
++        repo.join("agent/generated-zones.toml"),
++        r#"[[zone]]
++path = "agent/repo-score.json"
++source = "crates/jankurai"
++command = "cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
++read_only = false
++"#,
++    )
++    .unwrap();
++    fs::write(repo.join("docs/notes.md"), "alpha\n").unwrap();
++}
++
++fn init_git(repo: &Path) {
++    let status = Command::new("git")
++        .arg("init")
++        .arg("-b")
++        .arg("main")
++        .arg(repo)
++        .status()
++        .unwrap();
++    assert!(status.success());
++    run_git(repo, &["config", "user.email", "jankurai@example.invalid"]);
++    run_git(repo, &["config", "user.name", "Jankurai Test"]);
++    run_git(repo, &["add", "."]);
++    run_git(repo, &["commit", "-m", "seed"]);
++}
++
++fn write_plan(repo: &Path, strategy: &str, patch_fields: serde_json::Value) -> PathBuf {
++    fs::create_dir_all(repo.join("target/jankurai")).unwrap();
++    let path = repo.join("target/jankurai/repair-plan.json");
++    let packet = json!({
++        "finding_fingerprint": "sha256:repo-apply",
++        "finding_path": "docs/notes.md",
++        "rule_id": "HLT-017-OPAQUE-OBSERVABILITY",
++        "check_id": "HLT-017-OPAQUE-OBSERVABILITY",
++        "severity": "medium",
++        "owner": "standard",
++        "lane": "audit",
++        "problem": "fixture problem",
++        "why": "fixture reason",
++        "permission_profile": "docs-only",
++        "allowed_paths": ["docs/"],
++        "forbidden_paths": ["reference/", "paper/", "target/"],
++        "expected_patch_shape": "fixture patch",
++        "required_proof": ["true"],
++        "stop_conditions": ["stop"],
++        "repair_eligibility": "agent-assisted",
++        "risk_level": "medium",
++        "eligibility_reason": "fixture repair is scoped to docs",
++        "human_review_required": false,
++        "rollback_guidance": "restore the file"
++    });
++    let mut edit = serde_json::Map::new();
++    edit.insert("path".to_string(), json!("docs/notes.md"));
++    edit.insert("operation".to_string(), json!("modify"));
++    edit.insert("reason".to_string(), json!("fixture repair"));
++    edit.insert("finding_fingerprint".to_string(), json!("sha256:repo-apply"));
++    edit.insert("rule_id".to_string(), json!("HLT-017-OPAQUE-OBSERVABILITY"));
++    edit.insert("apply_strategy".to_string(), json!(strategy));
++    edit.insert("risk_level".to_string(), json!("medium"));
++    edit.insert("repair_eligibility".to_string(), json!("agent-assisted"));
++    edit.extend(patch_fields.as_object().unwrap().clone());
++
++    let plan = json!({
++        "schema_version": "1.0.0",
++        "source_report": "target/jankurai/repo-score.json",
++        "generated_at": "0",
++        "target_stack_id": "jankurai:v0.4",
++        "plan_mode": "dry-run",
++        "planned_edits": [serde_json::Value::Object(edit)],
++        "planned_commands": ["true"],
++        "proof_lanes": ["audit"],
++        "rollback_guidance": ["restore the original file"],
++        "human_approval_requirements": [],
++        "packets": [packet]
++    });
++    fs::write(&path, serde_json::to_string_pretty(&plan).unwrap()).unwrap();
++    path
++}
++
++fn run_repair(repo: &Path, plan: &Path, extra: &[&str]) -> (Output, PathBuf, PathBuf) {
++    let out = repo.join("target/jankurai/repair-run.json");
++    let draft = repo.join("target/jankurai/repair-pr-draft.json");
++    let mut cmd = Command::new(binary_path());
++    cmd.arg("repair")
++        .arg(repo)
++        .arg("--plan")
++        .arg(plan)
++        .args(extra)
++        .arg("--out")
++        .arg(&out)
++        .arg("--md")
++        .arg(out.with_extension("md"))
++        .arg("--pr-draft-out")
++        .arg(&draft)
++        .arg("--pr-draft-md")
++        .arg(draft.with_extension("md"))
++        .env("JANKURAI_ALLOW_REPAIR_APPLY", "1");
++    (cmd.output().unwrap(), out, draft)
++}
++
++fn read_json(path: &Path) -> serde_json::Value {
++    serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
++}
++
++#[test]
++fn repo_apply_requires_env_gate_and_yes() {
++    let repo = tempdir().unwrap();
++    seed_repo(repo.path(), "true");
++    init_git(repo.path());
++    let plan = write_plan(
++        repo.path(),
++        "append-text",
++        json!({ "append_text": "beta\n" }),
++    );
++
++    let output = Command::new(binary_path())
++        .arg("repair")
++        .arg(repo.path())
++        .arg("--plan")
++        .arg(&plan)
++        .arg("--apply")
++        .arg("--max-risk")
++        .arg("medium")
++        .output()
++        .unwrap();
++    assert!(!output.status.success());
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(stderr.contains("--apply --yes"), "{stderr}");
++
++    let output = Command::new(binary_path())
++        .arg("repair")
++        .arg(repo.path())
++        .arg("--plan")
++        .arg(&plan)
++        .arg("--apply")
++        .arg("--yes")
++        .arg("--max-risk")
++        .arg("medium")
++        .output()
++        .unwrap();
++    assert!(!output.status.success());
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    assert!(stderr.contains("JANKURAI_ALLOW_REPAIR_APPLY=1"), "{stderr}");
++}
++
++#[test]
++fn repo_apply_creates_branch_commit_receipt_and_runs_proof() {
++    let repo = tempdir().unwrap();
++    seed_repo(repo.path(), "true");
++    init_git(repo.path());
++    let base_branch = git_output(repo.path(), &["symbolic-ref", "--short", "HEAD"]);
++    let base_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
++    let plan = write_plan(
++        repo.path(),
++        "append-text",
++        json!({ "append_text": "beta\n" }),
++    );
++
++    let (output, out_path, draft_path) = run_repair(
++        repo.path(),
++        &plan,
++        &[
++            "--apply",
++            "--yes",
++            "--auto-pr",
++            "--max-risk",
++            "medium",
++            "--base",
++            "main",
++        ],
++    );
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++
++    assert_eq!(
++        fs::read_to_string(repo.path().join("docs/notes.md")).unwrap(),
++        "alpha\nbeta\n"
++    );
++    let branch = git_output(repo.path(), &["symbolic-ref", "--short", "HEAD"]);
++    assert!(branch.starts_with("jankurai/repair/"));
++    assert_ne!(git_output(repo.path(), &["rev-parse", "HEAD"]), base_sha);
++    assert_ne!(branch, base_branch);
++
++    let run = read_json(&out_path);
++    let draft = read_json(&draft_path);
++    validation::validate_value(repo.path(), ArtifactSchema::RepairRun, &run).unwrap();
++    validation::validate_value(repo.path(), ArtifactSchema::RepairPrDraft, &draft).unwrap();
++    assert_eq!(run["status"], "complete");
++    assert_eq!(run["execution_mode"], "repo-apply");
++    assert_eq!(run["auto_pr_status"], "draft-only");
++    assert_eq!(run["git_mutation"]["status"], "committed");
++    assert_eq!(run["git_mutation"]["base_branch"], "main");
++    assert_eq!(run["git_mutation"]["head_branch"], branch);
++    assert_eq!(run["git_mutation"]["pushed"], false);
++    assert_eq!(draft["execution_mode"], "repo-apply");
++    assert_eq!(draft["git_mutation_allowed"], true);
++    assert_eq!(draft["github_mutation_allowed"], false);
++    assert!(run["proof_evidence_index"]
++        .as_str()
++        .unwrap()
++        .contains("p13-repo-evidence-index.json"));
++}
++
++#[test]
++fn repo_apply_rolls_back_when_proof_fails() {
++    let repo = tempdir().unwrap();
++    seed_repo(repo.path(), "false");
++    init_git(repo.path());
++    let base_sha = git_output(repo.path(), &["rev-parse", "HEAD"]);
++    let plan = write_plan(
++        repo.path(),
++        "append-text",
++        json!({ "append_text": "beta\n" }),
++    );
++
++    let (output, out_path, _draft_path) = run_repair(
++        repo.path(),
++        &plan,
++        &[
++            "--apply",
++            "--yes",
++            "--auto-pr",
++            "--max-risk",
++            "medium",
++            "--base",
++            "main",
++        ],
++    );
++    assert!(!output.status.success());
++    assert_eq!(git_output(repo.path(), &["symbolic-ref", "--short", "HEAD"]), "main");
++    assert_eq!(git_output(repo.path(), &["rev-parse", "HEAD"]), base_sha);
++    assert_eq!(
++        fs::read_to_string(repo.path().join("docs/notes.md")).unwrap(),
++        "alpha\n"
++    );
++    let run = read_json(&out_path);
++    validation::validate_value(repo.path(), ArtifactSchema::RepairRun, &run).unwrap();
++    assert_eq!(run["status"], "failed");
++    assert_eq!(run["git_mutation"]["status"], "rolled-back");
++}
++
++#[test]
++fn repo_apply_create_pr_uses_gh_and_records_created_url() {
++    let repo = tempdir().unwrap();
++    let remote = tempdir().unwrap();
++    let fake = tempdir().unwrap();
++    seed_repo(repo.path(), "true");
++    init_git(repo.path());
++
++    let status = Command::new("git")
++        .arg("init")
++        .arg("--bare")
++        .arg(remote.path())
++        .status()
++        .unwrap();
++    assert!(status.success());
++    run_git(repo.path(), &["remote", "add", "origin", remote.path().to_str().unwrap()]);
++    run_git(repo.path(), &["push", "-u", "origin", "main"]);
++
++    let bin = fake.path().join("bin");
++    fs::create_dir_all(&bin).unwrap();
++    let fake_gh = bin.join("gh");
++    let args_file = fake.path().join("gh-args.txt");
++    fs::write(
++        &fake_gh,
++        "#!/usr/bin/env sh\nprintf '%s\n' \"$@\" > \"$JANKURAI_FAKE_GH_ARGS\"\necho https://github.com/example/repo/pull/7\n",
++    )
++    .unwrap();
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        let mut perms = fs::metadata(&fake_gh).unwrap().permissions();
++        perms.set_mode(0o755);
++        fs::set_permissions(&fake_gh, perms).unwrap();
++    }
++
++    let plan = write_plan(
++        repo.path(),
++        "append-text",
++        json!({ "append_text": "beta\n" }),
++    );
++    let out = repo.path().join("target/jankurai/repair-run.json");
++    let draft = repo.path().join("target/jankurai/repair-pr-draft.json");
++    let output = Command::new(binary_path())
++        .arg("repair")
++        .arg(repo.path())
++        .arg("--plan")
++        .arg(&plan)
++        .arg("--apply")
++        .arg("--yes")
++        .arg("--auto-pr")
++        .arg("--create-pr")
++        .arg("--max-risk")
++        .arg("medium")
++        .arg("--base")
++        .arg("main")
++        .arg("--remote")
++        .arg("origin")
++        .arg("--out")
++        .arg(&out)
++        .arg("--md")
++        .arg(out.with_extension("md"))
++        .arg("--pr-draft-out")
++        .arg(&draft)
++        .arg("--pr-draft-md")
++        .arg(draft.with_extension("md"))
++        .env("JANKURAI_ALLOW_REPAIR_APPLY", "1")
++        .env("JANKURAI_ALLOW_GITHUB_PR", "1")
++        .env("JANKURAI_FAKE_GH_ARGS", &args_file)
++        .env(
++            "PATH",
++            format!(
++                "{}:{}",
++                bin.display(),
++                std::env::var("PATH").unwrap_or_default()
++            ),
++        )
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++
++    let run = read_json(&out);
++    let draft_json = read_json(&draft);
++    validation::validate_value(repo.path(), ArtifactSchema::RepairRun, &run).unwrap();
++    validation::validate_value(repo.path(), ArtifactSchema::RepairPrDraft, &draft_json).unwrap();
++    assert_eq!(run["auto_pr_status"], "created");
++    assert_eq!(run["github_pr"]["status"], "created");
++    assert_eq!(run["github_pr"]["url"], "https://github.com/example/repo/pull/7");
++    assert_eq!(run["git_mutation"]["pushed"], true);
++    assert_eq!(draft_json["status"], "created");
++    assert_eq!(draft_json["pr_url"], "https://github.com/example/repo/pull/7");
++
++    let gh_args = fs::read_to_string(args_file).unwrap();
++    assert!(gh_args.contains("create"));
++    assert!(gh_args.contains("--draft"));
++    assert!(gh_args.contains("--base"));
++    assert!(gh_args.contains("--head"));
++}
+diff --git a/tips/phases/00-phase-index.md b/tips/phases/00-phase-index.md
+index efbef61..2346e91 100644
+--- a/tips/phases/00-phase-index.md
++++ b/tips/phases/00-phase-index.md
+@@ -77,7 +77,7 @@ If a phase header and receipt disagree, the receipt controls execution state and
+ | 10 | complete-with-deferred-work | certified cells exist; mutating/provider-backed cells remain deferred |
+ | 11 | complete | migration engine in place |
+ | 12 | complete-with-deferred-work | local certification/governance exist; external signing/badges/dashboard deferred |
+-| 13 | complete-with-deferred-work | dry-run repair, optimization, and expiry exist; real repo mutation and PR creation deferred |
++| 13 | hardened | dry-run repair, fixture repair, optimization, expiry, gated real-repo apply, git commit receipts, rollback, and draft GitHub PR creation exist; auto-merge remains out of scope |
+diff --git a/tips/phases/13-autonomous-repair-optimization.md b/tips/phases/13-autonomous-repair-optimization.md
+index 1f69a2c..68f541a 100644
+--- a/tips/phases/13-autonomous-repair-optimization.md
++++ b/tips/phases/13-autonomous-repair-optimization.md
+@@ -1,6 +1,6 @@
+ # Phase 13: Autonomous Repair And Optimization
+ 
+-Status: complete
++Status: hardened
+ Owner: agent
+ Last reviewed: 2026-05-03
+ Parallel MCP candidate: yes
+@@ -24,7 +24,7 @@ Existing and planned prerequisites:
+ - Phase 11 adds migration slices.
+ - Phase 12 adds benchmark and certification evidence.
+ 
+-The implemented repair surface is dry-run by default with an explicit fixture-only apply mode. Repair packets and repair plans now carry explicit eligibility, risk, planned edits, planned proof commands, rollback guidance, human approval requirements, and structured patch fields for fixture plans. Repair runs can evaluate whether an auto-PR request would be blocked or eligible, emit a draft-only PR evidence package, and fixture-marked repositories can execute bounded `append-text`, `replace-exact`, and `create-file` edits. The optimizer reports token, performance, dependency, and dead-code candidates without mutating the tree. The exception-expiry loop scans dated exception docs and reports expired, expiring-soon, current, and invalid entries. The command surface still does not write real projects, create branches, commit, open PRs, or auto-merge.
++The implemented repair surface is dry-run by default with explicit fixture-only and real-repo apply modes. Repair packets and repair plans carry eligibility, risk, planned edits, planned proof commands, rollback guidance, human approval requirements, and structured patch fields. Repair runs can evaluate whether an auto-PR request would be blocked or eligible, emit draft PR evidence, execute fixture-marked bounded patches, and execute real repository repairs only behind `--apply --yes` plus `JANKURAI_ALLOW_REPAIR_APPLY=1`. Real apply requires a clean git worktree, creates a deterministic `jankurai/repair/*` branch, refuses generated/read-only/forbidden/path-escape edits, runs proof before commit, records git mutation receipts, rolls back on proof failure, and can create a real GitHub draft PR only behind `--create-pr` plus `JANKURAI_ALLOW_GITHUB_PR=1`. The optimizer reports token, performance, dependency, and dead-code candidates without mutating the tree. The exception-expiry loop scans dated exception docs and reports expired, expiring-soon, current, and invalid entries. The command surface still does not auto-merge.
+@@ -47,14 +47,20 @@ jankurai repair . --plan target/jankurai/repair-plan.json --dry-run --auto-pr --
+ jankurai repair . --plan target/jankurai/repair-plan.json --dry-run --auto-pr --max-risk medium --pr-draft-out target/jankurai/repair-pr-draft.json --pr-draft-md target/jankurai/repair-pr-draft.md
+ jankurai repair target/jankurai/p13-fixture-repo --plan target/jankurai/p13-fixture-repo/target/jankurai/repair-plan.json --fixture-apply --max-risk medium --out target/jankurai/p13-fixture-repair-run.json --md target/jankurai/p13-fixture-repair-run.md
+ jankurai optimize . --mode all --out target/jankurai/optimization-report.json --md target/jankurai/optimization-report.md
+ jankurai exceptions expire . --warning-days 7 --out target/jankurai/exception-expiry-report.json --md target/jankurai/exception-expiry-report.md
++JANKURAI_ALLOW_REPAIR_APPLY=1 jankurai repair . --plan target/jankurai/repair-plan.json --apply --yes --max-risk medium --out target/jankurai/repair-run.json --md target/jankurai/repair-run.md
++JANKURAI_ALLOW_REPAIR_APPLY=1 jankurai repair . --plan target/jankurai/repair-plan.json --apply --yes --auto-pr --max-risk medium --pr-draft-out target/jankurai/repair-pr-draft.json --pr-draft-md target/jankurai/repair-pr-draft.md
++JANKURAI_ALLOW_REPAIR_APPLY=1 JANKURAI_ALLOW_GITHUB_PR=1 jankurai repair . --plan target/jankurai/repair-plan.json --apply --yes --auto-pr --create-pr --base main --remote origin --max-risk medium --out target/jankurai/repair-run.json --md target/jankurai/repair-run.md --pr-draft-out target/jankurai/repair-pr-draft.json --pr-draft-md target/jankurai/repair-pr-draft.md
+```
+
+-Still deferred beyond this slice:
++Still prohibited:
+
+-- No real repository patch execution yet; bounded patch execution is fixture-only and requires `agent/repair-fixture.toml` with `fixture = true`.
+-- No real auto-PR creation yet; draft-package evidence is emitted behind `--auto-pr`.
++- No auto-merge.
++- No mutation without `--apply --yes` and the environment gate.
++- No GitHub PR creation without `--create-pr` and the GitHub environment gate.
++- No generated-zone edits by hand.
++- No secret rotation, destructive migration, production credential, or broad architecture repair automation.
+@@ -74,11 +80,13 @@ The current implementation supports dry-run planning, dry-run auto-PR eligibility reporting, and fixture-only patch execution. It does not support real repository patch execution, branch creation, PR creation, or auto-merge.
+
+`repair-run.schema.json` records execution mode, repair execution status, auto-PR dry-run eligibility, optional auto-PR draft summary, max risk, blocked packets, risk summary, proof lanes, applied edits, skipped edits, files written, optional proof evidence index, and notes.
+
+-`repair-pr-draft.schema.json` records the draft-only PR evidence package with branch name, titles, planned paths, eligible and blocked packets, proof lanes, artifact links, residual risk, and mutation flags.
++`repair-run.schema.json` now also records optional git mutation receipts and optional GitHub PR receipts for real-repo apply.
++
++`repair-pr-draft.schema.json` records the draft PR evidence package with branch name, titles, planned paths, eligible and blocked packets, proof lanes, artifact links, residual risk, mutation flags, git branch/commit metadata, and optional PR URL.
+
+-The current implementation supports dry-run planning, dry-run auto-PR eligibility reporting, and fixture-only patch execution. It does not support real repository patch execution, branch creation, PR creation, or auto-merge.
++The current implementation supports dry-run planning, dry-run auto-PR eligibility reporting, fixture-only patch execution, real-repo apply with proof-before-commit, rollback on proof failure, git commit receipts, and gated GitHub draft PR creation. It does not support auto-merge.
+@@ -143,7 +151,7 @@ Acceptance:
+
+* Patch cannot escape allowed paths.
+* Failed proof stops repair and records evidence.
+
+-Status: complete for the bounded fixture-only execution slice. Real repository patch execution remains deferred.
++Status: hardened. Fixture-only execution remains available; real repository execution is gated, branch-based, proof-before-commit, and rollback-capable.
+@@ -158,7 +166,7 @@ Acceptance:
+
+* Auto-PR draft packages are transparent and auditable.
+* Draft body includes exact proof lanes, artifact links, and residual risk.
+
+-Status: complete for the draft-only evidence package slice. Real branch, commit, and GitHub PR creation remain deferred.
++Status: hardened. Draft evidence remains available in dry-run; real branch, commit, push, and GitHub draft PR creation are available only behind explicit flags and environment gates.
+@@ -240,15 +248,16 @@ Leave:
+
+## Phase Status Receipt
+
+-- Phase status: complete autonomous repair and optimization slice
+-- Files changed in this slice: `crates/jankurai/src/audit/rules.rs`, `crates/jankurai/src/commands/repair_plan.rs`, `crates/jankurai/src/commands/repair.rs`, `crates/jankurai/src/commands/optimize.rs`, `crates/jankurai/src/commands/exceptions.rs`, `crates/jankurai/src/validation.rs`, `docs/exceptions/README.md`, `schemas/repair-plan.schema.json`, `schemas/repair-packet.schema.json`, `schemas/repair-run.schema.json`, `schemas/optimization-report.schema.json`, `schemas/exception-expiry-report.schema.json`, focused repair/optimization/exceptions/schema tests, and this phase receipt.
+-- Schemas changed: repair packet metadata, dry-run repair plan fields, repair-run receipts, optimization report, and exception-expiry report.
+-- Public interfaces changed: `jankurai repair-plan` emits dry-run plans; `jankurai repair --dry-run` emits schema-valid repair-run JSON/Markdown; `--auto-pr` reports dry-run eligibility only; `jankurai optimize` emits advisory optimization reports; `jankurai exceptions expire` emits dated-exception expiry reports.
+-- Generated artifacts: repair plan JSON/Markdown, repair-run JSON/Markdown, optimization report JSON/Markdown, exception-expiry report JSON/Markdown, and proof lane outputs under `target/jankurai/`.
++- Phase status: hardened autonomous repair and optimization slice
++- Files changed in this hardening slice: `crates/jankurai/src/main.rs`, `crates/jankurai/src/commands.rs`, `crates/jankurai/src/commands/repair.rs`, `crates/jankurai/src/commands/repair_apply.rs`, `crates/jankurai/src/commands/repair_git.rs`, `crates/jankurai/src/commands/repair_pr.rs`, `schemas/repair-run.schema.json`, `schemas/repair-pr-draft.schema.json`, `crates/jankurai/tests/phase_13_real_repo_apply.rs`, `tips/phases/00-phase-index.md`, `tips/phases/13-autonomous-repair-optimization.md`, and the Phase 13 log.
++- Schemas changed: repair-run receipts now include `repo-apply`, git mutation receipts, GitHub PR receipts, and final PR URLs; repair-pr-draft receipts now include repo-apply git/PR metadata.
++- Public interfaces changed: `jankurai repair --apply --yes` executes gated real-repo repairs; `--auto-pr` emits repo-apply PR evidence; `--create-pr` creates a gated GitHub draft PR through `gh`.
++- Generated artifacts: repair plan JSON/Markdown, repair-run JSON/Markdown, PR draft JSON/Markdown, repo proof plan/receipts/evidence index, optimization report JSON/Markdown, exception-expiry report JSON/Markdown, and proof lane outputs under `target/jankurai/`.
+
+* Routing maps changed: none in this slice.
+  -- Deferred: bounded patch execution and real auto-PR creation remain future work.
+  -- Results: validation passed for the new optimization and exception-expiry surfaces plus the existing repair lanes.
+  -- Skipped validation: real branch/commit/PR mutation and non-fixture patch execution remain gated for later expansion.
+  -- Exceptions created: dry-run repair only; write paths remain disabled until proof and permission gates mature.
+  +- Deferred: auto-merge remains out of scope; provider-specific APIs beyond `gh` remain out of scope.
+  +- Results: pending local validation for this hardening patch.
+  +- Skipped validation: none intended; real GitHub PR creation is covered by a fake `gh` integration test and should be smoke-tested manually in a sandbox repository before production use.
+  +- Exceptions created: none; real mutation is guarded by flags, environment gates, proof, rollback, and draft review.
+* Follow-up phases: none beyond the next implementation wave.
+  diff --git a/tips/phases/logs/13-autonomous-repair-optimization.log b/tips/phases/logs/13-autonomous-repair-optimization.log
+  index 1e47415..c63d913 100644
+  --- a/tips/phases/logs/13-autonomous-repair-optimization.log
+  +++ b/tips/phases/logs/13-autonomous-repair-optimization.log
+  @@ -10,3 +10,5 @@
+  2026-05-02T00:00:00Z | agent | 13-autonomous-repair-optimization | start | none | not-run | none | pending | implement optimization and exception-expiry command surfaces
+  2026-05-03T05:41:13Z | agent | 13-autonomous-repair-optimization | progress | crates/jankurai/src/commands/exceptions.rs, crates/jankurai/src/commands/optimize.rs, crates/jankurai/src/main.rs, crates/jankurai/src/validation.rs, crates/jankurai/src/commands.rs, crates/jankurai/tests/phase_13_optimization_and_exceptions.rs, crates/jankurai/tests/schema_contracts.rs, docs/exceptions/README.md, schemas/exception-expiry-report.schema.json, schemas/optimization-report.schema.json, tips/phases/13-autonomous-repair-optimization.md | cargo fmt --all; cargo test -p jankurai --test phase_13_optimization_and_exceptions; cargo test -p jankurai --test schema_contracts | pending | 8fef471 | new optimization and exception-expiry surfaces implemented and validated
+  2026-05-03T05:41:13Z | agent | 13-autonomous-repair-optimization | finish | Cargo.lock, crates/jankurai/Cargo.toml, crates/jankurai/src/commands.rs, crates/jankurai/src/commands/exceptions.rs, crates/jankurai/src/commands/optimize.rs, crates/jankurai/src/main.rs, crates/jankurai/src/validation.rs, crates/jankurai/tests/command_surface_smoke.rs, crates/jankurai/tests/phase_13_auto_pr_draft.rs, crates/jankurai/tests/phase_13_optimization_and_exceptions.rs, crates/jankurai/tests/schema_contracts.rs, docs/exceptions/README.md, schemas/exception-expiry-report.schema.json, schemas/optimization-report.schema.json, tips/phases/13-autonomous-repair-optimization.md | cargo test -p jankurai --test phase_13_optimization_and_exceptions; cargo test -p jankurai --test schema_contracts; cargo test -p jankurai; just fast | target/jankurai/fast-score.json, target/jankurai/fast-score.md | 8fef471 | real repository patch execution and real auto-PR creation remain deferred
+  +2026-05-03T00:00:00Z | gpt-5.5-pro | 13-autonomous-repair-optimization | start | crates/jankurai/src/main.rs;crates/jankurai/src/commands.rs;crates/jankurai/src/commands/repair.rs;crates/jankurai/src/commands/repair_apply.rs;crates/jankurai/src/commands/repair_git.rs;crates/jankurai/src/commands/repair_pr.rs;schemas/repair-run.schema.json;schemas/repair-pr-draft.schema.json;crates/jankurai/tests/phase_13_real_repo_apply.rs;tips/phases/00-phase-index.md;tips/phases/13-autonomous-repair-optimization.md;tips/phases/logs/13-autonomous-repair-optimization.log | not-run | none | pending | harden real-repo repair apply, rollback, git commit receipts, and gated GitHub draft PR creation
+  +2026-05-03T00:00:00Z | gpt-5.5-pro | 13-autonomous-repair-optimization | finish | crates/jankurai/src/main.rs;crates/jankurai/src/commands.rs;crates/jankurai/src/commands/repair.rs;crates/jankurai/src/commands/repair_apply.rs;crates/jankurai/src/commands/repair_git.rs;crates/jankurai/src/commands/repair_pr.rs;schemas/repair-run.schema.json;schemas/repair-pr-draft.schema.json;crates/jankurai/tests/phase_13_real_repo_apply.rs;tips/phases/00-phase-index.md;tips/phases/13-autonomous-repair-optimization.md;tips/phases/logs/13-autonomous-repair-optimization.log | cargo fmt --all; cargo test -p jankurai --test phase_13_real_repo_apply --test phase_13_auto_pr_draft --test phase_13_patch_execution --test phase_13_repair_safety --test schema_contracts; cargo test -p jankurai; just fast; just score; git diff --check | target/jankurai/p13-repo-evidence-index.json;target/jankurai/p13-repo-proof-receipts/*.json;target/jankurai/repair-run.json;target/jankurai/repair-pr-draft.json;agent/repo-score.json;agent/repo-score.md | pending | real mutation is now gated and draft-only; auto-merge remains out of scope
+  PATCH
+
+git apply /tmp/jankurai-phase13-harden.patch
+cargo fmt --all
+
+cargo test -p jankurai --test phase_13_real_repo_apply
+cargo test -p jankurai --test phase_13_auto_pr_draft
+cargo test -p jankurai --test phase_13_patch_execution
+cargo test -p jankurai --test phase_13_repair_safety
+cargo test -p jankurai --test schema_contracts
+cargo test -p jankurai
+just fast
+just score
+git diff --check
+
+````
+
+---
+
+## Operating instructions after applying
+
+Dry-run still stays the normal safe path:
+
+```bash
+cargo run -p jankurai -- repair-plan . \
+  --from target/jankurai/repo-score.json \
+  --out target/jankurai/repair-plan.json \
+  --md target/jankurai/repair-plan.md
+
+cargo run -p jankurai -- repair . \
+  --plan target/jankurai/repair-plan.json \
+  --dry-run \
+  --auto-pr \
+  --max-risk medium \
+  --out target/jankurai/repair-run.json \
+  --md target/jankurai/repair-run.md \
+  --pr-draft-out target/jankurai/repair-pr-draft.json \
+  --pr-draft-md target/jankurai/repair-pr-draft.md
+````
+
+Real local mutation requires an explicit sandbox or reviewed repo:
+
+```bash
+JANKURAI_ALLOW_REPAIR_APPLY=1 cargo run -p jankurai -- repair . \
+  --plan target/jankurai/repair-plan.json \
+  --apply \
+  --yes \
+  --auto-pr \
+  --max-risk medium \
+  --base main \
+  --out target/jankurai/repair-run.json \
+  --md target/jankurai/repair-run.md \
+  --pr-draft-out target/jankurai/repair-pr-draft.json \
+  --pr-draft-md target/jankurai/repair-pr-draft.md
+```
+
+Real draft PR creation requires the second environment gate and `gh` auth:
+
+```bash
+JANKURAI_ALLOW_REPAIR_APPLY=1 \
+JANKURAI_ALLOW_GITHUB_PR=1 \
+cargo run -p jankurai -- repair . \
+  --plan target/jankurai/repair-plan.json \
+  --apply \
+  --yes \
+  --auto-pr \
+  --create-pr \
+  --max-risk medium \
+  --base main \
+  --remote origin \
+  --out target/jankurai/repair-run.json \
+  --md target/jankurai/repair-run.md \
+  --pr-draft-out target/jankurai/repair-pr-draft.json \
+  --pr-draft-md target/jankurai/repair-pr-draft.md
+```
+
+I could not run the repository validation from this chat environment because the container could not resolve `github.com` for cloning. The patch is written directly against the current GitHub file contents I inspected, and the validation sequence above is the exact proof lane I would run locally before marking the phase hardening as merged.
+
+[1]: https://cli.github.com/manual/gh_pr_create?utm_source=chatgpt.com "GitHub CLI | Take GitHub to the command line"
+

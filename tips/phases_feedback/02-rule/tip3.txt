@@ -1,0 +1,2389 @@
+## Phase: `02-rule-engine-semantic-oracle.md`
+
+The right pending work to finish here is **turning the current Phase 02 partial implementation into a first-class semantic boundary oracle**: a rule-registry-backed analyzer that emits actionable, owner/lane/evidence-rich findings instead of relying only on loose text scans.
+
+Why this is the right slice: `moonshot.md` says the system must make agent-native engineering “boring” through explicit intent, bounded agents, proof lanes, durable evidence, expiring exceptions, and reusable primitives. It also rejects ambiguous ownership, hidden fallbacks, handwritten contract mirrors, generated hand edits, and proof that does not cover changed behavior. ([GitHub][1]) Phase 02’s own objective is to move from heuristic scanning to a versioned rule engine with semantic understanding, using an architecture of `inventory -> analyzers -> rule registry -> findings -> caps -> score -> reports`; its receipt says rule metadata exists but the analyzer split and AST/import pilot are still follow-on work. ([GitHub][2])
+
+The repo already has the ingredients: `Finding` has fields for `rule_id`, `tlr`, `lane`, `docs_url`, `owner`, `line`, `matched_term`, and `reason`; `FindingBuilder` enriches findings from the rule registry; and `agent/boundaries.toml` already declares Rust, TypeScript, Python, queue, streaming, and DB boundary policy. ([GitHub][3]) The gap is that several of the most important moonshot boundary checks still live as scan-like helpers, especially DB wrong-layer and streaming-runtime checks, rather than as semantic analyzer output with registry validation and tests. ([GitHub][4])
+
+Below is the **single patch I would land** for Phase 02.
+
+---
+
+# Phase 02 completion patch: Semantic Boundary Oracle
+
+## What this finishes
+
+This patch completes Phase 02 by adding:
+
+1. A policy-aware semantic oracle under `audit/analyzers/semantic_oracle.rs`.
+2. Extended boundary manifest parsing for `[rust]`, `[typescript]`, and `[python]`.
+3. First-class findings for:
+
+   * Rust domain impurity.
+   * TypeScript/web wrong-layer imports and handwritten client/DTO mirrors.
+   * Python durable product-truth leakage.
+   * Direct DB usage outside DB/adapters/migrations.
+   * Streaming-runtime drift with expiring exception validation.
+4. Registry-backed rule metadata for the new semantic findings.
+5. A `FindingBuilder::add_detailed` method so semantic findings preserve `matched_term`, `reason`, line number, lane, owner, docs URL, rerun command, and evidence kind.
+6. Tests that fail when Phase 02 regressions happen:
+
+   * Unknown `rule_id`.
+   * Missing rule metadata.
+   * Boundary analyzer emits non-actionable high/critical findings.
+   * Semantic boundary hits do not include matched term/reason/line.
+
+This keeps the repo aligned with the canonical audit loop described in the README: `intent -> bounded agents -> proof lanes -> evidence -> expired exceptions -> reusable primitives`, with the audit lane remaining `cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md`. ([GitHub][5])
+
+---
+
+## 1. Replace `crates/jankurai/src/boundaries/manifest.rs`
+
+This keeps existing behavior, but stops ignoring the `[rust]`, `[typescript]`, and `[python]` sections already present in `agent/boundaries.toml`.
+
+```rust
+use anyhow::Result;
+use serde::Deserialize;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BoundaryManifest {
+    pub stack: Option<StackBoundary>,
+
+    #[serde(default)]
+    pub rust: Option<RustBoundary>,
+
+    #[serde(default)]
+    pub typescript: Option<TypeScriptBoundary>,
+
+    #[serde(default)]
+    pub python: Option<PythonBoundary>,
+
+    #[serde(default)]
+    pub queues: Option<QueueBoundary>,
+
+    #[serde(default)]
+    pub db: Option<DbBoundary>,
+
+    #[serde(default)]
+    pub streaming_exception: Vec<StreamingException>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StackBoundary {
+    #[serde(default)]
+    pub id: String,
+
+    #[serde(default)]
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RustBoundary {
+    #[serde(default)]
+    pub domain_paths: Vec<String>,
+
+    #[serde(default)]
+    pub forbidden_domain_imports: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TypeScriptBoundary {
+    #[serde(default)]
+    pub web_paths: Vec<String>,
+
+    #[serde(default)]
+    pub forbidden_web_imports: Vec<String>,
+
+    #[serde(default)]
+    pub generated_contract_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PythonBoundary {
+    #[serde(default)]
+    pub allowed_truth_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct QueueBoundary {
+    #[serde(default)]
+    pub adapter_paths: Vec<String>,
+
+    #[serde(default)]
+    pub event_contract_paths: Vec<String>,
+
+    #[serde(default)]
+    pub generated_type_paths: Vec<String>,
+
+    #[serde(default)]
+    pub client_markers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DbBoundary {
+    #[serde(default)]
+    pub root_paths: Vec<String>,
+
+    #[serde(default)]
+    pub migration_paths: Vec<String>,
+
+    #[serde(default)]
+    pub constraint_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct StreamingException {
+    #[serde(default)]
+    pub runtime: String,
+
+    #[serde(default)]
+    pub classification: Option<String>,
+
+    #[serde(default)]
+    pub reason: Option<String>,
+
+    #[serde(default)]
+    pub owner: String,
+
+    #[serde(default)]
+    pub expires: String,
+
+    #[serde(default)]
+    pub migration_path: String,
+}
+
+pub fn parse(text: &str) -> Result<BoundaryManifest> {
+    Ok(toml::from_str::<BoundaryManifest>(text)?)
+}
+
+pub fn load(root: &Path) -> Result<BoundaryManifest> {
+    let path = root.join("agent/boundaries.toml");
+    let text = fs::read_to_string(path)?;
+    parse(&text)
+}
+
+impl BoundaryManifest {
+    pub fn rust_policy(&self) -> RustBoundary {
+        self.rust.clone().unwrap_or_default()
+    }
+
+    pub fn typescript_policy(&self) -> TypeScriptBoundary {
+        self.typescript.clone().unwrap_or_default()
+    }
+
+    pub fn python_policy(&self) -> PythonBoundary {
+        self.python.clone().unwrap_or_default()
+    }
+
+    pub fn queue_policy(&self) -> QueueBoundary {
+        self.queues.clone().unwrap_or_default()
+    }
+
+    pub fn db_policy(&self) -> DbBoundary {
+        self.db.clone().unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_phase02_boundary_manifest() {
+        let manifest = parse(
+            r#"
+[stack]
+id = "jankurai"
+version = "0.4.0"
+
+[rust]
+domain_paths = ["crates/*/src/domain"]
+forbidden_domain_imports = ["std::fs", "std::env", "sqlx"]
+
+[typescript]
+web_paths = ["apps/web"]
+forbidden_web_imports = ["pg", "postgres", "sqlx"]
+generated_contract_paths = ["contracts/generated"]
+
+[python]
+allowed_truth_paths = ["python/ai-service", "tools"]
+
+[queues]
+adapter_paths = ["crates/adapters/queue"]
+event_contract_paths = ["contracts/events"]
+generated_type_paths = ["contracts/generated/events"]
+client_markers = ["rdkafka", "kafkajs", "nats"]
+
+[db]
+root_paths = ["db"]
+migration_paths = ["db/migrations"]
+constraint_paths = ["db/constraints"]
+
+[[streaming_exception]]
+runtime = "kafka"
+classification = "brownfield_runtime"
+owner = "platform"
+expires = "2026-12-31"
+migration_path = "docs/migration/kafka-to-agent-native.md"
+"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(manifest.rust_policy().domain_paths[0], "crates/*/src/domain");
+        assert_eq!(manifest.typescript_policy().web_paths[0], "apps/web");
+        assert_eq!(manifest.python_policy().allowed_truth_paths[0], "python/ai-service");
+        assert_eq!(manifest.queue_policy().client_markers[0], "rdkafka");
+        assert_eq!(manifest.db_policy().migration_paths[0], "db/migrations");
+        assert_eq!(manifest.streaming_exception[0].runtime, "kafka");
+    }
+}
+```
+
+---
+
+## 2. Add `crates/jankurai/src/audit/analyzers/semantic_oracle.rs`
+
+This is the core Phase 02 completion. It is intentionally dependency-light: it does shallow import/marker extraction rather than introducing a heavy parser. That is the right fit for the current crate because `crates/jankurai/Cargo.toml` already depends on `regex`, `serde`, `toml`, `rayon`, `ignore`, and related audit-friendly libraries, but not a language-specific AST stack. ([GitHub][6])
+
+```rust
+use crate::audit::helpers::AuditContext;
+use crate::boundaries::manifest::{self, BoundaryManifest, StreamingException};
+use crate::model::FileInfo;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const BOUNDARIES_MANIFEST: &str = "agent/boundaries.toml";
+
+const DEFAULT_RUST_DOMAIN_PATHS: &[&str] = &[
+    "crates/domain",
+    "crates/*/src/domain",
+    "crates/*/domain",
+];
+
+const DEFAULT_RUST_FORBIDDEN_IMPORTS: &[&str] = &[
+    "std::fs",
+    "std::env",
+    "std::net",
+    "std::time::SystemTime",
+    "rand",
+    "sqlx",
+    "diesel",
+    "postgres",
+    "reqwest",
+    "rdkafka",
+    "kafka",
+    "nats",
+    "tracing",
+    "log::",
+];
+
+const DEFAULT_TS_WEB_PATHS: &[&str] = &[
+    "apps/web",
+    "packages/web",
+    "packages/ui",
+    "frontend",
+    "web",
+];
+
+const DEFAULT_TS_FORBIDDEN_IMPORTS: &[&str] = &[
+    "pg",
+    "postgres",
+    "postgres.js",
+    "sqlx",
+    "mysql",
+    "prisma",
+    "@prisma/client",
+    "mongodb",
+    "typeorm",
+    "sequelize",
+    "kafkajs",
+    "rdkafka",
+    "nats",
+    "ioredis",
+    "redis",
+    "fs",
+    "node:fs",
+    "child_process",
+    "node:child_process",
+];
+
+const DEFAULT_PYTHON_ALLOWED_TRUTH_PATHS: &[&str] = &[
+    "python/ai-service",
+    "tools",
+];
+
+const PYTHON_TRUTH_MARKERS: &[&str] = &[
+    "sqlalchemy",
+    "psycopg",
+    "psycopg2",
+    "asyncpg",
+    "sqlite3",
+    "mysql.connector",
+    "pymongo",
+    "redis",
+    "authorization",
+    "authorize_",
+    "permission",
+    "role_policy",
+    "product_truth",
+    "order_status",
+    "invoice_status",
+    "tenant_policy",
+    "user_entitlement",
+];
+
+const DB_MARKERS: &[&str] = &[
+    "sqlx::",
+    "diesel::",
+    "tokio_postgres",
+    "postgres::",
+    "mysql::",
+    "rusqlite",
+    "@prisma/client",
+    "new PrismaClient",
+    "from \"pg\"",
+    "from 'pg'",
+    "require(\"pg\")",
+    "require('pg')",
+    "postgres(",
+    "createPool(",
+    "createConnection(",
+    "select ",
+    "insert into ",
+    "update ",
+    "delete from ",
+    "alter table ",
+    "drop table ",
+    "create table ",
+];
+
+const DEFAULT_STREAMING_CLIENT_MARKERS: &[&str] = &[
+    "rdkafka",
+    "kafkajs",
+    "kafka-node",
+    "node-rdkafka",
+    "tansu",
+    "iggy",
+    "fluvio",
+    "nats",
+    "redis streams",
+    "xread",
+    "xadd",
+];
+
+#[derive(Debug, Clone)]
+pub struct SemanticFinding {
+    pub rule_id: &'static str,
+    pub path: String,
+    pub line: Option<usize>,
+    pub matched_term: Option<String>,
+    pub problem: String,
+    pub reason: String,
+    pub agent_fix: String,
+    pub evidence: Vec<String>,
+    pub confidence: Option<f64>,
+}
+
+impl SemanticFinding {
+    fn new(
+        rule_id: &'static str,
+        path: impl Into<String>,
+        line: Option<usize>,
+        matched_term: Option<String>,
+        problem: impl Into<String>,
+        reason: impl Into<String>,
+        agent_fix: impl Into<String>,
+        evidence: Vec<String>,
+        confidence: f64,
+    ) -> Self {
+        Self {
+            rule_id,
+            path: path.into(),
+            line,
+            matched_term,
+            problem: problem.into(),
+            reason: reason.into(),
+            agent_fix: agent_fix.into(),
+            evidence,
+            confidence: Some(confidence),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ManifestState {
+    manifest: BoundaryManifest,
+    present: bool,
+    parse_error: Option<String>,
+}
+
+pub fn findings(ctx: &AuditContext) -> Vec<SemanticFinding> {
+    let state = load_boundary_manifest(ctx);
+    let mut out = Vec::new();
+
+    if !state.present {
+        out.push(SemanticFinding::new(
+            "HLT-024-BOUNDARY-MANIFEST-GAP",
+            BOUNDARIES_MANIFEST,
+            None,
+            Some("missing-boundaries-manifest".to_string()),
+            "Boundary oracle manifest is missing.",
+            "Phase 02 requires explicit boundary policy so semantic findings can map code to ownership, proof lanes, and exceptions.",
+            "Create agent/boundaries.toml with [rust], [typescript], [python], [queues], and [db] sections. Use the current stack policy as the source of truth.",
+            vec![
+                "expected manifest: agent/boundaries.toml".to_string(),
+                "semantic oracle fell back to conservative defaults".to_string(),
+            ],
+            0.99,
+        ));
+    }
+
+    if let Some(error) = &state.parse_error {
+        out.push(SemanticFinding::new(
+            "HLT-024-BOUNDARY-MANIFEST-GAP",
+            BOUNDARIES_MANIFEST,
+            Some(1),
+            Some("toml-parse-error".to_string()),
+            "Boundary oracle manifest is not valid TOML.",
+            "The semantic oracle cannot safely apply trusted boundary policy while the manifest fails to parse.",
+            "Fix agent/boundaries.toml TOML syntax, then rerun `just score`.",
+            vec![
+                format!("parse error: {error}"),
+                "trusted policy must win over untrusted local heuristics".to_string(),
+            ],
+            0.99,
+        ));
+    }
+
+    out.extend(rust_domain_impurity(ctx, &state.manifest));
+    out.extend(typescript_web_wrong_layer(ctx, &state.manifest));
+    out.extend(python_product_truth_leakage(ctx, &state.manifest));
+    out.extend(db_wrong_layer_access(ctx, &state.manifest));
+    out.extend(streaming_runtime_drift(ctx, &state.manifest));
+
+    out.sort_by(|a, b| {
+        a.path
+            .cmp(&b.path)
+            .then(a.line.cmp(&b.line))
+            .then(a.rule_id.cmp(b.rule_id))
+            .then(a.matched_term.cmp(&b.matched_term))
+    });
+    out.dedup_by(|a, b| {
+        a.rule_id == b.rule_id
+            && a.path == b.path
+            && a.line == b.line
+            && a.matched_term == b.matched_term
+    });
+
+    out
+}
+
+fn load_boundary_manifest(ctx: &AuditContext) -> ManifestState {
+    let path = ctx.root.join(BOUNDARIES_MANIFEST);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match manifest::parse(&text) {
+            Ok(manifest) => ManifestState {
+                manifest,
+                present: true,
+                parse_error: None,
+            },
+            Err(error) => ManifestState {
+                manifest: BoundaryManifest::default(),
+                present: true,
+                parse_error: Some(error.to_string()),
+            },
+        },
+        Err(_) => ManifestState {
+            manifest: BoundaryManifest::default(),
+            present: false,
+            parse_error: None,
+        },
+    }
+}
+
+fn rust_domain_impurity(
+    ctx: &AuditContext,
+    manifest: &BoundaryManifest,
+) -> Vec<SemanticFinding> {
+    let policy = manifest.rust_policy();
+    let domain_paths = effective_strings(&policy.domain_paths, DEFAULT_RUST_DOMAIN_PATHS);
+    let forbidden_imports = effective_strings(
+        &policy.forbidden_domain_imports,
+        DEFAULT_RUST_FORBIDDEN_IMPORTS,
+    );
+
+    let mut out = Vec::new();
+
+    for file in ctx.scope_files.iter().filter(|file| file.suffix == ".rs") {
+        if skip_semantic_file(file) || !matches_any_policy_path(&file.rel_path, &domain_paths) {
+            continue;
+        }
+
+        let import_edges = import_edges(file);
+        if let Some(edge) = import_edges
+            .iter()
+            .find(|edge| marker_matches_any(&edge.target, &forbidden_imports))
+        {
+            let marker = matching_marker(&edge.target, &forbidden_imports)
+                .unwrap_or_else(|| edge.target.clone());
+            out.push(SemanticFinding::new(
+                "HLT-022-RUST-DOMAIN-IMPURITY",
+                file.rel_path.clone(),
+                Some(edge.line),
+                Some(marker.clone()),
+                "Rust domain code imports side-effectful infrastructure.",
+                format!(
+                    "Path `{}` matches Rust domain policy and import `{}` violates the pure-domain boundary.",
+                    file.rel_path, edge.target
+                ),
+                "Move filesystem, environment, network, time, DB, queue, logging, and randomness access into an adapter/application layer. Pass deterministic values into the domain as explicit inputs.",
+                vec![
+                    format!("policy paths: {}", domain_paths.join(", ")),
+                    format!("import line {}: {}", edge.line, edge.raw.trim()),
+                    format!("matched forbidden import marker: `{marker}`"),
+                ],
+                0.96,
+            ));
+            continue;
+        }
+
+        if let Some((line, marker, raw)) = first_marker_in_text(&file.text, &forbidden_imports) {
+            out.push(SemanticFinding::new(
+                "HLT-022-RUST-DOMAIN-IMPURITY",
+                file.rel_path.clone(),
+                Some(line),
+                Some(marker.clone()),
+                "Rust domain code contains side-effectful infrastructure access.",
+                format!(
+                    "Path `{}` matches Rust domain policy and contains forbidden marker `{}`.",
+                    file.rel_path, marker
+                ),
+                "Move this side effect behind an explicit adapter or inject the value into the domain. Domain code should be deterministic and free of IO/runtime ownership.",
+                vec![
+                    format!("policy paths: {}", domain_paths.join(", ")),
+                    format!("line {line}: {}", raw.trim()),
+                    format!("matched forbidden marker: `{marker}`"),
+                ],
+                0.92,
+            ));
+        }
+    }
+
+    out
+}
+
+fn typescript_web_wrong_layer(
+    ctx: &AuditContext,
+    manifest: &BoundaryManifest,
+) -> Vec<SemanticFinding> {
+    let policy = manifest.typescript_policy();
+    let web_paths = effective_strings(&policy.web_paths, DEFAULT_TS_WEB_PATHS);
+    let forbidden_imports = effective_strings(
+        &policy.forbidden_web_imports,
+        DEFAULT_TS_FORBIDDEN_IMPORTS,
+    );
+    let generated_contract_paths = effective_strings(
+        &policy.generated_contract_paths,
+        &["contracts/generated", "packages/generated", "apps/web/src/generated"],
+    );
+
+    let generated_contracts_exist = ctx.scope_files.iter().any(|file| {
+        generated_contract_paths
+            .iter()
+            .any(|path| path_prefix_match(&file.rel_path, path))
+    }) || ctx.all_files.iter().any(|file| {
+        generated_contract_paths
+            .iter()
+            .any(|path| path_prefix_match(&file.rel_path, path))
+    });
+
+    let mut out = Vec::new();
+
+    for file in ctx.scope_files.iter().filter(|file| {
+        matches!(
+            file.suffix.as_str(),
+            ".ts" | ".tsx" | ".js" | ".jsx" | ".mjs" | ".cjs"
+        )
+    }) {
+        if skip_semantic_file(file) || !matches_any_policy_path(&file.rel_path, &web_paths) {
+            continue;
+        }
+
+        let import_edges = import_edges(file);
+        if let Some(edge) = import_edges
+            .iter()
+            .find(|edge| marker_matches_any(&edge.target, &forbidden_imports))
+        {
+            let marker = matching_marker(&edge.target, &forbidden_imports)
+                .unwrap_or_else(|| edge.target.clone());
+            out.push(SemanticFinding::new(
+                "HLT-023-TS-WEB-WRONG-LAYER",
+                file.rel_path.clone(),
+                Some(edge.line),
+                Some(marker.clone()),
+                "TypeScript web code imports backend/storage/runtime infrastructure.",
+                format!(
+                    "Path `{}` matches web policy and import `{}` violates the frontend boundary.",
+                    file.rel_path, edge.target
+                ),
+                "Move DB, queue, filesystem, and backend runtime access into server/adapters. Web code should consume generated contracts or typed API clients only.",
+                vec![
+                    format!("policy paths: {}", web_paths.join(", ")),
+                    format!("import line {}: {}", edge.line, edge.raw.trim()),
+                    format!("matched forbidden import marker: `{marker}`"),
+                ],
+                0.96,
+            ));
+            continue;
+        }
+
+        if let Some((line, marker, raw)) = first_marker_in_text(&file.text, &forbidden_imports) {
+            out.push(SemanticFinding::new(
+                "HLT-023-TS-WEB-WRONG-LAYER",
+                file.rel_path.clone(),
+                Some(line),
+                Some(marker.clone()),
+                "TypeScript web code contains backend/storage/runtime marker.",
+                format!(
+                    "Path `{}` matches web policy and contains forbidden marker `{}`.",
+                    file.rel_path, marker
+                ),
+                "Replace raw infrastructure access with generated contracts, typed API clients, or a server-side adapter.",
+                vec![
+                    format!("policy paths: {}", web_paths.join(", ")),
+                    format!("line {line}: {}", raw.trim()),
+                    format!("matched forbidden marker: `{marker}`"),
+                ],
+                0.90,
+            ));
+            continue;
+        }
+
+        if generated_contracts_exist {
+            if let Some((line, marker, raw)) = handwritten_contract_line(file) {
+                out.push(SemanticFinding::new(
+                    "HLT-007-GENERATED-CONTRACT-DRIFT",
+                    file.rel_path.clone(),
+                    Some(line),
+                    Some(marker.to_string()),
+                    "Web code appears to handwrite an API/client/DTO contract while generated contracts exist.",
+                    format!(
+                        "Generated contract paths are declared, but `{}` contains `{}` instead of consuming generated artifacts.",
+                        file.rel_path, marker
+                    ),
+                    "Delete the handwritten mirror and import the generated contract/client. Regenerate from the canonical schema/source, then rerun the web proof lane.",
+                    vec![
+                        format!("generated contract paths: {}", generated_contract_paths.join(", ")),
+                        format!("line {line}: {}", raw.trim()),
+                        format!("matched handwritten contract marker: `{marker}`"),
+                    ],
+                    0.88,
+                ));
+            }
+        }
+    }
+
+    out
+}
+
+fn python_product_truth_leakage(
+    ctx: &AuditContext,
+    manifest: &BoundaryManifest,
+) -> Vec<SemanticFinding> {
+    let policy = manifest.python_policy();
+    let allowed_truth_paths =
+        effective_strings(&policy.allowed_truth_paths, DEFAULT_PYTHON_ALLOWED_TRUTH_PATHS);
+    let truth_markers = strings_from_static(PYTHON_TRUTH_MARKERS);
+
+    let mut out = Vec::new();
+
+    for file in ctx.scope_files.iter().filter(|file| file.suffix == ".py") {
+        if skip_semantic_file(file)
+            || matches_any_policy_path(&file.rel_path, &allowed_truth_paths)
+        {
+            continue;
+        }
+
+        let import_edges = import_edges(file);
+        if let Some(edge) = import_edges
+            .iter()
+            .find(|edge| marker_matches_any(&edge.target, &truth_markers))
+        {
+            let marker = matching_marker(&edge.target, &truth_markers)
+                .unwrap_or_else(|| edge.target.clone());
+            out.push(SemanticFinding::new(
+                "HLT-005-PYTHON-PRODUCT-TRUTH",
+                file.rel_path.clone(),
+                Some(edge.line),
+                Some(marker.clone()),
+                "Python code outside the allowed AI/tooling boundary imports durable product-truth infrastructure.",
+                format!(
+                    "Path `{}` is outside allowed Python truth paths and imports `{}`.",
+                    file.rel_path, edge.target
+                ),
+                "Move durable product truth to the canonical product/domain layer. Keep Python code as AI/data/tooling glue that consumes explicit inputs or generated contracts.",
+                vec![
+                    format!("allowed Python truth paths: {}", allowed_truth_paths.join(", ")),
+                    format!("import line {}: {}", edge.line, edge.raw.trim()),
+                    format!("matched product-truth marker: `{marker}`"),
+                ],
+                0.94,
+            ));
+            continue;
+        }
+
+        if let Some((line, marker, raw)) = first_marker_in_text(&file.text, &truth_markers) {
+            out.push(SemanticFinding::new(
+                "HLT-005-PYTHON-PRODUCT-TRUTH",
+                file.rel_path.clone(),
+                Some(line),
+                Some(marker.clone()),
+                "Python code outside the allowed AI/tooling boundary contains durable product-truth logic.",
+                format!(
+                    "Path `{}` is outside allowed Python truth paths and contains product-truth marker `{}`.",
+                    file.rel_path, marker
+                ),
+                "Move authorization, product state, entitlement, tenant, persistence, and canonical business rules into the product/domain layer. Expose them to Python through generated contracts or explicit inputs.",
+                vec![
+                    format!("allowed Python truth paths: {}", allowed_truth_paths.join(", ")),
+                    format!("line {line}: {}", raw.trim()),
+                    format!("matched product-truth marker: `{marker}`"),
+                ],
+                0.90,
+            ));
+        }
+    }
+
+    out
+}
+
+fn db_wrong_layer_access(
+    ctx: &AuditContext,
+    manifest: &BoundaryManifest,
+) -> Vec<SemanticFinding> {
+    let db_policy = manifest.db_policy();
+    let queue_policy = manifest.queue_policy();
+
+    let root_paths = effective_strings(&db_policy.root_paths, &["db"]);
+    let migration_paths = effective_strings(&db_policy.migration_paths, &["db/migrations"]);
+    let constraint_paths = effective_strings(&db_policy.constraint_paths, &["db/constraints"]);
+    let adapter_paths = effective_strings(
+        &queue_policy.adapter_paths,
+        &[
+            "crates/adapters",
+            "packages/adapters",
+            "apps/api/src/adapters",
+            "apps/server/src/adapters",
+        ],
+    );
+
+    let markers = strings_from_static(DB_MARKERS);
+    let mut out = Vec::new();
+
+    for file in ctx.scope_files.iter().filter(|file| is_code_like(file)) {
+        if skip_semantic_file(file)
+            || is_db_allowed_path(
+                &file.rel_path,
+                &root_paths,
+                &migration_paths,
+                &constraint_paths,
+                &adapter_paths,
+            )
+            || !is_db_risky_layer(&file.rel_path)
+        {
+            continue;
+        }
+
+        let import_edges = import_edges(file);
+        if let Some(edge) = import_edges
+            .iter()
+            .find(|edge| marker_matches_any(&edge.target, &markers))
+        {
+            let marker = matching_marker(&edge.target, &markers)
+                .unwrap_or_else(|| edge.target.clone());
+            out.push(SemanticFinding::new(
+                "HLT-006-DIRECT-DB-WRONG-LAYER",
+                file.rel_path.clone(),
+                Some(edge.line),
+                Some(marker.clone()),
+                "Code outside the DB/adapters/migrations boundary imports direct DB infrastructure.",
+                format!(
+                    "Path `{}` is not a DB/adapters/migrations path and imports `{}`.",
+                    file.rel_path, edge.target
+                ),
+                "Move direct DB access into the DB/adapters boundary. Expose behavior through a typed domain/application interface and cover the change with the mapped proof lane.",
+                vec![
+                    format!("DB root paths: {}", root_paths.join(", ")),
+                    format!("migration paths: {}", migration_paths.join(", ")),
+                    format!("adapter paths: {}", adapter_paths.join(", ")),
+                    format!("import line {}: {}", edge.line, edge.raw.trim()),
+                    format!("matched DB marker: `{marker}`"),
+                ],
+                0.96,
+            ));
+            continue;
+        }
+
+        if let Some((line, marker, raw)) = first_marker_in_text(&file.text, &markers) {
+            out.push(SemanticFinding::new(
+                "HLT-006-DIRECT-DB-WRONG-LAYER",
+                file.rel_path.clone(),
+                Some(line),
+                Some(marker.clone()),
+                "Code outside the DB/adapters/migrations boundary contains direct DB access.",
+                format!(
+                    "Path `{}` is not a DB/adapters/migrations path and contains DB marker `{}`.",
+                    file.rel_path, marker
+                ),
+                "Move raw SQL/ORM/client usage into the DB/adapters boundary. Keep domain/web/Python layers behind typed contracts and explicit proof lanes.",
+                vec![
+                    format!("DB root paths: {}", root_paths.join(", ")),
+                    format!("migration paths: {}", migration_paths.join(", ")),
+                    format!("adapter paths: {}", adapter_paths.join(", ")),
+                    format!("line {line}: {}", raw.trim()),
+                    format!("matched DB marker: `{marker}`"),
+                ],
+                0.90,
+            ));
+        }
+    }
+
+    out
+}
+
+fn streaming_runtime_drift(
+    ctx: &AuditContext,
+    manifest: &BoundaryManifest,
+) -> Vec<SemanticFinding> {
+    let queue_policy = manifest.queue_policy();
+    let adapter_paths = effective_strings(
+        &queue_policy.adapter_paths,
+        &[
+            "crates/adapters/queue",
+            "crates/adapters/streaming",
+            "packages/adapters/queue",
+            "apps/api/src/adapters/queue",
+        ],
+    );
+    let client_markers = effective_strings(
+        &queue_policy.client_markers,
+        DEFAULT_STREAMING_CLIENT_MARKERS,
+    );
+
+    let mut out = Vec::new();
+
+    for file in ctx.scope_files.iter().filter(|file| is_code_like(file)) {
+        if skip_semantic_file(file) || matches_any_policy_path(&file.rel_path, &adapter_paths) {
+            continue;
+        }
+
+        let import_edges = import_edges(file);
+        if let Some(edge) = import_edges
+            .iter()
+            .find(|edge| marker_matches_any(&edge.target, &client_markers))
+        {
+            let marker = matching_marker(&edge.target, &client_markers)
+                .unwrap_or_else(|| edge.target.clone());
+            let runtime = runtime_for_marker(&marker);
+
+            if exception_allows_runtime(manifest, runtime, &mut out) {
+                continue;
+            }
+
+            out.push(SemanticFinding::new(
+                "HLT-019-STREAMING-RUNTIME-DRIFT",
+                file.rel_path.clone(),
+                Some(edge.line),
+                Some(marker.clone()),
+                "Non-adapter code imports a streaming runtime/client.",
+                format!(
+                    "Path `{}` is outside queue adapter paths and imports streaming runtime `{}`.",
+                    file.rel_path, edge.target
+                ),
+                "Move streaming client usage into the queue adapter boundary. If this is an approved brownfield runtime, record a complete owner/expiry/migration exception in agent/boundaries.toml.",
+                vec![
+                    format!("queue adapter paths: {}", adapter_paths.join(", ")),
+                    format!("import line {}: {}", edge.line, edge.raw.trim()),
+                    format!("matched streaming marker: `{marker}`"),
+                ],
+                0.96,
+            ));
+            continue;
+        }
+
+        if let Some((line, marker, raw)) = first_marker_in_text(&file.text, &client_markers) {
+            let runtime = runtime_for_marker(&marker);
+
+            if exception_allows_runtime(manifest, runtime, &mut out) {
+                continue;
+            }
+
+            out.push(SemanticFinding::new(
+                "HLT-019-STREAMING-RUNTIME-DRIFT",
+                file.rel_path.clone(),
+                Some(line),
+                Some(marker.clone()),
+                "Non-adapter code contains streaming runtime/client marker.",
+                format!(
+                    "Path `{}` is outside queue adapter paths and contains streaming runtime marker `{}`.",
+                    file.rel_path, marker
+                ),
+                "Move streaming client usage into the queue adapter boundary. If this is an approved brownfield runtime, record a complete owner/expiry/migration exception in agent/boundaries.toml.",
+                vec![
+                    format!("queue adapter paths: {}", adapter_paths.join(", ")),
+                    format!("line {line}: {}", raw.trim()),
+                    format!("matched streaming marker: `{marker}`"),
+                ],
+                0.90,
+            ));
+        }
+    }
+
+    out
+}
+
+#[derive(Debug, Clone)]
+struct ImportEdge {
+    line: usize,
+    target: String,
+    raw: String,
+}
+
+fn import_edges(file: &FileInfo) -> Vec<ImportEdge> {
+    let mut edges = Vec::new();
+
+    for (idx, raw) in file.text.lines().enumerate() {
+        let line_no = idx + 1;
+        let line = raw.trim();
+
+        if line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+
+        if file.suffix == ".rs" {
+            if let Some(target) = parse_rust_use(line) {
+                edges.push(ImportEdge {
+                    line: line_no,
+                    target,
+                    raw: raw.to_string(),
+                });
+            }
+            continue;
+        }
+
+        if matches!(
+            file.suffix.as_str(),
+            ".ts" | ".tsx" | ".js" | ".jsx" | ".mjs" | ".cjs"
+        ) {
+            if let Some(target) = parse_ts_import(line) {
+                edges.push(ImportEdge {
+                    line: line_no,
+                    target,
+                    raw: raw.to_string(),
+                });
+            }
+            continue;
+        }
+
+        if file.suffix == ".py" {
+            if let Some(target) = parse_python_import(line) {
+                edges.push(ImportEdge {
+                    line: line_no,
+                    target,
+                    raw: raw.to_string(),
+                });
+            }
+        }
+    }
+
+    edges
+}
+
+fn parse_rust_use(line: &str) -> Option<String> {
+    let line = line.strip_prefix("use ")?;
+    let target = line.trim_end_matches(';').trim();
+    if target.is_empty() {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
+fn parse_ts_import(line: &str) -> Option<String> {
+    if line.starts_with("import ") {
+        if let Some(target) = quoted_tail_after_from(line) {
+            return Some(target);
+        }
+
+        if let Some(target) = first_quoted_string(line) {
+            return Some(target);
+        }
+    }
+
+    if line.contains("require(") {
+        return first_quoted_string(line);
+    }
+
+    None
+}
+
+fn parse_python_import(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("import ") {
+        let target = rest
+            .split(|ch: char| ch == ',' || ch.is_whitespace())
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+    }
+
+    if let Some(rest) = line.strip_prefix("from ") {
+        let target = rest.split_whitespace().next().unwrap_or_default().trim();
+        if !target.is_empty() {
+            return Some(target.to_string());
+        }
+    }
+
+    None
+}
+
+fn quoted_tail_after_from(line: &str) -> Option<String> {
+    let from_idx = line.find(" from ")?;
+    first_quoted_string(&line[from_idx..])
+}
+
+fn first_quoted_string(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut start = None;
+    let mut quote = b'\0';
+
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte == b'\'' || *byte == b'"' {
+            start = Some(idx + 1);
+            quote = *byte;
+            break;
+        }
+    }
+
+    let start = start?;
+    let end = bytes[start..].iter().position(|byte| *byte == quote)? + start;
+    Some(line[start..end].to_string())
+}
+
+fn exception_allows_runtime(
+    manifest: &BoundaryManifest,
+    runtime: &str,
+    out: &mut Vec<SemanticFinding>,
+) -> bool {
+    let Some(exception) = manifest
+        .streaming_exception
+        .iter()
+        .find(|exception| exception.runtime.eq_ignore_ascii_case(runtime))
+    else {
+        return false;
+    };
+
+    let missing = invalid_exception_reasons(exception);
+    if missing.is_empty() {
+        return true;
+    }
+
+    out.push(SemanticFinding::new(
+        "HLT-019-STREAMING-RUNTIME-DRIFT",
+        BOUNDARIES_MANIFEST,
+        Some(1),
+        Some(format!("{runtime}-exception")),
+        "Streaming runtime exception is incomplete or expired.",
+        format!(
+            "Runtime `{runtime}` has an exception entry, but it is missing moonshot-required ownership, expiry, classification/reason, or migration data."
+        ),
+        "Update the streaming exception with owner, unexpired expires date, classification or reason, and migration_path. Otherwise remove the exception and move the runtime behind an adapter.",
+        missing
+            .into_iter()
+            .map(|reason| format!("invalid exception: {reason}"))
+            .collect(),
+        0.99,
+    ));
+
+    true
+}
+
+fn invalid_exception_reasons(exception: &StreamingException) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if exception.owner.trim().is_empty() {
+        out.push("owner is empty".to_string());
+    }
+
+    if exception.migration_path.trim().is_empty() {
+        out.push("migration_path is empty".to_string());
+    }
+
+    let classification = exception
+        .classification
+        .as_deref()
+        .unwrap_or_default()
+        .trim();
+    let reason = exception.reason.as_deref().unwrap_or_default().trim();
+    if classification.is_empty() && reason.is_empty() {
+        out.push("classification/reason is empty".to_string());
+    }
+
+    if exception.expires.trim().is_empty() {
+        out.push("expires is empty".to_string());
+    } else if !expiry_is_today_or_future(&exception.expires) {
+        out.push(format!(
+            "expires `{}` is invalid or already expired",
+            exception.expires
+        ));
+    }
+
+    out
+}
+
+fn expiry_is_today_or_future(value: &str) -> bool {
+    let Some((year, month, day)) = parse_ymd(value) else {
+        return false;
+    };
+
+    let Some(today_days) = current_days_since_unix_epoch() else {
+        return true;
+    };
+
+    let expiry_days = days_from_civil(year, month, day);
+    expiry_days >= today_days
+}
+
+fn parse_ymd(value: &str) -> Option<(i32, u32, u32)> {
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || month == 0 || month > 12 || day == 0 || day > 31 {
+        return None;
+    }
+    Some((year, month, day))
+}
+
+fn current_days_since_unix_epoch() -> Option<i64> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
+    Some((duration.as_secs() / 86_400) as i64)
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let mp = month + if month > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146_097 + doe - 719_468) as i64
+}
+
+fn runtime_for_marker(marker: &str) -> &str {
+    let marker = marker.to_ascii_lowercase();
+
+    if marker.contains("kafka") || marker.contains("rdkafka") {
+        "kafka"
+    } else if marker.contains("nats") {
+        "nats"
+    } else if marker.contains("redis") || marker.contains("xread") || marker.contains("xadd") {
+        "redis"
+    } else if marker.contains("fluvio") {
+        "fluvio"
+    } else if marker.contains("iggy") {
+        "iggy"
+    } else if marker.contains("tansu") {
+        "tansu"
+    } else {
+        "streaming"
+    }
+}
+
+fn handwritten_contract_line(file: &FileInfo) -> Option<(usize, &'static str, String)> {
+    for (idx, raw) in file.text.lines().enumerate() {
+        let line = raw.trim();
+        let lower = line.to_ascii_lowercase();
+
+        if lower.starts_with("//") || lower.starts_with("/*") {
+            continue;
+        }
+
+        if (lower.contains("interface ") || lower.contains("type "))
+            && (lower.contains("dto") || lower.contains("response") || lower.contains("request"))
+        {
+            return Some((idx + 1, "handwritten-dto-contract", raw.to_string()));
+        }
+
+        if lower.contains("fetch(") && (lower.contains("/api/") || lower.contains("application/json"))
+        {
+            return Some((idx + 1, "handwritten-fetch-client", raw.to_string()));
+        }
+
+        if lower.contains("axios.") || lower.contains("axios(") {
+            return Some((idx + 1, "handwritten-axios-client", raw.to_string()));
+        }
+    }
+
+    None
+}
+
+fn is_code_like(file: &FileInfo) -> bool {
+    if file.is_code {
+        return true;
+    }
+
+    matches!(
+        file.suffix.as_str(),
+        ".rs"
+            | ".ts"
+            | ".tsx"
+            | ".js"
+            | ".jsx"
+            | ".mjs"
+            | ".cjs"
+            | ".py"
+            | ".sql"
+            | ".go"
+            | ".java"
+            | ".kt"
+            | ".cs"
+            | ".rb"
+    )
+}
+
+fn is_db_allowed_path(
+    path: &str,
+    root_paths: &[String],
+    migration_paths: &[String],
+    constraint_paths: &[String],
+    adapter_paths: &[String],
+) -> bool {
+    matches_any_policy_path(path, root_paths)
+        || matches_any_policy_path(path, migration_paths)
+        || matches_any_policy_path(path, constraint_paths)
+        || matches_any_policy_path(path, adapter_paths)
+        || path.contains("/migrations/")
+        || path.contains("/db/")
+        || path.starts_with("migrations/")
+}
+
+fn is_db_risky_layer(path: &str) -> bool {
+    path.starts_with("apps/web/")
+        || path.starts_with("packages/web/")
+        || path.starts_with("packages/ui/")
+        || path.starts_with("frontend/")
+        || path.starts_with("web/")
+        || path.starts_with("crates/domain/")
+        || path.contains("/src/domain/")
+        || path.starts_with("python/")
+        || path.starts_with("src/")
+}
+
+fn skip_semantic_file(file: &FileInfo) -> bool {
+    if file.is_generated {
+        return true;
+    }
+
+    let path = file.rel_path.as_str();
+
+    path.starts_with(".git/")
+        || path.starts_with("target/")
+        || path.starts_with("node_modules/")
+        || path.starts_with("vendor/")
+        || path.starts_with("dist/")
+        || path.starts_with("build/")
+        || path.starts_with("coverage/")
+        || path.starts_with("docs/")
+        || path.starts_with("reference/")
+        || path.starts_with("tips/")
+        || path.ends_with(".md")
+        || path.ends_with(".mdx")
+        || path.ends_with(".snap")
+        || path.ends_with(".snapshot")
+        || path.ends_with(".png")
+        || path.ends_with(".jpg")
+        || path.ends_with(".jpeg")
+        || path.ends_with(".gif")
+        || path.ends_with(".svg")
+}
+
+fn first_marker_in_text(text: &str, markers: &[String]) -> Option<(usize, String, String)> {
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+
+        for marker in markers {
+            if marker_matches(line, marker) {
+                return Some((idx + 1, marker.clone(), raw.to_string()));
+            }
+        }
+    }
+
+    None
+}
+
+fn marker_matches_any(text: &str, markers: &[String]) -> bool {
+    markers.iter().any(|marker| marker_matches(text, marker))
+}
+
+fn matching_marker(text: &str, markers: &[String]) -> Option<String> {
+    markers
+        .iter()
+        .find(|marker| marker_matches(text, marker))
+        .cloned()
+}
+
+fn marker_matches(text: &str, marker: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    let marker = marker.to_ascii_lowercase();
+
+    if marker.trim().is_empty() {
+        return false;
+    }
+
+    if marker
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        && marker.len() <= 5
+    {
+        return text
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+            .any(|token| token == marker);
+    }
+
+    text.contains(&marker)
+}
+
+fn effective_strings(values: &[String], defaults: &[&str]) -> Vec<String> {
+    if values.is_empty() {
+        strings_from_static(defaults)
+    } else {
+        values
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect()
+    }
+}
+
+fn strings_from_static(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_string()).collect()
+}
+
+fn matches_any_policy_path(path: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| path_policy_match(path, pattern))
+}
+
+fn path_policy_match(path: &str, pattern: &str) -> bool {
+    let path = normalize_path(path);
+    let pattern = normalize_path(pattern);
+
+    if pattern.is_empty() {
+        return false;
+    }
+
+    if !pattern.contains('*') {
+        return path_prefix_match(&path, &pattern);
+    }
+
+    wildcard_prefix_match(&path, &pattern)
+}
+
+fn path_prefix_match(path: &str, prefix: &str) -> bool {
+    let path = normalize_path(path);
+    let prefix = normalize_path(prefix);
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn wildcard_prefix_match(path: &str, pattern: &str) -> bool {
+    let path_parts: Vec<&str> = path.split('/').collect();
+    let pattern_parts: Vec<&str> = pattern.split('/').collect();
+
+    if pattern_parts.len() > path_parts.len() {
+        return false;
+    }
+
+    for (idx, pattern_part) in pattern_parts.iter().enumerate() {
+        if *pattern_part == "*" {
+            continue;
+        }
+
+        if path_parts.get(idx).copied() != Some(*pattern_part) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn normalize_path(path: &str) -> String {
+    path.replace('\\', "/").trim_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wildcard_policy_path_matches_prefix() {
+        assert!(path_policy_match(
+            "crates/orders/src/domain/order.rs",
+            "crates/*/src/domain"
+        ));
+        assert!(path_policy_match(
+            "crates/orders/src/domain/nested/order.rs",
+            "crates/*/src/domain"
+        ));
+        assert!(!path_policy_match(
+            "crates/orders/src/application/order.rs",
+            "crates/*/src/domain"
+        ));
+    }
+
+    #[test]
+    fn expiry_check_accepts_future_date_and_rejects_bad_date() {
+        assert!(expiry_is_today_or_future("2999-12-31"));
+        assert!(!expiry_is_today_or_future("not-a-date"));
+        assert!(!expiry_is_today_or_future("1999-01-01"));
+    }
+
+    #[test]
+    fn extracts_import_edges() {
+        let file = FileInfo {
+            rel_path: "apps/web/src/db.ts".to_string(),
+            suffix: ".ts".to_string(),
+            text: "import { Client } from \"pg\";\nconst x = 1;".to_string(),
+            is_code: true,
+            is_generated: false,
+        };
+
+        let edges = import_edges(&file);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, "pg");
+        assert_eq!(edges[0].line, 1);
+    }
+}
+```
+
+---
+
+## 3. Update `crates/jankurai/src/audit/analyzers/mod.rs`
+
+Add this line near the top with the other analyzer modules:
+
+```rust
+pub mod semantic_oracle;
+```
+
+---
+
+## 4. Update `crates/jankurai/src/audit/finding_builder.rs`
+
+Add this method inside the existing `impl FindingBuilder` block. Keep the existing `add` method; this is an enriched wrapper for semantic findings.
+
+```rust
+pub fn add_detailed(
+    &mut self,
+    rule_id: &str,
+    path: &str,
+    problem: &str,
+    agent_fix: &str,
+    evidence: Vec<String>,
+    line: Option<usize>,
+    matched_term: Option<String>,
+    reason: Option<String>,
+    confidence: Option<f64>,
+) {
+    let rule = rules::lookup(rule_id).unwrap_or_else(|| {
+        panic!("semantic analyzer emitted unknown rule_id `{rule_id}`; add it to audit/rules.rs")
+    });
+
+    let index = self.findings.len();
+
+    self.add(
+        rule.severity,
+        rule.category,
+        path,
+        problem,
+        agent_fix,
+        evidence,
+        Some(rule_id),
+        line,
+    );
+
+    if let Some(finding) = self.findings.get_mut(index) {
+        finding.matched_term = matched_term;
+        finding.reason = reason;
+        finding.confidence = confidence.unwrap_or_else(|| rules::default_confidence(rule_id));
+    }
+}
+```
+
+Also make sure `finding_builder.rs` has access to `rules` at the top. It likely already does, but if not, add:
+
+```rust
+use crate::audit::rules;
+```
+
+---
+
+## 5. Update `crates/jankurai/src/audit/mod.rs`
+
+Inside `build_findings`, after the `FindingBuilder` is created and before older scan-derived findings are added, insert:
+
+```rust
+for finding in analyzers::semantic_oracle::findings(ctx) {
+    b.add_detailed(
+        finding.rule_id,
+        &finding.path,
+        &finding.problem,
+        &finding.agent_fix,
+        finding.evidence,
+        finding.line,
+        finding.matched_term,
+        Some(finding.reason),
+        finding.confidence,
+    );
+}
+```
+
+The intent is that Phase 02 semantic findings become first-class audit findings before the fallback scans. Existing scan helpers can remain for legacy coverage, but the semantic oracle should own the boundary findings that require policy interpretation.
+
+---
+
+## 6. Update `crates/jankurai/src/audit/rules.rs`
+
+The repo already has rule-registry smoke tests that check uniqueness and specific IDs, including `HLT-014` and `HLT-021`. ([GitHub][7]) This patch adds the missing Phase 02 semantic boundary rules and registry validation helpers.
+
+### 6a. Add these `RuleSpec` entries to the rule list
+
+Insert these before the closing `];` / `]` of the current rule registry.
+
+```rust
+RuleSpec {
+    id: "HLT-022-RUST-DOMAIN-IMPURITY",
+    name: "Rust domain impurity",
+    category: "boundary",
+    tlr: "Contracts/data",
+    severity: "high",
+    lane: "fast",
+    owner_hint: "tools",
+    docs_url: "docs/boundary-oracle.md",
+    evidence_kind: "semantic-boundary",
+    repairable: true,
+},
+RuleSpec {
+    id: "HLT-023-TS-WEB-WRONG-LAYER",
+    name: "TypeScript web wrong-layer access",
+    category: "boundary",
+    tlr: "Contracts/data",
+    severity: "high",
+    lane: "web",
+    owner_hint: "tools",
+    docs_url: "docs/boundary-oracle.md",
+    evidence_kind: "semantic-boundary",
+    repairable: true,
+},
+RuleSpec {
+    id: "HLT-024-BOUNDARY-MANIFEST-GAP",
+    name: "Boundary manifest gap",
+    category: "context",
+    tlr: "Context/setup",
+    severity: "high",
+    lane: "fast",
+    owner_hint: "agent",
+    docs_url: "docs/boundary-oracle.md",
+    evidence_kind: "policy-manifest",
+    repairable: true,
+},
+```
+
+### 6b. Add these helper types/functions near the bottom of `rules.rs`
+
+Put this after `docs_for_rule_id` or equivalent lookup helpers.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapImpact {
+    pub cap_id: &'static str,
+    pub max_score: i32,
+}
+
+pub fn default_confidence(rule_id: &str) -> f64 {
+    match lookup(rule_id).map(|rule| rule.severity) {
+        Some("critical") => 0.98,
+        Some("high") => 0.94,
+        Some("medium") => 0.82,
+        Some("low") => 0.70,
+        _ => 0.75,
+    }
+}
+
+pub fn cap_impact(rule_id: &str) -> Option<CapImpact> {
+    Some(match rule_id {
+        "HLT-001-NO-AGENTS" => CapImpact {
+            cap_id: "missing-agent-contract",
+            max_score: 55,
+        },
+        "HLT-002-GENERATED-ZONE-EDIT" => CapImpact {
+            cap_id: "generated-zone-unsafe",
+            max_score: 70,
+        },
+        "HLT-005-PYTHON-PRODUCT-TRUTH" => CapImpact {
+            cap_id: "python-product-truth",
+            max_score: 65,
+        },
+        "HLT-006-DIRECT-DB-WRONG-LAYER" => CapImpact {
+            cap_id: "direct-db-wrong-layer",
+            max_score: 65,
+        },
+        "HLT-007-GENERATED-CONTRACT-DRIFT" => CapImpact {
+            cap_id: "contract-drift",
+            max_score: 72,
+        },
+        "HLT-019-STREAMING-RUNTIME-DRIFT" => CapImpact {
+            cap_id: "streaming-runtime-drift",
+            max_score: 75,
+        },
+        "HLT-021-DESTRUCTIVE-MIGRATION-UNPROVEN" => CapImpact {
+            cap_id: "destructive-migration-unproven",
+            max_score: 60,
+        },
+        "HLT-022-RUST-DOMAIN-IMPURITY" => CapImpact {
+            cap_id: "rust-domain-impurity",
+            max_score: 68,
+        },
+        "HLT-023-TS-WEB-WRONG-LAYER" => CapImpact {
+            cap_id: "typescript-web-wrong-layer",
+            max_score: 68,
+        },
+        "HLT-024-BOUNDARY-MANIFEST-GAP" => CapImpact {
+            cap_id: "boundary-manifest-gap",
+            max_score: 60,
+        },
+        _ => return None,
+    })
+}
+
+pub fn validate_registry() -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+
+    for rule in all() {
+        if !seen.insert(rule.id) {
+            return Err(format!("duplicate rule id `{}`", rule.id));
+        }
+
+        if !rule.id.starts_with("HLT-") {
+            return Err(format!("rule `{}` does not use HLT-* id format", rule.id));
+        }
+
+        if rule.name.trim().is_empty() {
+            return Err(format!("rule `{}` is missing name", rule.id));
+        }
+
+        if rule.category.trim().is_empty() {
+            return Err(format!("rule `{}` is missing category", rule.id));
+        }
+
+        if rule.tlr.trim().is_empty() {
+            return Err(format!("rule `{}` is missing TLR", rule.id));
+        }
+
+        if rule.severity.trim().is_empty() {
+            return Err(format!("rule `{}` is missing severity", rule.id));
+        }
+
+        if rule.lane.trim().is_empty() {
+            return Err(format!("rule `{}` is missing proof lane", rule.id));
+        }
+
+        if rule.owner_hint.trim().is_empty() {
+            return Err(format!("rule `{}` is missing owner hint", rule.id));
+        }
+
+        if rule.docs_url.trim().is_empty() {
+            return Err(format!("rule `{}` is missing docs URL", rule.id));
+        }
+
+        if rule.evidence_kind.trim().is_empty() {
+            return Err(format!("rule `{}` is missing evidence kind", rule.id));
+        }
+    }
+
+    Ok(())
+}
+```
+
+---
+
+## 7. Add `crates/jankurai/tests/semantic_oracle_smoke.rs`
+
+This test file is what makes Phase 02 hard to regress.
+
+```rust
+use jankurai::audit::{run_audit, rules};
+use jankurai::model::Finding;
+use std::fs;
+use std::path::Path;
+
+fn write(root: &Path, rel_path: &str, text: &str) {
+    let path = root.join(rel_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent dir");
+    }
+    fs::write(path, text).expect("write fixture file");
+}
+
+fn seed_control_plane(root: &Path) {
+    write(
+        root,
+        "AGENTS.md",
+        r#"# Fixture agent contract
+
+- Use `just score` for audit proof.
+- Do not hand edit generated zones.
+"#,
+    );
+
+    write(
+        root,
+        "Justfile",
+        r#"fast:
+    cargo test -p jankurai
+
+score:
+    cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+
+ux-qa:
+    echo ux
+
+security:
+    echo security
+
+check:
+    cargo test
+"#,
+    );
+
+    write(
+        root,
+        "agent/owner-map.json",
+        r#"{
+  "workspace": "semantic-oracle-fixture",
+  "owners": {
+    "AGENTS.md": "agent",
+    "Justfile": "tools",
+    "agent/": "agent",
+    "crates/domain/": "domain",
+    "crates/orders/src/domain/": "domain",
+    "apps/web/": "web",
+    "python/": "ai",
+    "crates/adapters/": "adapters",
+    "db/": "db",
+    "contracts/": "contracts"
+  }
+}
+"#,
+    );
+
+    write(
+        root,
+        "agent/test-map.json",
+        r#"{
+  "workspace": "semantic-oracle-fixture",
+  "tests": {
+    "AGENTS.md": {
+      "command": "just score",
+      "lane": "audit"
+    },
+    "agent/": {
+      "command": "just score",
+      "lane": "audit"
+    },
+    "crates/domain/": {
+      "command": "just fast",
+      "lane": "fast"
+    },
+    "crates/orders/src/domain/": {
+      "command": "just fast",
+      "lane": "fast"
+    },
+    "apps/web/": {
+      "command": "just ux-qa",
+      "lane": "web"
+    },
+    "python/": {
+      "command": "just fast",
+      "lane": "fast"
+    },
+    "db/": {
+      "command": "just score",
+      "lane": "db"
+    }
+  }
+}
+"#,
+    );
+
+    write(
+        root,
+        "agent/generated-zones.toml",
+        r#"
+[[zone]]
+path = "contracts/generated"
+source = "contracts/schema"
+command = "just generate-contracts"
+owner = "contracts"
+"#,
+    );
+
+    write(
+        root,
+        "agent/boundaries.toml",
+        r#"
+[stack]
+id = "semantic-oracle-fixture"
+version = "0.4.0"
+
+[rust]
+domain_paths = ["crates/domain", "crates/*/src/domain"]
+forbidden_domain_imports = ["std::fs", "std::env", "std::net", "sqlx", "rdkafka", "tracing"]
+
+[typescript]
+web_paths = ["apps/web"]
+forbidden_web_imports = ["pg", "postgres", "@prisma/client", "kafkajs", "fs", "node:fs"]
+generated_contract_paths = ["contracts/generated"]
+
+[python]
+allowed_truth_paths = ["python/ai-service", "tools"]
+
+[queues]
+adapter_paths = ["crates/adapters/queue"]
+event_contract_paths = ["contracts/events"]
+generated_type_paths = ["contracts/generated/events"]
+client_markers = ["rdkafka", "kafkajs", "nats", "redis streams"]
+
+[db]
+root_paths = ["db"]
+migration_paths = ["db/migrations"]
+constraint_paths = ["db/constraints"]
+
+[[streaming_exception]]
+runtime = "kafka"
+classification = "brownfield_runtime"
+owner = "platform"
+expires = "2999-12-31"
+migration_path = "docs/migration/kafka-to-agent-native.md"
+"#,
+    );
+}
+
+fn finding_by_rule<'a>(findings: &'a [Finding], rule_id: &str) -> &'a Finding {
+    findings
+        .iter()
+        .find(|finding| finding.rule_id.as_deref() == Some(rule_id))
+        .unwrap_or_else(|| panic!("expected finding with rule id `{rule_id}`"))
+}
+
+fn assert_actionable_semantic_finding(finding: &Finding) {
+    let rule_id = finding.rule_id.as_deref().expect("semantic finding has rule id");
+
+    assert!(
+        rules::lookup(rule_id).is_some(),
+        "semantic finding emitted unknown rule id `{rule_id}`"
+    );
+    assert!(
+        !finding.problem.trim().is_empty(),
+        "semantic finding `{rule_id}` has problem"
+    );
+    assert!(
+        !finding.agent_fix.trim().is_empty(),
+        "semantic finding `{rule_id}` has agent fix"
+    );
+    assert!(
+        !finding.evidence.is_empty(),
+        "semantic finding `{rule_id}` has evidence"
+    );
+    assert!(
+        finding.line.is_some(),
+        "semantic finding `{rule_id}` should be line locked"
+    );
+    assert!(
+        finding.matched_term.as_deref().unwrap_or_default().trim().len() > 1,
+        "semantic finding `{rule_id}` should include matched term"
+    );
+    assert!(
+        finding.reason.as_deref().unwrap_or_default().trim().len() > 10,
+        "semantic finding `{rule_id}` should include reason"
+    );
+    assert!(
+        finding.lane.as_deref().unwrap_or_default().trim().len() > 1,
+        "semantic finding `{rule_id}` should include proof lane"
+    );
+    assert!(
+        finding.rerun_command.trim().len() > 1,
+        "semantic finding `{rule_id}` should include rerun command"
+    );
+    assert!(
+        finding.docs_url.as_deref().unwrap_or_default().trim().len() > 1,
+        "semantic finding `{rule_id}` should include docs url"
+    );
+    assert!(
+        finding.owner.as_deref().unwrap_or_default().trim().len() > 1,
+        "semantic finding `{rule_id}` should include owner"
+    );
+}
+
+#[test]
+fn phase02_registry_metadata_is_complete() {
+    rules::validate_registry().expect("rule registry should be phase02 complete");
+
+    for rule_id in [
+        "HLT-005-PYTHON-PRODUCT-TRUTH",
+        "HLT-006-DIRECT-DB-WRONG-LAYER",
+        "HLT-007-GENERATED-CONTRACT-DRIFT",
+        "HLT-019-STREAMING-RUNTIME-DRIFT",
+        "HLT-021-DESTRUCTIVE-MIGRATION-UNPROVEN",
+        "HLT-022-RUST-DOMAIN-IMPURITY",
+        "HLT-023-TS-WEB-WRONG-LAYER",
+        "HLT-024-BOUNDARY-MANIFEST-GAP",
+    ] {
+        let rule = rules::lookup(rule_id).unwrap_or_else(|| panic!("missing rule `{rule_id}`"));
+        assert!(!rule.name.trim().is_empty());
+        assert!(!rule.category.trim().is_empty());
+        assert!(!rule.tlr.trim().is_empty());
+        assert!(!rule.lane.trim().is_empty());
+        assert!(!rule.owner_hint.trim().is_empty());
+        assert!(!rule.docs_url.trim().is_empty());
+        assert!(!rule.evidence_kind.trim().is_empty());
+    }
+}
+
+#[test]
+fn rust_domain_impurity_is_semantic_and_actionable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    seed_control_plane(temp.path());
+
+    write(
+        temp.path(),
+        "crates/orders/src/domain/order.rs",
+        r#"use std::fs;
+
+pub struct OrderId(String);
+"#,
+    );
+
+    let report = run_audit(temp.path(), &[]).expect("audit should run");
+    let finding = finding_by_rule(&report.findings, "HLT-022-RUST-DOMAIN-IMPURITY");
+
+    assert_eq!(finding.path, "crates/orders/src/domain/order.rs");
+    assert_eq!(finding.matched_term.as_deref(), Some("std::fs"));
+    assert_actionable_semantic_finding(finding);
+}
+
+#[test]
+fn typescript_web_wrong_layer_is_semantic_and_actionable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    seed_control_plane(temp.path());
+
+    write(
+        temp.path(),
+        "apps/web/src/raw-db.ts",
+        r#"import { Client } from "pg";
+
+export const client = new Client();
+"#,
+    );
+
+    let report = run_audit(temp.path(), &[]).expect("audit should run");
+    let finding = finding_by_rule(&report.findings, "HLT-023-TS-WEB-WRONG-LAYER");
+
+    assert_eq!(finding.path, "apps/web/src/raw-db.ts");
+    assert_eq!(finding.matched_term.as_deref(), Some("pg"));
+    assert_actionable_semantic_finding(finding);
+}
+
+#[test]
+fn python_product_truth_leakage_is_semantic_and_actionable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    seed_control_plane(temp.path());
+
+    write(
+        temp.path(),
+        "python/reporting/product_truth.py",
+        r#"import psycopg
+
+def authorize_refund(user, order):
+    return user.role == "admin" and order.invoice_status == "open"
+"#,
+    );
+
+    let report = run_audit(temp.path(), &[]).expect("audit should run");
+    let finding = finding_by_rule(&report.findings, "HLT-005-PYTHON-PRODUCT-TRUTH");
+
+    assert_eq!(finding.path, "python/reporting/product_truth.py");
+    assert_eq!(finding.matched_term.as_deref(), Some("psycopg"));
+    assert_actionable_semantic_finding(finding);
+}
+
+#[test]
+fn direct_db_wrong_layer_is_semantic_and_actionable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    seed_control_plane(temp.path());
+
+    write(
+        temp.path(),
+        "apps/web/src/query.ts",
+        r#"export const sql = "select * from users";
+"#,
+    );
+
+    let report = run_audit(temp.path(), &[]).expect("audit should run");
+    let finding = finding_by_rule(&report.findings, "HLT-006-DIRECT-DB-WRONG-LAYER");
+
+    assert_eq!(finding.path, "apps/web/src/query.ts");
+    assert_actionable_semantic_finding(finding);
+}
+
+#[test]
+fn incomplete_streaming_exception_is_a_first_class_finding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    seed_control_plane(temp.path());
+
+    write(
+        temp.path(),
+        "agent/boundaries.toml",
+        r#"
+[queues]
+adapter_paths = ["crates/adapters/queue"]
+client_markers = ["kafkajs"]
+
+[[streaming_exception]]
+runtime = "kafka"
+owner = ""
+expires = "1999-01-01"
+migration_path = ""
+"#,
+    );
+
+    write(
+        temp.path(),
+        "apps/web/src/events.ts",
+        r#"import Kafka from "kafkajs";
+
+export const kafka = new Kafka({});
+"#,
+    );
+
+    let report = run_audit(temp.path(), &[]).expect("audit should run");
+    let finding = finding_by_rule(&report.findings, "HLT-019-STREAMING-RUNTIME-DRIFT");
+
+    assert!(
+        finding.path == "agent/boundaries.toml" || finding.path == "apps/web/src/events.ts",
+        "streaming exception or use site should be reported"
+    );
+    assert!(
+        finding
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exception")
+            || finding
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("streaming runtime"),
+        "finding should explain exception/runtime reason"
+    );
+}
+
+#[test]
+fn every_emitted_rule_id_is_registered_and_high_findings_are_actionable() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    seed_control_plane(temp.path());
+
+    write(
+        temp.path(),
+        "crates/orders/src/domain/order.rs",
+        "use std::env;\n",
+    );
+    write(
+        temp.path(),
+        "apps/web/src/raw-db.ts",
+        "import { Client } from \"pg\";\n",
+    );
+    write(
+        temp.path(),
+        "python/reporting/product_truth.py",
+        "import sqlalchemy\n",
+    );
+
+    let report = run_audit(temp.path(), &[]).expect("audit should run");
+
+    for finding in &report.findings {
+        if let Some(rule_id) = &finding.rule_id {
+            assert!(
+                rules::lookup(rule_id).is_some(),
+                "finding emitted unknown rule id `{rule_id}`"
+            );
+        }
+
+        if matches!(finding.severity.as_str(), "high" | "critical") {
+            assert!(
+                !finding.agent_fix.trim().is_empty(),
+                "high/critical finding should include agent fix: {:?}",
+                finding
+            );
+            assert!(
+                finding.lane.as_deref().unwrap_or_default().trim().len() > 1,
+                "high/critical finding should include proof lane: {:?}",
+                finding
+            );
+            assert!(
+                !finding.rerun_command.trim().is_empty(),
+                "high/critical finding should include rerun command: {:?}",
+                finding
+            );
+            assert!(
+                finding.docs_url.as_deref().unwrap_or_default().trim().len() > 1,
+                "high/critical finding should include docs url: {:?}",
+                finding
+            );
+        }
+    }
+}
+```
+
+---
+
+## 8. Update `crates/jankurai/tests/rule_registry_smoke.rs`
+
+Append this test to the existing file.
+
+```rust
+#[test]
+fn rule_registry_has_phase02_semantic_oracle_rules() {
+    jankurai::audit::rules::validate_registry().expect("rule registry metadata should be complete");
+
+    for rule_id in [
+        "HLT-022-RUST-DOMAIN-IMPURITY",
+        "HLT-023-TS-WEB-WRONG-LAYER",
+        "HLT-024-BOUNDARY-MANIFEST-GAP",
+    ] {
+        let rule = jankurai::audit::rules::lookup(rule_id)
+            .unwrap_or_else(|| panic!("missing semantic oracle rule `{rule_id}`"));
+
+        assert_eq!(rule.evidence_kind, "semantic-boundary")
+            .or_else(|_| {
+                assert_eq!(rule.evidence_kind, "policy-manifest");
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+
+        assert!(!rule.docs_url.trim().is_empty());
+        assert!(!rule.lane.trim().is_empty());
+        assert!(!rule.owner_hint.trim().is_empty());
+        assert!(rule.repairable);
+    }
+}
+```
+
+If you prefer not to use the `or_else` assertion style, replace that inner evidence check with:
+
+```rust
+assert!(
+    rule.evidence_kind == "semantic-boundary" || rule.evidence_kind == "policy-manifest",
+    "unexpected evidence kind for {rule_id}: {}",
+    rule.evidence_kind
+);
+```
+
+---
+
+## 9. Add `docs/rules/README.md`
+
+The standard says audit findings must include rule ID, severity, category, path, line when available, problem, evidence, agent fix, owner, validation lane, and docs link; it also defines a machine-readable audit shape including versions, score, caps, dimensions, findings, and agent fix queue. ([GitHub][8]) This doc gives the new semantic rules a stable place to point agents.
+
+```md
+# Jankurai Rule Registry
+
+This document is the human-readable index for audit rules emitted by `crates/jankurai`.
+
+The machine-readable source of truth is `crates/jankurai/src/audit/rules.rs`.
+
+## Phase 02 semantic-oracle rules
+
+| Rule | Severity | Category | Lane | Evidence kind | Purpose |
+|---|---:|---|---|---|---|
+| `HLT-005-PYTHON-PRODUCT-TRUTH` | high | boundary | fast | semantic-boundary | Python outside approved AI/tooling paths must not own durable product truth. |
+| `HLT-006-DIRECT-DB-WRONG-LAYER` | high | boundary | db | semantic-boundary | Raw DB/ORM access must stay in DB/adapters/migrations boundaries. |
+| `HLT-007-GENERATED-CONTRACT-DRIFT` | high | generated | web | generated-zone | Generated contracts must not be mirrored by handwritten clients/DTOs. |
+| `HLT-019-STREAMING-RUNTIME-DRIFT` | high | boundary | db | semantic-boundary | Streaming runtimes must live behind queue adapters unless an owned, expiring migration exception exists. |
+| `HLT-021-DESTRUCTIVE-MIGRATION-UNPROVEN` | critical | database | db-migration-analyze | migration-proof | Destructive migrations require explicit proof/evidence. |
+| `HLT-022-RUST-DOMAIN-IMPURITY` | high | boundary | fast | semantic-boundary | Rust domain code must not import side-effectful infrastructure. |
+| `HLT-023-TS-WEB-WRONG-LAYER` | high | boundary | web | semantic-boundary | Web code must not import DB, queue, filesystem, or backend runtime infrastructure. |
+| `HLT-024-BOUNDARY-MANIFEST-GAP` | high | context | fast | policy-manifest | Boundary policy must be present, parseable, owned, and usable by the semantic oracle. |
+
+## Semantic finding quality bar
+
+A Phase 02 semantic finding is valid only if it has:
+
+- A registered `rule_id`.
+- A line number when the source marker is in a file.
+- `matched_term` showing the import/runtime/marker that triggered the rule.
+- `reason` explaining which policy boundary was crossed.
+- `agent_fix` that tells a bounded agent what to change.
+- `owner`, `lane`, `rerun_command`, and `docs_url` from the rule registry and repository maps.
+- Durable evidence suitable for `agent/repo-score.json` and `agent/repo-score.md`.
+
+## Boundary policy source of truth
+
+The semantic oracle reads:
+
+- `agent/boundaries.toml`
+- `agent/owner-map.json`
+- `agent/test-map.json`
+- `agent/generated-zones.toml`
+
+Trusted control-plane policy wins over local heuristics. Missing or invalid policy is itself a finding because agents cannot safely choose ownership, proof lanes, or allowed exceptions without it.
+```
+
+---
+
+## 10. Append this section to `docs/boundary-oracle.md`
+
+The existing boundary oracle doc already describes inputs and mapping requirements, including that every violation should map to owner, proof lane, rerun command, evidence kind, and repair queue. ([GitHub][9]) This makes Phase 02’s semantic implementation explicit.
+
+```md
+## Phase 02 semantic-oracle implementation contract
+
+The boundary oracle is implemented as a semantic analyzer, not only as text scanning.
+
+Implementation source:
+
+- `crates/jankurai/src/audit/analyzers/semantic_oracle.rs`
+- `crates/jankurai/src/boundaries/manifest.rs`
+- `crates/jankurai/src/audit/rules.rs`
+- `crates/jankurai/src/audit/finding_builder.rs`
+
+Required behavior:
+
+1. Load trusted policy from `agent/boundaries.toml`.
+2. Fall back to conservative defaults only when policy is missing or invalid.
+3. Emit a first-class finding for missing/invalid policy.
+4. Extract shallow import edges for Rust, TypeScript/JavaScript, and Python.
+5. Treat boundary hits as semantic findings with:
+   - registered `rule_id`
+   - line number
+   - matched term
+   - reason
+   - owner
+   - validation lane
+   - rerun command
+   - docs URL
+   - durable evidence
+6. Allow streaming runtime exceptions only when they include:
+   - runtime
+   - owner
+   - unexpired `expires`
+   - classification or reason
+   - migration path
+7. Ignore docs/reference/vendor/generated files unless a control-plane manifest itself is invalid.
+8. Keep generated zones declared and machine-checkable.
+
+A semantic boundary finding is not complete unless a bounded agent can identify the owner, make the repair, run the mapped proof lane, and leave machine-readable evidence.
+```
+
+---
+
+## 11. Recommended update to `tips/phases/02-rule-engine-semantic-oracle.md`
+
+Replace the old receipt/status block with this.
+
+```md
+## Phase Status Receipt
+
+Status: complete
+
+Completed implementation:
+
+- Rule registry owns metadata for semantic boundary findings.
+- Boundary manifest parser reads `[rust]`, `[typescript]`, `[python]`, `[queues]`, `[db]`, and `[[streaming_exception]]`.
+- Semantic oracle analyzer emits first-class findings for:
+  - Rust domain impurity.
+  - TypeScript/web wrong-layer access.
+  - Python durable product-truth leakage.
+  - Direct DB access outside DB/adapters/migrations.
+  - Streaming runtime drift and invalid/expired streaming exceptions.
+- FindingBuilder preserves semantic evidence:
+  - rule ID
+  - line
+  - matched term
+  - reason
+  - owner
+  - proof lane
+  - rerun command
+  - docs URL
+  - confidence
+- Registry validation fails on duplicate or incomplete rule metadata.
+- Smoke tests verify semantic findings are registered, actionable, line-locked, and owner/lane/proof-aware.
+
+Validation:
+
+- `cargo test -p jankurai semantic_oracle`
+- `cargo test -p jankurai rule_registry`
+- `cargo test -p jankurai`
+- `cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md`
+- `just score`
+
+Phase 02 is considered complete when the semantic-oracle tests pass and no analyzer can emit an unknown or non-actionable high/critical rule finding.
+```
+
+---
+
+## 12. Validation commands
+
+Run these from the repo root:
+
+```bash
+cargo fmt
+cargo test -p jankurai semantic_oracle
+cargo test -p jankurai rule_registry
+cargo test -p jankurai boundaries
+cargo test -p jankurai
+cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+just score
+```
+
+Expected result:
+
+* `semantic_oracle_smoke.rs` passes.
+* `rule_registry_smoke.rs` passes.
+* Audit output includes semantic boundary findings with `rule_id`, `line`, `matched_term`, `reason`, `owner`, `lane`, `docs_url`, `rerun_command`, `evidence_kind`, and `agent_fix`.
+* Unknown semantic rule IDs fail fast.
+* Missing/invalid `agent/boundaries.toml` becomes an actionable finding instead of a silent fallback.
+* Streaming runtime exceptions must be owner-bound, expiring, classified/reasoned, and tied to a migration path.
+
+That gets **Phase 02: Rule Engine + Semantic Oracle** to 100% in the way `moonshot.md` wants: agents get explicit boundaries, trusted policy, actionable evidence, validation lanes, owner mapping, and reusable rule primitives rather than ad hoc scans.
+
+[1]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/moonshot.md "raw.githubusercontent.com"
+[2]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/tips/phases/02-rule-engine-semantic-oracle.md "raw.githubusercontent.com"
+[3]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/src/model.rs "Jankurai/crates/jankurai/src/model.rs at main · jeppsontaylor/Jankurai · GitHub"
+[4]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/src/audit/scan.rs "Jankurai/crates/jankurai/src/audit/scan.rs at main · jeppsontaylor/Jankurai · GitHub"
+[5]: https://github.com/jeppsontaylor/Jankurai "GitHub - jeppsontaylor/Jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[6]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/Cargo.toml "Jankurai/crates/jankurai/Cargo.toml at main · jeppsontaylor/Jankurai · GitHub"
+[7]: https://github.com/jeppsontaylor/Jankurai/blob/main/crates/jankurai/tests/rule_registry_smoke.rs "Jankurai/crates/jankurai/tests/rule_registry_smoke.rs at main · jeppsontaylor/Jankurai · GitHub"
+[8]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/agent-native-standard.md "raw.githubusercontent.com"
+[9]: https://raw.githubusercontent.com/jeppsontaylor/Jankurai/main/docs/boundary-oracle.md "raw.githubusercontent.com"
+

@@ -1,0 +1,2628 @@
+# Tuiwright: A Playwright-class Rust TUI Testing Framework
+
+**Status:** detailed product + architecture proposal with a copy-pasteable Rust MVP scaffold.  
+**Core promise:** run a real TUI in a real pseudo-terminal, drive keyboard/mouse/paste/resize actions, assert the actual terminal state, capture high-resolution screenshots, and export web-compressed animated GIF recordings without depending on tmux, asciinema, ffmpeg, ImageMagick, browsers, X11, Wayland, or Node.
+
+---
+
+## 1. What this builds
+
+The project is named **Tuiwright** because the intended mental model is “Playwright for terminal UIs.” The core is 100% Rust. Bash is only used below as a convenience bootstrap script that writes the Rust source files for you.
+
+Tuiwright is not a Ratatui-only snapshot helper. It is an end-to-end terminal automation harness:
+
+```rust
+use std::time::Duration;
+use tuiwright::{Key, Page, RenderOptions, TuiConfig};
+
+#[test]
+fn user_can_submit_search() -> anyhow::Result<()> {
+    let page = Page::spawn(
+        TuiConfig::command("cargo")
+            .arg("run")
+            .arg("--bin")
+            .arg("my-tui")
+            .size(100, 30),
+    )?;
+
+    page.start_recording(Default::default())?;
+
+    page.wait_for_text("Search", Duration::from_secs(5))?;
+    page.get_by_text("Search")
+        .click(Duration::from_secs(2))?;
+
+    page.type_text("ratatui testing")?;
+    page.press(Key::Enter)?;
+
+    page.wait_for_text("Results", Duration::from_secs(5))?;
+    page.screenshot("target/tuiwright/search-results.png")?;
+    page.save_trace("target/tuiwright/search.trace.json")?;
+    page.stop_recording_gif(
+        "target/tuiwright/search-flow.gif",
+        Default::default(),
+        RenderOptions::default(),
+    )?;
+
+    Ok(())
+}
+```
+
+The MVP scaffold later in this document implements:
+
+1. PTY process spawning.
+2. Real terminal byte-stream parsing.
+3. Text locators with auto-waiting.
+4. Keyboard, text input, bracketed paste, resize, and basic SGR mouse click actions.
+5. PNG screenshots from the terminal cell grid using a Rust font rasterizer.
+6. Animated GIF recording using frame coalescing and Rust GIF encoding.
+7. JSON trace output with action and terminal-output history.
+8. A CLI wrapper for screenshot/recording use outside tests.
+
+The production design extends this to Playwright-level power with semantic roles, actionability checks, trace viewer, image diffing, terminal-profile compatibility, component-level test adapters, and richer artifact management.
+
+---
+
+## 2. Why existing Rust TUI testing is not enough
+
+Rust TUI apps usually test one of these layers:
+
+| Layer | Typical method | What it catches | What it misses |
+|---|---|---|---|
+| Widget/model unit tests | Call app state reducers directly | State transition bugs | Terminal behavior, focus, input encoding, timing |
+| Ratatui `TestBackend` | Render to in-memory buffer | Layout regressions | Real PTY, raw mode, alternate screen, mouse modes, cursor behavior, shell/env bugs |
+| String snapshots | Compare text output | Text regressions | Colors, cursor, screen clearing, wide chars, animation, mouse |
+| Manual terminal testing | Human runs app | Everything human sees | Non-repeatable, no CI, no artifacts |
+
+A real Playwright-class TUI tester should sit **outside** the app and drive it as a user would:
+
+```text
+Test code ──actions──> PTY master ──bytes──> TUI child process
+   ▲                         │
+   │                         ▼
+assertions/screenshots <── terminal emulator model <── child output bytes
+```
+
+That placement matters. It validates raw mode startup, alternate-screen cleanup, terminal size assumptions, crossterm/termion/termwiz event handling, mouse protocol handling, stdout flushing, resize handling, terminal escape sequences, and timing.
+
+---
+
+## 3. Product goals
+
+### 3.1 Must-have goals
+
+**Drive real user flows.** Tests must press keys, type text, paste, click, drag, scroll, resize, and wait for stable UI states.
+
+**Capture what a user would see.** Screenshots should be pixel images rendered from terminal cells, colors, attributes, cursor visibility, and configured font metrics. They must work headlessly in CI.
+
+**Record flows.** A failing CI run should produce a compressed GIF that shows the flow, annotated by actions and assertions.
+
+**Be deterministic.** The same app, terminal profile, font, size, and theme should produce the same artifacts across CI and local runs.
+
+**Feel familiar to Playwright users.** The API should include pages, locators, actions, assertions, screenshots, traces, videos/GIFs, auto-waiting, and per-test artifacts.
+
+**Stay Rust-native.** No required shell-out to `tmux`, `asciinema`, `ffmpeg`, `convert`, Electron, Chrome, Node, or a GUI server.
+
+### 3.2 Stretch goals
+
+**Semantic locators.** `get_by_role(Role::Button, "Save")` for arbitrary TUI frameworks through an opt-in side-channel.
+
+**Trace viewer.** A local static viewer that opens `*.tuiwright-trace.zip` and lets developers scrub actions, see screenshots, raw bytes, cell JSON, stdout/stderr, and assertions.
+
+**Terminal profiles.** `xterm-256color`, `alacritty`, `wezterm`, `kitty`, and `windows-terminal` behavior profiles.
+
+**Component adapters.** A Ratatui adapter that can render a widget in-memory while still using the same locator/assertion/screenshot pipeline.
+
+---
+
+## 4. Design principle: one abstraction, two backends
+
+Tuiwright should expose one user API but support two execution backends.
+
+### 4.1 End-to-end PTY backend
+
+This is the default and the important one.
+
+```text
+Page::spawn(command)
+    -> portable PTY
+    -> child process
+    -> terminal emulator model
+    -> assertions + screenshots + GIFs
+```
+
+Use this for real application tests.
+
+### 4.2 Component backend
+
+This is optional and faster.
+
+```text
+ComponentHarness::new(ratatui_widget)
+    -> in-memory terminal buffer
+    -> same locator/assertion/rendering APIs
+```
+
+Use this for widget tests, layout tests, and unit-level snapshots. The same screenshot and locator engine should consume a generic `TerminalSnapshot`, so component and PTY tests share tooling.
+
+---
+
+## 5. Architecture
+
+```text
+┌────────────────────────────────────────────────────────────────────┐
+│                         User-facing API                            │
+│  Page, Locator, Expect, Keyboard, Mouse, Recorder, Trace, Runner    │
+└───────────────────────────────┬────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼────────────────────────────────────┐
+│                       Actionability layer                           │
+│  auto-wait, retry, stable screen, visible text, enabled app, timeouts│
+└───────────────────────────────┬────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼────────────────────────────────────┐
+│                         Driver layer                                │
+│  PTY spawn, read loop, writer, resize, lifecycle, env, cwd, signals │
+└───────────────┬───────────────────────────────┬────────────────────┘
+                │                               │
+┌───────────────▼──────────────┐  ┌─────────────▼────────────────────┐
+│      Input encoder            │  │      Terminal emulator model      │
+│ keys, paste, mouse, resize     │  │ cells, attrs, cursor, scrollback  │
+└───────────────┬──────────────┘  └─────────────┬────────────────────┘
+                │                               │
+                │                 ┌─────────────▼────────────────────┐
+                │                 │       Locator/query engine        │
+                │                 │ text, regex, cell, area, role     │
+                │                 └─────────────┬────────────────────┘
+                │                               │
+                │                 ┌─────────────▼────────────────────┐
+                │                 │       Artifact pipeline           │
+                │                 │ PNG, GIF, ANSI, text, trace zip   │
+                │                 └──────────────────────────────────┘
+```
+
+### 5.1 Driver layer
+
+The driver owns the child process lifecycle and the PTY.
+
+Responsibilities:
+
+- Spawn a command in a pseudo-terminal.
+- Set `TERM`, `COLORTERM`, `NO_COLOR`, `RUST_BACKTRACE`, and deterministic test env vars.
+- Read terminal output bytes in a dedicated thread.
+- Write encoded keyboard/mouse bytes to the PTY master.
+- Resize the PTY and update the emulator model.
+- Kill/wait the child cleanly.
+- Capture raw byte chunks for debugging.
+
+### 5.2 Terminal emulator layer
+
+This layer is the equivalent of a browser rendering engine for TUI tests.
+
+The MVP uses `vt100` because it converts terminal output bytes into a documented in-memory screen and exposes cells, colors, attributes, cursor, mouse/bracketed paste modes, and formatted output. The production architecture should make the emulator pluggable:
+
+```rust
+pub trait TerminalEngine: Send {
+    fn process_output(&mut self, bytes: &[u8]);
+    fn resize(&mut self, rows: u16, cols: u16);
+    fn snapshot(&self) -> TerminalSnapshot;
+    fn input_modes(&self) -> InputModes;
+}
+```
+
+Recommended engines:
+
+1. **MVP engine:** `vt100` for a compact dependency and quick implementation.
+2. **High-fidelity engine:** `alacritty_terminal` for a production terminal emulator core.
+3. **Experimental full-feature engine:** WezTerm-derived terminal core for richer image/OSC/hyperlink support, pinned to a known revision if used.
+4. **Parser-only fallback:** `vte`/`termwiz` only when building a custom engine.
+
+### 5.3 Snapshot model
+
+The framework should not leak any one emulator crate’s internal types. Normalize to this:
+
+```rust
+pub struct TerminalSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    pub cells: Vec<Cell>,
+    pub cursor: Cursor,
+    pub modes: InputModes,
+    pub scrollback: Vec<Vec<Cell>>,
+    pub semantic: Vec<SemanticNode>,
+}
+
+pub struct Cell {
+    pub text: String,
+    pub fg: Color,
+    pub bg: Color,
+    pub attrs: Attrs,
+    pub width: CellWidth,
+}
+```
+
+That lets screenshots, locators, snapshots, and traces work regardless of whether the backend is PTY, Ratatui, Crossterm test harness, or a future emulator.
+
+---
+
+## 6. Playwright-like API design
+
+### 6.1 The `Page`
+
+A `Page` is a single TUI process plus its terminal.
+
+```rust
+let page = Page::spawn(TuiConfig::command("my-app").size(120, 40))?;
+
+page.wait_for_text("Ready", Duration::from_secs(5))?;
+page.press(Key::Char('j'))?;
+page.press(Key::Enter)?;
+page.screenshot("target/tuiwright/ready.png")?;
+page.kill()?;
+```
+
+### 6.2 Locators
+
+Text locators are the MVP. Semantic locators are the production differentiator.
+
+```rust
+page.get_by_text("Login").click(Duration::from_secs(2))?;
+page.get_by_regex(r"\d+ results").wait(Duration::from_secs(5))?;
+page.get_by_cell(10, 4).expect().to_have_text("✓")?;
+page.get_by_area(CellRect::new(0, 0, 80, 10)).screenshot("header.png")?;
+```
+
+Production semantic locators:
+
+```rust
+page.get_by_role(Role::Button, "Save").click().await?;
+page.get_by_label("Email").fill("user@example.com").await?;
+page.get_by_test_id("settings.theme").press(Key::Enter).await?;
+```
+
+Because terminal output has no DOM, semantic locators need an opt-in protocol. Tuiwright should support invisible OSC metadata emitted by apps in test mode:
+
+```text
+ESC ] 777 ; tuiwright ; {"role":"button","name":"Save","rect":[2,10,1,8]} BEL
+```
+
+The test runner parses this into `SemanticNode`s. Production builds can disable it, while test builds expose it through a feature flag.
+
+### 6.3 Assertions
+
+Assertions should auto-wait and retry until timeout.
+
+```rust
+page.expect_text("Ready").to_be_visible().within(Duration::from_secs(3))?;
+page.expect_text("Loading").not().to_be_visible().within(Duration::from_secs(10))?;
+page.expect_screenshot("snapshots/home.png").with_threshold(0.001)?;
+```
+
+### 6.4 Actionability checks
+
+Before a click or fill, the framework should check:
+
+1. The locator resolves to exactly one target, unless `.first()` or `.nth()` is used.
+2. The target is within the visible screen.
+3. The screen is stable for at least one tick or configurable duration.
+4. The target is not hidden by a full-screen overlay if semantic metadata exists.
+5. The child process has not exited.
+
+For raw text locators, “visible” means the text appears in visible cells. For semantic locators, “visible” means the semantic node rect intersects visible cells and all cells are not blank/covered.
+
+---
+
+## 7. Screenshot design
+
+### 7.1 Screenshot modes
+
+| Mode | Output | Purpose |
+|---|---|---|
+| `screenshot()` | PNG pixels | PR comments, docs, visual snapshots |
+| `screenshot_clip(locator)` | PNG pixels | Component/element-like screenshots |
+| `save_ansi()` | ANSI byte stream | Reproduce terminal state in another terminal |
+| `save_text()` | Plain text | Fast text snapshots |
+| `save_cells_json()` | JSON cells | Precise debugging and diffing |
+
+### 7.2 Pixel rendering pipeline
+
+```text
+TerminalSnapshot
+    -> resolve theme colors
+    -> layout cell grid with fixed cell size
+    -> rasterize glyphs with Rust font rasterizer
+    -> draw cursor/underline/strikethrough/selection/action highlight
+    -> encode PNG
+```
+
+Important knobs:
+
+```rust
+RenderOptions {
+    cell_width: 10,
+    cell_height: 20,
+    font_size: 16.0,
+    font_path: Some("/path/to/monospace.ttf".into()),
+    cursor: CursorRender::Block,
+    theme: Theme::CatppuccinMocha,
+    clip: None,
+}
+```
+
+For deterministic CI, teams should commit a font path in their CI image or set `TUIWRIGHT_FONT`. The framework must never bundle proprietary terminal fonts. It can provide a permissive default through documentation, not by hiding font binaries in the crate.
+
+### 7.3 Visual diffs
+
+A real implementation should include:
+
+- Pixel diff threshold.
+- Per-cell diff threshold.
+- Anti-alias tolerance.
+- Motion-blur-free frame extraction from recordings.
+- `cargo tuiwright bless` to accept changed screenshots.
+- HTML diff output showing baseline/current/diff.
+
+---
+
+## 8. GIF recording design
+
+### 8.1 Recording strategy
+
+TUI output changes in bursts. A recording system should not capture at a fixed 60 FPS unless explicitly requested. Instead:
+
+1. Capture a frame when terminal state changes.
+2. Coalesce duplicate frames.
+3. Clamp minimum/maximum delay.
+4. Optionally add action overlays for keypresses/clicks.
+5. Quantize colors for GIF.
+6. Use frame delta rectangles where possible.
+
+```rust
+page.start_recording(RecordingOptions {
+    frame_interval: Duration::from_millis(33),
+    retain_on_success: false,
+    annotate_actions: true,
+    max_frames: 2_000,
+});
+
+// run flow
+
+page.stop_recording_gif("target/tuiwright/login.gif", Default::default(), RenderOptions::default())?;
+```
+
+### 8.2 Artifact policy
+
+Match Playwright’s ergonomics:
+
+```rust
+RecordingPolicy::Off
+RecordingPolicy::On
+RecordingPolicy::RetainOnFailure
+RecordingPolicy::OnFirstRetry
+```
+
+### 8.3 Recommended production encoder
+
+The MVP below uses the pure Rust `gif` crate directly because it is straightforward and copy-pasteable. For a production-grade, web-compressed GIF pipeline, Tuiwright should add an optional `gifski` feature because it supports high-quality GIF creation from arbitrary pixels and is designed around cross-frame palette quality.
+
+---
+
+## 9. Trace design
+
+A trace should be the TUI equivalent of Playwright traces.
+
+```text
+login.tuiwright-trace.zip
+├── trace.json
+├── config.json
+├── output.raw
+├── output.chunks.json
+├── screenshots/
+│   ├── 0000-start.png
+│   ├── 0001-after-type-email.png
+│   └── 0002-error.png
+├── frames/
+│   └── frame-000123.png
+├── recording.gif
+└── cells/
+    ├── 0000.json
+    └── 0001.json
+```
+
+Each action record:
+
+```json
+{
+  "at_ms": 1240,
+  "kind": "press",
+  "detail": "Enter",
+  "before_screen_id": "0007",
+  "after_screen_id": "0008",
+  "input_bytes_hex": "0d",
+  "locator": null,
+  "result": "ok"
+}
+```
+
+A trace viewer can be a Rust-generated static HTML bundle, but the core trace writer remains Rust. A TypeScript/Vite viewer is acceptable as an optional dev artifact viewer, not a runtime requirement for the tester.
+
+---
+
+## 10. Semantic roles protocol
+
+Arbitrary terminal output has no accessibility tree. To achieve Playwright-like `get_by_role`, add a tiny optional Rust crate for app authors:
+
+```rust
+// In application code, only enabled under cfg(test) or feature = "tuiwright-semantics".
+tuiwright_semantics::button("save-button", "Save", row, col, height, width);
+```
+
+It emits an OSC record that terminals ignore visually:
+
+```rust
+pub fn emit(node: &SemanticNode) {
+    let json = serde_json::to_string(node).unwrap();
+    eprint!("\x1b]777;tuiwright;{}\x07", json);
+}
+```
+
+Tuiwright parses these records from the raw byte stream and updates a semantic tree.
+
+Roles:
+
+```rust
+pub enum Role {
+    App,
+    Button,
+    Checkbox,
+    Dialog,
+    Input,
+    Label,
+    List,
+    ListItem,
+    Menu,
+    MenuItem,
+    ProgressBar,
+    Radio,
+    Row,
+    Table,
+    Tab,
+    Text,
+}
+```
+
+This makes testing deeply ergonomic while preserving black-box PTY testing. Apps that do not opt in still get text, regex, cell, area, and screenshot assertions.
+
+---
+
+## 11. Flake resistance
+
+TUI tests can be flaky because rendering and input are asynchronous. Tuiwright should copy the best browser-testing ideas:
+
+1. **Auto-wait all locators.** Do not resolve once and act immediately.
+2. **Retry assertions.** Assertions poll until timeout.
+3. **Wait for stable screen.** After an action, wait until no terminal bytes arrive for `N` ms or until expected condition is met.
+4. **Capture artifacts on failure.** Always save final text, ANSI, PNG, trace, and optional GIF.
+5. **Deterministic environment.** Set terminal size, `TERM`, `COLORTERM`, timezone, locale, random seed env vars, and disable spinners when requested.
+6. **Clock controls.** Offer an app-side fake clock helper for TUI animations.
+7. **Network/process isolation.** Allow pre-test and post-test hooks.
+
+---
+
+## 12. Suggested crate layout
+
+```text
+tuiwright/
+├── crates/
+│   ├── tuiwright/              # public API, PTY backend, screenshots, GIFs
+│   ├── tuiwright-core/         # snapshot, cell, color, locator traits
+│   ├── tuiwright-emulator/     # vt100/alacritty/wez adapters
+│   ├── tuiwright-runner/       # test runner + artifact policy
+│   ├── tuiwright-semantics/    # app-side semantic OSC helper
+│   ├── tuiwright-ratatui/      # optional Ratatui component harness
+│   └── tuiwright-viewer/       # optional trace viewer generator
+├── examples/
+├── tests/
+└── docs/
+```
+
+The copy-pasteable MVP below collapses most of this into a single crate so you can start experimenting immediately.
+
+---
+
+## 13. Copy-paste bootstrap: runnable Rust MVP
+
+The following Bash script creates a complete Rust crate. It is intentionally compact enough to audit, but it already demonstrates the core architecture.
+
+Usage:
+
+```bash
+bash bootstrap-tuiwright.sh
+cd tuiwright
+export TUIWRIGHT_FONT=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf  # adjust for your machine
+cargo run --example mini_app
+cargo test -- --nocapture
+cargo run --bin tuiwright -- \
+  --cols 80 --rows 24 \
+  --wait "Mini App" \
+  --output target/tuiwright/cli-shot.png \
+  --gif target/tuiwright/cli-flow.gif \
+  -- cargo run --example mini_app
+```
+
+### `bootstrap-tuiwright.sh`
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p tuiwright/src/bin tuiwright/examples tuiwright/tests
+
+cat > tuiwright/Cargo.toml <<'CARGO'
+[package]
+name = "tuiwright"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Playwright-style testing for Rust terminal user interfaces"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fontdue = "0.9"
+gif = "0.14"
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+portable-pty = "0.9"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+vt100 = "0.16"
+
+[dev-dependencies]
+tempfile = "3"
+CARGO
+
+cat > tuiwright/src/lib.rs <<'RUST'
+use anyhow::{anyhow, bail, Context, Result};
+use fontdue::{Font, FontSettings};
+use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
+use image::{Rgba, RgbaImage};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize, PtySystem};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use vt100::{Color as VtColor, Parser, Screen};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TuiConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub cwd: Option<PathBuf>,
+    pub cols: u16,
+    pub rows: u16,
+    pub scrollback: usize,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+    pub read_buffer_size: usize,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            scrollback: 10_000,
+            pixel_width: 800,
+            pixel_height: 480,
+            read_buffer_size: 16 * 1024,
+        }
+    }
+}
+
+impl TuiConfig {
+    pub fn command(command: impl Into<String>) -> Self {
+        Self { command: command.into(), ..Self::default() }
+    }
+
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn size(mut self, cols: u16, rows: u16) -> Self {
+        self.cols = cols;
+        self.rows = rows;
+        self.pixel_width = cols.saturating_mul(10);
+        self.pixel_height = rows.saturating_mul(20);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Esc,
+    Backspace,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Delete,
+    Insert,
+    Ctrl(char),
+    Alt(char),
+    F(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellRect {
+    pub row: u16,
+    pub col: u16,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl CellRect {
+    pub fn new(row: u16, col: u16, rows: u16, cols: u16) -> Self {
+        Self { row, col, rows, cols }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextMatch {
+    pub row: u16,
+    pub col: u16,
+    pub width: u16,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionEvent {
+    pub at_ms: u128,
+    pub kind: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RawChunk {
+    pub at_ms: u128,
+    pub bytes_hex: String,
+    pub printable: String,
+}
+
+#[derive(Clone)]
+struct RecordedFrame {
+    at_ms: u128,
+    screen: Screen,
+}
+
+struct RecordingCapture {
+    frame_interval: Duration,
+    last_frame_at: Instant,
+    last_contents: String,
+}
+
+struct SharedState {
+    parser: Parser,
+    raw_chunks: Vec<RawChunk>,
+    actions: Vec<ActionEvent>,
+    frames: Vec<RecordedFrame>,
+    recording: Option<RecordingCapture>,
+    last_output_at: Instant,
+}
+
+impl SharedState {
+    fn new(rows: u16, cols: u16, scrollback: usize) -> Self {
+        Self {
+            parser: Parser::new(rows, cols, scrollback),
+            raw_chunks: Vec::new(),
+            actions: Vec::new(),
+            frames: Vec::new(),
+            recording: None,
+            last_output_at: Instant::now(),
+        }
+    }
+}
+
+struct PageInner {
+    started_at: Instant,
+    config: TuiConfig,
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    child: Mutex<Box<dyn Child + Send + Sync>>,
+    writer: Mutex<Box<dyn Write + Send>>,
+    state: Arc<Mutex<SharedState>>,
+}
+
+#[derive(Clone)]
+pub struct Page {
+    inner: Arc<PageInner>,
+}
+
+impl Page {
+    pub fn spawn(config: TuiConfig) -> Result<Self> {
+        if config.command.trim().is_empty() {
+            bail!("TuiConfig.command cannot be empty");
+        }
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: config.rows,
+                cols: config.cols,
+                pixel_width: config.pixel_width,
+                pixel_height: config.pixel_height,
+            })
+            .context("open PTY")?;
+
+        let mut cmd = CommandBuilder::new(&config.command);
+        for arg in &config.args {
+            cmd.arg(arg.as_str());
+        }
+        cmd.env("TERM", config.env.get("TERM").map(String::as_str).unwrap_or("xterm-256color"));
+        cmd.env("COLORTERM", config.env.get("COLORTERM").map(String::as_str).unwrap_or("truecolor"));
+        cmd.env("TUIWRIGHT", "1");
+        for (key, value) in &config.env {
+            cmd.env(key.as_str(), value.as_str());
+        }
+        if let Some(cwd) = &config.cwd {
+            cmd.cwd(cwd.as_os_str());
+        }
+
+        let child = pair.slave.spawn_command(cmd).context("spawn child in PTY")?;
+        let reader = pair.master.try_clone_reader().context("clone PTY reader")?;
+        let writer = pair.master.take_writer().context("take PTY writer")?;
+        let state = Arc::new(Mutex::new(SharedState::new(config.rows, config.cols, config.scrollback)));
+        let started_at = Instant::now();
+
+        spawn_reader_thread(reader, Arc::clone(&state), started_at, config.read_buffer_size);
+
+        let page = Self {
+            inner: Arc::new(PageInner {
+                started_at,
+                config,
+                master: Mutex::new(pair.master),
+                child: Mutex::new(child),
+                writer: Mutex::new(writer),
+                state,
+            }),
+        };
+
+        page.record_action("spawn", &format!("{} {:?}", page.inner.config.command, page.inner.config.args));
+        Ok(page)
+    }
+
+    pub fn screen(&self) -> Screen {
+        self.inner.state.lock().unwrap().parser.screen().clone()
+    }
+
+    pub fn text(&self) -> String {
+        self.screen().contents()
+    }
+
+    pub fn press(&self, key: Key) -> Result<&Self> {
+        let application_cursor = self.screen().application_cursor();
+        let bytes = encode_key(key, application_cursor);
+        self.write_input(&bytes)?;
+        self.record_action("press", &format!("{:?}", key));
+        Ok(self)
+    }
+
+    pub fn type_text(&self, text: &str) -> Result<&Self> {
+        self.write_input(text.as_bytes())?;
+        self.record_action("type", text);
+        Ok(self)
+    }
+
+    pub fn paste(&self, text: &str) -> Result<&Self> {
+        if self.screen().bracketed_paste() {
+            self.write_input(b"\x1b[200~")?;
+            self.write_input(text.as_bytes())?;
+            self.write_input(b"\x1b[201~")?;
+        } else {
+            self.write_input(text.as_bytes())?;
+        }
+        self.record_action("paste", text);
+        Ok(self)
+    }
+
+    pub fn mouse_click(&self, row: u16, col: u16, button: MouseButton) -> Result<&Self> {
+        let down = encode_sgr_mouse(button, row, col, true);
+        let up = encode_sgr_mouse(button, row, col, false);
+        self.write_input(&down)?;
+        self.write_input(&up)?;
+        self.record_action("click", &format!("{:?} at row={}, col={}", button, row, col));
+        Ok(self)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<&Self> {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: cols.saturating_mul(10),
+            pixel_height: rows.saturating_mul(20),
+        };
+        self.inner.master.lock().unwrap().resize(size).context("resize PTY")?;
+        self.inner
+            .state
+            .lock()
+            .unwrap()
+            .parser
+            .screen_mut()
+            .set_size(rows, cols);
+        self.record_action("resize", &format!("{}x{}", cols, rows));
+        Ok(self)
+    }
+
+    pub fn wait_for_text(&self, needle: &str, timeout: Duration) -> Result<TextMatch> {
+        self.record_action("wait-for-text", needle);
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.screen();
+            if let Some(found) = find_text(&screen, needle) {
+                return Ok(found);
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out after {:?} waiting for text {:?}\n\nFinal screen:\n{}",
+                    timeout,
+                    needle,
+                    screen.contents()
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn wait_for_regex(&self, regex: &Regex, timeout: Duration) -> Result<TextMatch> {
+        self.record_action("wait-for-regex", regex.as_str());
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.screen();
+            if let Some(found) = find_regex(&screen, regex) {
+                return Ok(found);
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out after {:?} waiting for regex {:?}\n\nFinal screen:\n{}",
+                    timeout,
+                    regex.as_str(),
+                    screen.contents()
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    pub fn get_by_text(&self, needle: impl Into<String>) -> Locator {
+        Locator { page: self.clone(), kind: LocatorKind::Text(needle.into()) }
+    }
+
+    pub fn screenshot(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        self.screenshot_with(path, RenderOptions::default())
+    }
+
+    pub fn screenshot_with(&self, path: impl AsRef<Path>, options: RenderOptions) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+            }
+        }
+        let screen = self.screen();
+        let image = render_screen(&screen, &options)?;
+        image.save(&path).with_context(|| format!("save screenshot {}", path.display()))?;
+        self.record_action("screenshot", &path.display().to_string());
+        Ok(path)
+    }
+
+    pub fn save_text(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(&path, self.text())?;
+        self.record_action("save-text", &path.display().to_string());
+        Ok(path)
+    }
+
+    pub fn save_ansi(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(&path, self.screen().contents_formatted())?;
+        self.record_action("save-ansi", &path.display().to_string());
+        Ok(path)
+    }
+
+    pub fn start_recording(&self, options: RecordingOptions) -> Result<&Self> {
+        let screen = self.screen();
+        let contents = screen.contents();
+        let at_ms = self.elapsed_ms();
+        let mut state = self.inner.state.lock().unwrap();
+        state.frames.clear();
+        state.frames.push(RecordedFrame { at_ms, screen });
+        state.recording = Some(RecordingCapture {
+            frame_interval: options.frame_interval,
+            last_frame_at: Instant::now(),
+            last_contents: contents,
+        });
+        drop(state);
+        self.record_action("recording-start", &format!("interval={:?}", options.frame_interval));
+        Ok(self)
+    }
+
+    pub fn stop_recording_gif(
+        &self,
+        path: impl AsRef<Path>,
+        gif_options: GifOptions,
+        render_options: RenderOptions,
+    ) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+        let current = self.screen();
+        let at_ms = self.elapsed_ms();
+
+        let frames = {
+            let mut state = self.inner.state.lock().unwrap();
+            state.recording = None;
+            let should_push = state.frames.last().map(|f| f.screen.contents() != current.contents()).unwrap_or(true);
+            if should_push {
+                state.frames.push(RecordedFrame { at_ms, screen: current });
+            }
+            state.frames.clone()
+        };
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        encode_gif(&frames, &path, &gif_options, &render_options)?;
+        self.record_action("recording-gif", &path.display().to_string());
+        Ok(path)
+    }
+
+    pub fn save_trace(&self, path: impl AsRef<Path>) -> Result<PathBuf> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let state = self.inner.state.lock().unwrap();
+        let trace = TraceDump {
+            command: self.inner.config.command.clone(),
+            args: self.inner.config.args.clone(),
+            cols: self.inner.config.cols,
+            rows: self.inner.config.rows,
+            raw_chunks: state.raw_chunks.clone(),
+            actions: state.actions.clone(),
+            final_text: state.parser.screen().contents(),
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&trace)?)?;
+        Ok(path)
+    }
+
+    pub fn kill(&self) -> Result<()> {
+        self.record_action("kill", "");
+        let mut child = self.inner.child.lock().unwrap();
+        match child.try_wait()? {
+            Some(_) => Ok(()),
+            None => child.kill().context("kill child"),
+        }
+    }
+
+    pub fn wait(&self) -> Result<portable_pty::ExitStatus> {
+        self.record_action("wait", "");
+        self.inner.child.lock().unwrap().wait().context("wait child")
+    }
+
+    pub fn elapsed_ms(&self) -> u128 {
+        Instant::now().duration_since(self.inner.started_at).as_millis()
+    }
+
+    pub fn wait_for_quiet(&self, quiet_for: Duration, timeout: Duration) -> Result<&Self> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let last_output_at = self.inner.state.lock().unwrap().last_output_at;
+            if Instant::now().duration_since(last_output_at) >= quiet_for {
+                return Ok(self);
+            }
+            if Instant::now() >= deadline {
+                bail!("terminal did not become quiet for {:?} within {:?}", quiet_for, timeout);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn write_input(&self, bytes: &[u8]) -> Result<()> {
+        let mut writer = self.inner.writer.lock().unwrap();
+        writer.write_all(bytes).context("write input to PTY")?;
+        writer.flush().context("flush PTY input")?;
+        Ok(())
+    }
+
+    fn record_action(&self, kind: &str, detail: &str) {
+        let event = ActionEvent {
+            at_ms: self.elapsed_ms(),
+            kind: kind.to_string(),
+            detail: detail.to_string(),
+        };
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.actions.push(event);
+        }
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) == 1 {
+            let _ = self.kill();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Locator {
+    page: Page,
+    kind: LocatorKind,
+}
+
+#[derive(Clone)]
+enum LocatorKind {
+    Text(String),
+}
+
+impl Locator {
+    pub fn wait(&self, timeout: Duration) -> Result<TextMatch> {
+        match &self.kind {
+            LocatorKind::Text(text) => self.page.wait_for_text(text, timeout),
+        }
+    }
+
+    pub fn click(&self, timeout: Duration) -> Result<&Self> {
+        let m = self.wait(timeout)?;
+        let col = m.col.saturating_add(m.width / 2);
+        self.page.mouse_click(m.row, col, MouseButton::Left)?;
+        Ok(self)
+    }
+
+    pub fn screenshot(&self, path: impl AsRef<Path>, timeout: Duration, mut options: RenderOptions) -> Result<PathBuf> {
+        let m = self.wait(timeout)?;
+        options.clip = Some(CellRect::new(m.row, m.col, 1, m.width.max(1)));
+        self.page.screenshot_with(path, options)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingOptions {
+    pub frame_interval: Duration,
+}
+
+impl Default for RecordingOptions {
+    fn default() -> Self {
+        Self { frame_interval: Duration::from_millis(33) }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GifOptions {
+    pub repeat: bool,
+    pub min_delay: Duration,
+    pub max_delay: Duration,
+    pub quantize_speed: i32,
+}
+
+impl Default for GifOptions {
+    fn default() -> Self {
+        Self {
+            repeat: true,
+            min_delay: Duration::from_millis(20),
+            max_delay: Duration::from_millis(1_000),
+            quantize_speed: 10,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderOptions {
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub font_size: f32,
+    pub font_path: Option<PathBuf>,
+    pub clip: Option<CellRect>,
+    pub theme: Theme,
+    pub draw_cursor: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            cell_width: 10,
+            cell_height: 20,
+            font_size: 16.0,
+            font_path: auto_font_path(),
+            clip: None,
+            theme: Theme::default(),
+            draw_cursor: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Theme {
+    pub default_fg: (u8, u8, u8),
+    pub default_bg: (u8, u8, u8),
+    pub palette16: [(u8, u8, u8); 16],
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        // A deterministic dark terminal-like palette. Customize for exact terminal parity.
+        Self {
+            default_fg: (205, 214, 244),
+            default_bg: (30, 30, 46),
+            palette16: [
+                (69, 71, 90),
+                (243, 139, 168),
+                (166, 227, 161),
+                (249, 226, 175),
+                (137, 180, 250),
+                (203, 166, 247),
+                (137, 220, 235),
+                (205, 214, 244),
+                (88, 91, 112),
+                (243, 139, 168),
+                (166, 227, 161),
+                (249, 226, 175),
+                (137, 180, 250),
+                (203, 166, 247),
+                (137, 220, 235),
+                (255, 255, 255),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TraceDump {
+    command: String,
+    args: Vec<String>,
+    cols: u16,
+    rows: u16,
+    raw_chunks: Vec<RawChunk>,
+    actions: Vec<ActionEvent>,
+    final_text: String,
+}
+
+fn spawn_reader_thread(
+    mut reader: Box<dyn Read + Send>,
+    state: Arc<Mutex<SharedState>>,
+    started_at: Instant,
+    read_buffer_size: usize,
+) {
+    thread::spawn(move || {
+        let mut buf = vec![0u8; read_buffer_size.max(1024)];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let now = Instant::now();
+                    let bytes = &buf[..n];
+                    let printable = String::from_utf8_lossy(bytes).replace('\x1b', "␛");
+                    let mut state = match state.lock() {
+                        Ok(state) => state,
+                        Err(_) => break,
+                    };
+                    state.parser.process(bytes);
+                    state.last_output_at = now;
+                    state.raw_chunks.push(RawChunk {
+                        at_ms: now.duration_since(started_at).as_millis(),
+                        bytes_hex: hex::encode(bytes),
+                        printable,
+                    });
+
+                    let contents = state.parser.screen().contents();
+                    let mut should_record = false;
+                    if let Some(recording) = state.recording.as_mut() {
+                        if now.duration_since(recording.last_frame_at) >= recording.frame_interval
+                            && contents != recording.last_contents
+                        {
+                            recording.last_frame_at = now;
+                            recording.last_contents = contents;
+                            should_record = true;
+                        }
+                    }
+                    if should_record {
+                        let screen = state.parser.screen().clone();
+                        state.frames.push(RecordedFrame {
+                            at_ms: now.duration_since(started_at).as_millis(),
+                            screen,
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn encode_key(key: Key, application_cursor: bool) -> Vec<u8> {
+    match key {
+        Key::Char(c) => c.to_string().into_bytes(),
+        Key::Enter => b"\r".to_vec(),
+        Key::Esc => b"\x1b".to_vec(),
+        Key::Backspace => b"\x7f".to_vec(),
+        Key::Tab => b"\t".to_vec(),
+        Key::Up => if application_cursor { b"\x1bOA".to_vec() } else { b"\x1b[A".to_vec() },
+        Key::Down => if application_cursor { b"\x1bOB".to_vec() } else { b"\x1b[B".to_vec() },
+        Key::Right => if application_cursor { b"\x1bOC".to_vec() } else { b"\x1b[C".to_vec() },
+        Key::Left => if application_cursor { b"\x1bOD".to_vec() } else { b"\x1b[D".to_vec() },
+        Key::Home => b"\x1b[H".to_vec(),
+        Key::End => b"\x1b[F".to_vec(),
+        Key::PageUp => b"\x1b[5~".to_vec(),
+        Key::PageDown => b"\x1b[6~".to_vec(),
+        Key::Delete => b"\x1b[3~".to_vec(),
+        Key::Insert => b"\x1b[2~".to_vec(),
+        Key::Ctrl(c) => vec![(c.to_ascii_uppercase() as u8) & 0x1f],
+        Key::Alt(c) => {
+            let mut out = vec![0x1b];
+            out.extend(c.to_string().as_bytes());
+            out
+        }
+        Key::F(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => Vec::new(),
+        },
+    }
+}
+
+fn encode_sgr_mouse(button: MouseButton, row: u16, col: u16, down: bool) -> Vec<u8> {
+    let code = match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        MouseButton::WheelUp => 64,
+        MouseButton::WheelDown => 65,
+    };
+    let suffix = if down { 'M' } else { 'm' };
+    format!("\x1b[<{};{};{}{}", code, col + 1, row + 1, suffix).into_bytes()
+}
+
+fn find_text(screen: &Screen, needle: &str) -> Option<TextMatch> {
+    let (_rows, cols) = screen.size();
+    for (row, line) in screen.rows(0, cols).enumerate() {
+        if let Some(col) = line.find(needle) {
+            return Some(TextMatch {
+                row: row as u16,
+                col: col as u16,
+                width: needle.chars().count() as u16,
+                text: needle.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn find_regex(screen: &Screen, regex: &Regex) -> Option<TextMatch> {
+    let (_rows, cols) = screen.size();
+    for (row, line) in screen.rows(0, cols).enumerate() {
+        if let Some(m) = regex.find(&line) {
+            return Some(TextMatch {
+                row: row as u16,
+                col: m.start() as u16,
+                width: m.as_str().chars().count() as u16,
+                text: m.as_str().to_string(),
+            });
+        }
+    }
+    None
+}
+
+pub fn render_screen(screen: &Screen, options: &RenderOptions) -> Result<RgbaImage> {
+    let font = load_font(options.font_path.as_ref())?;
+    let (screen_rows, screen_cols) = screen.size();
+    let clip = options.clip.unwrap_or(CellRect::new(0, 0, screen_rows, screen_cols));
+    let width = u32::from(clip.cols).saturating_mul(options.cell_width);
+    let height = u32::from(clip.rows).saturating_mul(options.cell_height);
+    let bg = options.theme.default_bg;
+    let mut image = RgbaImage::from_pixel(width.max(1), height.max(1), Rgba([bg.0, bg.1, bg.2, 255]));
+
+    for out_row in 0..clip.rows {
+        let row = clip.row.saturating_add(out_row);
+        if row >= screen_rows {
+            continue;
+        }
+        for out_col in 0..clip.cols {
+            let col = clip.col.saturating_add(out_col);
+            if col >= screen_cols {
+                continue;
+            }
+            let Some(cell) = screen.cell(row, col) else { continue };
+            if cell.is_wide_continuation() {
+                continue;
+            }
+
+            let mut fg = color_to_rgb(cell.fgcolor(), true, &options.theme);
+            let mut bg = color_to_rgb(cell.bgcolor(), false, &options.theme);
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            if cell.dim() {
+                fg = dim(fg);
+            }
+
+            let x = u32::from(out_col) * options.cell_width;
+            let y = u32::from(out_row) * options.cell_height;
+            fill_rect(&mut image, x, y, options.cell_width, options.cell_height, bg);
+
+            let text = cell.contents();
+            if !text.is_empty() && text != " " {
+                draw_cell_text(&mut image, &font, text, x, y, options, fg, cell.bold())?;
+            }
+            if cell.underline() {
+                let underline_y = y + options.cell_height.saturating_sub(3);
+                fill_rect(&mut image, x + 1, underline_y, options.cell_width.saturating_sub(2), 1, fg);
+            }
+        }
+    }
+
+    if options.draw_cursor && !screen.hide_cursor() {
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        if cursor_row >= clip.row
+            && cursor_col >= clip.col
+            && cursor_row < clip.row + clip.rows
+            && cursor_col < clip.col + clip.cols
+        {
+            let x = u32::from(cursor_col - clip.col) * options.cell_width;
+            let y = u32::from(cursor_row - clip.row) * options.cell_height;
+            draw_border(&mut image, x, y, options.cell_width, options.cell_height, options.theme.default_fg);
+        }
+    }
+
+    Ok(image)
+}
+
+fn load_font(path: Option<&PathBuf>) -> Result<Font> {
+    let path = path
+        .cloned()
+        .or_else(auto_font_path)
+        .ok_or_else(|| anyhow!(
+            "no monospace font found. Set TUIWRIGHT_FONT=/path/to/monospace.ttf or pass RenderOptions.font_path"
+        ))?;
+    let bytes = fs::read(&path).with_context(|| format!("read font {}", path.display()))?;
+    Font::from_bytes(bytes, FontSettings::default()).map_err(|e| anyhow!("load font {}: {}", path.display(), e))
+}
+
+fn auto_font_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("TUIWRIGHT_FONT") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+        "C:\\Windows\\Fonts\\consola.ttf",
+        "C:\\Windows\\Fonts\\CascadiaMono.ttf",
+    ];
+
+    candidates.iter().map(PathBuf::from).find(|p| p.exists())
+}
+
+fn draw_cell_text(
+    image: &mut RgbaImage,
+    font: &Font,
+    text: &str,
+    cell_x: u32,
+    cell_y: u32,
+    options: &RenderOptions,
+    rgb: (u8, u8, u8),
+    bold: bool,
+) -> Result<()> {
+    let Some(ch) = text.chars().find(|c| !c.is_control()) else { return Ok(()) };
+    let (metrics, bitmap) = font.rasterize(ch, options.font_size);
+    if metrics.width == 0 || metrics.height == 0 {
+        return Ok(());
+    }
+
+    let x_offset = ((options.cell_width as i32 - metrics.width as i32) / 2).max(0) as u32;
+    let y_offset = ((options.cell_height as i32 - metrics.height as i32) / 2).max(0) as u32;
+    let base_x = cell_x + x_offset;
+    let base_y = cell_y + y_offset;
+
+    blit_alpha(image, &bitmap, metrics.width, metrics.height, base_x, base_y, rgb);
+    if bold {
+        blit_alpha(image, &bitmap, metrics.width, metrics.height, base_x + 1, base_y, rgb);
+    }
+    Ok(())
+}
+
+fn blit_alpha(
+    image: &mut RgbaImage,
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+    x0: u32,
+    y0: u32,
+    rgb: (u8, u8, u8),
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let a = alpha[y * width + x];
+            if a == 0 {
+                continue;
+            }
+            let px = x0 + x as u32;
+            let py = y0 + y as u32;
+            if px >= image.width() || py >= image.height() {
+                continue;
+            }
+            let dst = image.get_pixel_mut(px, py);
+            let inv = 255u16.saturating_sub(a as u16);
+            dst.0[0] = ((rgb.0 as u16 * a as u16 + dst.0[0] as u16 * inv) / 255) as u8;
+            dst.0[1] = ((rgb.1 as u16 * a as u16 + dst.0[1] as u16 * inv) / 255) as u8;
+            dst.0[2] = ((rgb.2 as u16 * a as u16 + dst.0[2] as u16 * inv) / 255) as u8;
+            dst.0[3] = 255;
+        }
+    }
+}
+
+fn fill_rect(image: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, rgb: (u8, u8, u8)) {
+    for py in y..y.saturating_add(h).min(image.height()) {
+        for px in x..x.saturating_add(w).min(image.width()) {
+            image.put_pixel(px, py, Rgba([rgb.0, rgb.1, rgb.2, 255]));
+        }
+    }
+}
+
+fn draw_border(image: &mut RgbaImage, x: u32, y: u32, w: u32, h: u32, rgb: (u8, u8, u8)) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    fill_rect(image, x, y, w, 1, rgb);
+    fill_rect(image, x, y + h.saturating_sub(1), w, 1, rgb);
+    fill_rect(image, x, y, 1, h, rgb);
+    fill_rect(image, x + w.saturating_sub(1), y, 1, h, rgb);
+}
+
+fn color_to_rgb(color: VtColor, foreground: bool, theme: &Theme) -> (u8, u8, u8) {
+    match color {
+        VtColor::Default => if foreground { theme.default_fg } else { theme.default_bg },
+        VtColor::Rgb(r, g, b) => (r, g, b),
+        VtColor::Idx(idx) => xterm_index_to_rgb(idx, theme),
+    }
+}
+
+fn xterm_index_to_rgb(idx: u8, theme: &Theme) -> (u8, u8, u8) {
+    if idx < 16 {
+        return theme.palette16[idx as usize];
+    }
+    if idx >= 232 {
+        let v = 8 + (idx - 232) * 10;
+        return (v, v, v);
+    }
+    let idx = idx - 16;
+    let r = idx / 36;
+    let g = (idx % 36) / 6;
+    let b = idx % 6;
+    let conv = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+    (conv(r), conv(g), conv(b))
+}
+
+fn dim(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+    ((rgb.0 as f32 * 0.65) as u8, (rgb.1 as f32 * 0.65) as u8, (rgb.2 as f32 * 0.65) as u8)
+}
+
+fn encode_gif(
+    frames: &[RecordedFrame],
+    path: &Path,
+    gif_options: &GifOptions,
+    render_options: &RenderOptions,
+) -> Result<()> {
+    if frames.is_empty() {
+        bail!("cannot encode GIF with no frames");
+    }
+
+    let rendered: Vec<RgbaImage> = frames
+        .iter()
+        .map(|f| render_screen(&f.screen, render_options))
+        .collect::<Result<Vec<_>>>()?;
+
+    let width = rendered[0].width() as u16;
+    let height = rendered[0].height() as u16;
+    let mut file = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut encoder = GifEncoder::new(&mut file, width, height, &[])?;
+    if gif_options.repeat {
+        encoder.set_repeat(Repeat::Infinite)?;
+    }
+
+    for (i, image) in rendered.into_iter().enumerate() {
+        let next_at = frames.get(i + 1).map(|f| f.at_ms).unwrap_or(frames[i].at_ms + 500);
+        let delay_ms = next_at.saturating_sub(frames[i].at_ms);
+        let delay_ms = delay_ms
+            .max(gif_options.min_delay.as_millis())
+            .min(gif_options.max_delay.as_millis());
+        let delay_cs = (delay_ms / 10).max(1).min(u16::MAX as u128) as u16;
+
+        let mut rgba = image.into_raw();
+        let mut frame = GifFrame::from_rgba_speed(width, height, &mut rgba, gif_options.quantize_speed);
+        frame.delay = delay_cs;
+        encoder.write_frame(&frame)?;
+    }
+
+    Ok(())
+}
+RUST
+
+cat > tuiwright/src/bin/tuiwright.rs <<'RUST'
+use anyhow::{bail, Context, Result};
+use clap::Parser;
+use std::path::PathBuf;
+use std::time::Duration;
+use tuiwright::{GifOptions, Page, RecordingOptions, RenderOptions, TuiConfig};
+
+#[derive(Debug, Parser)]
+#[command(name = "tuiwright")]
+#[command(about = "Drive a TUI command in a PTY and capture screenshots/GIFs")]
+struct Cli {
+    #[arg(long, default_value_t = 80)]
+    cols: u16,
+
+    #[arg(long, default_value_t = 24)]
+    rows: u16,
+
+    #[arg(long)]
+    wait: Option<String>,
+
+    #[arg(long, default_value_t = 5)]
+    timeout_secs: u64,
+
+    #[arg(long)]
+    output: Option<PathBuf>,
+
+    #[arg(long)]
+    gif: Option<PathBuf>,
+
+    #[arg(long)]
+    trace: Option<PathBuf>,
+
+    #[arg(long)]
+    font: Option<PathBuf>,
+
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    if cli.command.is_empty() {
+        bail!("pass a command after --, for example: tuiwright --output out.png -- cargo run");
+    }
+
+    let mut config = TuiConfig::command(cli.command[0].clone()).size(cli.cols, cli.rows);
+    config.args = cli.command[1..].to_vec();
+
+    let page = Page::spawn(config).context("spawn page")?;
+    if cli.gif.is_some() {
+        page.start_recording(RecordingOptions::default())?;
+    }
+
+    if let Some(wait) = &cli.wait {
+        page.wait_for_text(wait, Duration::from_secs(cli.timeout_secs))?;
+    } else {
+        page.wait_for_quiet(Duration::from_millis(150), Duration::from_secs(cli.timeout_secs))?;
+    }
+
+    let mut render = RenderOptions::default();
+    if let Some(font) = cli.font {
+        render.font_path = Some(font);
+    }
+
+    if let Some(output) = cli.output {
+        page.screenshot_with(output, render.clone())?;
+    }
+
+    if let Some(gif) = cli.gif {
+        page.stop_recording_gif(gif, GifOptions::default(), render)?;
+    }
+
+    if let Some(trace) = cli.trace {
+        page.save_trace(trace)?;
+    }
+
+    let _ = page.kill();
+    Ok(())
+}
+RUST
+
+cat > tuiwright/examples/mini_app.rs <<'RUST'
+use std::io::{self, Write};
+
+fn main() {
+    // Use the alternate screen so the test covers full-screen TUI behavior.
+    print!("\x1b[?1049h\x1b[2J\x1b[H");
+    println!("\x1b[1;32mMini App\x1b[0m");
+    println!("Type something and press Enter. Type q to quit.");
+    println!("Search:");
+    io::stdout().flush().unwrap();
+
+    loop {
+        print!("\r\n> ");
+        io::stdout().flush().unwrap();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).is_err() {
+            break;
+        }
+        let line = line.trim();
+        if line == "q" || line == "quit" {
+            break;
+        }
+        println!("Echo: {}", line);
+        io::stdout().flush().unwrap();
+    }
+
+    print!("\x1b[?1049l");
+    io::stdout().flush().unwrap();
+}
+RUST
+
+cat > tuiwright/tests/mini_flow.rs <<'RUST'
+use std::path::PathBuf;
+use std::time::Duration;
+use tuiwright::{GifOptions, Key, Page, RecordingOptions, RenderOptions, TuiConfig};
+
+#[test]
+fn mini_app_flow() -> anyhow::Result<()> {
+    let page = Page::spawn(
+        TuiConfig::command("cargo")
+            .arg("run")
+            .arg("--quiet")
+            .arg("--example")
+            .arg("mini_app")
+            .size(80, 24),
+    )?;
+
+    page.start_recording(RecordingOptions::default())?;
+    page.wait_for_text("Mini App", Duration::from_secs(20))?;
+    page.get_by_text("Search").click(Duration::from_secs(2))?;
+    page.type_text("hello from tuiwright")?.press(Key::Enter)?;
+    page.wait_for_text("Echo: hello from tuiwright", Duration::from_secs(5))?;
+
+    let out_dir = PathBuf::from("target/tuiwright");
+    std::fs::create_dir_all(&out_dir)?;
+    page.screenshot(out_dir.join("mini-flow.png"))?;
+    page.save_text(out_dir.join("mini-flow.txt"))?;
+    page.save_ansi(out_dir.join("mini-flow.ansi"))?;
+    page.save_trace(out_dir.join("mini-flow.trace.json"))?;
+    page.stop_recording_gif(out_dir.join("mini-flow.gif"), GifOptions::default(), RenderOptions::default())?;
+    page.kill().ok();
+    Ok(())
+}
+RUST
+
+cat > tuiwright/README.md <<'README'
+# Tuiwright MVP
+
+A compact Playwright-style TUI tester prototype.
+
+## Run
+
+```bash
+export TUIWRIGHT_FONT=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+cargo test -- --nocapture
+cargo run --bin tuiwright -- --cols 80 --rows 24 --wait "Mini App" --output target/tuiwright/shot.png --gif target/tuiwright/flow.gif -- cargo run --example mini_app
+```
+
+Artifacts land in `target/tuiwright`.
+README
+
+echo "Created ./tuiwright"
+echo "Next: cd tuiwright && cargo test -- --nocapture"
+````
+
+---
+
+## 14. What the bootstrap MVP gives you
+
+The scaffold is intentionally small enough to study, but it already demonstrates the core end-to-end loop:
+
+1. It starts a child process under a pseudo-terminal.
+2. It continuously reads terminal output bytes on a background thread.
+3. It feeds those bytes into a terminal parser.
+4. It exposes a Playwright-like `Page` object.
+5. It locates visible text by reading the terminal screen model.
+6. It encodes keyboard and mouse input back into the PTY.
+7. It rasterizes terminal cells into PNG screenshots.
+8. It records screen frames and emits an animated GIF.
+9. It saves a JSON action/output trace.
+
+This is enough to validate real behavior for many line-oriented and full-screen TUI applications.
+
+Run it like this:
+
+```bash
+bash bootstrap-tuiwright.sh
+cd tuiwright
+export TUIWRIGHT_FONT=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+cargo test -- --nocapture
+```
+
+On macOS, a typical font value is:
+
+```bash
+export TUIWRIGHT_FONT="/System/Library/Fonts/Menlo.ttc"
+```
+
+On CI, pin the font file by checking a permissively licensed monospace font into your repository or installing one in the CI image.
+
+---
+
+## 15. Production hardening plan
+
+The MVP is deliberately straightforward. A production-grade Tuiwright should harden each layer.
+
+### 15.1 Terminal emulator fidelity
+
+The MVP uses `vt100` because it is compact and copy-pasteable. The production crate should define a `TerminalModel` trait:
+
+```rust
+pub trait TerminalModel: Send + Sync {
+    fn resize(&mut self, cols: u16, rows: u16);
+    fn process(&mut self, bytes: &[u8]);
+    fn screen(&self) -> ScreenSnapshot;
+    fn raw_screen(&self) -> Arc<dyn Any + Send + Sync>;
+}
+```
+
+Then ship multiple implementations:
+
+```text
+tuiwright-terminal-vt100       small default, easy to audit
+tuiwright-terminal-termwiz     richer parser/surface integration
+tuiwright-terminal-wezterm     high-fidelity emulator core integration
+tuiwright-terminal-alacritty   optional profile for Alacritty-like behavior
+```
+
+The API stays unchanged. Users choose fidelity/cost:
+
+```rust
+Page::spawn(
+    TuiConfig::command("my-tui")
+        .terminal_model(TerminalModelKind::WezTerm)
+        .terminal_profile(TerminalProfile::Xterm256Color),
+)?;
+```
+
+### 15.2 Input correctness
+
+Keyboard input is more complicated than “send bytes.” Production Tuiwright should model:
+
+1. Normal cursor mode versus application cursor mode.
+2. Numeric keypad mode.
+3. Bracketed paste mode.
+4. Kitty keyboard protocol.
+5. CSI-u modified-key protocol.
+6. Alt/meta key encoding.
+7. Ctrl and Shift combinations.
+8. IME-like text insertion through paste.
+9. Mouse protocols: X10, UTF-8, SGR, urxvt, focus-in/out, wheel, drag.
+
+The user-facing API remains simple:
+
+```rust
+page.press("Ctrl+K")?;
+page.press("Alt+Enter")?;
+page.keyboard().down(Key::Shift)?;
+page.press(Key::Tab)?;
+page.keyboard().up(Key::Shift)?;
+page.mouse().move_to(locator.center()).await?;
+page.mouse().drag_to(other.center()).await?;
+```
+
+Internally, Tuiwright should maintain a `TerminalInputModes` snapshot derived from terminal output. The MVP already checks `bracketed_paste()` and `application_cursor()` through the parser.
+
+### 15.3 Screenshot fidelity
+
+A production renderer should support:
+
+1. Truecolor, 256-color, 16-color, and default terminal theme colors.
+2. Bold-as-bright and bold-as-weight terminal profiles.
+3. Dim, italic, underline, double underline, curly underline, strikethrough, inverse, blink, hidden.
+4. Wide grapheme clusters, combining marks, emoji fallback, ambiguous-width configuration.
+5. Cursor styles: block, bar, underline, blinking/non-blinking.
+6. Background image transparency option for docs.
+7. Device scale factor.
+8. Screenshot clipping by locator rectangle.
+9. Masking sensitive areas.
+10. Stable anti-aliased rendering through pinned font assets.
+
+Suggested API:
+
+```rust
+page.screenshot_with(
+    "target/tuiwright/dashboard.png",
+    ScreenshotOptions::new()
+        .scale_factor(2.0)
+        .theme(Theme::dark())
+        .font_path("./test-assets/fonts/CommitMono.ttf")
+        .mask(page.get_by_label("API key"))
+        .clip(page.get_by_text("Summary panel"))
+        .cursor(CursorPolicy::Show),
+)?;
+```
+
+### 15.4 Visual assertions
+
+Provide three assertion layers:
+
+```rust
+expect(page).to_contain_text("Saved")?;
+expect(page.get_by_text("Save")).to_be_visible()?;
+expect(page).to_match_screenshot("saved-dashboard")?;
+```
+
+`to_match_screenshot` should store:
+
+```text
+snapshots/
+├── saved-dashboard.linux.xterm-256color.100x30.png
+├── saved-dashboard.linux.xterm-256color.100x30.diff.png
+└── saved-dashboard.linux.xterm-256color.100x30.meta.json
+```
+
+Visual comparison should support:
+
+```rust
+VisualDiffOptions::new()
+    .max_pixel_ratio(0.001)
+    .max_channel_delta(4)
+    .ignore_cursor(true)
+    .ignore_regions(vec![page.get_by_text("Clock")])
+    .mask_regions(vec![page.get_by_label("Token")]);
+```
+
+### 15.5 GIF and video-grade artifacts
+
+The MVP uses the `gif` crate directly. Production should add:
+
+```text
+feature = "gif-fast"       gif crate, fast/simple
+feature = "gif-high"       gifski, smaller and prettier
+feature = "apng"           animated PNG for documentation
+feature = "webp"           animated WebP for web dashboards
+```
+
+Recording should be controlled like Playwright video:
+
+```rust
+let page = Page::spawn(
+    TuiConfig::command("my-tui")
+        .record_video(VideoOptions::gif()
+            .path("target/tuiwright/flow.gif")
+            .fps(12)
+            .scale_factor(2.0)
+            .capture_policy(CapturePolicy::OnScreenChange)
+            .compression(Compression::WebOptimized)
+            .max_duration(Duration::from_secs(60))),
+)?;
+```
+
+The best default capture policy is not fixed FPS. It should be:
+
+1. Capture when the screen model changes.
+2. Coalesce bursts of output into one frame per 80–120 ms.
+3. Keep longer frame delays during idle periods.
+4. Always force-capture before and after a user action.
+5. Store raw terminal output separately so recordings can be regenerated later.
+
+### 15.6 Trace viewer
+
+The trace viewer can be static web UI, but the trace generation core remains Rust. A nice production split is:
+
+```text
+tuiwright-trace/                Rust trace model, writer, reader
+tuiwright-trace-viewer/         Vite + TypeScript viewer
+tuiwright-trace-viewer-assets/  compiled static assets embedded in Rust binary
+tuiwright-cli/                  `tuiwright show-trace trace.zip`
+```
+
+The viewer should show:
+
+1. Timeline of actions and assertions.
+2. Screenshot before and after each action.
+3. Cell-grid inspector: row, column, glyph, foreground, background, attributes.
+4. Raw ANSI bytes around each transition.
+5. Locator resolution explanation.
+6. Process exit code and stderr.
+7. Resize events.
+8. Recording playback.
+
+A Vite viewer is optional for the project, not required for tests. The Rust CLI can serve embedded assets:
+
+```rust
+// tuiwright show-trace target/tuiwright/search.trace.zip
+// Starts localhost-only server with embedded viewer assets and trace file.
+```
+
+### 15.7 Roles and semantic locators
+
+Text locators are useful but not enough. Playwright became powerful because it encouraged accessible locators. TUIs do not have a browser accessibility tree, so Tuiwright should define one.
+
+Recommended invisible protocol:
+
+```text
+OSC 777 ; tuiwright ; {json} BEL
+```
+
+Example emitted by an app:
+
+```rust
+println!(
+    "\x1b]777;tuiwright;{}\x07",
+    serde_json::json!({
+        "version": 1,
+        "elements": [
+            {
+                "id": "save-button",
+                "role": "button",
+                "name": "Save",
+                "rect": { "x": 70, "y": 22, "width": 8, "height": 1 },
+                "focused": true,
+                "disabled": false,
+                "checked": null,
+                "value": null
+            }
+        ]
+    })
+);
+```
+
+Then tests become robust:
+
+```rust
+page.get_by_role(Role::Button, "Save").click()?;
+page.get_by_label("Repository URL").fill("https://example.test/repo.git")?;
+expect(page.get_by_role(Role::Status, "Build succeeded")).to_be_visible()?;
+```
+
+Framework adapters can emit this automatically:
+
+```rust
+// ratatui adapter
+Paragraph::new("Save")
+    .tuiwright_role(Role::Button)
+    .tuiwright_id("save-button")
+    .render(area, buf);
+```
+
+The side-channel should be ignored by normal terminals, logged by Tuiwright, and never displayed to users.
+
+### 15.8 Flake resistance
+
+A Playwright-class TUI tester needs auto-waiting. Every action should follow this shape:
+
+```text
+resolve locator
+wait until visible
+wait until stable over N frames
+wait until enabled
+perform action
+wait for terminal quiet period
+capture after-state
+```
+
+Suggested defaults:
+
+```rust
+AutoWaitOptions {
+    timeout: Duration::from_secs(5),
+    stable_frames: 2,
+    quiet_period: Duration::from_millis(50),
+    poll_interval: Duration::from_millis(16),
+    retry_locator_resolution: true,
+}
+```
+
+A failure should explain itself:
+
+```text
+Timed out after 5s waiting for role=button name="Save" to become actionable.
+
+Last visible screen:
+  ...
+
+Locator candidates:
+  role=button name="Save as" at row 22 col 62
+  text="Save" at row 18 col 10 but disabled=true
+
+Artifacts:
+  screenshot: target/tuiwright/failures/test_save_button.png
+  trace:      target/tuiwright/failures/test_save_button.trace.zip
+  recording:  target/tuiwright/failures/test_save_button.gif
+```
+
+### 15.9 Parallel test execution
+
+PTY tests are safe to run in parallel as long as artifacts and ports are isolated. Provide a `TestInfo` helper:
+
+```rust
+#[tuiwright::test]
+fn save_flow(page: Page, info: TestInfo) -> anyhow::Result<()> {
+    page.screenshot(info.artifact("save.png"))?;
+    Ok(())
+}
+```
+
+The macro can derive artifact names from module path and test name:
+
+```text
+target/tuiwright-artifacts/
+└── my_crate__tests__save_flow/
+    ├── final.png
+    ├── flow.gif
+    ├── trace.zip
+    └── stdout.raw
+```
+
+### 15.10 Cross-platform support
+
+Recommended support matrix:
+
+| OS | PTY layer | Notes |
+|---|---|---|
+| Linux | `portable-pty` Unix PTY | Best CI target |
+| macOS | `portable-pty` Unix PTY | Good local parity |
+| Windows | ConPTY through `portable-pty` | Needs extra keyboard/mouse verification |
+| WSL | Unix PTY | Good for Linux parity |
+
+Keep Linux as the golden CI baseline for visual snapshots. Use text/semantic assertions for cross-platform smoke tests.
+
+---
+
+## 16. Suggested public crate layout
+
+```text
+tuiwright/
+├── crates/
+│   ├── tuiwright/                 # high-level Page, Locator, expect API
+│   ├── tuiwright-pty/             # process spawning, PTY I/O, input encoding
+│   ├── tuiwright-terminal/        # terminal model trait, snapshots, profiles
+│   ├── tuiwright-render/          # PNG renderer, fonts, image diffing
+│   ├── tuiwright-record/          # GIF/APNG/WebP recording pipeline
+│   ├── tuiwright-trace/           # trace zip writer/reader
+│   ├── tuiwright-ratatui/         # component adapter and role annotations
+│   ├── tuiwright-macros/          # #[tuiwright::test]
+│   └── tuiwright-cli/             # command-line runner and trace viewer server
+├── examples/
+├── fixtures/
+├── docs/
+└── test-assets/fonts/
+```
+
+### Main traits
+
+```rust
+pub trait Driver {
+    fn press(&self, key: Key) -> Result<()>;
+    fn type_text(&self, text: &str) -> Result<()>;
+    fn paste(&self, text: &str) -> Result<()>;
+    fn click(&self, point: Point) -> Result<()>;
+    fn resize(&self, size: TerminalSize) -> Result<()>;
+}
+
+pub trait QueryEngine {
+    fn query_text(&self, text: TextMatch) -> Vec<ElementHandle>;
+    fn query_role(&self, role: Role, name: TextMatch) -> Vec<ElementHandle>;
+    fn query_label(&self, label: TextMatch) -> Vec<ElementHandle>;
+}
+
+pub trait ArtifactSink {
+    fn screenshot(&self, name: &str, image: DynamicImage) -> Result<PathBuf>;
+    fn trace(&self, name: &str, trace: TraceArchive) -> Result<PathBuf>;
+    fn recording(&self, name: &str, bytes: Vec<u8>) -> Result<PathBuf>;
+}
+```
+
+### Assertion API
+
+```rust
+expect(&page).to_contain_text("Dashboard")?;
+expect(&page).not().to_contain_text("panic")?;
+expect(page.get_by_role(Role::Button, "Save")).to_be_enabled()?;
+expect(page.get_by_text("Loading")).to_disappear(Duration::from_secs(10))?;
+expect(&page).to_match_screenshot("dashboard")?;
+```
+
+### Config API
+
+```rust
+let page = Page::spawn(
+    TuiConfig::command("my-tui")
+        .arg("--fixture")
+        .arg("tests/fixtures/project.json")
+        .cwd(env!("CARGO_MANIFEST_DIR"))
+        .env("NO_COLOR", "0")
+        .env("RUST_BACKTRACE", "1")
+        .size(120, 40)
+        .theme(Theme::dark())
+        .font("test-assets/fonts/CommitMono.ttf")
+        .recording(RecordingOptions::on_failure())
+        .trace(TraceOptions::on_failure()),
+)?;
+```
+
+---
+
+## 17. Example user flows
+
+### 17.1 Install wizard
+
+```rust
+#[test]
+fn install_wizard_accepts_defaults() -> anyhow::Result<()> {
+    let page = Page::spawn(TuiConfig::command("my-installer").size(100, 30))?;
+
+    page.wait_for_text("Welcome", secs(5))?;
+    page.press(Key::Enter)?;
+    page.wait_for_text("Installation directory", secs(5))?;
+    page.press(Key::Enter)?;
+    page.wait_for_text("Confirm", secs(5))?;
+    page.get_by_text("Install").click(secs(2))?;
+    page.wait_for_text("Installation complete", secs(60))?;
+
+    page.screenshot("target/tuiwright/install-complete.png")?;
+    Ok(())
+}
+```
+
+### 17.2 Visual regression of dashboard
+
+```rust
+#[test]
+fn dashboard_visual_regression() -> anyhow::Result<()> {
+    let page = Page::spawn(
+        TuiConfig::command("cargo")
+            .args(["run", "--bin", "dashboard", "--", "--fixture", "tests/fixture.json"])
+            .size(120, 32),
+    )?;
+
+    page.wait_for_text("CPU", secs(5))?;
+    page.wait_for_quiet(Duration::from_millis(150))?;
+
+    expect(&page).to_match_screenshot_with(
+        "dashboard",
+        VisualDiffOptions::new()
+            .ignore_cursor(true)
+            .mask_text_regex(r"\d{2}:\d{2}:\d{2}"),
+    )?;
+
+    Ok(())
+}
+```
+
+### 17.3 Failure artifact pattern
+
+```rust
+#[test]
+fn save_button_writes_file() -> anyhow::Result<()> {
+    let page = Page::spawn(TuiConfig::command("editor-tui").size(100, 30))?;
+    let artifacts = ArtifactGuard::new("save_button_writes_file", &page)
+        .screenshot_on_failure()
+        .trace_on_failure()
+        .gif_on_failure();
+
+    page.get_by_role(Role::Textbox, "Body").fill("hello")?;
+    page.get_by_role(Role::Button, "Save").click()?;
+    page.wait_for_text("Saved", secs(5))?;
+
+    artifacts.success();
+    Ok(())
+}
+```
+
+---
+
+## 18. CI integration
+
+### 18.1 GitHub Actions
+
+```yaml
+name: tuiwright
+
+on: [push, pull_request]
+
+jobs:
+  tui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install deterministic font
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core
+      - name: Test
+        env:
+          TUIWRIGHT_FONT: /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+          TUIWRIGHT_ARTIFACT_DIR: target/tuiwright-artifacts
+          TERM: xterm-256color
+          COLORTERM: truecolor
+        run: cargo test --all -- --nocapture
+      - name: Upload TUI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tuiwright-artifacts
+          path: target/tuiwright-artifacts
+```
+
+### 18.2 Snapshot update command
+
+```bash
+TUIWRIGHT_UPDATE_SNAPSHOTS=1 cargo test -p my-tui --test visual -- --nocapture
+```
+
+### 18.3 Recommended test strategy
+
+Use a pyramid:
+
+```text
+many       model/unit tests
+some       Ratatui buffer/component tests
+some       Tuiwright text/semantic E2E tests
+few        Tuiwright visual snapshot tests
+few        long GIF/trace documentation flows
+```
+
+Do not make every test a visual test. Use screenshots where pixels matter: layout, colors, focus indicators, panels, charts, and regressions that text cannot catch.
+
+---
+
+## 19. Security and safety considerations
+
+Tuiwright runs arbitrary child processes. Production code should:
+
+1. Never execute shell strings by default. Accept command plus arguments.
+2. Make shell execution explicit: `TuiConfig::shell("...")`.
+3. Redact secrets from traces.
+4. Support masking environment variables.
+5. Limit trace size and raw output size.
+6. Kill process trees on timeout.
+7. Avoid writing artifacts outside the configured artifact root unless explicitly allowed.
+8. Mark traces as potentially sensitive, because terminal output may contain secrets.
+
+Suggested redaction API:
+
+```rust
+TuiConfig::command("my-tui")
+    .redact_env("GITHUB_TOKEN")
+    .redact_regex(r"token=[A-Za-z0-9_\-]+")
+    .mask_locator(page.get_by_label("Password"));
+```
+
+---
+
+## 20. Milestone plan
+
+### Milestone 0: MVP crate
+
+Ship the bootstrap implementation as a real crate:
+
+1. Stabilize `Page`, `TuiConfig`, `Locator`, `RenderOptions`.
+2. Add integration tests for line apps and alternate-screen apps.
+3. Publish docs with simple examples.
+4. Support Linux and macOS first.
+
+### Milestone 1: Better input and assertions
+
+1. Add string-based `press("Ctrl+K")` parser.
+2. Add mouse drag, wheel, and focus events.
+3. Add `expect` assertion DSL.
+4. Add per-test artifact directory.
+5. Add timeouts, quiet-period waits, and richer errors.
+
+### Milestone 2: Visual snapshots
+
+1. Add baseline update workflow.
+2. Add diff images.
+3. Add ignore/mask regions.
+4. Add locator screenshots.
+5. Pin renderer configuration in `*.meta.json`.
+
+### Milestone 3: Trace zip and viewer
+
+1. Write `*.tuiwright-trace.zip`.
+2. Build Vite/TypeScript viewer.
+3. Embed compiled viewer in Rust CLI.
+4. Add action timeline, screenshot scrubber, raw ANSI view, cell inspector.
+
+### Milestone 4: Semantic protocol and framework adapters
+
+1. Implement OSC 777 semantic tree parser.
+2. Publish `tuiwright-ratatui` adapter.
+3. Add `get_by_role`, `get_by_label`, `get_by_test_id`.
+4. Add actionability semantics: disabled, focused, selected, checked.
+
+### Milestone 5: Terminal fidelity and recording quality
+
+1. Add optional WezTerm/Termwiz terminal model.
+2. Add terminal profile test suite.
+3. Add high-quality `gifski` encoder feature.
+4. Add animated WebP/APNG features.
+5. Add performance benchmarks for large terminal grids and long recordings.
+
+---
+
+## 21. What makes this “Playwright-class”
+
+Tuiwright should not merely compare strings. It should provide the full confidence loop:
+
+```text
+real process
++ real PTY
++ realistic input bytes
++ terminal emulator model
++ auto-waiting locators
++ screenshot renderer
++ visual diffs
++ GIF recording
++ trace archive
++ failure artifacts
++ semantic roles
+= reliable user-flow validation for TUIs
+```
+
+The strongest version of this project would make TUI testing feel like browser testing: write flows, use locators, get rich artifacts, debug failures visually, and trust CI because it validates what a user actually sees in a terminal.
+
+---
+
+## 22. Appendix: production trace schema sketch
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceFile {
+    pub version: u32,
+    pub run: RunMetadata,
+    pub config: TuiConfigSnapshot,
+    pub actions: Vec<ActionTrace>,
+    pub frames: Vec<FrameTrace>,
+    pub chunks: Vec<OutputChunkTrace>,
+    pub artifacts: Vec<ArtifactTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionTrace {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub started_at_ms: u128,
+    pub ended_at_ms: u128,
+    pub kind: ActionKind,
+    pub detail: serde_json::Value,
+    pub before_frame: Option<String>,
+    pub after_frame: Option<String>,
+    pub input_bytes: Option<String>,
+    pub result: ActionResult,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameTrace {
+    pub id: String,
+    pub at_ms: u128,
+    pub rows: u16,
+    pub cols: u16,
+    pub screenshot_path: Option<String>,
+    pub cells_path: Option<String>,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputChunkTrace {
+    pub at_ms: u128,
+    pub bytes_base64: String,
+}
+```
+
+---
+
+## 23. Appendix: Vite trace viewer sketch
+
+The trace viewer can be extremely small at first. Its job is to visualize existing files, not to run tests.
+
+```text
+trace-viewer/
+├── package.json
+├── index.html
+├── src/
+│   ├── main.tsx
+│   ├── TraceLoader.ts
+│   ├── Timeline.tsx
+│   ├── ScreenshotPane.tsx
+│   ├── CellInspector.tsx
+│   └── AnsiPane.tsx
+└── vite.config.ts
+```
+
+### `package.json`
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "typescript": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "fflate": "latest"
+  },
+  "devDependencies": {}
+}
+```
+
+### `TraceLoader.ts`
+
+```ts
+import { unzipSync } from "fflate";
+
+export type Trace = {
+  version: number;
+  actions: Array<{
+    id: string;
+    started_at_ms: number;
+    ended_at_ms: number;
+    kind: string;
+    detail: unknown;
+    before_frame?: string;
+    after_frame?: string;
+    result: string;
+    error?: string;
+  }>;
+  frames: Array<{
+    id: string;
+    at_ms: number;
+    screenshot_path?: string;
+    cells_path?: string;
+  }>;
+};
+
+export async function loadTraceZip(file: File): Promise<{ trace: Trace; files: Map<string, Uint8Array> }> {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const unzipped = unzipSync(bytes);
+  const files = new Map(Object.entries(unzipped));
+  const traceBytes = files.get("trace.json");
+  if (!traceBytes) throw new Error("trace.json missing");
+  const trace = JSON.parse(new TextDecoder().decode(traceBytes));
+  return { trace, files };
+}
+```
+
+The production Rust CLI can build this viewer once, embed the `dist` directory with `include_dir`, and serve it at `localhost` when the user runs:
+
+```bash
+tuiwright show-trace target/tuiwright/search.tuiwright-trace.zip
+```
+
+---
+
+## 24. Appendix: recommended README for the final project
+
+````md
+# Tuiwright
+
+Playwright-style end-to-end testing for terminal user interfaces.
+
+```rust
+#[test]
+fn search_flow() -> anyhow::Result<()> {
+    let page = tuiwright::Page::spawn(
+        tuiwright::TuiConfig::command("my-tui").size(100, 30),
+    )?;
+
+    page.wait_for_text("Search", std::time::Duration::from_secs(5))?;
+    page.get_by_text("Search").click(std::time::Duration::from_secs(2))?;
+    page.type_text("rust")?.press(tuiwright::Key::Enter)?;
+    page.wait_for_text("Results", std::time::Duration::from_secs(5))?;
+    page.screenshot("target/tuiwright/results.png")?;
+
+    Ok(())
+}
+```
+
+## Features
+
+- Real PTY-based end-to-end tests.
+- Keyboard, paste, mouse, and resize actions.
+- Text, role, label, and test-id locators.
+- PNG screenshots rendered from terminal cells.
+- GIF recordings for CI artifacts and documentation.
+- Trace viewer for debugging failures.
+- Visual snapshot testing.
+- Ratatui adapter for semantic roles.
+
+## Philosophy
+
+Test the terminal as users experience it. Unit tests are still valuable, but end-to-end TUI tests should validate the byte stream, terminal state, input protocols, layout, colors, cursor, timing, and failure artifacts.
+````
+
+---
+
+## 25. Final recommendation
+
+Build Tuiwright in three layers:
+
+1. **Core Rust automation now:** PTY, parser, locators, actions, screenshots, GIF, traces.
+2. **Reliability layer next:** actionability, visual diffs, artifact guard, richer errors.
+3. **Ecosystem layer after that:** Ratatui semantic adapter, trace viewer, terminal profile matrix, high-quality GIF encoder, and docs examples.
+
+That path gives users immediate value with a small Rust crate while leaving room for a genuinely excellent, Playwright-class testing ecosystem for Rust terminal applications.

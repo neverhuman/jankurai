@@ -1,0 +1,1532 @@
+I couldn’t `git clone` from the shell because DNS resolution to GitHub failed in the container, but I inspected the repository through the GitHub/web surfaces and pulled the relevant files directly. My read: **Phase 03 is already substantially implemented, but “100% done and hardened” should mean more than “the current phase doc says complete.”** It should mean the Proof Router can withstand ambiguous paths, bad mappings, stale receipts, command tampering, artifact mutation, schema drift, and release-mode false greens.
+
+# Phase 03: Proof Router — current state, gap analysis, and finish plan
+
+## 0. Executive verdict
+
+The repo already has the load-bearing pieces for Phase 03:
+
+`jankurai lane` / `jankurai proof` build plans, `jankurai prove` can execute either a persisted plan or `--changed` / `--changed-from`, receipts and logs are written under `target/jankurai/`, an evidence index is produced, commands are allowlisted against `agent/proof-lanes.toml` plus `agent/test-map.json`, and release-mode audit can require proof receipts. The repo’s own Phase 03 document marks the phase as complete/hardened and lists validation as 93 score, 0 findings, and 13 `proof_surface_smoke` tests passing.  
+
+The main thing left is **not basic functionality**. The remaining work is **adversarial hardening**:
+
+1. Make path routing exact and segment-aware.
+2. Move lane semantics out of command-string matching and into explicit metadata.
+3. Make schemas strict enough to catch malformed plans/receipts.
+4. Make evidence tamper-evident with digests for every linked artifact.
+5. Add a first-class `proof verify` / gate step so release mode checks **coverage**, not merely “some receipts exist.”
+6. Add property/adversarial tests for routing, stale evidence, path escapes, sibling-prefix collisions, and receipt mutation.
+7. Wire CI so a PR cannot pass with stale, partial, or mismatched proof.
+
+That is the path to declaring Phase 03 truly “100% done.”
+
+---
+
+# 1. What Phase 03 must guarantee
+
+The standard says path changes must route through `agent/test-map.json`, agents must run the smallest mapped lane, and skipped lanes must be reported with reasons. It also defines the proof lane vocabulary: `fast`, `contract`, `db`, `web`, `e2e`, `security`, `observability`, `audit`, and `release`. 
+
+For this repo’s moonshot claim, Phase 03 should guarantee this invariant:
+
+> Given a changed scope, Jankurai deterministically selects the smallest credible proof lane set, executes only approved commands, records receipts and evidence, and can later verify that the evidence still proves the exact changed scope at the exact git revision.
+
+That means the router is not finished merely when it emits a plan. It is finished when it can answer all of these, mechanically:
+
+| Question                                       | Required answer                                                                             |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Which changed paths are in scope?              | Normalized, repo-relative, no traversal/root ambiguity.                                     |
+| Who owns each path?                            | Exact owner route and owner name.                                                           |
+| Which route matched each path?                 | Test-map route, proof lane, command, specificity score, and reason.                         |
+| Why is this the smallest credible proof?       | Required lanes, skipped lanes, risk escalations, and human-approval requirements.           |
+| Did the command that ran match the plan?       | Receipt command hash/ID matches plan command hash/ID.                                       |
+| Did the command run at the right git revision? | Receipt/evidence `git_head` matches expected head.                                          |
+| Did the artifacts remain unchanged?            | SHA-256 digest chain from plan → receipt → logs/artifacts.                                  |
+| Can release mode trust it?                     | A verifier returns pass/fail based on coverage, freshness, success, and artifact integrity. |
+
+---
+
+# 2. Current implementation map
+
+## 2.1 Planner and runner
+
+The core Phase 03 code lives in `crates/jankurai/src/commands/proof.rs`. It defines `ProofPlanArgs`, `ProveArgs`, `ProofPlan`, `PlannedRun`, `SkippedLaneEntry`, and `ProofEvidenceIndex`; it builds proof plans from changed paths; and it executes planned runs into receipts/logs/evidence indexes. 
+
+Important current behavior:
+
+* `run_lane` and `run_proof` build a plan.
+* `run_prove` accepts either `--plan` or `--changed` / `--changed-from`, but rejects mixing both modes.
+* Changed-mode `prove` writes `proof-plan.json` and `proof-plan.md`, reloads the persisted plan, then executes it.
+* The proof runner writes receipts, logs, failed receipt paths, skipped lanes, risk notes, human approval requirements, and companion artifact paths into the evidence index.
+* If there are no runnable proof commands, it still writes repairable plan/evidence artifacts and then fails.
+* Command execution is allowlisted unless both `--allow-unsigned-commands` and `JANKURAI_ALLOW_UNSIGNED_PROOF_COMMANDS=1` are present. 
+
+## 2.2 Control-plane inputs
+
+`RepoCatalog` loads the routing data from:
+
+* `agent/owner-map.json`
+* `agent/test-map.json`
+* `agent/generated-zones.toml`
+* `agent/proof-lanes.toml`
+
+It exposes owner lookup, test-route lookup, proof-lane lookup, generated-zone lookup, and the proof command allowlist. 
+
+The repo’s actual `test-map.json` already routes many important surfaces: `docs/` to `just score`, `schemas/` to Rust tests plus UX build, `crates/jankurai/` to Rust tests plus version checks, `packages/ux-qa/` to `just ux-qa`, and `db/migrations/` to the migration analysis lane. 
+
+The actual `proof-lanes.toml` defines live lanes including `fast`, `audit`, `paper`, `security`, `full`, `adapters`, `versions-check`, `doctor`, `test-cli`, `db-migration-analyze`, `build-schemas`, `test-ux-ci`, `versions`, and `ux-qa`. 
+
+## 2.3 Schemas and validation
+
+There are schemas for proof plan, proof receipt, and evidence index, and the Rust validation layer has `ArtifactSchema::ProofPlan`, `ProofReceipt`, and `EvidenceIndex`, with `validation::write_json` validating artifacts before writing them.    
+
+Current schema posture is intentionally permissive: the proof plan schema allows `planned_runs` as loose objects and allows additional properties; proof receipt and evidence index schemas also allow additional properties. That is compatibility-friendly, but not fully hardened.   
+
+## 2.4 Tests already present
+
+The existing `proof_surface_smoke.rs` test file is strong for a Phase 03 baseline. It covers plan equivalence, unmapped-path risk, unsigned command rejection, receipt/log writing, continue-on-error, `prove --changed`, `prove --changed-from`, invalid argument combinations, no-runnable-route behavior, and named-lane `rules_covered` behavior. 
+
+This is excellent smoke coverage. What is missing is adversarial/property coverage and integrity verification.
+
+---
+
+# 3. The hardening gaps that matter most
+
+## Gap 1 — path matching is too permissive
+
+Current route matching uses this shape:
+
+```rust
+path == prefix || path.starts_with(prefix) || prefix.starts_with(path)
+```
+
+That means matching is broad and symmetric. It helps with directory-ish inputs, but it risks sibling-prefix false positives and ambiguous broad routes. For a load-bearing proof router, this is the first thing I would harden. 
+
+Examples to defend against:
+
+* `docs2/file.md` must not match `docs/`.
+* `agentic/foo.md` must not match `agent/`.
+* `crates/jankurai-extra/file.rs` must not match `crates/jankurai/`.
+* Passing repo root, `.`, `./`, or an absolute path outside the repo must never create a broad proof pass.
+* Passing a directory must either expand deterministically to files or be represented as a broad scope with explicit residual risk.
+
+## Gap 2 — proof lane identity is still command-string-centered
+
+The planner maps a test route to a named lane by looking up the test command in `proof-lanes.toml`. This works, but it makes command strings the de facto identity. That is fragile: whitespace normalization helps, but a hardened router should use stable lane IDs and command IDs.  
+
+A mature Phase 03 should route like this:
+
+```text
+changed path -> test-map route -> lane_id -> command_spec -> receipt.command_id
+```
+
+not:
+
+```text
+changed path -> command string -> maybe lane name
+```
+
+## Gap 3 — `rules_covered` is hard-coded in Rust
+
+`rules_covered_for_run` maps lane names like `audit`, `security`, `db`, `web`, and `ux-qa` to hard-coded HLT rule IDs, and filters IDs through `rules::lookup`. That is safe compared with guessing from command text, but it is not yet a declarative source-of-truth contract. 
+
+The next step is to put rule coverage metadata in `proof-lanes.toml` or a related schema, then have Rust validate it against the rule registry.
+
+## Gap 4 — schemas are too loose for “100% hardened”
+
+The schemas currently validate the basic shape, but they allow extra fields and leave some important objects loose. For example, `planned_runs` accepts any object with additional properties, and receipt/evidence schemas permit unknown extra data.   
+
+That is fine during rapid iteration, but the hardening bar should be:
+
+* typed `planned_runs`
+* typed `route_decisions`
+* strict known fields
+* explicit version bump
+* negative schema tests
+* migration compatibility for older artifacts
+
+## Gap 5 — evidence index does not yet provide a full digest chain
+
+The evidence index records important links and has a digest for `ux_qa_report_path`, but most receipts, logs, companion artifacts, and the plan itself are linked by path only. A malicious or accidental post-run mutation can currently change logs/artifacts without the evidence index proving the mutation.  
+
+A hardened ledger needs SHA-256 for:
+
+* canonical proof plan
+* each receipt
+* each log
+* every expected artifact
+* companion reports: UX, security, repo score, SARIF, GitHub summary, repair queue, boundaries
+* control manifests: owner map, test map, proof lanes, generated zones, audit policy, standard version
+
+## Gap 6 — audit release mode checks receipt presence, not full coverage
+
+Release mode currently adds a high finding if no proof receipts are supplied. That is a good start, but the true gate must verify that receipts cover the exact plan, changed paths, required lanes, commands, git head, and artifact digests.  
+
+The missing primitive is a first-class verifier:
+
+```bash
+jankurai proof verify --plan ... --evidence-index ...
+```
+
+or:
+
+```bash
+jankurai prove ... --verify
+```
+
+## Gap 7 — doctor validates only the default proof ledger shape
+
+`doctor` validates proof receipts and evidence index when present under default `target/jankurai/proof-receipts` and `target/jankurai/evidence-index.json`, and it warns on stale git heads. That is useful, but hardened proof runs often use custom output directories. Those custom runs should also be discoverable and verifiable. 
+
+## Gap 8 — `bash -lc` execution should become a compatibility path, not the ideal path
+
+`execute_run` currently invokes `bash -lc <command>`. The allowlist makes this much safer, but 100% hardening should move toward structured commands: `argv`, command ID, fixed cwd, scrubbed env, timeout, and declared side-effect policy. 
+
+---
+
+# 4. The target “100% done” definition
+
+I would declare Phase 03 complete/hardened only when all of these are true:
+
+1. **Route correctness:** every changed path has an exact, segment-aware owner/test route or an explicit blocking residual risk.
+2. **Smallest credible lane:** the planner chooses the minimal lane set that covers all changed paths plus risk escalators.
+3. **Deterministic plan:** the same repo state and changed scope always produces byte-stable canonical plan content except for documented volatile fields.
+4. **Strict plan schema:** proof plans, runs, route decisions, skipped lanes, and expected artifacts are typed and schema-validated.
+5. **Command safety:** proof commands resolve from lane IDs/command IDs, not raw ad hoc strings; shell execution is legacy-compatible but not the preferred representation.
+6. **Execution safety:** commands have timeout, cwd, env policy, output capture, non-destructive defaults, and structured failure metadata.
+7. **Tamper-evident evidence:** plan, receipts, logs, and artifacts have digest links.
+8. **Verification gate:** a verifier can prove that evidence matches the plan, command policy, changed paths, and git head.
+9. **Audit integration:** release/ratchet mode requires verified coverage, not just receipt presence.
+10. **Adversarial tests:** routing/property/schema/integrity tests fail on sibling-prefix matches, stale receipts, mutated logs, invalid commands, missing artifacts, and unmapped paths.
+11. **CI enforcement:** PRs produce, verify, and archive proof evidence; stale or partial evidence fails.
+12. **Docs/phase receipt:** standard, testing docs, and Phase 03 receipt describe the real behavior and exact validation commands.
+
+---
+
+# 5. Full finish plan
+
+## Workstream A — Harden path normalization and matching
+
+### Goal
+
+Make it impossible for the proof router to accidentally treat a sibling path, root path, path traversal, or broad directory input as proven by the wrong route.
+
+### Code changes
+
+Primary files:
+
+* `crates/jankurai/src/commands/context_data.rs`
+* `crates/jankurai/src/commands/proof.rs`
+* new optional module: `crates/jankurai/src/commands/proof_route.rs`
+* `crates/jankurai/tests/proof_route_matching.rs`
+* `crates/jankurai/tests/proof_surface_smoke.rs`
+
+Replace the current symmetric `path_matches` logic with segment-aware matching. Current behavior lives in `context_data.rs` and uses plain `starts_with` in both directions. 
+
+Target behavior:
+
+```rust
+enum RoutePatternKind {
+    ExactFile,
+    DirectoryPrefix,
+}
+
+struct RoutePattern {
+    raw: String,
+    normalized: String,
+    kind: RoutePatternKind,
+}
+
+struct RouteMatch {
+    pattern: String,
+    matched_path: String,
+    specificity: usize,
+    kind: RoutePatternKind,
+}
+```
+
+Rules:
+
+* `docs/` matches `docs/readme.md`.
+* `docs/` matches `docs` only if the input is explicitly treated as a directory scope.
+* `docs/` does **not** match `docs2/readme.md`.
+* `docs` as an exact file route matches only `docs`.
+* `agent/MASTER_PLAN.md` beats `agent/`.
+* Equal-specificity conflicting routes are a hard diagnostic.
+* Absolute paths must resolve inside repo or fail.
+* `..` components must fail unless canonicalization proves the final target is inside repo.
+* Root-equivalent paths remain rejected.
+
+### Add a route decision record
+
+Add this to `ProofPlan`:
+
+```rust
+pub struct RouteDecision {
+    pub changed_path: String,
+    pub owner: Option<String>,
+    pub owner_pattern: Option<String>,
+    pub test_pattern: Option<String>,
+    pub lane: Option<String>,
+    pub command_id: Option<String>,
+    pub command: Option<String>,
+    pub specificity: usize,
+    pub decision: String, // routed | unmapped-owner | unmapped-test | blocked
+    pub reason: String,
+    pub risk_notes: Vec<String>,
+}
+```
+
+This is the “explainability spine” for the Proof Router. It lets downstream audit/repair prove exactly why a lane was selected.
+
+### Tests to add
+
+Add focused tests:
+
+```text
+route_does_not_match_sibling_prefix
+route_file_specificity_beats_directory_prefix
+route_rejects_repo_root
+route_rejects_parent_traversal
+route_accepts_absolute_path_inside_repo
+route_rejects_absolute_path_outside_repo
+route_directory_input_requires_explicit_scope_or_expands
+route_conflicting_equal_specificity_fails
+```
+
+### Acceptance criteria
+
+* No `starts_with` route can match a sibling prefix.
+* Every `changed_path` gets exactly one route decision.
+* Every unmapped path is represented in `risk_notes` and `human_approval_requirements`.
+* Existing `proof_surface_smoke` tests still pass.
+
+---
+
+## Workstream B — Make lane identity explicit
+
+### Goal
+
+Stop using command strings as the identity layer. Commands should be executable details, not the semantic key.
+
+### Code changes
+
+Primary files:
+
+* `agent/proof-lanes.toml`
+* `agent/test-map.json`
+* `schemas/proof-lanes.schema.json`
+* `schemas/test-map.schema.json`
+* `crates/jankurai/src/commands/context_data.rs`
+* `crates/jankurai/src/commands/proof.rs`
+* `crates/jankurai/tests/schema_contracts.rs`
+
+Current `proof-lanes.toml` defines lane `name`, `command`, and `purpose`. Current `test-map.json` maps paths to commands and purposes.  
+
+Add explicit lane metadata:
+
+```toml
+[[lane]]
+id = "audit"
+name = "audit"
+command_id = "jankurai.score"
+command = "just score"
+purpose = "write agent/repo-score.json and agent/repo-score.md"
+category = "audit"
+risk = "standard"
+rules_covered = ["HLT-003-OWNERLESS-PATH", "HLT-004-UNMAPPED-PROOF"]
+expected_artifacts = [
+  "agent/repo-score.json",
+  "agent/repo-score.md"
+]
+timeout_seconds = 120
+requires_network = false
+requires_secrets = false
+destructive = false
+```
+
+Update test-map entries to prefer lane IDs:
+
+```json
+{
+  "tests": {
+    "docs/": {
+      "lane": "audit",
+      "purpose": "verify docs remain agent-readable and routed"
+    },
+    "crates/jankurai/": {
+      "lane": "versions-check",
+      "purpose": "verify the audit package compiles and still emits JSON/Markdown"
+    }
+  }
+}
+```
+
+Keep `command` as backward-compatible fallback for old fixtures.
+
+### Resolver behavior
+
+Routing should resolve in this order:
+
+1. `test-map` entry has `lane` → load lane from `proof-lanes.toml`.
+2. `test-map` entry has `command_id` → load command by ID.
+3. legacy `command` → map to lane by normalized command string.
+4. if none resolve → plan is produced with blocking residual risk.
+
+### Acceptance criteria
+
+* Every first-party route in `agent/test-map.json` resolves to a known lane ID.
+* Legacy command-string routes still work in tests.
+* `proof-lanes.toml` validates all `rules_covered` against registered rules.
+* Plan output includes both `lane` and `command_id`.
+
+---
+
+## Workstream C — Add risk escalators to prove “smallest credible lane”
+
+### Goal
+
+The current planner picks lanes from test-map and records residual risk for unmapped paths. The hardened router should also escalate when the **type of change** requires more than the base test-map route.
+
+Examples:
+
+| Change type                                                             | Required escalation                 |
+| ----------------------------------------------------------------------- | ----------------------------------- |
+| `Cargo.lock`, `package-lock.json`, `.github/workflows`                  | security/supply-chain lane          |
+| `db/migrations/**`                                                      | DB migration analyze lane           |
+| `contracts/**`, schema/source API contract changes                      | contract/build-schemas lane         |
+| `packages/ux-qa/**`, UI/story/route files                               | UX/rendered proof lane              |
+| `agent/test-map.json`, `agent/proof-lanes.toml`, `agent/owner-map.json` | audit + route-self-test             |
+| generated-zone source changes                                           | generated reproduction lane         |
+| generated-zone output changes                                           | source-regeneration proof or block  |
+| release-critical paths                                                  | release/full lane or human approval |
+
+The standard already makes proof lanes and risk classes central to conformance; the router should embody that policy instead of leaving it as prose. 
+
+### Code changes
+
+Add a planner stage:
+
+```rust
+fn risk_escalations_for_path(path: &str, catalog: &RepoCatalog) -> Vec<RequiredLane>
+```
+
+Then compute:
+
+```text
+base lanes from test-map
++ escalated lanes from risk rules
+- duplicate lanes
+= required lanes
+```
+
+### Acceptance criteria
+
+* `Cargo.lock` plans include security/supply-chain proof.
+* `db/migrations/foo.sql` plans include migration analysis.
+* changing `agent/test-map.json` forces proof-router self-validation.
+* generated output changed without source route creates blocking risk.
+* docs-only changes still avoid unnecessary UX/security/full lanes unless routed.
+
+---
+
+## Workstream D — Tighten `ProofPlan` schema and make plans canonical
+
+### Goal
+
+A plan should be strict enough to serve as a contract.
+
+### Code changes
+
+Primary files:
+
+* `schemas/proof-plan.schema.json`
+* `crates/jankurai/src/commands/proof.rs`
+* `crates/jankurai/src/model.rs` if shared types move
+* `crates/jankurai/tests/schema_contracts.rs`
+* new negative tests
+
+Current proof plan schema is permissive and allows `planned_runs` as loose objects. 
+
+Add required fields:
+
+```json
+{
+  "schema_version": "1.1.0",
+  "planner_version": "0.4.0",
+  "standard_version": "0.4.0",
+  "repo_root": "...",
+  "git_head": "...",
+  "base_ref": "...",
+  "changed_paths": [],
+  "route_decisions": [],
+  "required_lanes": [],
+  "optional_lanes": [],
+  "skipped_lane_entries": [],
+  "planned_runs": [],
+  "expected_artifacts": [],
+  "risk_notes": [],
+  "human_approval_requirements": [],
+  "manifest_fingerprints": {},
+  "plan_digest": "sha256:..."
+}
+```
+
+Typed `planned_runs`:
+
+```json
+{
+  "lane": "audit",
+  "command_id": "jankurai.score",
+  "command": "just score",
+  "owner": "standard",
+  "changed_paths": ["docs/foo.md"],
+  "artifacts": ["agent/repo-score.json"],
+  "residual_risk": [],
+  "timeout_seconds": 120,
+  "requires_network": false,
+  "requires_secrets": false,
+  "destructive": false
+}
+```
+
+### Canonicalization
+
+Add canonical JSON digesting:
+
+```rust
+fn canonical_plan_digest(plan: &ProofPlan) -> String
+```
+
+Rules:
+
+* Sort maps/sets deterministically.
+* Exclude `plan_digest` itself from its digest.
+* Normalize all paths to POSIX repo-relative.
+* Use full git SHA, not short SHA, for evidence identity.
+* Include manifest fingerprints.
+
+### Acceptance criteria
+
+* Plan schema rejects unknown fields after version bump.
+* Plan schema rejects missing lane, command, artifacts, or route decision.
+* Same input produces same canonical digest.
+* Existing old plans can still be loaded through a compatibility migration path or explicitly fail with an actionable message.
+
+---
+
+## Workstream E — Harden command execution
+
+### Goal
+
+Make running proof commands safe, bounded, and auditable.
+
+### Current state
+
+`execute_run` uses `bash -lc`, captures stdout/stderr into a log, stores exit code, elapsed time, git head, run ID, and receipt metadata. 
+
+### Target behavior
+
+Add a command spec:
+
+```rust
+pub struct CommandSpec {
+    pub command_id: String,
+    pub shell: Option<String>,   // legacy
+    pub argv: Option<Vec<String>>,
+    pub cwd: String,
+    pub timeout_seconds: u64,
+    pub env_policy: EnvPolicy,
+    pub destructive: bool,
+    pub requires_network: bool,
+    pub requires_secrets: bool,
+}
+```
+
+Execution policy:
+
+* Prefer `argv` over shell.
+* Shell commands remain allowed only for existing lane compatibility.
+* Always enforce timeout.
+* Always execute inside repo.
+* Reject destructive lanes unless explicitly declared and approved.
+* Scrub environment by default.
+* Add `JANKURAI_PROOF=1`, `CI=1`, and stable locale.
+* Capture signal/timeout separately from exit code.
+* Store `started_at`, `finished_at`, `elapsed_ms`.
+* Store `command_digest`.
+
+### Add receipt fields
+
+```json
+{
+  "command_id": "jankurai.score",
+  "command_digest": "sha256:...",
+  "started_at": "...",
+  "finished_at": "...",
+  "timeout_seconds": 120,
+  "timed_out": false,
+  "signal": null,
+  "env_policy": "scrubbed",
+  "cwd": "."
+}
+```
+
+### Acceptance criteria
+
+* Unsigned commands are rejected unless dual hatch is present.
+* A plan command that differs from lane metadata fails before execution.
+* Timeout creates a receipt with `timed_out: true`.
+* Failed receipts are still written.
+* `continue_on_error` still collects all possible receipts.
+
+---
+
+## Workstream F — Make evidence tamper-evident
+
+### Goal
+
+Every artifact the proof claims must be verifiable later.
+
+### Current state
+
+Evidence index includes paths, commands, receipts, logs, failed receipts, skipped lanes, risk notes, human approvals, changed paths, and optional companion paths. It also includes a UX report digest, but most artifacts are path-linked only.  
+
+### Target evidence index shape
+
+```json
+{
+  "schema_version": "1.3.0",
+  "generated_at": "...",
+  "repo_root": ".",
+  "git_head": "...",
+  "base_ref": "...",
+  "plan": {
+    "path": "target/jankurai/proof-runs/<run_id>/proof-plan.json",
+    "sha256": "sha256:..."
+  },
+  "manifest_fingerprints": {
+    "owner_map": "sha256:...",
+    "test_map": "sha256:...",
+    "proof_lanes": "sha256:...",
+    "generated_zones": "sha256:...",
+    "standard_version": "sha256:..."
+  },
+  "runs": [
+    {
+      "lane": "audit",
+      "command_id": "jankurai.score",
+      "receipt_path": "...",
+      "receipt_sha256": "...",
+      "log_path": "...",
+      "log_sha256": "...",
+      "exit_code": 0,
+      "changed_paths": ["docs/foo.md"],
+      "artifacts": [
+        {
+          "path": "agent/repo-score.json",
+          "sha256": "sha256:...",
+          "kind": "repo-score"
+        }
+      ]
+    }
+  ],
+  "decision": {
+    "status": "pass",
+    "reason": "all required lanes passed and artifacts verified"
+  }
+}
+```
+
+### Store proof runs by run ID
+
+Instead of scattering default outputs, use this layout:
+
+```text
+target/jankurai/proof-runs/<run_id>/
+  proof-plan.json
+  proof-plan.md
+  evidence-index.json
+  receipts/
+    000-audit.json
+  logs/
+    000-audit.log
+```
+
+Then keep compatibility pointers:
+
+```text
+target/jankurai/proof-plan.json
+target/jankurai/evidence-index.json
+target/jankurai/proof-receipts/
+target/jankurai/logs/
+target/jankurai/latest-proof-run.json
+```
+
+### Acceptance criteria
+
+* Mutating a log after execution makes verification fail.
+* Mutating a receipt after execution makes verification fail.
+* Mutating the plan after execution makes verification fail.
+* Missing expected artifact makes verification fail.
+* Evidence index includes digests for all known companion artifacts.
+
+---
+
+## Workstream G — Add `proof verify`
+
+### Goal
+
+Create the missing merge-grade oracle: given a plan and evidence index, determine whether the proof is valid.
+
+### CLI shape
+
+Add one of these:
+
+```bash
+jankurai proof verify \
+  --plan target/jankurai/proof-plan.json \
+  --evidence-index target/jankurai/evidence-index.json
+```
+
+or:
+
+```bash
+jankurai prove . --changed-from origin/main --verify
+```
+
+Because `proof` is currently a planning alias, the cleanest CLI might be:
+
+```bash
+jankurai proof-verify ...
+```
+
+or a nested subcommand in a later CLI refactor.
+
+### Verifier checks
+
+The verifier must fail if:
+
+* proof plan schema invalid
+* evidence index schema invalid
+* plan digest mismatch
+* manifest fingerprints mismatch without explicit replan
+* evidence `git_head` differs from expected head
+* required lane missing receipt
+* receipt command does not match plan command ID/digest
+* receipt changed paths do not cover route decision changed paths
+* required artifact missing
+* artifact digest mismatch
+* receipt exit code nonzero
+* timeout occurred
+* skipped lane is actually required by risk policy
+* human approval is required but no approval artifact exists
+* receipt is stale relative to current `HEAD`
+* unsigned command hatch was used in non-advisory/release mode
+
+### Verifier output
+
+Produce a new artifact:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "status": "pass",
+  "plan_path": "...",
+  "evidence_index_path": "...",
+  "verified_at": "...",
+  "git_head": "...",
+  "covered_paths": [],
+  "covered_lanes": [],
+  "failed_checks": [],
+  "warnings": []
+}
+```
+
+### Acceptance criteria
+
+* `proof verify` returns exit 0 only when all required evidence is fresh, successful, and digest-valid.
+* It fails on stale receipts.
+* It fails on missing lane coverage.
+* It fails on mutated logs/artifacts.
+* It fails on unapproved human-approval requirements.
+* It writes a verification receipt for CI/archive.
+
+---
+
+## Workstream H — Upgrade audit integration from “receipt present” to “verified proof”
+
+### Goal
+
+Release mode should not accept “some receipt exists.” It should accept only verified coverage for the audited scope.
+
+### Current state
+
+`run_audit_and_write` adds a high finding in release mode when no proof receipts are supplied. `Report` includes `proof_receipts`, and `AuditOptions` can load receipts.   
+
+### Target behavior
+
+Add audit options:
+
+```bash
+jankurai audit . \
+  --mode release \
+  --proof-evidence target/jankurai/evidence-index.json \
+  --proof-verification target/jankurai/proof-verification.json
+```
+
+Audit should add high findings for:
+
+* missing proof verification in release mode
+* verification status not pass
+* verified proof does not cover all changed scope paths
+* verified proof head differs from audit head
+* verified proof lacks required lanes
+* verification used unsigned command hatch
+* verification has unapproved human approval requirements
+
+### Acceptance criteria
+
+* Release audit cannot pass with only an arbitrary receipt.
+* Release audit can pass with verified evidence.
+* Markdown report summarizes proof coverage compactly.
+* SARIF/GitHub summary can show proof failures as annotations.
+
+---
+
+## Workstream I — Make doctor discover and validate all proof ledgers
+
+### Goal
+
+Doctor should be able to find custom proof runs, not only default paths.
+
+### Current state
+
+Doctor validates default receipts/evidence when present and warns if `git_head` is stale. 
+
+### Target behavior
+
+Doctor should inspect:
+
+```text
+target/jankurai/evidence-index.json
+target/jankurai/latest-proof-run.json
+target/jankurai/proof-runs/*/evidence-index.json
+target/jankurai/proof-runs/*/proof-verification.json
+```
+
+Add diagnostics:
+
+* `proof-run-discovery`
+* `proof-plan-schema`
+* `proof-evidence-schema`
+* `proof-verification-schema`
+* `proof-artifact-digest`
+* `proof-run-stale-head`
+* `proof-run-missing-latest-pointer`
+* `proof-run-custom-dir-unindexed`
+
+### Acceptance criteria
+
+* Custom proof run directories are checked.
+* Stale or mutated proof run is reported.
+* `doctor --fail-on medium` catches malformed evidence.
+
+---
+
+## Workstream J — Expand tests from smoke to adversarial
+
+The existing proof tests are good smoke coverage; now add adversarial tests around the exact failure modes that would create false confidence. 
+
+### New test files
+
+```text
+crates/jankurai/tests/proof_route_matching.rs
+crates/jankurai/tests/proof_schema_negative.rs
+crates/jankurai/tests/proof_evidence_integrity.rs
+crates/jankurai/tests/proof_verify_gate.rs
+```
+
+### Route-matching tests
+
+```text
+docs2_does_not_match_docs_prefix
+agentic_does_not_match_agent_prefix
+specific_file_route_beats_directory_route
+absolute_inside_repo_is_normalized
+absolute_outside_repo_is_rejected
+parent_traversal_is_rejected
+root_scope_is_rejected
+directory_scope_requires_explicit_flag_or_expands
+duplicate_equal_specificity_routes_fail
+```
+
+### Schema-negative tests
+
+```text
+proof_plan_rejects_unknown_planned_run_field
+proof_plan_rejects_missing_route_decision
+proof_plan_rejects_invalid_lane
+proof_receipt_rejects_missing_command_id
+proof_receipt_rejects_invalid_rule_coverage_shape
+evidence_index_rejects_missing_plan_digest
+evidence_index_rejects_invalid_artifact_digest
+```
+
+### Evidence-integrity tests
+
+```text
+verify_fails_when_log_is_mutated
+verify_fails_when_receipt_is_mutated
+verify_fails_when_plan_is_mutated
+verify_fails_when_expected_artifact_missing
+verify_fails_when_artifact_digest_mismatch
+verify_fails_when_receipt_git_head_stale
+verify_passes_for_fresh_successful_run
+```
+
+### Command-safety tests
+
+```text
+unsigned_command_rejected_without_dual_hatch
+unsigned_command_allowed_only_with_flag_and_env
+command_id_mismatch_rejected
+timeout_writes_failed_receipt
+destructive_lane_rejected_without_policy
+shell_command_legacy_path_still_works_for_existing_lanes
+```
+
+### Property tests
+
+Use `proptest` for path matching:
+
+```rust
+proptest! {
+    #[test]
+    fn directory_prefix_does_not_match_sibling(prefix in "[a-z]{1,12}", suffix in "[a-z]{1,12}") {
+        prop_assume!(suffix != "");
+        let route = format!("{}/", prefix);
+        let sibling = format!("{}-{}/file.rs", prefix, suffix);
+        prop_assert!(!path_matches_route(&sibling, &route));
+    }
+}
+```
+
+### Acceptance criteria
+
+* All existing `proof_surface_smoke` tests pass.
+* New adversarial suites pass.
+* At least one negative test fails against the current loose behavior before the hardening patch, proving the test is meaningful.
+
+---
+
+## Workstream K — CI wiring
+
+### Goal
+
+Make proof routing a merge gate, not just a local tool.
+
+### PR workflow target
+
+For pull requests:
+
+```bash
+cargo run -p jankurai -- prove . \
+  --changed-from origin/main \
+  --plan-out target/jankurai/proof-runs/pr/proof-plan.json \
+  --plan-md target/jankurai/proof-runs/pr/proof-plan.md \
+  --out-dir target/jankurai/proof-runs/pr/receipts \
+  --evidence-index target/jankurai/proof-runs/pr/evidence-index.json \
+  --continue-on-error
+
+cargo run -p jankurai -- proof verify \
+  --plan target/jankurai/proof-runs/pr/proof-plan.json \
+  --evidence-index target/jankurai/proof-runs/pr/evidence-index.json \
+  --out target/jankurai/proof-runs/pr/proof-verification.json
+
+cargo run -p jankurai -- audit . \
+  --mode release \
+  --proof-evidence target/jankurai/proof-runs/pr/evidence-index.json \
+  --proof-verification target/jankurai/proof-runs/pr/proof-verification.json \
+  --json agent/repo-score.json \
+  --md agent/repo-score.md
+```
+
+Upload:
+
+```text
+target/jankurai/proof-runs/pr/**
+agent/repo-score.json
+agent/repo-score.md
+target/jankurai/jankurai.sarif
+target/jankurai/summary.md
+```
+
+### CI acceptance criteria
+
+* Missing proof verification fails.
+* Failed lane fails.
+* Stale evidence fails.
+* Mutated artifact fails.
+* Unmapped changed path fails unless explicit approval artifact exists.
+* CI artifacts include plan, markdown plan, receipts, logs, evidence index, verification result, repo score, and summary.
+
+---
+
+## Workstream L — Docs, standard, and phase receipt
+
+### Goal
+
+Make the implementation and docs match exactly.
+
+### Files
+
+* `docs/testing.md`
+* `docs/agent-native-standard.md`
+* `agent/JANKURAI_STANDARD.md`
+* `tips/phases/03-proof-router-evidence-ledger.md`
+* `tips/phases/logs/03-proof-router-evidence-ledger.log`
+* `.github/workflows/*`
+
+### Update docs with
+
+* `jankurai lane` = plan only
+* `jankurai prove` = plan + execute + receipts + evidence
+* `jankurai proof verify` = evidence integrity and coverage gate
+* How `--changed` differs from `--changed-from`
+* Directory-scope behavior
+* How to read route decisions
+* How to interpret skipped lanes
+* What human approvals look like
+* How unsigned command hatch works and when it is forbidden
+* CI examples
+* Artifact layout
+
+### Phase receipt should include
+
+* exact changed files
+* exact validation commands
+* exact artifacts generated
+* score
+* findings
+* tests run
+* residual risk
+* exceptions
+* git SHA
+
+The existing Phase 03 doc already contains a rich phase receipt and says completion is hardened; after the final hardening pass, update it to distinguish “baseline hardened” from “adversarially hardened” or “v2 hardened.” 
+
+---
+
+# 6. Recommended implementation order
+
+## Wave 1 — Router correctness first
+
+Do this before evidence and CI changes.
+
+1. Replace path matching with segment-aware route matching.
+2. Add route decision records.
+3. Add route-specific tests.
+4. Preserve current plan output compatibility where possible.
+
+**Why first:** if routing is wrong, every receipt downstream can be beautifully structured and still prove the wrong thing.
+
+## Wave 2 — Lane metadata and plan schema
+
+1. Add explicit lane IDs and command IDs.
+2. Add `rules_covered` metadata to lanes.
+3. Add typed `planned_runs` and `route_decisions`.
+4. Canonicalize plan digest.
+5. Add schema negative tests.
+
+**Why second:** once route decisions are precise, lock the contract.
+
+## Wave 3 — Runner safety
+
+1. Add command specs.
+2. Add timeout/env/cwd/destructive policy.
+3. Add richer receipt fields.
+4. Keep shell-command compatibility for current lanes.
+
+**Why third:** the runner must not become the attack surface.
+
+## Wave 4 — Evidence integrity
+
+1. Add plan, receipt, log, and artifact digests.
+2. Store proof runs under run IDs.
+3. Add latest pointer.
+4. Add evidence index v1.3 or v2.0.
+5. Add mutation tests.
+
+**Why fourth:** evidence must become durable and tamper-evident.
+
+## Wave 5 — Verification gate
+
+1. Add `proof verify`.
+2. Validate coverage, freshness, commands, success, artifacts, and digests.
+3. Emit verification artifact.
+4. Add audit integration.
+
+**Why fifth:** this turns evidence into a merge decision.
+
+## Wave 6 — CI and docs
+
+1. Update workflows.
+2. Upload evidence artifacts.
+3. Update docs and phase receipt.
+4. Run full validation.
+
+**Why last:** CI should enforce the final model, not an intermediate contract.
+
+---
+
+# 7. Exact file-level work packets
+
+## Packet 03-A — Route matcher hardening
+
+**Owns**
+
+```text
+crates/jankurai/src/commands/context_data.rs
+crates/jankurai/src/commands/proof.rs
+crates/jankurai/tests/proof_route_matching.rs
+crates/jankurai/tests/proof_surface_smoke.rs
+```
+
+**Tasks**
+
+* Replace `path_matches`.
+* Add route decision model.
+* Add route specificity.
+* Add conflict detection.
+* Add path traversal/root/sibling tests.
+
+**Done when**
+
+```bash
+cargo test -p jankurai --test proof_route_matching
+cargo test -p jankurai --test proof_surface_smoke
+```
+
+pass.
+
+---
+
+## Packet 03-B — Lane contract metadata
+
+**Owns**
+
+```text
+agent/proof-lanes.toml
+agent/test-map.json
+schemas/proof-lanes.schema.json
+schemas/test-map.schema.json
+crates/jankurai/src/commands/context_data.rs
+crates/jankurai/tests/schema_contracts.rs
+```
+
+**Tasks**
+
+* Add lane IDs.
+* Add command IDs.
+* Add `rules_covered`.
+* Add expected artifacts.
+* Preserve legacy command fallback.
+* Validate registered rule IDs.
+
+**Done when**
+
+* every first-party `test-map` route resolves to a lane ID
+* schema contract tests pass
+* legacy smoke fixtures still pass
+
+---
+
+## Packet 03-C — Strict proof plan schema
+
+**Owns**
+
+```text
+schemas/proof-plan.schema.json
+crates/jankurai/src/commands/proof.rs
+crates/jankurai/tests/proof_schema_negative.rs
+crates/jankurai/tests/schema_contracts.rs
+```
+
+**Tasks**
+
+* Type `planned_runs`.
+* Add `route_decisions`.
+* Add `manifest_fingerprints`.
+* Add `plan_digest`.
+* Make schema strict for new version.
+* Add migration/error messaging for old plan versions.
+
+**Done when**
+
+* valid generated plans validate
+* malformed plans fail
+* old plan compatibility behavior is intentional and tested
+
+---
+
+## Packet 03-D — Runner hardening
+
+**Owns**
+
+```text
+crates/jankurai/src/commands/proof.rs
+schemas/proof-receipt.schema.json
+crates/jankurai/tests/proof_surface_smoke.rs
+crates/jankurai/tests/proof_command_policy.rs
+```
+
+**Tasks**
+
+* Add command ID/digest.
+* Add timeout.
+* Add env/cwd/destructive policy.
+* Add structured failure metadata.
+* Keep allowlist escape hatch dual-gated.
+
+**Done when**
+
+* timeout tests pass
+* unsigned command tests pass
+* existing receipt/log tests pass
+
+---
+
+## Packet 03-E — Evidence integrity
+
+**Owns**
+
+```text
+schemas/evidence-index.schema.json
+crates/jankurai/src/commands/proof.rs
+crates/jankurai/src/commands/doctor.rs
+crates/jankurai/tests/proof_evidence_integrity.rs
+crates/jankurai/tests/schema_contracts.rs
+```
+
+**Tasks**
+
+* Add digest chain.
+* Add run-ID directory layout.
+* Add latest proof run pointer.
+* Add companion artifact digests.
+* Teach doctor to discover custom proof runs.
+
+**Done when**
+
+* mutation tests fail correctly
+* doctor catches stale/malformed evidence
+* schema tests pass
+
+---
+
+## Packet 03-F — Proof verification and audit gate
+
+**Owns**
+
+```text
+crates/jankurai/src/main.rs
+crates/jankurai/src/commands/proof.rs
+crates/jankurai/src/audit/mod.rs
+crates/jankurai/src/model.rs
+schemas/proof-verification.schema.json
+schemas/repo-score.schema.json
+crates/jankurai/tests/proof_verify_gate.rs
+```
+
+**Tasks**
+
+* Add verifier command.
+* Add verification artifact.
+* Audit release mode consumes verified proof.
+* Report proof failures as findings.
+* Keep advisory mode permissive.
+
+**Done when**
+
+* release audit fails without verified proof
+* release audit passes with verified proof
+* stale/missing/mutated proof fails
+
+---
+
+## Packet 03-G — Docs and CI
+
+**Owns**
+
+```text
+docs/testing.md
+docs/agent-native-standard.md
+agent/JANKURAI_STANDARD.md
+tips/phases/03-proof-router-evidence-ledger.md
+tips/phases/logs/03-proof-router-evidence-ledger.log
+.github/workflows/*
+```
+
+**Tasks**
+
+* Update proof execution docs.
+* Update standard language for verified proof.
+* Add CI proof workflow.
+* Add phase closeout receipt.
+
+**Done when**
+
+* docs examples work
+* CI uploads all proof artifacts
+* phase receipt includes validation evidence
+
+---
+
+# 8. Final validation matrix
+
+Run this in order.
+
+## Focused router validation
+
+```bash
+cargo test -p jankurai --test proof_route_matching
+cargo test -p jankurai --test proof_surface_smoke
+```
+
+## Schema validation
+
+```bash
+cargo test -p jankurai --test schema_contracts
+cargo test -p jankurai --test proof_schema_negative
+```
+
+## Evidence integrity validation
+
+```bash
+cargo test -p jankurai --test proof_evidence_integrity
+cargo test -p jankurai --test proof_verify_gate
+```
+
+## Full Rust validation
+
+```bash
+cargo test -p jankurai
+```
+
+## Fast lane
+
+```bash
+just fast
+```
+
+## Real changed-path proof smoke
+
+```bash
+cargo run -p jankurai -- prove . \
+  --changed crates/jankurai/src/commands/proof.rs \
+  --plan-out target/jankurai/phase03-hardened/proof-plan.json \
+  --plan-md target/jankurai/phase03-hardened/proof-plan.md \
+  --out-dir target/jankurai/phase03-hardened/receipts \
+  --evidence-index target/jankurai/phase03-hardened/evidence-index.json
+```
+
+## Verify evidence
+
+```bash
+cargo run -p jankurai -- proof verify \
+  --plan target/jankurai/phase03-hardened/proof-plan.json \
+  --evidence-index target/jankurai/phase03-hardened/evidence-index.json \
+  --out target/jankurai/phase03-hardened/proof-verification.json
+```
+
+## Release audit gate
+
+```bash
+cargo run -p jankurai -- audit . \
+  --mode release \
+  --proof-evidence target/jankurai/phase03-hardened/evidence-index.json \
+  --proof-verification target/jankurai/phase03-hardened/proof-verification.json \
+  --json agent/repo-score.json \
+  --md agent/repo-score.md
+```
+
+## Doctor
+
+```bash
+cargo run -p jankurai -- doctor . --fail-on medium
+```
+
+## Optional high-risk lanes
+
+Run these if touched paths require them:
+
+```bash
+just security
+just ux-qa
+cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json
+```
+
+---
+
+# 9. Non-negotiable acceptance criteria
+
+Phase 03 is 100% done when these all pass:
+
+1. **Path routing**
+
+   * Sibling-prefix false matches are impossible.
+   * Root/path traversal escapes fail.
+   * Route specificity is deterministic.
+   * Equal-specificity conflicts fail.
+
+2. **Lane selection**
+
+   * Every route resolves to lane ID or blocking risk.
+   * Required lanes include risk escalators.
+   * Optional/skipped lanes have reasons.
+   * The plan explains why selected lanes are sufficient.
+
+3. **Execution**
+
+   * Commands are allowlisted by ID/spec.
+   * Shell execution is bounded and compatible, not uncontrolled.
+   * Timeouts and failures produce receipts.
+   * Unsigned command hatch is impossible to trigger accidentally.
+
+4. **Evidence**
+
+   * Plan, receipts, logs, and artifacts have digests.
+   * Evidence survives CI archiving.
+   * Mutation after run is detectable.
+   * Custom proof runs are discoverable.
+
+5. **Verification**
+
+   * `proof verify` passes only for fresh, successful, complete, digest-valid evidence.
+   * Release audit requires verified proof coverage.
+   * Missing/stale/partial evidence produces hard findings.
+
+6. **Tests**
+
+   * Existing proof smoke tests pass.
+   * New adversarial tests pass.
+   * Negative schema tests prove schemas are strict.
+   * Evidence mutation tests prove integrity checks work.
+
+7. **Docs/CI**
+
+   * Standard and testing docs match actual CLI behavior.
+   * CI runs proof, verifies it, audits release mode, and uploads artifacts.
+   * Phase receipt records exact validation and residual risk.
+
+---
+
+# 10. The “smallest credible lane” algorithm I would implement
+
+This is the core algorithm that should live behind Phase 03.
+
+```text
+Input:
+  repo root
+  changed paths or changed-from ref
+  owner map
+  test map
+  proof lanes
+  generated zones
+  standard/rule metadata
+  audit/risk metadata
+
+Step 1: Normalize scope
+  - Convert to repo-relative POSIX paths.
+  - Reject root, traversal, and outside-repo paths.
+  - Expand or explicitly mark directory scopes.
+
+Step 2: Route each path
+  - Match owner route by segment-aware specificity.
+  - Match test route by segment-aware specificity.
+  - Emit RouteDecision for every path.
+  - Block or flag missing owner/test route.
+
+Step 3: Resolve lane identity
+  - Prefer test-map lane ID.
+  - Fall back to command ID.
+  - Fall back to legacy command string.
+  - Validate lane metadata.
+
+Step 4: Apply risk escalators
+  - Generated zones
+  - Security/supply-chain
+  - DB migration
+  - Contract/schema
+  - UI/rendered UX
+  - Standard/control-plane changes
+  - Release-critical changes
+
+Step 5: Build minimal lane set
+  - Deduplicate by lane ID.
+  - Sort by deterministic priority.
+  - Preserve all changed path coverage.
+  - Mark skipped lanes with reasons.
+
+Step 6: Emit canonical plan
+  - Route decisions
+  - Required lanes
+  - Planned runs
+  - Expected artifacts
+  - Manifest fingerprints
+  - Plan digest
+
+Step 7: Execute safely
+  - Validate command specs.
+  - Run with timeout/env/cwd policy.
+  - Capture logs and receipts.
+
+Step 8: Index evidence
+  - Link every artifact.
+  - Digest every artifact.
+  - Record git head and manifest fingerprints.
+
+Step 9: Verify
+  - Validate plan/evidence/receipts.
+  - Check coverage/freshness/digests.
+  - Return merge decision.
+```
+
+That algorithm is what makes the Proof Router the “load-bearing wall.”
+
+---
+
+# 11. Priority ranking inside Phase 03
+
+If the team has limited time, do these in this exact order:
+
+1. **Segment-aware path routing.** This prevents proving the wrong path.
+2. **Route decision records.** This makes every proof explainable.
+3. **Lane IDs / command IDs.** This removes command-string fragility.
+4. **Plan digest + receipt/log/artifact digests.** This makes evidence tamper-evident.
+5. **`proof verify`.** This converts evidence into a real gate.
+6. **Release audit uses verified proof.** This prevents false-green releases.
+7. **Adversarial tests.** This keeps the above from regressing.
+8. **CI artifact upload and docs.** This makes it operational.
+
+---
+
+# 12. Final call
+
+The repo’s Phase 03 is already beyond a prototype: it has planner, runner, receipts, logs, evidence index, allowlist, changed-mode proof execution, audit receipt loading, doctor checks, and smoke tests.    
+
+To finish it to the standard you are asking for, treat the remaining work as **proof-router hardening v2**:
+
+```text
+route precisely
+identify lanes explicitly
+execute safely
+digest everything
+verify coverage
+gate release mode
+test adversarially
+archive in CI
+```
+
+Once those are done, Phase 03 becomes the foundation that Phases 07 and 10–13 can safely depend on.
+
