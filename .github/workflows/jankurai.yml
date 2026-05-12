@@ -12,6 +12,10 @@ concurrency:
   group: jankurai-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Workflows are thin orchestration. The executable source of truth is
+# under ops/ci/*.sh — local runs use the same scripts. See
+# docs/ci-local.md for the local-CI contract.
+
 jobs:
   test-matrix:
     name: test (${{ matrix.os }})
@@ -27,20 +31,14 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup show
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
         with:
           shared-key: test-${{ matrix.os }}
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Quality gates
+        run: bash ops/ci/quality-gates.sh
 
   coverage-llvm:
     name: coverage (llvm-cov)
@@ -52,7 +50,7 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component llvm-tools-preview
+        run: rustup show
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
         with:
@@ -63,13 +61,8 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Generate coverage report
-        run: |
-          mkdir -p target/coverage
-          cargo llvm-cov --workspace --all-features --locked \
-            --lcov --output-path target/coverage/lcov.info
-          cargo llvm-cov report --json --output-path target/coverage/coverage.json
-          cargo llvm-cov report --summary-only | tee target/coverage/summary.txt
+      - name: Coverage lane
+        run: bash ops/ci/coverage-llvm.sh
 
       - name: Publish coverage summary
         if: always()
@@ -107,132 +100,15 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+        run: rustup show
 
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
         with:
           node-version: "22"
           cache: npm
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Install Playwright browsers
-        run: npx playwright install chromium --with-deps
-
-      - name: Install security tools
-        env:
-          GITLEAKS_VERSION: "8.30.0"
-          CARGO_AUDIT_VERSION: "0.22.1"
-          ZIZMOR_VERSION: "1.12.0"
-        run: |
-          set -euo pipefail
-          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
-          cargo install zizmor --version "$ZIZMOR_VERSION" --locked
-
-          tmp="$(mktemp -d)"
-          trap 'rm -rf "$tmp"' EXIT
-          cd "$tmp"
-          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
-          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
-          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
-          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
-
-      - name: Quality gates
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-          cargo test --workspace --all-targets --all-features --locked
-          npm --workspace @jankurai/ux-qa run build
-          npm --workspace @jankurai/ux-qa run test
-
-      - name: Install local jankurai
-        run: cargo install --path crates/jankurai --locked --force
-
-      - name: Prepare jankurai artifact directories
-        run: mkdir -p target/jankurai target/jankurai/security target/jankurai/public
-
-      - name: Resolve accepted baseline
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            git fetch origin main --depth=1
-            if git diff --name-only origin/main...HEAD | grep -qx 'agent/baselines/main.repo-score.json'; then
-              cp agent/baselines/main.repo-score.json target/jankurai/accepted-baseline.json
-            else
-              git show origin/main:agent/baselines/main.repo-score.json > target/jankurai/accepted-baseline.json
-            fi
-          elif [ -f agent/baselines/main.repo-score.json ]; then
-            cp agent/baselines/main.repo-score.json target/jankurai/accepted-baseline.json
-          else
-            echo "missing accepted baseline: commit agent/baselines/main.repo-score.json from a reviewed clean main audit" >&2
-            exit 1
-          fi
-
-      - name: Proofbind verify
-        run: |
-          set -euo pipefail
-          mode="required"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            mode="advisory"
-          fi
-          jankurai proofbind verify . --changed-from origin/main --mode "$mode"
-
-      - name: Proofmark rust
-        run: |
-          set -euo pipefail
-          mode="required"
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            mode="advisory"
-          fi
-          jankurai proofmark rust . --mode "$mode" --obligations target/jankurai/proofbind/obligations.json
-
-      - name: Rust witness build
-        run: jankurai rust witness build .
-
-      - name: Security lane
-        run: jankurai security run . --strict --profile ci --out target/jankurai/security/evidence.json
-
-      - name: Start UX QA smoke server
-        run: |
-          set -euo pipefail
-          node tools/ux-qa-smoke-server.mjs > target/jankurai/ux-qa-server.log 2>&1 &
-          echo "$!" > target/jankurai/ux-qa-server.pid
-          for attempt in {1..30}; do
-            if curl -fsS "http://127.0.0.1:3000/?ux_state=success" >/dev/null; then
-              exit 0
-            fi
-            sleep 1
-          done
-          cat target/jankurai/ux-qa-server.log >&2
-          exit 1
-
-      - name: UX QA smoke
-        run: jankurai ux audit --config agent/ux-qa.toml --out target/jankurai/ux-qa.json
-
-      - name: Coverage audit
-        run: |
-          mkdir -p target/jankurai/coverage
-          cargo run -p jankurai -- coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md
-
-      - name: Language bad-behavior fixtures
-        run: cargo test -p jankurai --test language_bad_behavior
-
-      - name: Migration evidence fixtures
-        run: cargo test -p jankurai --test migration_prompt_verify --test migration_slice_risk
-
-      - name: Final jankurai audit
-        run: |
-          jankurai audit . \
-            --mode ratchet \
-            --baseline target/jankurai/accepted-baseline.json \
-            --json target/jankurai/repo-score.json \
-            --md target/jankurai/repo-score.md \
-            --sarif target/jankurai/jankurai.sarif \
-            --github-step-summary target/jankurai/summary.md \
-            --repair-queue-jsonl target/jankurai/repair-queue.jsonl \
-            --proof-receipts target/jankurai/proofmark/proof-receipt.json
+      - name: Audit lane
+        run: bash ops/ci/audit.sh
 
       - name: Publish jankurai summary
         if: always()

@@ -106,6 +106,9 @@ ci-release:
 ci:
     bash scripts/ci-local.sh all
 
+ci-container:
+    bash ops/ci/run-in-container.sh "bash ops/ci/audit.sh"
+
 zizmor:
     zizmor .github/workflows
 
