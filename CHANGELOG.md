@@ -8,6 +8,42 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 No user-facing changes yet.
 
+## 1.1.0 - 2026-05-12
+
+### Fixed
+
+- Wire the new `HLT-041-COMMENT-HYGIENE` rule into the shape aggregator and
+  catalog assertion so comment-hygiene findings roll up into the audit
+  shape dimension.
+- Eliminate Python audit false-positives by stripping docstrings,
+  comments, and string literals before line-based `eval`/`exec`/`compile`
+  detectors; `model.eval()`, `re.compile(...)`, and commented-out calls
+  no longer trip the rule.
+- Harden `.github/workflows/release.yml` against zizmor findings (cache
+  poisoning, superfluous-actions, unverified-tag) and pass
+  `gh release create --verify-tag` on publish.
+
+### Added
+
+- `allowed_non_product_paths` Python boundary so non-product surfaces
+  such as `seed_data/` and `ops/scripts/` are exempt from Python caps
+  and shape scoring without losing audit visibility.
+- `coverage-llvm` GitHub Actions job producing `lcov.info` + `coverage.json`
+  artifacts via `cargo-llvm-cov`; `just cov` is the local equivalent.
+- `test-matrix` GitHub Actions job covering `ubuntu-latest` and
+  `macos-latest` with fail-fast disabled.
+- `.github/workflows/release.yml` for tag-triggered, audit-gated release
+  builds and GitHub Release publication using `gh release create`.
+- README "Test Surface" section with a regenerable horizontal bar chart
+  of `#[test]` counts per category, driven by
+  `scripts/render-test-surface.sh` and verified by CI.
+- Governance scaffolding: `CODEOWNERS`, `.pre-commit-config.yaml`, and
+  `docs/branch-protection.md`.
+- Local CI parity: `just ci-doctor`, `just ci-quick`, `just ci-coverage`,
+  `just ci-audit`, `just ci-release`, `just ci`, and `just zizmor`
+  recipes backed by `scripts/ci-local.sh` and `scripts/ci-doctor.sh`.
+  Documented in `docs/ci-local.md`.
+
 ## 1.0.0 - 2026-05-11
 
 ### Fixed
