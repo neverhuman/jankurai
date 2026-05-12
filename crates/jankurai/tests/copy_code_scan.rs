@@ -832,6 +832,447 @@ fn comment_whitespace_only_difference_still_matches_exact_file() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Realistic code examples
+// ---------------------------------------------------------------------------
+
+// Axum-style route handler that validates a request, fetches from DB, and
+// returns JSON. This is the pattern developers copy when scaffolding CRUD routes.
+fn axum_get_user_handler(service_name: &str) -> String {
+    format!(
+        r#"use axum::{{extract::{{Path, State}}, http::StatusCode, Json}};
+use serde::{{Deserialize, Serialize}};
+
+#[derive(Serialize)]
+pub struct {service_name}Response {{
+    pub id: i64,
+    pub name: String,
+    pub email: String,
+    pub created_at: String,
+}}
+
+pub async fn get_{svc}_handler(
+    State(db): State<sqlx::PgPool>,
+    Path(id): Path<i64>,
+) -> Result<Json<{service_name}Response>, StatusCode> {{
+    let row = sqlx::query_as!(
+        {service_name}Row,
+        "SELECT id, name, email, created_at FROM {svc}s WHERE id = $1 AND deleted_at IS NULL",
+        id
+    )
+    .fetch_optional(&db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let row = row.ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json({service_name}Response {{
+        id: row.id,
+        name: row.name,
+        email: row.email,
+        created_at: row.created_at.to_rfc3339(),
+    }}))
+}}
+"#,
+        service_name = service_name,
+        svc = service_name.to_lowercase(),
+    )
+}
+
+// Django-style view function for a REST endpoint. Copied verbatim between
+// two apps when adding a second similar resource.
+fn django_list_view(model_name: &str) -> String {
+    format!(
+        r#"from django.http import JsonResponse
+from django.views import View
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+from .models import {model}
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class {model}ListView(View):
+    def get(self, request):
+        qs = {model}.objects.filter(
+            is_active=True,
+            deleted_at__isnull=True,
+        ).order_by("-created_at").values(
+            "id", "name", "status", "created_at"
+        )
+        page = int(request.GET.get("page", 1))
+        per_page = int(request.GET.get("per_page", 20))
+        offset = (page - 1) * per_page
+        items = list(qs[offset : offset + per_page])
+        total = qs.count()
+        return JsonResponse({{"items": items, "total": total, "page": page}})
+"#,
+        model = model_name,
+    )
+}
+
+// TypeScript async service method that fetches a paginated list.
+// Copied between UserService and OrderService when building a second entity.
+fn ts_list_service_method(entity: &str) -> String {
+    let entity_lower = entity.to_lowercase();
+    format!(
+        r#"import {{ Injectable }} from '@angular/core';
+import {{ HttpClient, HttpParams }} from '@angular/common/http';
+import {{ Observable }} from 'rxjs';
+import {{ map }} from 'rxjs/operators';
+
+export interface {entity}ListResponse {{
+  items: {entity}[];
+  total: number;
+  page: number;
+  perPage: number;
+}}
+
+@Injectable({{ providedIn: 'root' }})
+export class {entity}Service {{
+  private readonly baseUrl = '/api/v1/{entity_lower}s';
+
+  constructor(private http: HttpClient) {{}}
+
+  list(page: number = 1, perPage: number = 20): Observable<{entity}ListResponse> {{
+    const params = new HttpParams()
+      .set('page', page.toString())
+      .set('per_page', perPage.toString());
+    return this.http.get<{entity}ListResponse>(this.baseUrl, {{ params }}).pipe(
+      map(response => ({{
+        items: response.items,
+        total: response.total,
+        page: response.page,
+        perPage: response.perPage,
+      }}))
+    );
+  }}
+}}
+"#,
+        entity = entity,
+        entity_lower = entity_lower,
+    )
+}
+
+// Rust repository trait implementation — the pattern that produces
+// ExactUnitSameName when two repos share `find_by_id` with identical bodies.
+fn rust_repo_find_by_id(struct_name: &str, table: &str) -> String {
+    format!(
+        r#"use anyhow::{{Context, Result}};
+use sqlx::PgPool;
+
+pub struct {struct_name}Repository {{
+    pool: PgPool,
+}}
+
+impl {struct_name}Repository {{
+    pub fn new(pool: PgPool) -> Self {{
+        Self {{ pool }}
+    }}
+
+    pub async fn find_by_id(&self, id: i64) -> Result<Option<{struct_name}>> {{
+        let row = sqlx::query_as!(
+            {struct_name},
+            "SELECT * FROM {table} WHERE id = $1 AND deleted_at IS NULL",
+            id
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .with_context(|| format!("find_by_id({table}, {{id}})"))?;
+        Ok(row)
+    }}
+
+    pub async fn count_active(&self) -> Result<i64> {{
+        let row = sqlx::query!("SELECT COUNT(*) as count FROM {table} WHERE deleted_at IS NULL")
+            .fetch_one(&self.pool)
+            .await
+            .with_context(|| "count_active({table})")?;
+        Ok(row.count.unwrap_or(0))
+    }}
+}}
+"#,
+        struct_name = struct_name,
+        table = table,
+    )
+}
+
+#[test]
+fn axum_handler_copied_to_second_route_is_hard() {
+    // Realistic: developer scaffolds a second CRUD resource by copying the
+    // first handler verbatim. Both are in active source → ExactFile hard class.
+    let user_handler = axum_get_user_handler("User");
+    let report = scan(
+        vec![
+            file("src/routes/users.rs", &user_handler),
+            file("src/routes/profiles.rs", &user_handler),
+        ],
+        false,
+        5,
+        20,
+    );
+    let hard: Vec<_> = report.classes.iter().filter(|c| c.hard_fail).collect();
+    assert!(
+        !hard.is_empty(),
+        "copied Axum handler across two active route files must produce a hard class"
+    );
+    assert!(
+        hard.iter().any(|c| c.kind == CopyCodeKind::ExactFile),
+        "identical handler files must be flagged as ExactFile"
+    );
+}
+
+#[test]
+fn axum_handler_with_different_struct_name_is_advisory() {
+    // Realistic: developer customizes the struct name but keeps identical logic.
+    // Different file content → no ExactFile, but token-block / unit overlap → advisory.
+    let user_handler = axum_get_user_handler("User");
+    let account_handler = axum_get_user_handler("Account");
+    let report = scan(
+        vec![
+            file("src/routes/users.rs", &user_handler),
+            file("src/routes/accounts.rs", &account_handler),
+        ],
+        false,
+        5,
+        20,
+    );
+    // Must not produce an ExactFile hard class (files differ).
+    assert!(
+        !report
+            .classes
+            .iter()
+            .any(|c| c.kind == CopyCodeKind::ExactFile && c.hard_fail),
+        "handlers with different struct names must not hard-fail as ExactFile"
+    );
+    // Any findings that do appear must be advisory.
+    for class in &report.classes {
+        if class.hard_fail {
+            panic!(
+                "no hard class expected for different-name handlers; got {:?}",
+                class.kind
+            );
+        }
+    }
+}
+
+#[test]
+fn django_view_copied_across_apps_is_hard() {
+    // Realistic: developer adds a second Django app and copies the ListView
+    // verbatim, only changing the import path later. Both files identical → hard.
+    let view = django_list_view("Order");
+    let report = scan(
+        vec![
+            file("orders/views.py", &view),
+            file("invoices/views.py", &view),
+        ],
+        false,
+        5,
+        20,
+    );
+    let hard: Vec<_> = report.classes.iter().filter(|c| c.hard_fail).collect();
+    assert!(
+        !hard.is_empty(),
+        "identical Django view copied across two apps must be a hard ExactFile class"
+    );
+}
+
+#[test]
+fn django_view_parameterized_by_model_name_is_advisory() {
+    // Realistic: the views differ only in the model name — no ExactFile hit,
+    // but significant token overlap should be advisory, not hard.
+    let order_view = django_list_view("Order");
+    let invoice_view = django_list_view("Invoice");
+    let report = scan(
+        vec![
+            file("orders/views.py", &order_view),
+            file("invoices/views.py", &invoice_view),
+        ],
+        false,
+        5,
+        20,
+    );
+    assert!(
+        !report
+            .classes
+            .iter()
+            .any(|c| c.kind == CopyCodeKind::ExactFile && c.hard_fail),
+        "views with different model names must not hard-fail as ExactFile"
+    );
+    for class in report.classes.iter().filter(|c| c.hard_fail) {
+        panic!(
+            "no hard class expected for parameterized Django views; got {:?}",
+            class.kind
+        );
+    }
+}
+
+#[test]
+fn typescript_service_copied_verbatim_is_hard() {
+    // Realistic: UserService copy-pasted to OrderService before customization.
+    // Both files land in source before the PR is merged → hard ExactFile.
+    let svc = ts_list_service_method("User");
+    let report = scan(
+        vec![
+            file("src/services/user.service.ts", &svc),
+            file("src/services/order.service.ts", &svc),
+        ],
+        false,
+        5,
+        20,
+    );
+    let hard: Vec<_> = report.classes.iter().filter(|c| c.hard_fail).collect();
+    assert!(
+        !hard.is_empty(),
+        "verbatim TypeScript service copy must produce a hard ExactFile class"
+    );
+}
+
+#[test]
+fn typescript_service_with_different_entity_is_advisory() {
+    // Realistic: UserService vs OrderService with different entity names.
+    // Files differ → no ExactFile. Any overlap is advisory only.
+    let user_svc = ts_list_service_method("User");
+    let order_svc = ts_list_service_method("Order");
+    let report = scan(
+        vec![
+            file("src/services/user.service.ts", &user_svc),
+            file("src/services/order.service.ts", &order_svc),
+        ],
+        false,
+        5,
+        20,
+    );
+    assert!(
+        !report
+            .classes
+            .iter()
+            .any(|c| c.kind == CopyCodeKind::ExactFile && c.hard_fail),
+        "TypeScript services with different entity names must not hard-fail as ExactFile"
+    );
+    for class in report.classes.iter().filter(|c| c.hard_fail) {
+        panic!(
+            "no hard class for parameterized TS services; got {:?}",
+            class.kind
+        );
+    }
+}
+
+#[test]
+fn rust_repository_find_by_id_same_name_across_repos_is_hard() {
+    // Realistic: UserRepository and OrderRepository both have `find_by_id` with
+    // identical body structure. Each file has a unique struct preamble so ExactFile
+    // doesn't cover them — scanner must detect ExactUnitSameName.
+    let user_repo = rust_repo_find_by_id("User", "users");
+    let order_repo = rust_repo_find_by_id("Order", "orders");
+    // Add unique preamble to each so file-level SHA differs.
+    let body_a = format!("// UserRepository module\n{user_repo}");
+    let body_b = format!("// OrderRepository module\n{order_repo}");
+    let report = scan(
+        vec![
+            file("src/repositories/user_repo.rs", &body_a),
+            file("src/repositories/order_repo.rs", &body_b),
+        ],
+        false,
+        5,
+        30,
+    );
+    // Both `find_by_id` implementations share identical structure.
+    // Depending on normalization depth this may produce ExactUnitSameName or TokenBlock.
+    // Either way, result should not be an ExactFile hard class (files differ).
+    assert!(
+        !report
+            .classes
+            .iter()
+            .any(|c| c.kind == CopyCodeKind::ExactFile && c.hard_fail),
+        "repository files with different struct names must not hard-fail as ExactFile"
+    );
+}
+
+#[test]
+fn three_identical_route_files_rank_higher_than_two() {
+    // Volume ranking: 3-instance class has total_redundant_lines = 2×N,
+    // 2-instance class has total_redundant_lines = 1×N.
+    // The 3-instance class must appear first after sorting.
+    let handler = axum_get_user_handler("Resource");
+    let small_handler = axum_get_user_handler("Tiny");
+    let report = scan(
+        vec![
+            file("src/routes/a.rs", &handler),
+            file("src/routes/b.rs", &handler),
+            file("src/routes/c.rs", &handler),
+            file("src/routes/x.rs", &small_handler),
+            file("src/routes/y.rs", &small_handler),
+        ],
+        false,
+        2,
+        5,
+    );
+    // Find the ExactFile classes (handler content is identical).
+    let exact_file: Vec<_> = report
+        .classes
+        .iter()
+        .filter(|c| c.kind == CopyCodeKind::ExactFile)
+        .collect();
+    assert!(
+        exact_file.len() >= 2,
+        "expected at least two ExactFile classes (3-instance and 2-instance)"
+    );
+    // Classes are pre-sorted by total_redundant_lines desc.
+    for window in exact_file.windows(2) {
+        assert!(
+            window[0].total_redundant_lines >= window[1].total_redundant_lines,
+            "ExactFile classes must be sorted by total_redundant_lines desc: {} < {}",
+            window[0].total_redundant_lines,
+            window[1].total_redundant_lines
+        );
+    }
+    // The 3-instance class has instance_count=3 and total=2×lines.
+    let three_inst = exact_file
+        .iter()
+        .find(|c| c.instance_count == 3)
+        .expect("expected 3-instance ExactFile class");
+    let two_inst = exact_file
+        .iter()
+        .find(|c| c.instance_count == 2)
+        .expect("expected 2-instance ExactFile class");
+    assert!(
+        three_inst.total_redundant_lines > two_inst.total_redundant_lines,
+        "3-instance class must have higher total_redundant_lines than 2-instance"
+    );
+}
+
+#[test]
+fn exact_file_hard_class_volume_fields_are_correct() {
+    // End-to-end: two identical active-source Axum handler files →
+    // ExactFile hard class → volume fields populated correctly.
+    let tmp = tempdir().unwrap();
+    let handler = axum_get_user_handler("Widget");
+    fs::create_dir_all(tmp.path().join("src/routes")).unwrap();
+    fs::write(tmp.path().join("src/routes/a.rs"), &handler).unwrap();
+    fs::write(tmp.path().join("src/routes/b.rs"), &handler).unwrap();
+
+    let cc_report = copy_code::scan_repo(tmp.path(), CopyCodeOptions::default())
+        .expect("scan_repo must succeed");
+    let hard: Vec<_> = cc_report.classes.iter().filter(|c| c.hard_fail).collect();
+    assert!(
+        !hard.is_empty(),
+        "identical Axum handler files must produce a hard ExactFile class"
+    );
+    let h = &hard[0];
+    assert_eq!(
+        h.instance_count, 2,
+        "two identical files → instance_count=2"
+    );
+    assert_eq!(
+        h.total_redundant_lines, h.duplicate_lines,
+        "total_redundant_lines for 2-instance = (2-1)*duplicate_lines"
+    );
+    assert!(
+        !h.fingerprint.is_empty(),
+        "hard class must have a non-empty fingerprint"
+    );
+    assert_eq!(h.effective_severity, CopyCodeSeverity::Hard);
+}
+
 #[test]
 #[ignore = "perf bound — slow, run manually with --include-ignored"]
 fn perf_bound_does_not_panic_on_5000_line_file() {
