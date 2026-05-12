@@ -1,12 +1,12 @@
 use crate::commands::release_data::{
     load_release_data, read_repo_score, workspace_root, FindingsSummary,
 };
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct CertifyArgs {
@@ -312,10 +312,3 @@ fn render_markdown(certification: &Certification) -> String {
     out
 }
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}

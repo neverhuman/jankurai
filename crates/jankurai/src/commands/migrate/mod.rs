@@ -4,10 +4,10 @@ pub mod prompt_verify;
 pub mod report;
 pub mod slice_risk;
 
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use inventory::{detect_stack, ApiSurface, ContractEvidence, DetectedItem, StackInventory};
 pub use plan::{build_migration_plan, MigrationPlan, MigrationSlice};
@@ -78,10 +78,3 @@ fn run_plan(repo: &Path, out: Option<&str>, md: Option<&str>, target: &str) -> R
     Ok(())
 }
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}

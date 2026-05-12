@@ -1,5 +1,7 @@
 use crate::commands::bench;
+use crate::commands::exceptions::repo_relative_path;
 use crate::commands::release_data::load_release_data;
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
@@ -7,7 +9,6 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct OptimizeArgs {
@@ -603,21 +604,7 @@ fn estimate_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
-fn repo_relative_path(repo: &Path, path: &Path) -> String {
-    path.strip_prefix(repo)
-        .ok()
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}
 
 fn render_markdown(report: &OptimizationReport) -> String {
     use std::fmt::Write;

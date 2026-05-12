@@ -772,20 +772,16 @@ fn finding(
     agent_fix: &str,
     proof_window: &'static str,
 ) -> LanguageFinding {
-    let snippet = line.trim().chars().take(160).collect::<String>();
-    LanguageFinding::new(
+    super::common::sql_finding(
         HLT_RULE_ID,
+        detector_id,
         matched_term,
-        file.rel_path.clone(),
-        Some(line_no),
-        snippet.clone(),
+        file,
+        line_no,
+        line,
         problem,
         reason,
         agent_fix,
-        vec![
-            format!("detector={detector_id}"),
-            format!("proof-window={proof_window}"),
-            format!("snippet={snippet}"),
-        ],
+        proof_window,
     )
 }

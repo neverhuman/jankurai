@@ -1,9 +1,9 @@
 use crate::commands::release_data::load_release_data;
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct GovernArgs {
@@ -139,10 +139,3 @@ fn render_markdown(policy: &GovernancePolicy) -> String {
     out
 }
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}

@@ -1,11 +1,12 @@
 use crate::commands::cell_catalog::{built_in_manifests, evidence_counts, CellManifest};
 use crate::commands::context_data::RepoCatalog;
+use crate::commands::repair::now_string;
+use crate::commands::score::join_or_none;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct RegistryArgs {
@@ -231,18 +232,4 @@ fn render_markdown(plan: &RegistryPlan) -> String {
     out
 }
 
-fn join_or_none(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".to_string()
-    } else {
-        values.join(", ")
-    }
-}
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}

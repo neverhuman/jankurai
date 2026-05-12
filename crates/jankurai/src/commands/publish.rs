@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::commands::repair::now_string;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct PublishArgs {
@@ -711,10 +711,3 @@ fn escape_xml(value: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}

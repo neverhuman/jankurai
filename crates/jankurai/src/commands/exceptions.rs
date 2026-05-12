@@ -1,4 +1,5 @@
 use crate::commands::release_data::load_release_data;
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{anyhow, Result};
 use chrono::{NaiveDate, Utc};
@@ -8,7 +9,6 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct ExceptionExpireArgs {
@@ -313,7 +313,7 @@ fn is_exception_doc(path: &Path) -> bool {
         && path.extension().and_then(|ext| ext.to_str()) == Some("md")
 }
 
-fn repo_relative_path(repo: &Path, path: &Path) -> String {
+pub(crate) fn repo_relative_path(repo: &Path, path: &Path) -> String {
     path.strip_prefix(repo)
         .ok()
         .unwrap_or(path)
@@ -321,13 +321,6 @@ fn repo_relative_path(repo: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}
 
 fn render_markdown(report: &ExceptionExpiryReport) -> String {
     use std::fmt::Write;

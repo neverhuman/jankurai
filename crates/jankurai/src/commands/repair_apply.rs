@@ -3,6 +3,7 @@ use super::repair::{
     increment_risk_summary, now_string, packet_eligibility, packet_risk, proof_lanes, push_unique,
     AppliedEdit, BlockedPacket, RepairArgs, RepairRun, RiskSummary, SkippedEdit,
 };
+use crate::commands::exceptions::repo_relative_path;
 use crate::audit::rules::{RepairEligibility, RepairRisk};
 use crate::commands::context_data::RepoCatalog;
 use crate::commands::repair_plan::{PlannedEdit, RepairPacket, RepairPlan};
@@ -108,7 +109,7 @@ pub fn run_fixture_apply(args: RepairArgs, plan: RepairPlan, max_risk: RepairRis
         if let Err(error) = proof::run_prove(proof_args) {
             terminal_error = Some(error.context("fixture proof verification failed"));
         }
-        Some(relative_repo_path(&args.repo, &evidence_index_path))
+        Some(repo_relative_path(&args.repo, &evidence_index_path))
     } else {
         None
     };
@@ -504,13 +505,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("sha256:{:x}", digest)
 }
 
-fn relative_repo_path(repo: &Path, path: &Path) -> String {
-    path.strip_prefix(repo)
-        .ok()
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
 
 fn fixture_notes(
     applied_edits: &[AppliedEdit],

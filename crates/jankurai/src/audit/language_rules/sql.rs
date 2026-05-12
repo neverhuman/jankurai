@@ -162,7 +162,8 @@ fn hard_hit_for_line(
     }
 
     if detect_full_table_write && is_full_table_write_line(&lower) {
-        return Some(finding(
+        return Some(super::common::sql_finding(
+            HLT_RULE_ID,
             DETECTOR_FULL_TABLE_WRITE,
             "update/delete",
             file,
@@ -176,7 +177,8 @@ fn hard_hit_for_line(
     }
 
     if is_dynamic_sql_line(&lower) {
-        return Some(finding(
+        return Some(super::common::sql_finding(
+            HLT_RULE_ID,
             DETECTOR_DYNAMIC_SQL,
             "execute",
             file,
@@ -196,7 +198,8 @@ fn advisory_hit_for_line(file: &FileInfo, line_no: usize, line: &str) -> Option<
     let normalized = normalize_sql_line(line)?;
     let lower = normalized.to_ascii_lowercase();
     if lower.contains("select *") {
-        return Some(finding(
+        return Some(super::common::sql_finding(
+            HLT_RULE_ID,
             DETECTOR_SELECT_STAR,
             "select *",
             file,
@@ -274,34 +277,4 @@ fn sort_key(a: &LanguageFinding, b: &LanguageFinding) -> std::cmp::Ordering {
         .then(a.line.unwrap_or(0).cmp(&b.line.unwrap_or(0)))
         .then(a.matched_term.cmp(b.matched_term))
         .then(a.problem.cmp(&b.problem))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finding(
-    detector_id: &'static str,
-    matched_term: &'static str,
-    file: &FileInfo,
-    line_no: usize,
-    line: &str,
-    problem: &str,
-    reason: &str,
-    agent_fix: &str,
-    proof_window: &'static str,
-) -> LanguageFinding {
-    let snippet = line.trim().chars().take(160).collect::<String>();
-    LanguageFinding::new(
-        HLT_RULE_ID,
-        matched_term,
-        file.rel_path.clone(),
-        Some(line_no),
-        snippet.clone(),
-        problem,
-        reason,
-        agent_fix,
-        vec![
-            format!("detector={detector_id}"),
-            format!("proof-window={proof_window}"),
-            format!("snippet={snippet}"),
-        ],
-    )
 }
