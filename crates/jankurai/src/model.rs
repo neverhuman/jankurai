@@ -1,9 +1,9 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-pub const STANDARD_VERSION: &str = "0.8.0";
-pub const AUDITOR_VERSION: &str = "1.1.0";
-pub const SCHEMA_VERSION: &str = "1.7.0";
+pub const STANDARD_VERSION: &str = "0.9.0";
+pub const AUDITOR_VERSION: &str = "1.3.0";
+pub const SCHEMA_VERSION: &str = "1.9.0";
 pub const PAPER_EDITION: &str = "2026.05-ed8";
 pub const TARGET_STACK_ID: &str = "rust-ts-vite-react-postgres-bounded-python";
 pub const TARGET_STACK: &str = "Rust core + TypeScript/React/Vite + PostgreSQL + generated contracts + exception-only Python AI/data service";
@@ -445,6 +445,8 @@ pub struct Report {
     pub tool_adoption: ToolAdoptionReadiness,
     pub security_evidence: SecurityEvidenceReadiness,
     pub boundaries: BoundariesReadiness,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub copy_code: Option<crate::audit::copy_code::CopyCodeReport>,
     pub profile_structure: ProfileStructureReadiness,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vibe_coverage: Option<VibeCoverageSummary>,

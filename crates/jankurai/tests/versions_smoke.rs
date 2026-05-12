@@ -1,3 +1,4 @@
+use jankurai::model::SCHEMA_VERSION;
 use jankurai::versions::check_versions;
 use std::fs;
 use tempfile::tempdir;
@@ -25,10 +26,10 @@ fn versions_bindings_validate() {
         format!(
             r#"
 standard = "jankurai"
-standard_version = "0.8.0"
+standard_version = "0.9.0"
 paper_edition = "2026.05-ed8"
 auditor_version = "{ver}"
-schema_version = "1.7.0"
+schema_version = "{schema}"
 target_stack = "rust-ts-vite-react-postgres-bounded-python"
 
 [[artifact]]
@@ -53,13 +54,13 @@ version = "2026.05-ed8"
 id = "coding-standard"
 path = "docs/agent-native-standard.md"
 version_field = "standard_version"
-version = "0.8.0"
+version = "0.9.0"
 
 [[artifact]]
 id = "agent-standard-brief"
 path = "agent/JANKURAI_STANDARD.md"
 version_field = "standard_version"
-version = "0.8.0"
+version = "0.9.0"
 
 [[artifact]]
 id = "ux-qa-runtime"
@@ -68,13 +69,14 @@ version_field = "auditor_version"
 version = "{ver}"
 "#,
             ver = jankurai::model::AUDITOR_VERSION,
+            schema = SCHEMA_VERSION,
         ),
     )
     .unwrap();
     fs::create_dir_all(dir.path().join("paper")).unwrap();
     fs::write(
         dir.path().join("paper/jankurai.md"),
-        "Paper edition: `2026.05-ed8`\nStandard version: `0.8.0`\n",
+        "Paper edition: `2026.05-ed8`\nStandard version: `0.9.0`\n",
     )
     .unwrap();
     fs::write(
@@ -86,12 +88,12 @@ version = "{ver}"
     fs::create_dir_all(dir.path().join("docs")).unwrap();
     fs::write(
         dir.path().join("docs/agent-native-standard.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
     fs::write(
         dir.path().join("agent/JANKURAI_STANDARD.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
     fs::create_dir_all(dir.path().join("packages/ux-qa")).unwrap();
