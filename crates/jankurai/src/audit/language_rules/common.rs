@@ -142,6 +142,192 @@ pub fn strip_comments_for_line_language(line: &str, kind: &str) -> String {
     stripped.trim().to_string()
 }
 
+fn earliest_python_triple_quote(line: &str) -> Option<(&'static str, usize)> {
+    let double = line.find("\"\"\"");
+    let single = line.find("'''");
+    match (double, single) {
+        (Some(d), Some(s)) if d <= s => Some(("\"\"\"", d)),
+        (Some(_d), Some(s)) => Some(("'''", s)),
+        (Some(d), None) => Some(("\"\"\"", d)),
+        (None, Some(s)) => Some(("'''", s)),
+        (None, None) => None,
+    }
+}
+
+fn strip_python_string_literals(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if in_single {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '\'' {
+                in_single = false;
+            }
+            continue;
+        }
+        if in_double {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_double = false;
+            }
+            continue;
+        }
+
+        if ch == '\'' {
+            if matches!(chars.peek(), Some(&'\'')) {
+                let mut preview = chars.clone();
+                preview.next();
+                if matches!(preview.next(), Some('\'')) {
+                    break;
+                }
+            }
+            in_single = true;
+            continue;
+        }
+        if ch == '"' {
+            if matches!(chars.peek(), Some(&'"')) {
+                let mut preview = chars.clone();
+                preview.next();
+                if matches!(preview.next(), Some('"')) {
+                    break;
+                }
+            }
+            in_double = true;
+            continue;
+        }
+
+        out.push(ch);
+    }
+
+    out
+}
+
+/// Return Python source lines with comments and docstrings stripped so line-based
+/// detectors only examine executable code.
+pub fn python_code_lines(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut in_docstring: Option<&'static str> = None;
+
+    for (idx, raw_line) in text.lines().enumerate() {
+        let mut line = raw_line.trim();
+        if line.is_empty() {
+            out.push((idx + 1, String::new()));
+            continue;
+        }
+
+        if let Some(delim) = in_docstring {
+            if let Some(end) = line.find(delim) {
+                line = &line[end + delim.len()..];
+                in_docstring = None;
+            } else {
+                out.push((idx + 1, String::new()));
+                continue;
+            }
+        }
+
+        let mut code = line.trim().to_string();
+        if code.is_empty() {
+            out.push((idx + 1, String::new()));
+            continue;
+        }
+
+        if let Some((delim, start)) = earliest_python_triple_quote(code.as_str()) {
+            let prefix = code[..start].trim_end();
+            let suffix = &code[start + delim.len()..];
+            let closing = suffix.find(delim);
+            let mut combined = String::new();
+            if !prefix.is_empty() {
+                combined.push_str(prefix);
+            }
+            if let Some(end) = closing {
+                let tail = suffix[end + delim.len()..].trim();
+                if !tail.is_empty() {
+                    if !combined.is_empty() {
+                        combined.push(' ');
+                    }
+                    combined.push_str(tail);
+                }
+            } else {
+                in_docstring = Some(delim);
+            }
+            code = combined.trim().to_string();
+        }
+
+        if code.is_empty() {
+            out.push((idx + 1, String::new()));
+            continue;
+        }
+
+        let code = code
+            .split_once('#')
+            .map(|(left, _)| left)
+            .unwrap_or(code.as_str())
+            .trim();
+        if code.is_empty() {
+            out.push((idx + 1, String::new()));
+            continue;
+        }
+
+        out.push((idx + 1, code.trim().to_string()));
+    }
+
+    out
+}
+
+/// True when the line contains a direct builtin call like `eval(`, `exec(`, or
+/// `compile(`, but not a qualified method call such as `model.eval()` or
+/// `re.compile(...)`.
+pub fn contains_unqualified_python_builtin_call(line: &str, builtin: &str) -> bool {
+    let stripped = strip_python_string_literals(line);
+    let trimmed = stripped.trim_start();
+    if trimmed.is_empty()
+        || trimmed.starts_with("def ")
+        || trimmed.starts_with("async def ")
+        || trimmed.starts_with("class ")
+    {
+        return false;
+    }
+
+    let needle = builtin.to_ascii_lowercase();
+    let hay = trimmed.to_ascii_lowercase();
+    let mut offset = 0usize;
+    while let Some(pos) = hay[offset..].find(&needle) {
+        let idx = offset + pos;
+        let before = hay[..idx].chars().rev().find(|c| !c.is_whitespace());
+        if matches!(before, Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+            offset = idx + needle.len();
+            continue;
+        }
+        let mut after = hay[idx + needle.len()..]
+            .chars()
+            .skip_while(|c| c.is_whitespace());
+        if matches!(after.next(), Some('(')) {
+            return true;
+        }
+        offset = idx + needle.len();
+    }
+
+    false
+}
+
 pub fn contains_secret_name(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     [
@@ -225,4 +411,141 @@ pub fn sort_and_cap_findings(
         })
         .take(max)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn collect_code(text: &str) -> Vec<String> {
+        python_code_lines(text)
+            .into_iter()
+            .filter(|(_, line)| !line.is_empty())
+            .map(|(_, line)| line)
+            .collect()
+    }
+
+    #[test]
+    fn python_code_lines_strips_hash_comments() {
+        let src = "x = 1  # eval(\nresult = x + 2  # exec(\n";
+        assert_eq!(collect_code(src), vec!["x = 1", "result = x + 2"]);
+    }
+
+    #[test]
+    fn python_code_lines_drops_pure_comment_and_blank_lines() {
+        let src = "# only a comment\n\n    \nvalue = 3\n";
+        let kept: Vec<(usize, String)> = python_code_lines(src)
+            .into_iter()
+            .filter(|(_, line)| !line.is_empty())
+            .collect();
+        assert_eq!(kept, vec![(4_usize, "value = 3".to_string())]);
+    }
+
+    #[test]
+    fn python_code_lines_skips_triple_quoted_docstring() {
+        let src = "def f():\n    \"\"\"docstring eval( inside\n    multiple lines\n    still doc\"\"\"\n    return 1\n";
+        assert_eq!(collect_code(src), vec!["def f():", "return 1"]);
+    }
+
+    #[test]
+    fn python_code_lines_handles_inline_triple_quote() {
+        let src = "msg = \"\"\"hello eval(\"\"\"\nrun = True\n";
+        let kept = collect_code(src);
+        assert!(kept.iter().any(|l| l == "msg ="));
+        assert!(kept.contains(&"run = True".to_string()));
+    }
+
+    #[test]
+    fn python_code_lines_handles_single_triple_quoted_docstring() {
+        let src = "def g():\n    '''single triple eval('''\n    return 2\n";
+        assert_eq!(collect_code(src), vec!["def g():", "return 2"]);
+    }
+
+    #[test]
+    fn unqualified_builtin_accepts_direct_call() {
+        assert!(contains_unqualified_python_builtin_call(
+            "eval(payload)",
+            "eval"
+        ));
+        assert!(contains_unqualified_python_builtin_call(
+            "    exec(code)",
+            "exec"
+        ));
+        assert!(contains_unqualified_python_builtin_call(
+            "compile(src, '<x>', 'exec')",
+            "compile"
+        ));
+    }
+
+    #[test]
+    fn unqualified_builtin_rejects_method_call() {
+        assert!(!contains_unqualified_python_builtin_call(
+            "model.eval()",
+            "eval"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "re.compile(pattern)",
+            "compile"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "self.exec(query)",
+            "exec"
+        ));
+    }
+
+    #[test]
+    fn unqualified_builtin_rejects_calls_inside_strings() {
+        assert!(!contains_unqualified_python_builtin_call(
+            "msg = \"eval(payload)\"",
+            "eval"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "msg = 'exec(payload)'",
+            "exec"
+        ));
+    }
+
+    #[test]
+    fn unqualified_builtin_rejects_definitions() {
+        assert!(!contains_unqualified_python_builtin_call(
+            "def eval(self, ctx):",
+            "eval"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "async def exec(s):",
+            "exec"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "class Compile(Base):",
+            "compile"
+        ));
+    }
+
+    #[test]
+    fn unqualified_builtin_requires_call_parens() {
+        assert!(!contains_unqualified_python_builtin_call(
+            "if eval in names:",
+            "eval"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "x = eval_handler()",
+            "eval"
+        ));
+        assert!(!contains_unqualified_python_builtin_call(
+            "compile_step = 1",
+            "compile"
+        ));
+    }
+
+    #[test]
+    fn unqualified_builtin_handles_escaped_quotes() {
+        assert!(!contains_unqualified_python_builtin_call(
+            "msg = \"escaped \\\" then eval(x)\"",
+            "eval"
+        ));
+        assert!(contains_unqualified_python_builtin_call(
+            "label = 'safe'; eval(payload)",
+            "eval"
+        ));
+    }
 }

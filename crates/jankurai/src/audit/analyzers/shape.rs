@@ -15,13 +15,18 @@ pub fn analyze(ctx: &AuditContext) -> DimensionResult {
     let mut score = 55;
     let mut evidence = vec![];
     let mut notes = vec![];
-    if let Some(file) = largest_file(&files) {
+    let shape_files: Vec<_> = files
+        .iter()
+        .filter(|f| !(f.suffix == ".py" && python_scoring_exempt(ctx, &f.rel_path)))
+        .cloned()
+        .collect();
+    if let Some(file) = largest_file(&shape_files) {
         evidence.push(format!(
             "largest authored code file: {} ({} LOC)",
             file.rel_path, file.line_count
         ));
     }
-    if let Some(max) = max_loc(&files) {
+    if let Some(max) = max_loc(&shape_files) {
         if max > 500 {
             score -= 15;
             evidence.push("code file exceeds 500 LOC".into());
@@ -127,6 +132,11 @@ pub fn analyze(ctx: &AuditContext) -> DimensionResult {
             "release",
             crate::audit::language_rules::release::summary(ctx).hard_findings,
             crate::audit::language_rules::release::summary(ctx).advisory_signals,
+        ),
+        (
+            "comments",
+            crate::audit::language_rules::comments::summary(ctx).hard_findings,
+            crate::audit::language_rules::comments::summary(ctx).advisory_signals,
         ),
     ] {
         hard_language_findings += hard;

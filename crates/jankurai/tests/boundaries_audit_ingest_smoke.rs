@@ -168,6 +168,68 @@ fn audit_without_boundaries_file_leaves_artifact_none() {
 }
 
 #[test]
+fn python_allowlist_paths_clear_python_caps_and_shape_largest_file_scoring() {
+    let dir = tempdir().unwrap();
+    runtime_repo(dir.path());
+    let large_python = "value = 1\n".repeat(1201);
+    fs::create_dir_all(dir.path().join("seed_data")).unwrap();
+    fs::write(dir.path().join("seed_data/seed_payload.py"), &large_python).unwrap();
+    fs::create_dir_all(
+        dir.path()
+            .join("crates/veox-bootstrap-interop/python_runtime"),
+    )
+    .unwrap();
+    fs::write(
+        dir.path()
+            .join("crates/veox-bootstrap-interop/python_runtime/runtime.py"),
+        &large_python,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("agent/boundaries.toml"),
+        r#"
+[stack]
+id = "fixture-stack"
+
+[queues]
+adapter_paths = []
+event_contract_paths = []
+generated_type_paths = []
+
+[python]
+allowed_non_product_paths = ["seed_data/", "ops/scripts/", "crates/veox-bootstrap-interop/python_runtime/"]
+"#,
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+    for cap in [
+        "non-optimal-product-language-found",
+        "too-much-python-in-product-surface",
+        "python-direct-product-truth-or-db-ownership",
+    ] {
+        assert!(
+            !report.caps_applied.iter().any(|applied| applied == cap),
+            "{cap} should be ignored for allowed non-product python paths"
+        );
+    }
+
+    let python = report
+        .dimensions
+        .iter()
+        .find(|dimension| dimension.name == "Python containment and polyglot hygiene")
+        .expect("python dimension");
+    assert_eq!(python.score, 100, "{python:?}");
+
+    let shape = report
+        .dimensions
+        .iter()
+        .find(|dimension| dimension.name == "Code shape and semantic surface")
+        .expect("shape dimension");
+    assert_eq!(shape.score, 70, "{shape:?}");
+}
+
+#[test]
 fn passing_audited_runtime_boundary_reclassifies_only_python_stack_caps() {
     let dir = tempdir().unwrap();
     runtime_repo(dir.path());

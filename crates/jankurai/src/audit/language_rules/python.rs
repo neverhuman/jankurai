@@ -2,10 +2,10 @@ use super::catalog::{
     ConfidencePolicy, Language, LanguageFinding, LanguageRule, Matcher, ProofWindow,
 };
 use super::common::{
-    finding, is_docs_reference_tips_or_generated, is_test_fixture_or_example,
-    sort_and_cap_findings, strip_comments_for_line_language,
+    contains_unqualified_python_builtin_call, finding, is_docs_reference_tips_or_generated,
+    is_test_fixture_or_example, python_code_lines, sort_and_cap_findings,
 };
-use crate::audit::helpers::AuditContext;
+use crate::audit::helpers::{python_scoring_exempt, AuditContext};
 use crate::model::FileInfo;
 
 const HLT_RULE_ID: &str = "HLT-033-PYTHON-BAD-BEHAVIOR";
@@ -137,9 +137,8 @@ pub fn findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
 pub fn advisory_signals(ctx: &AuditContext) -> Vec<LanguageFinding> {
     let mut out = Vec::new();
     for file in python_files(ctx) {
-        for (idx, raw_line) in file.text.lines().enumerate() {
-            let line = strip_comments_for_line_language(raw_line, "py");
-            if let Some(hit) = advisory_hit_for_line(&file, idx + 1, &line) {
+        for (idx, line) in python_code_lines(&file.text) {
+            if let Some(hit) = advisory_hit_for_line(&file, idx, &line) {
                 out.push(hit);
             }
         }
@@ -150,9 +149,8 @@ pub fn advisory_signals(ctx: &AuditContext) -> Vec<LanguageFinding> {
 fn hard_findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
     let mut out = Vec::new();
     for file in python_files(ctx) {
-        for (idx, raw_line) in file.text.lines().enumerate() {
-            let line = strip_comments_for_line_language(raw_line, "py");
-            if let Some(hit) = hard_hit_for_line(&file, idx + 1, &line) {
+        for (idx, line) in python_code_lines(&file.text) {
+            if let Some(hit) = hard_hit_for_line(&file, idx, &line) {
                 out.push(hit);
             }
         }
@@ -163,16 +161,17 @@ fn hard_findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
 fn python_files(ctx: &AuditContext) -> Vec<FileInfo> {
     ctx.all_files
         .iter()
-        .filter(|file| is_python_candidate(file))
+        .filter(|file| is_python_candidate(ctx, file))
         .cloned()
         .collect()
 }
 
-fn is_python_candidate(file: &FileInfo) -> bool {
+fn is_python_candidate(ctx: &AuditContext, file: &FileInfo) -> bool {
     let rel = file.rel_path.to_ascii_lowercase();
     !file.is_generated
         && !is_docs_reference_tips_or_generated(&rel)
         && !is_test_fixture_or_example(&rel)
+        && !python_scoring_exempt(ctx, &rel)
         && matches!(file.suffix.as_str(), ".py" | ".pyi")
 }
 
@@ -270,9 +269,9 @@ fn advisory_hit_for_line(file: &FileInfo, line_no: usize, line: &str) -> Option<
 }
 
 fn is_dynamic_code_line(lower: &str) -> bool {
-    lower.contains("eval(")
-        || lower.contains("exec(")
-        || lower.contains("compile(")
+    ["eval", "exec", "compile"]
+        .iter()
+        .any(|builtin| contains_unqualified_python_builtin_call(lower, builtin))
         || lower.contains("exec(open(")
 }
 

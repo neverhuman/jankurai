@@ -841,7 +841,10 @@ pub fn product_code_files(ctx: &AuditContext) -> Vec<FileInfo> {
 pub fn python_ratio(ctx: &AuditContext) -> f64 {
     let files = product_files(ctx)
         .into_iter()
-        .filter(|f| !accepted_boundary_file_for_cap(ctx, &f.rel_path, TOO_MUCH_PYTHON_CAP))
+        .filter(|f| {
+            !accepted_boundary_file_for_cap(ctx, &f.rel_path, TOO_MUCH_PYTHON_CAP)
+                && !python_scoring_exempt(ctx, &f.rel_path)
+        })
         .collect::<Vec<_>>();
     let total: usize = files.iter().map(|f| f.line_count).sum();
     let py: usize = files
@@ -862,6 +865,26 @@ pub fn is_allowed_python_path(path: &str) -> bool {
         .any(|p| path == *p || path.starts_with(&format!("{}/", p.trim_end_matches('/'))))
 }
 
+pub fn is_allowed_non_product_python_path(ctx: &AuditContext, path: &str) -> bool {
+    if is_allowed_python_path(path) {
+        return true;
+    }
+    let Some(manifest) = boundary_manifest(ctx) else {
+        return false;
+    };
+    let Some(python) = manifest.python else {
+        return false;
+    };
+    python.allowed_non_product_paths.iter().any(|prefix| {
+        let prefix = prefix.trim_end_matches('/');
+        path == prefix || path.starts_with(&format!("{prefix}/"))
+    })
+}
+
+pub fn python_scoring_exempt(ctx: &AuditContext, path: &str) -> bool {
+    is_allowed_non_product_python_path(ctx, path) || path_in_generated_zone(ctx, path)
+}
+
 pub fn bad_python_paths(ctx: &AuditContext) -> bool {
     !bad_python_path_hits(ctx).is_empty()
 }
@@ -871,7 +894,7 @@ pub fn bad_python_path_hits(ctx: &AuditContext) -> Vec<FileInfo> {
         .iter()
         .filter(|f| {
             f.suffix == ".py"
-                && !is_allowed_python_path(&f.rel_path)
+                && !python_scoring_exempt(ctx, &f.rel_path)
                 && !f.rel_path.contains("/tests/fixtures/")
                 && !f.rel_path.starts_with("tests/fixtures/")
                 && !accepted_boundary_file_for_cap(ctx, &f.rel_path, PYTHON_DIRECT_CAP)
@@ -1022,7 +1045,7 @@ pub fn non_optimal_language_hits(ctx: &AuditContext) -> Vec<FileInfo> {
                     ".scala", ".swift",
                 ]
                 .contains(&f.suffix.as_str())
-                    || (f.suffix == ".py" && !f.rel_path.starts_with("python/ai-service/")))
+                    || (f.suffix == ".py" && !python_scoring_exempt(ctx, &f.rel_path)))
         })
         .collect()
 }
@@ -1088,7 +1111,7 @@ pub fn all_scope_python_files_are_accepted_boundaries(ctx: &AuditContext) -> boo
     let python_files = ctx
         .scope_files
         .iter()
-        .filter(|file| file.suffix == ".py")
+        .filter(|file| file.suffix == ".py" && !python_scoring_exempt(ctx, &file.rel_path))
         .collect::<Vec<_>>();
     !python_files.is_empty()
         && python_files.iter().all(|file| {

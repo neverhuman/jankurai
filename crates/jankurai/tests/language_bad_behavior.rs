@@ -1,7 +1,7 @@
 use jankurai::audit::{
     self,
     helpers::AuditContext,
-    language_rules::{ci, docker, git, gittools, python, release, sql, typescript},
+    language_rules::{ci, comments, docker, git, gittools, python, release, sql, typescript},
 };
 use jankurai::model::{FileInfo, Finding};
 use serde_json::Value as JsonValue;
@@ -339,6 +339,63 @@ fn python_safe_fixtures_emit_no_hlt033_findings() {
 }
 
 #[test]
+fn python_code_line_matcher_ignores_qualified_calls_definitions_class_names_and_docstrings() {
+    let repo = tempdir().unwrap();
+    write(
+        &repo.path().join("src/safe_builtin_forms.py"),
+        r#"
+"""docstring mentions eval(), exec(), compile(), and re.compile()"""
+
+model.eval()
+self.eval()
+def eval(self):
+    return self.value
+class ClassEval(BaseModel):
+    pass
+class DifferentialEval(BaseEvaluator):
+    pass
+re.compile(r"[a-z]+")
+"#,
+    );
+
+    assert!(findings_for(repo.path(), "HLT-033-PYTHON-BAD-BEHAVIOR").is_empty());
+}
+
+#[test]
+fn python_code_line_matcher_still_flags_unqualified_builtin_calls() {
+    let repo = tempdir().unwrap();
+    write(
+        &repo.path().join("src/unsafe_builtin_calls.py"),
+        r#"
+eval(payload)
+exec(source)
+compile(source, "<expr>", "exec")
+"#,
+    );
+
+    let findings = findings_for(repo.path(), "HLT-033-PYTHON-BAD-BEHAVIOR");
+    assert_eq!(findings.len(), 3, "{findings:?}");
+    assert_has_finding(
+        &findings,
+        "src/unsafe_builtin_calls.py",
+        "python.exec.dynamic-code",
+        "snippet=eval(payload)",
+    );
+    assert_has_finding(
+        &findings,
+        "src/unsafe_builtin_calls.py",
+        "python.exec.dynamic-code",
+        "snippet=exec(source)",
+    );
+    assert_has_finding(
+        &findings,
+        "src/unsafe_builtin_calls.py",
+        "python.exec.dynamic-code",
+        "snippet=compile(source, \"<expr>\", \"exec\")",
+    );
+}
+
+#[test]
 fn docs_tips_reference_and_generated_paths_stay_out_of_sql_python_scans() {
     let repo = tempdir().unwrap();
     write(
@@ -460,6 +517,7 @@ fn catalog_entries_reference_stable_hlt_rules() {
     let git_rules = git::catalog();
     let gittools_rules = gittools::catalog();
     let release_rules = release::catalog();
+    let comments_rules = comments::catalog();
     let mut ids = HashSet::new();
     for rule in sql_rules
         .iter()
@@ -470,6 +528,7 @@ fn catalog_entries_reference_stable_hlt_rules() {
         .chain(git_rules.iter())
         .chain(gittools_rules.iter())
         .chain(release_rules.iter())
+        .chain(comments_rules.iter())
     {
         ids.insert(rule.hlt_rule_id);
     }
@@ -481,6 +540,7 @@ fn catalog_entries_reference_stable_hlt_rules() {
     assert!(ids.contains("HLT-035-GIT-BAD-BEHAVIOR"));
     assert!(ids.contains("HLT-036-GITTOOLS-BAD-BEHAVIOR"));
     assert!(ids.contains("HLT-037-RELEASE-BAD-BEHAVIOR"));
+    assert!(ids.contains("HLT-041-COMMENT-HYGIENE"));
     assert!(sql_rules
         .iter()
         .all(|rule| rule.hlt_rule_id == "HLT-030-SQL-BAD-BEHAVIOR"));
@@ -505,6 +565,9 @@ fn catalog_entries_reference_stable_hlt_rules() {
     assert!(release_rules
         .iter()
         .all(|rule| rule.hlt_rule_id == "HLT-037-RELEASE-BAD-BEHAVIOR"));
+    assert!(comments_rules
+        .iter()
+        .all(|rule| rule.hlt_rule_id == "HLT-041-COMMENT-HYGIENE"));
 }
 
 #[test]
