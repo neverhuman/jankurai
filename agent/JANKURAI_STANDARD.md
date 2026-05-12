@@ -1,7 +1,7 @@
 # jankurai Standard Agent Bootstrap
 
-Standard version: `0.8.0`
-Published: `2026-05-05`
+Standard version: `0.9.0`
+Published: `2026-05-12`
 Full standard: `docs/agent-native-standard.md`
 Version manifest: `agent/standard-version.toml`
 Paper: `Jankurai: A Versioned Repository Conformance Standard for Trustworthy AI-Assisted Merge`
@@ -205,8 +205,9 @@ Stop or fix first when any condition is true:
 | `HLT-040-REPO-ROT-BAD-BEHAVIOR` | Active source contains ambiguous old, backup, copied, parked, or hard-disabled code without owner, proof lane, expiry, and cleanup plan |
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
 | `HLT-042-CI-LOCAL-PARITY` | CI workflows inline commands rather than delegating to `ops/ci/*.sh`, leaving local runners without a way to reproduce the gate before push |
+| `HLT-043-COPY-PASTE-BAD-BEHAVIOR` | Exact active-source duplicate files and same-name semantic units are copied across owner boundaries |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-042` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family.
 
 ## Ownership Boundaries
 
@@ -323,6 +324,7 @@ jankurai versions
 just versions
 just fast
 just score
+cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md
 just paper
 just check
 just ci-doctor   # verify local toolchain matches CI
@@ -366,6 +368,28 @@ The audit emits `HLT-042-CI-LOCAL-PARITY` when a workflow inlines commands,
 when a referenced script is missing, when the runner/doctor/`ops/ci/lib.sh`
 shim is absent, when a Rust workspace lacks `rust-toolchain.toml`, or when
 `ops/git-hooks/pre-push` is missing.
+
+`HLT-043-COPY-PASTE-BAD-BEHAVIOR` covers exact active-source file copies and
+same-name semantic unit copies across different active files. The copy-code
+lane is advisory for warning-only areas such as tests, fixtures, stories,
+config, Docker, and migrations, but hard active-source duplicates are never
+excused.
+
+### Copy-Code Hard-Fail Scope (v1.3)
+
+The copy-code lane intentionally narrows its hard-fail surface to two
+inexcusable classes:
+
+1. **Exact file duplicates** in active source (`CopyCodeKind::ExactFile`).
+2. **Same-name function/method copies** across two or more active-source files
+   (`CopyCodeKind::ExactUnitSameName`) that clear `min_lines >= 10` and
+   `min_tokens >= 100`.
+
+All other detections (`ExactUnitDifferentName`, `TokenBlock`) are advisory
+regardless of scanner severity and are surfaced as volume-ranked warnings only.
+This narrow scope is enforced at finding-emit time via
+`CopyCodeClass::hard_fail`. To widen the hard-fail surface, modify
+`audit/copy_code.rs::effective_severity_for`.
 
 ## v0.5 Daily Merge Loop
 

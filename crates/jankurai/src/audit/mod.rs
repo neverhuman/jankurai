@@ -4,6 +4,8 @@ pub mod boundaries_artifact;
 pub mod boundary_reclassification;
 pub mod caps;
 pub mod ci_local_parity;
+pub mod copy_code;
+pub mod copy_code_cross_check;
 pub mod coverage;
 pub mod evidence;
 pub mod file_kinds;
@@ -128,10 +130,17 @@ pub fn run_audit_timed_with_options(
         scope_paths,
         self_audit: options.self_audit,
         boundary_reclassifications: vec![],
+        copy_code: None,
     };
     let boundary_reclassifications = boundary_reclassification::evaluate(&base_ctx);
+    let copy_code = copy_code::scan_files(
+        root,
+        &base_ctx.all_files,
+        copy_code::CopyCodeOptions::default(),
+    );
     let ctx = AuditContext {
         boundary_reclassifications,
+        copy_code: Some(copy_code.clone()),
         ..base_ctx
     };
     timings.record_duration("index_build", index_started.elapsed());
@@ -236,6 +245,7 @@ pub fn run_audit_timed_with_options(
             artifact: boundaries_artifact::load_manifest_summary(root),
             reclassifications: ctx.boundary_reclassifications.clone(),
         },
+        copy_code: Some(copy_code),
         profile_structure: profile_structure.clone(),
         vibe_coverage: crate::commands::vibe::audit_summary(root),
         coverage_evidence: coverage_ingest.summary,
@@ -774,9 +784,39 @@ fn build_findings(
             hit.line,
         );
     }
-    if !scan::duplicate_blocks(ctx).is_empty() {
-        let hit = scan::duplicate_blocks(ctx)[0].clone();
-        b.add("high", "vibe", &hit.path, "duplicated product code block detected", "extract the duplicated behavior behind one named boundary and add focused tests before changing behavior", vec![hit.problem.clone()], None, hit.line);
+    if let Some(copy_code) = ctx.copy_code.as_ref() {
+        for class in copy_code.classes.iter().filter(|class| class.hard_fail) {
+            if let Some(instance) = class.instances.first() {
+                b.add_with_rule(
+                    "HLT-043-COPY-PASTE-BAD-BEHAVIOR",
+                    &instance.path,
+                    &format!("copy-code hard class `{}` detected", class.id),
+                    &class.recommended_action,
+                    vec![
+                        format!("kind={:?}", class.kind),
+                        format!("language={}", class.language),
+                        format!("duplicate_lines={}", class.duplicate_lines),
+                        format!("duplicate_tokens={}", class.duplicate_tokens),
+                        format!("duplicate_bytes={}", class.duplicate_bytes),
+                        format!(
+                            "instances={}",
+                            class
+                                .instances
+                                .iter()
+                                .map(|instance| format!(
+                                    "{}:{}-{}",
+                                    instance.path, instance.start_line, instance.end_line
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    ],
+                    Some(instance.start_line),
+                    instance.unit_name.clone(),
+                    Some(class.reason.clone()),
+                );
+            }
+        }
     }
     if !scan::generated_zone_issues(ctx).is_empty() {
         let hit = scan::generated_zone_issues(ctx)[0].clone();
