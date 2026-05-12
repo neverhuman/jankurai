@@ -884,6 +884,26 @@ pub const RULES: &[RuleSpec] = &[
         cap_key: Some("comment-hygiene-dangerous-residue"),
         confidence_policy: ConfidencePolicy::High,
     },
+    RuleSpec {
+        id: "HLT-042-CI-LOCAL-PARITY",
+        name: "CI lacks local-run parity",
+        category: "ci",
+        tlr: "Verification",
+        lane: "fast",
+        docs_url: "docs/ci-local.md",
+        owner_hint: "ops",
+        evidence_kind: "repository-scan",
+        severity: "high",
+        repairable: true,
+        repair_eligibility: RepairEligibility::AgentAssisted,
+        repair_risk: RepairRisk::Low,
+        repair_reason:
+            "extracting workflow steps into ops/ci/*.sh and adding local runners is mechanical",
+        status: RuleStatus::Stable,
+        standard_section: "CI Local Parity",
+        cap_key: Some("ci-local-parity"),
+        confidence_policy: ConfidencePolicy::High,
+    },
 ];
 
 pub fn all() -> &'static [RuleSpec] {

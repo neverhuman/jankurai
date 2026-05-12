@@ -3,6 +3,7 @@ pub mod baseline;
 pub mod boundaries_artifact;
 pub mod boundary_reclassification;
 pub mod caps;
+pub mod ci_local_parity;
 pub mod coverage;
 pub mod evidence;
 pub mod file_kinds;
@@ -1058,6 +1059,18 @@ fn build_findings(
         );
     }
     for hit in repo_rot::findings(ctx) {
+        b.add_with_rule(
+            hit.rule_id,
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            hit.evidence,
+            hit.line,
+            Some(hit.matched_term.into()),
+            Some(hit.reason),
+        );
+    }
+    for hit in ci_local_parity::findings(ctx) {
         b.add_with_rule(
             hit.rule_id,
             &hit.path,
