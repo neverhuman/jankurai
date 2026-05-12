@@ -192,7 +192,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: neverhuman/jankurai@v1.1.0
+      - uses: neverhuman/jankurai@v1.2.0
         with:
           mode: advisory
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -333,6 +333,7 @@ The `docs/` directory includes anti-pattern catalogs covering common vibe-coding
 | [BAD_GIT.md](docs/BAD_GIT.md) | Git anti-patterns: force push, broad commits, missing context |
 | [BAD_DOCKER.md](docs/BAD_DOCKER.md) | Docker anti-patterns: root execution, unbounded layers, missing health checks |
 | [BAD_TYPE.md](docs/BAD_TYPE.md) | Type system anti-patterns: handwritten DTOs, missing generated clients |
+| [BAD_COPY.md](docs/BAD_COPY.md) | Copy-code anti-patterns: exact and high-confidence duplicate source code; **inexcusable cases (exact file copy, same-name function copy across files) score-impacting, all others advisory** |
 | [BAD_release.md](docs/BAD_release.md) | Release anti-patterns: mutable tags/assets, skipped proof, missing provenance, no rollback |
 
 ### Registered Tools
@@ -345,6 +346,8 @@ Jankurai's tool adoption catalog ([`agent/tool-adoption.toml`](agent/tool-adopti
 | `proof-routing` | auto | Changed-path proof obligation routing |
 | `proofbind` | advisory | Semantic surface binding validation |
 | `proofmark-rust` | advisory | Rust-specific proof receipt engine |
+| `copy-code` | advisory + narrow hard | Exact/same-name detection (hard) + volume-ranked advisory list; `copy-code rank` for stack-rank; optional `--cross-check jscpd` |
+| `jscpd` | external_advisory | Optional polyglot clone cross-check; install with `npm i -g jscpd` |
 | `security` | auto | Dependency, secret, and provenance scanning |
 | `ux-qa` | auto | Playwright UX evidence and accessibility |
 | `db-migration-analyze` | auto | Migration safety analysis |
@@ -355,6 +358,14 @@ Jankurai's tool adoption catalog ([`agent/tool-adoption.toml`](agent/tool-adopti
 | `release-bad-behavior` | advisory | Release tag, artifact, provenance, and rollback bad-behavior checks |
 | `web-security-bad-behavior` | auto | Vite exposure, client secret, browser token storage, and credentialed wildcard CORS checks |
 | `repo-rot-bad-behavior` | advisory | Active-source old, backup, copy, archive, and hard-disabled-code checks |
+
+### Copy-code redundancy audit
+
+- Full scan: `cargo run -p jankurai -- copy-code .`
+- Stack-rank top 20 by total redundant lines: `cargo run -p jankurai -- copy-code rank`
+- Cross-check with jscpd (optional, advisory): `cargo run -p jankurai -- copy-code . --cross-check jscpd`
+- Allowlist false positives in `agent/copy-code-allowlist.toml` (stable fingerprints with optional expiry).
+- See [BAD_COPY.md](docs/BAD_COPY.md) for the inexcusable list and tool matrix.
 
 ## Test Surface
 
@@ -471,7 +482,7 @@ Jankurai is licensed under the [MIT License](LICENSE).
 
 This repository is the working source for the paper *Jankurai: Merge Witnesses for Evidence-Carrying AI-Assisted Pull Requests*.
 
-Current release: standard `0.8.0`, auditor/action `1.1.0`, schema `1.7.0`, paper edition `2026.05-ed8`.
+Current release: standard `0.9.0`, auditor/action `1.2.0`, schema `1.8.0`, paper edition `2026.05-ed8`.
 
 Public thesis line: *Find the vibe. Prove the merge. Repair the repo.*
 
