@@ -1097,12 +1097,16 @@ fn django_view_parameterized_by_model_name_is_advisory() {
             .any(|c| c.kind == CopyCodeKind::ExactFile && c.hard_fail),
         "views with different model names must not hard-fail as ExactFile"
     );
-    for class in report.classes.iter().filter(|c| c.hard_fail) {
-        panic!(
-            "no hard class expected for parameterized Django views; got {:?}",
-            class.kind
-        );
-    }
+    let hard_kinds: Vec<_> = report
+        .classes
+        .iter()
+        .filter(|c| c.hard_fail)
+        .map(|c| format!("{:?}", c.kind))
+        .collect();
+    assert!(
+        hard_kinds.is_empty(),
+        "no hard class expected for parameterized Django views; got: {hard_kinds:?}"
+    );
 }
 
 #[test]
@@ -1148,12 +1152,16 @@ fn typescript_service_with_different_entity_is_advisory() {
             .any(|c| c.kind == CopyCodeKind::ExactFile && c.hard_fail),
         "TypeScript services with different entity names must not hard-fail as ExactFile"
     );
-    for class in report.classes.iter().filter(|c| c.hard_fail) {
-        panic!(
-            "no hard class for parameterized TS services; got {:?}",
-            class.kind
-        );
-    }
+    let hard_kinds: Vec<_> = report
+        .classes
+        .iter()
+        .filter(|c| c.hard_fail)
+        .map(|c| format!("{:?}", c.kind))
+        .collect();
+    assert!(
+        hard_kinds.is_empty(),
+        "no hard class expected for parameterized TS services; got: {hard_kinds:?}"
+    );
 }
 
 #[test]
