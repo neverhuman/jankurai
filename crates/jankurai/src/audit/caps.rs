@@ -279,6 +279,12 @@ pub const CAP_SPECS: &[CapSpec] = &[
         rule_id: Some("HLT-041-COMMENT-HYGIENE"),
         hardness: "hard",
     },
+    CapSpec {
+        key: "ci-local-parity",
+        max_score: 70,
+        rule_id: Some("HLT-042-CI-LOCAL-PARITY"),
+        hardness: "hard",
+    },
 ];
 
 pub const CAPS: &[(&str, i32)] = &[
@@ -327,6 +333,7 @@ pub const CAPS: &[(&str, i32)] = &[
     ("web-security-bad-behavior", 68),
     ("repo-rot-bad-behavior", 88),
     ("comment-hygiene-dangerous-residue", 72),
+    ("ci-local-parity", 70),
 ];
 
 pub fn caps_applied(ctx: &AuditContext, has_destructive_migration_sql: bool) -> Vec<String> {
@@ -477,6 +484,9 @@ pub fn caps_applied(ctx: &AuditContext, has_destructive_migration_sql: bool) -> 
     }
     if crate::audit::language_rules::comments::summary(ctx).hard_findings > 0 {
         caps.push("comment-hygiene-dangerous-residue".into());
+    }
+    if crate::audit::ci_local_parity::summary(ctx).hard_findings > 0 {
+        caps.push("ci-local-parity".into());
     }
     caps
 }

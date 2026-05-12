@@ -204,10 +204,10 @@ fn confidence_policy_is_consistent_with_severity() {
 
 #[test]
 fn rule_count_matches_expected() {
-    assert_eq!(rules::all().len(), 41, "Expected exactly 41 stable rules");
+    assert_eq!(rules::all().len(), 42, "Expected exactly 42 stable rules");
 }
 
 #[test]
 fn cap_count_matches_expected() {
-    assert_eq!(caps::CAP_SPECS.len(), 45, "Expected exactly 45 caps");
+    assert_eq!(caps::CAP_SPECS.len(), 46, "Expected exactly 46 caps");
 }

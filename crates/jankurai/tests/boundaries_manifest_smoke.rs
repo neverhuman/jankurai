@@ -26,6 +26,24 @@ id = "fixture"
 adapter_paths = []
 event_contract_paths = []
 generated_type_paths = []
+    "#;
+    validation::validate_boundaries_toml_text(&repo, text).unwrap();
+}
+
+#[test]
+fn boundaries_toml_accepts_python_non_product_allowlist() {
+    let repo = repo_root();
+    let text = r#"
+[stack]
+id = "fixture"
+
+[queues]
+adapter_paths = []
+event_contract_paths = []
+generated_type_paths = []
+
+[python]
+allowed_non_product_paths = ["seed_data/", "ops/scripts/", "crates/veox-bootstrap-interop/python_runtime/"]
 "#;
     validation::validate_boundaries_toml_text(&repo, text).unwrap();
 }

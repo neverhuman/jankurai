@@ -19,6 +19,20 @@ For demos or logs, force rich output with `JANKURAI_COLOR=always` and
 `jankurai version` prints the installed CLI/version/source diagnostics and the
 recommended upgrade command.
 
+## Optional: pre-commit hooks
+
+Install [pre-commit](https://pre-commit.com/) to mirror the CI gates locally:
+
+```bash
+pipx install pre-commit   # or: pip install --user pre-commit
+pre-commit install
+```
+
+The repository's `.pre-commit-config.yaml` runs `cargo fmt --check`,
+`cargo clippy -D warnings`, `gitleaks`, and verifies that the README test-surface
+chart is in sync with the source tree. Skip a single commit with
+`SKIP=cargo-clippy git commit ...` when you intentionally want to bypass a hook.
+
 `jankurai versions` checks the source checkout against `VERSION`,
 `crates/jankurai/Cargo.toml`, `packages/ux-qa/package.json`,
 `agent/standard-version.toml`, `docs/agent-native-standard.md`,

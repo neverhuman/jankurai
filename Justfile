@@ -74,6 +74,48 @@ phase13:
     cargo run -p jankurai -- optimize . --mode all --out target/jankurai/p13-optimization-report.json --md target/jankurai/p13-optimization-report.md
     cargo run -p jankurai -- exceptions expire . --warning-days 7 --strict --out target/jankurai/p13-exception-expiry.json --md target/jankurai/p13-exception-expiry.md
 
+cov:
+    mkdir -p target/coverage
+    cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/coverage/lcov.info
+    cargo llvm-cov report --json --output-path target/coverage/coverage.json
+    cargo llvm-cov report --summary-only | tee target/coverage/summary.txt
+
+test-surface:
+    bash scripts/render-test-surface.sh
+
+test-surface-check:
+    bash scripts/render-test-surface.sh --check
+
+# Local mirror of CI. Each recipe reproduces a GitHub Actions job so
+# breakage is caught before push, never first on GitHub.
+ci-doctor:
+    bash scripts/ci-doctor.sh
+
+bootstrap:
+    git config core.hooksPath ops/git-hooks
+    bash scripts/ci-doctor.sh
+
+ci-quick:
+    bash scripts/ci-local.sh quick
+
+ci-coverage:
+    bash scripts/ci-local.sh coverage
+
+ci-audit:
+    bash scripts/ci-local.sh audit
+
+ci-release:
+    bash scripts/ci-local.sh release
+
+ci:
+    bash scripts/ci-local.sh all
+
+ci-container:
+    bash ops/ci/run-in-container.sh "bash ops/ci/audit.sh"
+
+zizmor:
+    zizmor .github/workflows
+
 tuiwright-test:
     cargo test -p tuiwright --lib
     cargo test -p tuiwright --test smoke -- --test-threads=1

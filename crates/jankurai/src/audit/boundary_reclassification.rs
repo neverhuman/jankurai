@@ -1,4 +1,5 @@
 use super::helpers::{AuditContext, PYTHON_STACK_RECLASSIFY_CAPS};
+use super::language_rules::common::{contains_unqualified_python_builtin_call, python_code_lines};
 use crate::boundaries::manifest::{self, AuditedRuntimeBoundary};
 use crate::model::{BoundaryEvidenceArtifactSummary, BoundaryReclassification};
 use crate::validation::{self, ArtifactSchema};
@@ -459,22 +460,26 @@ fn run_builtin_checks(ctx: &AuditContext, covered_files: &[String], failed: &mut
         let Some(file) = ctx.all_files.iter().find(|file| file.rel_path == *rel) else {
             continue;
         };
-        let lower = file.text.to_ascii_lowercase();
-        for (id, markers) in BUILTIN_CHECKS {
-            for marker in markers.iter().copied() {
-                if let Some(line) = line_for_marker(&lower, marker) {
-                    failed.push(format!("{id}: `{rel}` line {line} contains `{marker}`"));
-                    break;
+        for (line_no, line) in python_code_lines(&file.text) {
+            let lower = line.to_ascii_lowercase();
+            for (id, markers) in BUILTIN_CHECKS {
+                for marker in markers.iter().copied() {
+                    let matched = if matches!(marker, "eval(" | "exec(" | "compile(") {
+                        contains_unqualified_python_builtin_call(
+                            &lower,
+                            marker.trim_end_matches('('),
+                        )
+                    } else {
+                        lower.contains(marker)
+                    };
+                    if matched {
+                        failed.push(format!("{id}: `{rel}` line {line_no} contains `{marker}`"));
+                        break;
+                    }
                 }
             }
         }
     }
-}
-
-fn line_for_marker(text: &str, marker: &str) -> Option<usize> {
-    text.lines()
-        .position(|line| line.contains(marker))
-        .map(|idx| idx + 1)
 }
 
 fn file_sha256(path: &Path) -> Option<String> {

@@ -1,5 +1,6 @@
 use super::helpers::*;
 use super::language_rules;
+use super::language_rules::common::{contains_unqualified_python_builtin_call, python_code_lines};
 use super::prose;
 use crate::model::FileInfo;
 use once_cell::sync::Lazy;
@@ -749,24 +750,33 @@ pub fn authz_isolation_hits(ctx: &AuditContext) -> Vec<FindingHit> {
 pub fn input_boundary_hits(ctx: &AuditContext) -> Vec<FindingHit> {
     let mut hits = Vec::new();
     for file in product_code_files(ctx) {
-        for (idx, line) in file.text.lines().enumerate() {
+        let lines = if file.suffix == ".py" {
+            python_code_lines(&file.text)
+        } else {
+            file.text
+                .lines()
+                .enumerate()
+                .map(|(idx, line)| (idx + 1, line.to_string()))
+                .collect::<Vec<_>>()
+        };
+        for (idx, line) in lines {
             if super::language_rules::common::nearby_allow(
                 &file.text,
-                idx + 1,
+                idx,
                 "HLT-023-INPUT-BOUNDARY-GAP",
             ) {
                 continue;
             }
             let lower = line.to_ascii_lowercase();
-            let matched = if lower.contains("eval(") {
+            let matched = if contains_unqualified_python_builtin_call(&line, "eval") {
                 Some("eval(")
-            } else if lower.contains("exec(")
+            } else if contains_unqualified_python_builtin_call(&line, "exec")
                 || (lower.contains("child_process") && !is_import_only_line(&lower))
                 || lower.contains("shell=true")
             {
                 Some("shell execution")
             } else if lower.contains("command::new") {
-                if file.suffix == ".rs" || is_fixed_safe_command_invocation(line) {
+                if file.suffix == ".rs" || is_fixed_safe_command_invocation(&line) {
                     None
                 } else if lower.contains(".arg(\"-c\")")
                     || lower.contains(".args([\"-c\"")

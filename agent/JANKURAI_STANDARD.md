@@ -204,8 +204,9 @@ Stop or fix first when any condition is true:
 | `HLT-039-WEB-SECURITY-BAD-BEHAVIOR` | Web apps expose high-confidence security hazards such as public Vite dev servers, client secrets, browser token storage, or credentialed wildcard CORS |
 | `HLT-040-REPO-ROT-BAD-BEHAVIOR` | Active source contains ambiguous old, backup, copied, parked, or hard-disabled code without owner, proof lane, expiry, and cleanup plan |
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
+| `HLT-042-CI-LOCAL-PARITY` | CI workflows inline commands rather than delegating to `ops/ci/*.sh`, leaving local runners without a way to reproduce the gate before push |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-041` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-042` are detector-backed catalog IDs in the bad-behavior family.
 
 ## Ownership Boundaries
 
@@ -324,10 +325,47 @@ just fast
 just score
 just paper
 just check
+just ci-doctor   # verify local toolchain matches CI
+just ci          # run every CI lane locally
 ```
 
 `jankurai upgrade` is write-capable; use `jankurai upgrade --score` to run the
 post-upgrade scoring lane.
+
+## CI Local Parity
+
+`HLT-042-CI-LOCAL-PARITY` enforces a deterministic, locally reproducible CI
+contract so failures are caught before push, not first on GitHub.
+
+Requirements:
+
+1. **Single source of truth.** CI commands live in versioned shell scripts
+   under `ops/ci/*.sh`. `.github/workflows/*.yml` files are thin orchestration
+   that set up the runner and call `bash ops/ci/<lane>.sh`.
+2. **Local runner.** `scripts/ci-local.sh` exposes the same lanes locally and
+   delegates to the same `ops/ci/*.sh` scripts (no hand-maintained
+   approximation).
+3. **Doctor.** `scripts/ci-doctor.sh` reports every tool the CI lanes need so
+   contributors can verify their environment matches CI.
+4. **Pinned toolchain.** `rust-toolchain.toml`, `.tool-versions`, and the
+   pinned versions in `ops/ci/lib.sh` (cargo install versions, action SHAs,
+   Node version) keep local and remote environments identical.
+5. **Artifact assertions.** Each `ops/ci/*.sh` lane checks that every expected
+   artifact path exists before exiting, so missing outputs fail locally too.
+6. **Container parity.** `ops/ci/Dockerfile.ci` provides an ubuntu image
+   matching the GitHub-hosted runner; `ops/ci/run-in-container.sh` (or
+   `just ci-container`) runs any lane inside it so runner-specific issues
+   are reproducible offline.
+7. **Mandatory pre-push gate.** `ops/git-hooks/pre-push` runs the same
+   `ops/ci/quality-gates.sh` script CI runs, so it is impossible to push
+   code that will redden the fast lane. `just bootstrap` wires the hook
+   via `git config core.hooksPath ops/git-hooks`. Bypasses require
+   `JANKURAI_SKIP_PREPUSH=1` and an incident note.
+
+The audit emits `HLT-042-CI-LOCAL-PARITY` when a workflow inlines commands,
+when a referenced script is missing, when the runner/doctor/`ops/ci/lib.sh`
+shim is absent, when a Rust workspace lacks `rust-toolchain.toml`, or when
+`ops/git-hooks/pre-push` is missing.
 
 ## v0.5 Daily Merge Loop
 

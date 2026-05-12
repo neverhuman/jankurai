@@ -9,6 +9,7 @@ pub fn analyze(ctx: &AuditContext) -> DimensionResult {
             f.suffix == ".py"
                 && !f.rel_path.contains("/tests/fixtures/")
                 && !f.rel_path.starts_with("tests/fixtures/")
+                && !python_scoring_exempt(ctx, &f.rel_path)
         })
         .cloned()
         .collect();

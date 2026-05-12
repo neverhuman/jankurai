@@ -48,6 +48,8 @@ pub struct TypeScriptBoundary {
 pub struct PythonBoundary {
     #[serde(default)]
     pub allowed_truth_paths: Vec<String>,
+    #[serde(default)]
+    pub allowed_non_product_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -133,6 +135,7 @@ generated_contract_paths = ["contracts/generated"]
 
 [python]
 allowed_truth_paths = ["python/ai-service"]
+allowed_non_product_paths = ["seed_data/", "ops/scripts/", "crates/veox-bootstrap-interop/python_runtime/"]
 
 [queues]
 adapter_paths = ["crates/adapters/queues", "crates/adapters/src/queues"]
@@ -206,6 +209,19 @@ required_checks = ["manifest-coverage", "payload-hash-match", "no-direct-db-acce
                 .as_ref()
                 .map(|python| python.allowed_truth_paths.as_slice()),
             Some(&["python/ai-service".to_string()][..])
+        );
+        assert_eq!(
+            manifest
+                .python
+                .as_ref()
+                .map(|python| python.allowed_non_product_paths.as_slice()),
+            Some(
+                &[
+                    "seed_data/".to_string(),
+                    "ops/scripts/".to_string(),
+                    "crates/veox-bootstrap-interop/python_runtime/".to_string()
+                ][..]
+            )
         );
         assert_eq!(
             manifest.db.as_ref().map(|db| db.root_paths.as_slice()),
