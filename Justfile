@@ -91,6 +91,10 @@ test-surface-check:
 ci-doctor:
     bash scripts/ci-doctor.sh
 
+bootstrap:
+    git config core.hooksPath ops/git-hooks
+    bash scripts/ci-doctor.sh
+
 ci-quick:
     bash scripts/ci-local.sh quick
 

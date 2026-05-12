@@ -356,10 +356,16 @@ Requirements:
    matching the GitHub-hosted runner; `ops/ci/run-in-container.sh` (or
    `just ci-container`) runs any lane inside it so runner-specific issues
    are reproducible offline.
+7. **Mandatory pre-push gate.** `ops/git-hooks/pre-push` runs the same
+   `ops/ci/quality-gates.sh` script CI runs, so it is impossible to push
+   code that will redden the fast lane. `just bootstrap` wires the hook
+   via `git config core.hooksPath ops/git-hooks`. Bypasses require
+   `JANKURAI_SKIP_PREPUSH=1` and an incident note.
 
 The audit emits `HLT-042-CI-LOCAL-PARITY` when a workflow inlines commands,
 when a referenced script is missing, when the runner/doctor/`ops/ci/lib.sh`
-shim is absent, or when a Rust workspace lacks `rust-toolchain.toml`.
+shim is absent, when a Rust workspace lacks `rust-toolchain.toml`, or when
+`ops/git-hooks/pre-push` is missing.
 
 ## v0.5 Daily Merge Loop
 

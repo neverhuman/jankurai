@@ -111,6 +111,19 @@ fn hard_findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
         ));
     }
 
+    if !file_exists(ctx, "ops/git-hooks/pre-push") {
+        out.push(finding(
+            HLT_RULE_ID,
+            "ci.local-parity.pre-push-hook-missing",
+            workflow_anchor(ctx),
+            1,
+            "ops/git-hooks/pre-push is missing",
+            "without a mandatory pre-push gate, broken code can be pushed and CI is the first place a failure shows up",
+            "add ops/git-hooks/pre-push that runs `bash ops/ci/quality-gates.sh` and wire it via `git config core.hooksPath ops/git-hooks`",
+            ProofWindow::None,
+        ));
+    }
+
     out
 }
 
@@ -163,11 +176,10 @@ fn file_exists(ctx: &AuditContext, rel: &str) -> bool {
 }
 
 fn workflow_anchor(ctx: &AuditContext) -> &FileInfo {
-    workflow_files(ctx).into_iter().next().unwrap_or_else(|| {
-        ctx.all_files
-            .first()
-            .expect("ctx has at least one file")
-    })
+    workflow_files(ctx)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ctx.all_files.first().expect("ctx has at least one file"))
 }
 
 fn has_rust_workspace(ctx: &AuditContext) -> bool {
@@ -229,12 +241,35 @@ mod tests {
             file(".github/workflows/ci.yml", workflow),
             file("ops/ci/lib.sh", "set -euo pipefail"),
             file("ops/ci/quality-gates.sh", "echo gates"),
+            file("ops/git-hooks/pre-push", "#!/usr/bin/env bash"),
             file("scripts/ci-local.sh", "echo local"),
             file("scripts/ci-doctor.sh", "echo doctor"),
             file("rust-toolchain.toml", "[toolchain]"),
             file("Cargo.toml", "[package]"),
         ]);
         assert_eq!(summary(&ctx).hard_findings, 0, "{:#?}", findings(&ctx));
+    }
+
+    #[test]
+    fn missing_pre_push_hook_flagged() {
+        let workflow = r#"jobs:
+  test:
+    steps:
+      - run: bash ops/ci/quality-gates.sh
+"#;
+        let ctx = ctx(vec![
+            file(".github/workflows/ci.yml", workflow),
+            file("ops/ci/lib.sh", ""),
+            file("ops/ci/quality-gates.sh", ""),
+            file("scripts/ci-local.sh", ""),
+            file("scripts/ci-doctor.sh", ""),
+        ]);
+        let hits = findings(&ctx);
+        assert!(
+            hits.iter()
+                .any(|h| h.matched_term == "ci.local-parity.pre-push-hook-missing"),
+            "{hits:#?}"
+        );
     }
 
     #[test]
