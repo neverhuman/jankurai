@@ -1,0 +1,213 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  audit-gate:
+    name: audit gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag matches VERSION
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          file="$(tr -d '[:space:]' < VERSION)"
+          if [ "$tag" != "$file" ]; then
+            echo "tag ${GITHUB_REF_NAME} (${tag}) does not match VERSION (${file})" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install security tools
+        env:
+          GITLEAKS_VERSION: "8.30.0"
+          CARGO_AUDIT_VERSION: "0.22.1"
+          ZIZMOR_VERSION: "1.12.0"
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked
+          cargo install zizmor --version "$ZIZMOR_VERSION" --locked
+
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          cd "$tmp"
+          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+
+      - name: Quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-targets --all-features --locked
+
+      - name: Install local jankurai
+        run: cargo install --path crates/jankurai --locked --force
+
+      - name: Security lane (strict)
+        run: |
+          mkdir -p target/jankurai/security
+          jankurai security run . --strict --profile ci --out target/jankurai/security/evidence.json
+
+      - name: Final audit (bound to strict security evidence)
+        run: |
+          mkdir -p target/jankurai
+          jankurai audit . \
+            --mode ratchet \
+            --baseline agent/baselines/main.repo-score.json \
+            --json target/jankurai/repo-score.json \
+            --md target/jankurai/repo-score.md \
+            --sarif target/jankurai/jankurai.sarif
+
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@53e96ec3b35fce51c141c0d6f0e31028a448722d
+        with:
+          sarif_file: target/jankurai/jankurai.sarif
+
+      - name: Upload audit evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-audit
+          path: |
+            target/jankurai/repo-score.json
+            target/jankurai/repo-score.md
+            target/jankurai/jankurai.sarif
+            target/jankurai/security/evidence.json
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: audit-gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Build jankurai binary
+        run: cargo build --release --locked -p jankurai --target ${{ matrix.target }}
+
+      - name: Stage release artifact
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          stage="jankurai-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          cp "target/${{ matrix.target }}/release/jankurai" "dist/${stage}/"
+          cp LICENSE README.md CHANGELOG.md "dist/${stage}/"
+          (cd dist && tar -czf "${stage}.tar.gz" "${stage}")
+          (cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256")
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: jankurai-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Download audit evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-audit
+          path: dist/audit
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          notes_file="dist/RELEASE_NOTES.md"
+          awk -v ver="$version" '
+            BEGIN { capture = 0 }
+            /^## / {
+              if (capture) exit
+              if (index($0, ver) > 0) { capture = 1; next }
+            }
+            capture { print }
+          ' CHANGELOG.md > "$notes_file"
+          if [ ! -s "$notes_file" ]; then
+            printf "Release %s\n\nSee CHANGELOG.md for details.\n" "$version" > "$notes_file"
+          fi
+          echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@7b4da11513bf3f43f9999e90eabced41ab8bb048
+        with:
+          body_path: ${{ steps.notes.outputs.notes_file }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/audit/repo-score.json
+            dist/audit/repo-score.md
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
