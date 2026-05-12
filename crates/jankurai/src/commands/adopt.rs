@@ -251,6 +251,7 @@ fn rollout_priority(id: &str) -> usize {
         "ux-qa" => 2,
         "db-migration-analyze" => 3,
         "contract-drift" => 4,
+        "copy-code" => 5,
         "rust-witness" => 5,
         "proof-routing" => 6,
         _ => 99,
@@ -270,6 +271,9 @@ fn next_tool_command(id: &str) -> String {
         }
         "contract-drift" => {
             "cargo run -p jankurai -- audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md".into()
+        }
+        "copy-code" => {
+            "cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md".into()
         }
         "rust-witness" => "cargo run -p jankurai -- rust witness build .".into(),
         _ => "jankurai adopt".into(),

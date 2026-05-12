@@ -1,11 +1,12 @@
 use clap::{Args, Parser, Subcommand};
 use jankurai::audit::policy::AuditMode;
 use jankurai::audit::{run_audit, run_audit_timed_with_options, AuditOptions};
+use jankurai::commands::copy_code::CopyCodeArgs;
 use jankurai::commands::{
-    adopt, agent, badge, bench, cell, certify, conformance, context_pack, coverage, doctor,
-    exceptions, govern, history, hooks, init, kickoff, migrate, optimize, paper, postmortem, proof,
-    proofbind, proofmark, publish, registry, repair, repair_plan, rules, rust, score, security,
-    update, vibe, witness,
+    adopt, agent, badge, bench, cell, certify, conformance, context_pack, copy_code, coverage,
+    doctor, exceptions, govern, history, hooks, init, kickoff, migrate, optimize, paper,
+    postmortem, proof, proofbind, proofmark, publish, registry, repair, repair_plan, rules, rust,
+    score, security, update, vibe, witness,
 };
 use jankurai::render::{render_markdown, write_json, write_markdown};
 use jankurai::report::issues::IssueFormat;
@@ -34,6 +35,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Audit(AuditArgs),
+    CopyCode(CopyCodeArgs),
     Adopt(AdoptArgs),
     Badge(BadgeCliArgs),
     Init(InitArgs),
@@ -1453,6 +1455,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Audit(args)) => {
             run_audit_and_write(args)?;
+        }
+        Some(Commands::CopyCode(args)) => {
+            copy_code::run(args)?;
         }
         Some(Commands::Adopt(args)) => {
             adopt::run(adopt::AdoptArgs {

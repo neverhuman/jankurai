@@ -42,9 +42,24 @@ pub fn analyze(ctx: &AuditContext) -> DimensionResult {
         score += 10;
         evidence.push("most code files stay under 300 LOC".into());
     }
-    if !scan::duplicate_blocks(ctx).is_empty() {
-        score -= 18;
-        evidence.push("duplicate code block marker found".into());
+    if let Some(copy_code) = ctx.copy_code.as_ref() {
+        let hard_count = copy_code.classes.iter().filter(|c| c.hard_fail).count();
+        if hard_count > 0 {
+            score -= 10;
+            evidence.push(format!(
+                "copy-code inexcusable classes found: {} (exact file or same-name function copy)",
+                hard_count
+            ));
+            notes.push(
+                "inexcusable copy-code: exact active-source file copy or same-name unit copy across files"
+                    .into(),
+            );
+        } else if copy_code.summary.warning_classes > 0 {
+            evidence.push(format!(
+                "copy-code advisory classes found: {} (advisory only, no score impact)",
+                copy_code.summary.warning_classes
+            ));
+        }
     }
     if !scan::todo_hits(ctx).is_empty() {
         score -= 20;
@@ -68,7 +83,10 @@ pub fn analyze(ctx: &AuditContext) -> DimensionResult {
         evidence.push("IO markers found in domain/core files".into());
     }
     if max_loc(&files).is_some_and(|max| max <= 350)
-        && scan::duplicate_blocks(ctx).is_empty()
+        && ctx
+            .copy_code
+            .as_ref()
+            .is_none_or(|report| !report.classes.iter().any(|c| c.hard_fail))
         && scan::todo_hits(ctx).is_empty()
         && scan::fallback_hits(ctx).is_empty()
         && scan::future_hostile_hits(ctx).is_empty()

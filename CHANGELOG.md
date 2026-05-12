@@ -8,6 +8,52 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 No user-facing changes yet.
 
+## 1.3.0 - 2026-05-12
+
+### Added
+
+- `copy-code rank` subcommand: stack-rank redundancy classes by total volume
+  across instances (`--top N --by lines|tokens|bytes --kind …`).
+- Volume-aware schema fields on copy-code classes: `instance_count`,
+  `total_redundant_lines`, `total_redundant_tokens`, `total_redundant_bytes`,
+  `effective_severity`, `hard_fail`, `fingerprint`.
+- `agent/copy-code-allowlist.toml`: stable-fingerprint exception mechanism
+  with optional `expires` date.
+- Optional `--cross-check jscpd` bridge: invokes `jscpd` if on `PATH`, records
+  cross-check evidence in `report.notes`. Never affects score.
+- `tools-adoption.toml` entry for `jscpd` (`external_advisory`).
+
+### Changed
+
+- Copy-code hard-fail surface narrowed to **inexcusable cases only**:
+  exact-file duplicates and same-name function/method copies across active
+  source. All other detections are advisory.
+- Sort order across classes now prioritizes total redundant volume across all
+  instances (`(n-1) * per_instance`), not per-instance size.
+- Workspace manifests (`Cargo.toml`, `package.json`, `tsconfig.json`,
+  `pyproject.toml`, `setup.cfg`) demoted to warning-only paths.
+- Derive macros and bare `impl` headers filtered from token-window matching.
+- Copy-code score penalty on the Code shape dimension reduced from -18 to -10.
+
+### Notes
+
+- The copy-code lane schema bumped to `1.1.0`. Existing baselines compatible.
+- Cross-check with `jscpd` is opt-in; install with `npm i -g jscpd`.
+
+## 1.2.0 - 2026-05-12
+
+### Added
+
+- Precision-first `copy-code` lane and `HLT-043-COPY-PASTE-BAD-BEHAVIOR` rule
+  for exact active-source copies and same-name semantic unit duplication.
+- `docs/BAD_COPY.md` plus README, testing, artifact-contract, and standard
+  documentation updates for the new copy-code audit path.
+
+### Changed
+
+- Bumped the auditor/action package release to `1.2.0`; standard compatibility
+  now tracks `0.9.0` and report schema now tracks `1.8.0`.
+
 ## 1.1.0 - 2026-05-12
 
 ### Fixed

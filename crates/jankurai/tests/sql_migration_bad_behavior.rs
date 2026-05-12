@@ -23,11 +23,11 @@ fn write_minimal_standard_repo(dir: &Path) {
     write(&dir.join("Justfile"), "check:\n    cargo test\n");
     write(
         &dir.join("agent/JANKURAI_STANDARD.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     );
     write(
         &dir.join("docs/agent-native-standard.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     );
 }
 

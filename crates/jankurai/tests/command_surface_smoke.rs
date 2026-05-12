@@ -103,6 +103,61 @@ fn run_repair_with_draft(
 }
 
 #[test]
+fn copy_code_help_surfaces_the_new_command() {
+    let output = Command::new(binary_path())
+        .arg("copy-code")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    assert!(help.contains("copy-code"));
+    assert!(help.contains("--json"));
+    assert!(help.contains("--strict"));
+}
+
+#[test]
+fn copy_code_command_writes_schema_valid_artifacts() {
+    let repo = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("schemas")).unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::copy(
+        repo_root().join("schemas/copy-code.schema.json"),
+        repo.path().join("schemas/copy-code.schema.json"),
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("src/a.rs"),
+        "pub fn run() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("src/b.rs"),
+        "pub fn run() { println!(\"hi\"); }\n",
+    )
+    .unwrap();
+
+    let json = repo.path().join("copy-code.json");
+    let md = repo.path().join("copy-code.md");
+    let status = Command::new(binary_path())
+        .arg("copy-code")
+        .arg(repo.path())
+        .arg("--json")
+        .arg(&json)
+        .arg("--md")
+        .arg(&md)
+        .status()
+        .unwrap();
+    assert!(status.success(), "copy-code command failed");
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
+    validation::validate_value(repo.path(), ArtifactSchema::CopyCode, &report).unwrap();
+    assert_eq!(report["summary"]["hard_classes"], 1);
+    assert!(fs::read_to_string(&md).unwrap().contains("## Hard Classes"));
+}
+
+#[test]
 fn new_planner_commands_emit_stable_json_and_markdown() {
     let repo = tempdir().unwrap();
     assert_eq!(fs::read_dir(repo.path()).unwrap().count(), 0);

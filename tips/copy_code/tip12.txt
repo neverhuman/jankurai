@@ -1,0 +1,478 @@
+## Best answer for your stack
+
+For **Python + Rust + Vite + TypeScript + React + Docker**, the smartest fast path is:
+
+1. **Token-based exact/near-exact detection first**: fastest, most reliable, lowest false-positive rate.
+2. **Run per-language or per-source-family scans** instead of mixing everything together.
+3. **Use high thresholds and strict mode first**, then loosen only where needed.
+4. **Use AST/parse-aware methods only for second-pass verification or deeper clone hunting.**
+5. **Avoid semantic/AI clone detection as the primary “no false positives” scanner**; it is useful for exploration, not clean automated enforcement.
+
+“No false positives” is realistic only for **Type-1 / Type-2 clones**: identical code except whitespace/comments, or syntactically identical code with renamed identifiers/literals. Once you search for **Type-3** near-miss clones or **Type-4** semantic clones, you are making a similarity judgment, so results become “candidates” rather than guaranteed duplicates. The standard clone taxonomy distinguishes these four levels clearly. 
+
+---
+
+## Ranked best-known methods
+
+| Rank | Method                                        | Best for                                       |       Speed |               False-positive risk | Best tools / approaches                       |
+| ---: | --------------------------------------------- | ---------------------------------------------- | ----------: | --------------------------------: | --------------------------------------------- |
+|    1 | **Token-based rolling hash / Rabin-Karp**     | Fast repo-wide duplicate detection             |   Very high | Very low if strict/high threshold | **jscpd**, **PMD CPD**                        |
+|    2 | **Token-based inverted index**                | Huge monorepos / cross-repo clone search       |   Very high |                     Low to medium | **SourcererCC-style**                         |
+|    3 | **Parser-normalized line/token comparison**   | Near-miss clones with controlled normalization | Medium/high |                      Low if tuned | **NiCad**                                     |
+|    4 | **AST subtree hashing / tree similarity**     | Structural duplicates, functions/components    |      Medium |                        Low/medium | **Deckard-style**, tree-sitter custom scanner |
+|    5 | **CI duplication metrics**                    | Preventing new duplication                     |      Medium |                  Low if baselined | **SonarQube**                                 |
+|    6 | **Line/text scanners**                        | Dockerfiles, configs, generated-ish text       |   Very high | Medium unless excludes are strict | **Simian**, jscpd                             |
+|    7 | **Semantic / embedding / AI clone detection** | Type-4 “same idea, different code” discovery   |    Variable |              High for enforcement | Use only as exploratory                       |
+
+The key distinction: **token-based scanners are usually the best first move** because they ignore formatting while still preserving enough syntax to avoid a lot of nonsense matches. Research surveys and clone-detection papers distinguish string, token, tree/AST, and semantic approaches; semantic approaches are powerful but historically much harder to scale cleanly across large codebases. ([Computer Science at UC Davis][1])
+
+---
+
+## 1. Use jscpd as the fastest practical first pass
+
+For your exact stack, **jscpd** is probably the best “start here” tool. It supports many formats and uses a Rabin-Karp-style algorithm; its supported formats include Docker, JavaScript, JSX, Python, Rust, TSX, TypeScript, YAML, and many others. ([GitHub][2])
+
+Use it in **strict mode**, with high minimums, and exclude anything generated or dependency-related.
+
+```json
+{
+  "$schema": "https://json.schemastore.org/jscpd.json",
+  "threshold": 0,
+  "minLines": 8,
+  "minTokens": 80,
+  "maxLines": 1000,
+  "mode": "strict",
+  "gitignore": true,
+  "reporters": ["console", "json"],
+  "ignore": [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/.next/**",
+    "**/.vite/**",
+    "**/.turbo/**",
+    "**/coverage/**",
+    "**/target/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/__pycache__/**",
+    "**/vendor/**",
+    "**/__generated__/**",
+    "**/generated/**",
+    "**/*.gen.*",
+    "**/*.generated.*",
+    "**/*.pb.*",
+    "**/*.snap",
+    "**/fixtures/**"
+  ]
+}
+```
+
+Run:
+
+```bash
+npx jscpd . --config .jscpd.json
+```
+
+For very low false positives, start with:
+
+```json
+"minLines": 10,
+"minTokens": 100,
+"mode": "strict"
+```
+
+Then lower to `80` tokens only after reviewing the first report.
+
+---
+
+## 2. Use PMD CPD as a conservative second opinion
+
+**PMD CPD** is another strong token-based duplicate detector. Its docs describe CPD as working across many languages and expose `--minimum-tokens`, language selection, and reporting options. PMD also documents that memory grows roughly linearly with source size, which matters for large monorepos. ([PMD][3])
+
+For your stack, PMD CPD supports **TypeScript**, **Python**, and **Rust** in CPD mode. ([PMD][4])
+
+Run scans **separately by language**:
+
+```bash
+pmd cpd \
+  --minimum-tokens 100 \
+  --dir src \
+  --language ts \
+  --format text
+
+pmd cpd \
+  --minimum-tokens 100 \
+  --dir src \
+  --language python \
+  --format text
+
+pmd cpd \
+  --minimum-tokens 120 \
+  --dir crates \
+  --language rust \
+  --format text
+```
+
+For lowest false positives, **do not initially enable**:
+
+```bash
+--ignore-identifiers
+--ignore-literals
+```
+
+PMD documents these options as disabled by default; when enabled, CPD can find duplicates that are no longer exactly identical. That increases recall but also increases the chance of less useful matches. ([PMD][3])
+
+A very good workflow is:
+
+```text
+jscpd strict results ∩ PMD CPD strict results = very high-confidence duplicates
+```
+
+Anything both tools find is almost certainly worth inspecting.
+
+---
+
+## 3. Use SonarQube for CI gating, not fastest discovery
+
+**SonarQube** is good when you want dashboards, history, and CI policy. For non-Java code, Sonar’s duplication definition defaults to at least **100 successive duplicated tokens** spread over at least **10 lines of code**; Java uses a statement-based threshold. It also lets you tune duplication parameters for non-Java languages. ([Sonar Documentation][5])
+
+SonarQube is not the fastest one-off scanner, but it is excellent for this rule:
+
+```text
+Do not fail the build because old duplicate code exists.
+Fail only when a pull request introduces new duplicated blocks above threshold.
+```
+
+That is the cleanest way to avoid noisy enforcement.
+
+---
+
+## 4. Use NiCad when you want high-quality near-miss clones
+
+If you care about “same code with small edits,” use a parser/normalization-based tool like **NiCad**. NiCad’s approach parses code, pretty-prints or normalizes it, removes comments, optionally applies transformations such as renaming, and then compares fragments with configurable difference thresholds using optimized longest-common-subsequence comparison. Its authors report high precision and high recall. 
+
+NiCad is best when:
+
+```text
+“I want fewer missed near-duplicates, and I am willing to spend more time reviewing results.”
+```
+
+Use conservative thresholds:
+
+```text
+0.00 = exact
+0.10 = up to 10% difference
+0.20 = up to 20% difference
+```
+
+For low false positives, stay around **0.00–0.10**. Do not jump straight to loose thresholds.
+
+---
+
+## 5. Use SourcererCC-style detection for massive codebases
+
+For truly huge repositories or cross-repository clone search, the smartest known method is often an **inverted-index token approach** like **SourcererCC**. The SourcererCC paper describes a token-based detector for exact and near-miss clones, using an optimized inverted index and token-order filtering to reduce comparisons; it reports scaling to **25,000 projects / 250M lines of code** on a standard workstation. 
+
+This is not necessarily the easiest tool to drop into a modern TS/Rust/Python app, but the architecture is important:
+
+```text
+Tokenize blocks
+→ build inverted index
+→ use token-frequency/order filters
+→ compare only plausible candidates
+→ verify candidates with stricter similarity checks
+```
+
+That is the design you want if you build your own internal scanner.
+
+---
+
+## 6. Use AST / tree-similarity only as a second pass
+
+AST-based detection is smarter than plain text matching because it understands structure. A Deckard-style approach parses code into trees, converts subtrees into characteristic vectors, and uses locality-sensitive hashing/clustering to find similar code. The Deckard paper reports applying this to large C and Java codebases and describes it as language-independent when given a grammar. ([Computer Science at UC Davis][1])
+
+For your stack, the modern practical version is:
+
+```text
+tree-sitter parser
+→ split into functions/components/methods
+→ normalize comments/whitespace/import trivia
+→ hash AST subtrees
+→ compare only same AST node kinds
+→ verify with token or AST edit distance
+```
+
+This is especially useful for:
+
+```text
+React components
+Rust functions
+Python functions/classes
+TypeScript service methods
+```
+
+But AST methods are usually slower and more engineering-heavy than jscpd/CPD. I would not start here unless you need a custom scanner.
+
+---
+
+## 7. Use Simian for very fast text/code scanning, especially configs
+
+**Simian** is a fast language-agnostic duplicate-code scanner that claims to scan millions of lines in seconds and supports many human-readable file types, including JavaScript, TypeScript, Python, HTML, XML, and others. ([Simian Similarity Analyzer][6])
+
+Use this kind of scanner for:
+
+```text
+Dockerfiles
+YAML
+shell scripts
+config files
+infra snippets
+```
+
+But be careful: line/text scanners can find “true” duplicates that are not useful, such as repeated dependency lists, repeated config blocks, or boilerplate. For Docker and config files, false positives are controlled mostly by **larger block thresholds and aggressive ignores**.
+
+---
+
+## The tuning recipe for fewest false positives
+
+### 1. Exclude aggressively
+
+Always exclude:
+
+```text
+node_modules
+dist
+build
+.next
+.vite
+.turbo
+coverage
+target
+.venv
+venv
+__pycache__
+vendor
+generated
+__generated__
+*.gen.*
+*.generated.*
+*.pb.*
+*.snap
+fixtures
+```
+
+Also consider excluding or separately scanning:
+
+```text
+migrations
+test snapshots
+Storybook stories
+OpenAPI clients
+Prisma-generated files
+protobuf output
+large route tables
+large constant maps
+translation files
+```
+
+Many “false positives” are not technically false. They are real duplication in code you do not intend to refactor.
+
+---
+
+### 2. Scan by language or domain
+
+Do not mix everything in one quality decision.
+
+Better:
+
+```text
+Scan TypeScript/TSX/JSX together
+Scan Python separately
+Scan Rust separately
+Scan Docker/config separately
+```
+
+Avoid comparing TypeScript to Dockerfiles or Python unless you explicitly want cross-language textual duplication.
+
+---
+
+### 3. Start strict, then loosen
+
+Recommended starting thresholds:
+
+| Code type          | Minimum lines | Minimum tokens | Mode        |
+| ------------------ | ------------: | -------------: | ----------- |
+| TypeScript / React |          8–10 |         80–120 | strict      |
+| Python             |          8–10 |         80–120 | strict      |
+| Rust               |         10–12 |        100–150 | strict      |
+| Docker/config      |          8–15 |         80–150 | strict/text |
+| Tests              |         12–20 |        120–200 | strict      |
+
+Tests often need higher thresholds because repeated setup code is common.
+
+---
+
+### 4. Do not normalize too early
+
+For the first pass, normalize only:
+
+```text
+comments
+whitespace
+formatting
+```
+
+Do **not** initially normalize:
+
+```text
+identifiers
+string literals
+number literals
+type names
+```
+
+Identifier/literal normalization is useful for finding Type-2 clones, but it can also turn unrelated code into “similar-looking” code. Use it only after you have a clean exact-duplicate baseline.
+
+---
+
+### 5. Verify candidates with a stricter second pass
+
+The best low-noise scanners do not just report every candidate. They verify.
+
+Reject a match if:
+
+```text
+It is only imports
+It is only comments
+It is mostly literals/constants
+It is generated code
+It is entirely inside test fixtures
+It is below entropy threshold
+It crosses unrelated languages
+It matches only boilerplate framework patterns
+```
+
+Prefer matches that:
+
+```text
+Cross files or modules
+Contain executable logic
+Repeat full functions or components
+Have 80+ tokens / 8+ lines
+Appear in 2+ production locations
+Would save meaningful LOC if abstracted
+```
+
+---
+
+## The “smartest” pipeline I would use
+
+For a real repo with your stack:
+
+```text
+1. Build an ignore list from .gitignore + custom generated/dependency patterns.
+2. Run jscpd strict across the repo.
+3. Run PMD CPD separately for TypeScript, Python, and Rust.
+4. Intersect or compare the reports.
+5. Mark anything found by both as high confidence.
+6. For Docker/config, use jscpd or Simian with higher thresholds.
+7. For deeper near-miss detection, run NiCad or an AST/tree-sitter pass only on source directories.
+8. In CI, baseline existing duplication and fail only on new duplicate groups.
+```
+
+That gives speed, reliability, and low false positives.
+
+---
+
+## Practical commands
+
+### Fast repo-wide jscpd scan
+
+```bash
+npx jscpd . \
+  --min-lines 10 \
+  --min-tokens 100 \
+  --mode strict \
+  --reporters console,json \
+  --ignore "**/node_modules/**" \
+  --ignore "**/dist/**" \
+  --ignore "**/build/**" \
+  --ignore "**/.next/**" \
+  --ignore "**/.vite/**" \
+  --ignore "**/coverage/**" \
+  --ignore "**/target/**" \
+  --ignore "**/.venv/**" \
+  --ignore "**/__generated__/**" \
+  --ignore "**/generated/**"
+```
+
+### PMD CPD TypeScript
+
+```bash
+pmd cpd \
+  --minimum-tokens 100 \
+  --dir src \
+  --language ts \
+  --format text
+```
+
+### PMD CPD Python
+
+```bash
+pmd cpd \
+  --minimum-tokens 100 \
+  --dir . \
+  --language python \
+  --format text
+```
+
+### PMD CPD Rust
+
+```bash
+pmd cpd \
+  --minimum-tokens 120 \
+  --dir . \
+  --language rust \
+  --format text
+```
+
+---
+
+## Reddit / practitioner signal
+
+Anecdotally, practitioners often complain that broad static-analysis platforms need careful configuration to avoid noisy results, while simpler duplicate-specific tools like CPD can be easier to get useful findings from. One Reddit thread includes a user reporting SonarQube false-positive/noise concerns and another saying PMD CPD found duplicate blocks with no false positives in their case. Treat that as anecdotal, not evidence, but it matches the practical pattern: **small focused duplicate tools are often cleaner than broad quality suites unless the suite is carefully tuned**. ([Reddit][7])
+
+---
+
+## Bottom line
+
+For **really fast + reliable + fewest false positives**, use this order:
+
+```text
+1. jscpd strict, high threshold
+2. PMD CPD per language, high threshold
+3. SonarQube only for CI/baseline/new-code gates
+4. NiCad for near-miss clones
+5. SourcererCC-style indexing for massive scale
+6. AST/tree-sitter custom pass for structural verification
+7. Semantic/AI clone search only for exploration, not enforcement
+```
+
+The highest-confidence setup is:
+
+```text
+jscpd strict + PMD CPD strict + aggressive excludes + high minTokens + CI baseline
+```
+
+That will find the duplicates most likely to be real, actionable, and worth refactoring without drowning you in noise.
+
+[1]: https://www.cs.ucdavis.edu/~su/publications/icse07.pdf "icse07.dvi"
+[2]: https://github.com/kucherenko/jscpd "GitHub - kucherenko/jscpd: Copy/paste detector for programming source code. · GitHub"
+[3]: https://pmd.github.io/pmd/pmd_userdocs_cpd.html "Finding duplicated code with CPD | PMD Source Code Analyzer"
+[4]: https://docs.pmd-code.org/latest/pmd_languages_js_ts.html "JavaScript and TypeScript support | PMD Source Code Analyzer"
+[5]: https://docs.sonarsource.com/sonarqube-server/2025.4/user-guide/code-metrics/metrics-definition "Understanding measures and metrics | SonarQube Server 2025.4 LTA | Sonar Documentation"
+[6]: https://simian.quandarypeak.com/ "Simian Similarity Analyzer"
+[7]: https://www.reddit.com/r/androiddev/comments/d8m88a/any_plugin_to_find_the_duplicate_code_in_project/ "Any plugin to find the duplicate code in project in studio : r/androiddev"
+

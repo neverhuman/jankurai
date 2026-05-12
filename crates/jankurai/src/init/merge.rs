@@ -164,22 +164,22 @@ mod tests {
 
     #[test]
     fn merge_standard_version_toml_replaces_version_keys_and_preserves_extras() {
-        let existing = r#"auditor_version = "0.8.11"
-schema_version = "1.6.0"
+        let existing = r#"auditor_version = "1.1.0"
+schema_version = "1.7.0"
 custom_note = "keep"
 "#;
         let template = r#"standard = "jankurai"
-standard_version = "0.8.0"
+standard_version = "0.9.0"
 paper_edition = "2026.05-ed8"
-auditor_version = "0.8.12"
-schema_version = "1.7.0"
+auditor_version = "1.2.0"
+schema_version = "1.8.0"
 target_stack = "rust-ts-vite-react-postgres-bounded-python"
 "#;
 
         let merged = merge_standard_version_toml(existing, template).unwrap();
 
-        assert!(merged.contains("auditor_version = \"0.8.12\""));
-        assert!(merged.contains("schema_version = \"1.7.0\""));
+        assert!(merged.contains("auditor_version = \"1.2.0\""));
+        assert!(merged.contains("schema_version = \"1.8.0\""));
         assert!(merged.contains("custom_note = \"keep\""));
     }
 

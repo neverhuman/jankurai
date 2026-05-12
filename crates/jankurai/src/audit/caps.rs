@@ -390,7 +390,11 @@ pub fn caps_applied(ctx: &AuditContext, has_destructive_migration_sql: bool) -> 
     if !scan::future_hostile_hits(ctx).is_empty() {
         caps.push("future-hostile-dead-language-in-product-code".into());
     }
-    if !scan::duplicate_blocks(ctx).is_empty() {
+    if ctx
+        .copy_code
+        .as_ref()
+        .is_some_and(|report| report.summary.hard_classes > 0)
+    {
         caps.push("severe-duplication-in-product-code".into());
     }
     if !scan::generated_zone_issues(ctx).is_empty()

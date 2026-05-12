@@ -110,6 +110,7 @@ fn ctx_with_files(files: Vec<FileInfo>) -> AuditContext {
         scope_paths: vec![],
         self_audit: false,
         boundary_reclassifications: vec![],
+        copy_code: None,
     }
 }
 

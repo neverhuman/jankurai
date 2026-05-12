@@ -196,6 +196,7 @@ fn repo_score_markdown_keeps_stable_sections() {
     for needle in [
         "# jankurai Repo Score",
         "## Hard Rule Caps",
+        "## Copy-Code Redundancy",
         "## Dimensions",
         "## Reference Profile Structure",
         "## Rendered UX QA",

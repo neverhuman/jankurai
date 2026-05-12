@@ -74,6 +74,7 @@ fn every_rule_lane_is_valid() {
                 "security",
                 "observability",
                 "audit",
+                "copy-code",
                 "release"
             ]
             .contains(&rule.lane),
@@ -204,7 +205,7 @@ fn confidence_policy_is_consistent_with_severity() {
 
 #[test]
 fn rule_count_matches_expected() {
-    assert_eq!(rules::all().len(), 42, "Expected exactly 42 stable rules");
+    assert_eq!(rules::all().len(), 43, "Expected exactly 43 stable rules");
 }
 
 #[test]

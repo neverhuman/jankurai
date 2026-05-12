@@ -13,6 +13,7 @@ Testing is routed proof. Agents should not guess which tests matter.
 | `security` | secrets, dependencies, SBOM/SCA, workflow lint |
 | `observability` | traces, request IDs, structured error payloads |
 | `audit` | jankurai repo score and hard-rule findings |
+| `copy-code` | exact and high-confidence duplicate source scan |
 | `proofbind` | changed-path to semantic-surface obligation routing |
 | `proofmark-rust` | changed Rust line coverage, focused mutation, and negative proof receipt evidence |
 | `full` | release/merge gate |
@@ -36,6 +37,7 @@ For this workspace:
 - `just ux-qa` builds and tests the optional Playwright geometry runtime.
 - `just fast` writes a deterministic audit snapshot under `target/jankurai/`.
 - `just score` writes local generated audit outputs at `agent/repo-score.json` and `agent/repo-score.md`; these files are ignored and are not accepted ratchet baselines.
+- `jankurai copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md` writes the copy-code redundancy report used for HLT-043 routing.
 - Accepted ratchet and public badge baselines live under `agent/baselines/`. CI copies the reviewed baseline to `target/jankurai/accepted-baseline.json` before the final audit.
 - `just conformance` runs the observed seed fixture suite, validates the
   conformance report schema through Rust tests, and regenerates

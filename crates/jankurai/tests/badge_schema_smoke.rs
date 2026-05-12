@@ -27,13 +27,13 @@ fn badge_command_emits_readme_schema_valid_json() {
     .unwrap();
     fs::write(
         repo.path().join("agent/JANKURAI_STANDARD.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
     fs::create_dir_all(repo.path().join("docs")).unwrap();
     fs::write(
         repo.path().join("docs/agent-native-standard.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
     let report = run_audit(repo.path(), &[]).unwrap();

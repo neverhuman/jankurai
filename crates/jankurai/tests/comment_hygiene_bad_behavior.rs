@@ -34,6 +34,7 @@ fn make_ctx(files: Vec<FileInfo>) -> jankurai::audit::helpers::AuditContext {
         scope_paths: vec![],
         self_audit: false,
         boundary_reclassifications: vec![],
+        copy_code: None,
     }
 }
 

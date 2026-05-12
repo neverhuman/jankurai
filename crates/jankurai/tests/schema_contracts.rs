@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use jankurai::model::{
-    AUDITOR_VERSION, PAPER_EDITION, SCHEMA_VERSION, STANDARD_VERSION, TARGET_STACK_ID,
+    FileInfo, AUDITOR_VERSION, PAPER_EDITION, SCHEMA_VERSION, STANDARD_VERSION, TARGET_STACK_ID,
 };
 use jankurai::validation::{self, ArtifactSchema};
 
@@ -70,6 +70,50 @@ fn coverage_schemas_parse_and_fixtures_validate() {
         "findings": []
     });
     validation::validate_value(&repo, ArtifactSchema::CoverageAudit, &audit).unwrap();
+}
+
+#[test]
+fn copy_code_schema_parses_and_report_validates() {
+    let repo = repo_root();
+    let schema: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repo.join("schemas/copy-code.schema.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        schema["$id"],
+        "https://jankurai.dev/schemas/copy-code.schema.json"
+    );
+
+    let files = vec![
+        FileInfo {
+            rel_path: "src/a.rs".into(),
+            name: "a.rs".into(),
+            suffix: ".rs".into(),
+            size: 32,
+            line_count: 1,
+            text: "pub fn run() { println!(\"hi\"); }\n".into(),
+            is_generated: false,
+            is_code: true,
+        },
+        FileInfo {
+            rel_path: "src/b.rs".into(),
+            name: "b.rs".into(),
+            suffix: ".rs".into(),
+            size: 32,
+            line_count: 1,
+            text: "pub fn run() { println!(\"hi\"); }\n".into(),
+            is_generated: false,
+            is_code: true,
+        },
+    ];
+    let report = jankurai::audit::copy_code::scan_files(
+        &repo,
+        &files,
+        jankurai::audit::copy_code::CopyCodeOptions::default(),
+    );
+    validation::validate_serializable(&repo, ArtifactSchema::CopyCode, &report).unwrap();
+    assert_eq!(report.summary.hard_classes, 1);
+    assert_eq!(report.classes[0].language, "rust");
 }
 
 #[test]
@@ -1194,7 +1238,7 @@ fn vibe_coverage_schemas_parse_and_source_validates() {
     );
     assert_eq!(
         source_schema["properties"]["schema_version"]["const"],
-        "1.7.0"
+        "1.9.0"
     );
     let issue_required = source_schema["$defs"]["issue"]["required"]
         .as_array()
