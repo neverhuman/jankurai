@@ -220,6 +220,7 @@ mod tests {
             all_files: files,
             self_audit: false,
             boundary_reclassifications: vec![],
+            copy_code: None,
         }
     }
 

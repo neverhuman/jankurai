@@ -23,13 +23,13 @@ fn write_pass_repo(repo: &Path) {
     fs::create_dir_all(repo.join("agent")).unwrap();
     fs::write(
         repo.join("agent/JANKURAI_STANDARD.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
     fs::create_dir_all(repo.join("docs")).unwrap();
     fs::write(
         repo.join("docs/agent-native-standard.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
 }

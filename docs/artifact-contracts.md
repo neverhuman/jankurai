@@ -6,6 +6,8 @@ Every durable or generated machine-readable surface should either validate again
 | --- | --- | --- |
 | `agent/repo-score.json` | `schemas/repo-score.schema.json`; `audit_smoke`, `report_compatibility_guard` | Local generated audit report JSON; ignored and not a trusted ratchet baseline |
 | `agent/repo-score.md` | Semantic: `report_compatibility_guard` (title + stable `##` sections) | Local generated human score; see `render.rs` |
+| `target/jankurai/copy-code.json` | `schemas/copy-code.schema.json`; `copy_code_scan`, `command_surface_smoke` | Copy-code redundancy report JSON written by `jankurai copy-code` |
+| `target/jankurai/copy-code.md` | Semantic: `copy_code_scan`, `command_surface_smoke` | Human copy-code redundancy summary |
 | `agent/baselines/main.repo-score.json` | `schemas/repo-score.schema.json`; `baseline_ratchet_smoke`, `badge_schema_smoke` | Tracked accepted baseline and public badge source; copy only from reviewed clean audit output |
 | `target/jankurai/jankurai.sarif` | Semantic: `report_compatibility_guard` | SARIF 2.1.0 envelope |
 | `target/jankurai/jankurai.junit.xml` (or path passed to `--junit`) | Semantic: `report_compatibility_guard` | JUnit-style XML |

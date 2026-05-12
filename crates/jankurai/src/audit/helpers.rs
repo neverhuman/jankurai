@@ -54,6 +54,7 @@ pub struct AuditContext {
     pub scope_paths: Vec<String>,
     pub self_audit: bool,
     pub boundary_reclassifications: Vec<BoundaryReclassification>,
+    pub copy_code: Option<crate::audit::copy_code::CopyCodeReport>,
 }
 
 pub fn weight_for(name: &str) -> u32 {
@@ -180,6 +181,15 @@ pub const TOOL_ADOPTION_CATALOG: &[ToolAdoptionCatalogEntry] = &[
         ci_command: "jankurai proofmark rust . --obligations target/jankurai/proofbind/obligations.json",
         artifact_paths: &["target/jankurai/proofmark/proofmark-receipt.json", "target/jankurai/proofmark/proof-receipt.json"],
         applicability: tool_rust_witness_applicable,
+    },
+    ToolAdoptionCatalogEntry {
+        id: "copy-code",
+        category: "audit",
+        replaced_tools: &["ad hoc copy-code review", "manual duplication triage"],
+        local_command: "cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md",
+        ci_command: "cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md",
+        artifact_paths: &["target/jankurai/copy-code.json", "target/jankurai/copy-code.md"],
+        applicability: tool_copy_code_applicable,
     },
     ToolAdoptionCatalogEntry {
         id: "security",
@@ -466,6 +476,10 @@ fn tool_contract_drift_applicable(ctx: &AuditContext) -> bool {
 
 fn tool_rust_witness_applicable(ctx: &AuditContext) -> bool {
     has_rust_surface(ctx)
+}
+
+fn tool_copy_code_applicable(ctx: &AuditContext) -> bool {
+    product_code_files(ctx).iter().any(|f| f.is_code)
 }
 
 fn tool_vibe_coverage_applicable(ctx: &AuditContext) -> bool {

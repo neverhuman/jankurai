@@ -230,6 +230,9 @@ pub fn rerun_command_for_lane(lane: Option<&str>) -> &'static str {
         "db-migration-analyze" => {
             "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json"
         }
+        "copy-code" => {
+            "cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md"
+        }
         "web" | "e2e" => "just ux-qa",
         "fast" => "just fast",
         "release" => "just check",
@@ -365,6 +368,7 @@ mod tests {
             scope_paths: vec![],
             self_audit: false,
             boundary_reclassifications: vec![],
+            copy_code: None,
         }
     }
 

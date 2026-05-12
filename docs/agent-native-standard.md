@@ -1,7 +1,7 @@
 # jankurai Agent-Native Repository Standard
 
-Standard version: `0.8.0`
-Published: `2026-05-05`
+Standard version: `0.9.0`
+Published: `2026-05-12`
 Paper: `Jankurai: A Versioned Repository Conformance Standard for Trustworthy AI-Assisted Merge`
 Public thesis line: `No proof, no merge; no receipt, no trust.`
 Target stack: Rust core, TypeScript/React/Vite product surface, PostgreSQL truth, generated contracts, exception-only Python AI/data service.
@@ -110,8 +110,9 @@ Stable rule IDs:
 | `HLT-040-REPO-ROT-BAD-BEHAVIOR` | Active source contains ambiguous old, backup, copied, parked, or hard-disabled code without owner, proof lane, expiry, and cleanup plan |
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
 | `HLT-042-CI-LOCAL-PARITY` | CI workflows do not delegate to versioned `ops/ci/*.sh` scripts, so failures cannot be reproduced locally before push |
+| `HLT-043-COPY-PASTE-BAD-BEHAVIOR` | Exact active-source duplicate files and same-name semantic units are copied across owner boundaries |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed in this release. `HLT-030` through `HLT-042` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed in this release. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family.
 
 Centerline drift is the delta between claimed conformance and observed repository behavior. Hard caps are versioned policy, not final empirical truth.
 

@@ -904,6 +904,26 @@ pub const RULES: &[RuleSpec] = &[
         cap_key: Some("ci-local-parity"),
         confidence_policy: ConfidencePolicy::High,
     },
+    RuleSpec {
+        id: "HLT-043-COPY-PASTE-BAD-BEHAVIOR",
+        name: "Copy-code redundancy in active source",
+        category: "copy-code",
+        tlr: "Maintainability entropy",
+        lane: "copy-code",
+        docs_url: "docs/BAD_COPY.md",
+        owner_hint: "tools",
+        evidence_kind: "repository-scan",
+        severity: "high",
+        repairable: true,
+        repair_eligibility: RepairEligibility::HumanRequired,
+        repair_risk: RepairRisk::High,
+        repair_reason:
+            "high-confidence copy-code classes should be consolidated under one owner before repair",
+        status: RuleStatus::Stable,
+        standard_section: "Copy-Code Redundancy",
+        cap_key: Some("severe-duplication-in-product-code"),
+        confidence_policy: ConfidencePolicy::High,
+    },
 ];
 
 pub fn all() -> &'static [RuleSpec] {

@@ -158,6 +158,9 @@ fn path_rot_hits(file: &FileInfo) -> Vec<LanguageFinding> {
         .next()
         .and_then(|name| name.split('.').next())
         .unwrap_or(lower.as_str());
+    if file_stem.starts_with("copy_code") {
+        return out;
+    }
     let fake_versioned_file = FAKE_VERSION_SUFFIX_RE.is_match(file_stem)
         || file_stem.contains("copy-of")
         || file_stem.contains("final-final");

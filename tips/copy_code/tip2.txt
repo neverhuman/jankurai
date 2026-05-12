@@ -1,0 +1,315 @@
+## Best overall strategy: use a **cascade**, not one detector
+
+For “really fast” and “few to no false positives,” the smartest approach is:
+
+**exact normalized hashing → token/shingle clone detector → AST/parser verification → only then semantic/ML discovery.**
+
+This is the same direction the serious clone-detection literature points toward: cheap candidate generation first, then stricter verification. SourcererCC, for example, scales by using a token-based inverted index plus filtering heuristics to reduce comparisons, and reported high precision/recall at 250MLOC scale. ([arXiv][1]) NiCad uses parser extraction, normalization, pretty-printing, and LCS-based comparison thresholds to catch exact and near-miss clones with high precision/recall. 
+
+The key insight: **only exact or normalized-structural equality can get you near-zero false positives**. “Near duplicate” and “semantic duplicate” detection always involves judgment, so use them as candidate finders, not automatic CI blockers.
+
+---
+
+## Top techniques, ranked
+
+| Rank | Technique                                            |          Speed |            False positives | Best for                                        |
+| ---: | ---------------------------------------------------- | -------------: | -------------------------: | ----------------------------------------------- |
+|    1 | **Exact canonical hashes** of files/functions/blocks | Extremely fast |                  Near zero | Verbatim duplicates, generated copies           |
+|    2 | **Normalized token hashes**                          | Extremely fast |                   Very low | Same logic with renamed variables/literals      |
+|    3 | **Rabin-Karp / winnowing / token shingles**          |      Very fast | Low if thresholds are high | TypeScript, TSX, Python, Rust, Dockerfile       |
+|    4 | **AST subtree hashing / Merkle AST hashes**          |           Fast |                   Very low | Function/component-level structural clones      |
+|    5 | **Parser-normalized near-miss detection** like NiCad |    Medium-fast |                        Low | Python function/block clones, serious audits    |
+|    6 | **AST vector / tree similarity** like Deckard        |         Medium |                 Medium-low | Larger structural similarity discovery          |
+|    7 | **ML / embeddings / semantic clone detection**       | Usually slower |                     Higher | Research/discovery, not “no false positives” CI |
+
+Clone literature usually describes Type 1 as exact clones, Type 2 as renamed/lexically similar clones, Type 3 as syntactically similar with inserted/deleted/modified statements, and Type 4 as semantically equivalent despite syntactic differences. ([wu-yueming.github.io][2]) Type 4 detection is where false positives rise sharply; even a 2024 ICSE paper notes that complex semantic clones are rarer in real-world scenarios and that heavy neural approaches can be computationally expensive, while token extraction is fast and scalable. ([wu-yueming.github.io][2])
+
+---
+
+## Best tools for your stack
+
+### 1. **jscpd** — best first-pass scanner for Python/Rust/TypeScript/React/Docker
+
+Use this first. It is fast, easy, CI-friendly, supports 150+ formats, and explicitly supports JavaScript, JSX, TypeScript, TSX, Python, Rust, and Docker. ([jscpd][3]) Its GitHub README says it uses the Rabin-Karp algorithm for duplicate search. ([GitHub][4]) The docs expose exactly the knobs you need for precision: `minLines`, `minTokens`, `maxSize`, `threshold`, `pattern`, `ignore`, and `.gitignore` support. ([jscpd][5])
+
+**Recommended jscpd config for low false positives:**
+
+```json
+{
+  "threshold": 0,
+  "reporters": ["console", "html", "json"],
+  "minLines": 10,
+  "minTokens": 80,
+  "maxLines": 1000,
+  "maxSize": "100kb",
+  "gitignore": true,
+  "ignore": [
+    "**/.git/**",
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/coverage/**",
+    "**/.turbo/**",
+    "**/.vite/**",
+    "**/.next/**",
+    "**/target/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/__pycache__/**",
+    "**/__generated__/**",
+    "**/generated/**",
+    "**/*.generated.*",
+    "**/*.gen.*",
+    "**/*.pb.*",
+    "**/*.snap",
+    "**/*.min.*",
+    "**/package-lock.json",
+    "**/pnpm-lock.yaml",
+    "**/yarn.lock",
+    "**/Cargo.lock"
+  ]
+}
+```
+
+Run:
+
+```bash
+npx jscpd \
+  --reporters console,html,json \
+  --min-lines 10 \
+  --min-tokens 80 \
+  --threshold 0 \
+  ./src ./packages ./apps ./crates
+```
+
+For React/TSX, do not set `minLines` too low. Low thresholds catch imports, props boilerplate, test setup, and repeated JSX layout fragments that are not worth refactoring. A Reddit TypeScript thread also points practitioners toward jscpd, while another suggestion there was jsinspect; treat that as anecdotal community signal, not primary evidence. ([Reddit][6])
+
+---
+
+### 2. **PMD CPD** — excellent independent confirmation pass
+
+PMD’s Copy/Paste Detector is mature and supports JavaScript/TypeScript, Python, and Rust for CPD. The PMD docs list TypeScript as CPD-capable, Python as CPD-capable, and Rust as CPD-capable. ([docs.pmd-code.org][7]) CPD also has CI-friendly exit codes and `--skip-duplicate-files`; its docs note linear memory growth with analyzed source size. ([pmd.github.io][8])
+
+Run separate language passes:
+
+```bash
+pmd cpd --minimum-tokens 100 --language ts \
+  --dir src --dir packages --format text --skip-duplicate-files
+
+pmd cpd --minimum-tokens 100 --language python \
+  --dir . --format text --skip-duplicate-files
+
+pmd cpd --minimum-tokens 100 --language rust \
+  --dir crates --format text --skip-duplicate-files
+```
+
+Important precision note: PMD options like `--ignore-identifiers` and `--ignore-literals` are not universal; the docs show those particular options as Java/C++-specific. ([pmd.github.io][8]) So for TypeScript/Python/Rust, rely mainly on higher `--minimum-tokens`, strong excludes, and cross-checking with jscpd or AST hashing.
+
+---
+
+### 3. **Custom tree-sitter AST hashing** — smartest “fewest false positives” method
+
+For a serious mixed-language codebase, the best custom detector is:
+
+1. Use Tree-sitter to parse Python, Rust, TypeScript, TSX, and optionally Dockerfile.
+2. Extract meaningful units: functions, methods, React components, hooks, Rust impl methods, Python class methods.
+3. Canonicalize each unit:
+
+   * remove comments/whitespace
+   * normalize identifiers to placeholders
+   * normalize literals to `LIT`
+   * optionally sort object keys/imports only when safe
+   * preserve operators, control flow, call shape, JSX tag structure
+4. Compute a hash of the canonical token stream.
+5. Compute a Merkle hash of AST node kinds and child hashes.
+6. Report only when both token similarity and AST shape agree.
+
+Tree-sitter is especially well-suited here because it is designed to build concrete syntax trees quickly, update them incrementally, and tolerate syntax errors. Its upstream parser list includes Python, Rust, and TypeScript, and the TypeScript grammar explicitly includes separate TypeScript and TSX grammars. ([Tree-sitter][9]) There is also a third-party Dockerfile grammar, but for Dockerfiles I would usually use exact/token matching only because they are short and boilerplate-heavy. ([GitHub][10])
+
+This custom method is the strongest path to **near-zero false positives** because it reports “these two functions/components have the same normalized structure,” not merely “these windows share tokens.”
+
+---
+
+### 4. **NiCad** — strongest high-quality near-miss detector, but mostly for supported languages
+
+NiCad is one of the best-known academic/open-source clone detectors. It supports files/functions/blocks, uses parsing + normalization + comparison, and its default plugins include Python, but not TypeScript/Rust out of the box. ([GitHub][11]) The NiCad tool paper says it combines language-sensitive parsing with language-independent similarity analysis, removes comments/normalizes formatting, and uses thresholds such as 0.0, 0.1, 0.2 for exact to near-miss clones. 
+
+Use NiCad when you want a **second, stricter Python audit**:
+
+```bash
+nicad functions python path/to/project default-report
+nicad blocks python path/to/project default-report
+```
+
+For your stack, NiCad is not the first choice across everything, but it is excellent for Python clone review.
+
+---
+
+### 5. **SourcererCC-style indexing** — best architecture for huge monorepos
+
+SourcererCC’s key idea is what I would copy for “really really fast”: tokenize blocks, index tokens, use ordering/filtering to shrink comparisons, then verify candidate pairs. It targets exact, Type 2, and Type 3 clones and uses an optimized inverted index plus filtering heuristics to reduce code-block comparisons. ([arXiv][1])
+
+In practice, implement this as:
+
+```text
+unit -> normalized token multiset / k-grams
+     -> inverted index token/kgram -> unit ids
+     -> candidate pairs only if enough overlap is possible
+     -> verify with token LCS / AST hash / edit distance
+```
+
+This scales much better than pairwise comparison.
+
+---
+
+### 6. **Deckard / AST vector similarity** — useful discovery, not strict CI
+
+Deckard is a classic tree-based approach: parse code into ASTs, convert subtrees into numerical vectors, and cluster similar vectors. Its paper reports scalability and accuracy on large C/Java systems including the Linux kernel and JDK. ([Computer Science UC Davis][12])
+
+This is powerful for finding structural similarity, but I would not use AST-vector similarity alone as a blocker. Use it for audits, then verify candidates with canonical AST/token comparison.
+
+---
+
+### 7. **ML / embeddings / semantic clone tools** — only as advisory discovery
+
+Do not use embeddings as your first scanner if your priority is “fewest to no false positives.” They are attractive for Type 4 semantic clones, but Type 4 is the hardest category to validate. Recent work like Toma argues for lightweight token-based ML because complex semantic clone detection can be costly, and token features can be extracted quickly at scale. ([wu-yueming.github.io][2])
+
+Good use of ML: “show me possible duplicated business logic to review.”
+
+Bad use of ML: “fail the build because these two snippets are semantically duplicated.”
+
+---
+
+## Language-specific guidance
+
+### TypeScript / React / Vite
+
+Use jscpd first, PMD CPD second, AST hashing for serious cleanup.
+
+Exclude:
+
+```text
+node_modules
+dist
+build
+coverage
+.vite
+.turbo
+.next
+storybook-static
+*.snap
+*.generated.*
+__generated__
+```
+
+For React, compare at **component/hook/function** granularity. Do not flag tiny JSX fragments. Repeated JSX wrappers, prop drilling, test render helpers, stories, and mock data are common false positives. Use `minTokens >= 80` and preferably `minLines >= 10`.
+
+### Python
+
+Use jscpd + PMD CPD; use NiCad for high-quality near-miss function/block detection.
+
+Exclude:
+
+```text
+.venv
+venv
+__pycache__
+migrations
+*.pb.py
+*_pb2.py
+generated
+```
+
+Whether to exclude migrations depends on your goal. For maintainability cleanup, exclude them. For auditing accidental copy/paste in application logic, definitely exclude them.
+
+### Rust
+
+Use jscpd + PMD CPD; for custom detection, tree-sitter Rust AST hashing is very effective.
+
+Exclude:
+
+```text
+target
+Cargo.lock
+generated bindings
+schema-generated code
+```
+
+Be careful with macros. Source-level clone detectors see macro invocations, not expanded code. That is usually fine for duplicate source cleanup, but do not interpret macro-heavy similarity as semantic duplication.
+
+### Docker / Dockerfiles
+
+jscpd supports Docker format. ([jscpd][3]) But Dockerfiles are short and often intentionally repetitive, so use high thresholds or exact-only detection. Flagging repeated `apt-get update`, `COPY package*.json`, or multi-stage boilerplate is often noise.
+
+---
+
+## Lowest-false-positive recipe
+
+Use these rules:
+
+1. **Never scan everything.** Respect `.gitignore`, then explicitly skip generated, vendor, build, cache, lock, snapshot, minified, and dependency folders.
+2. **Do not compare across unrelated languages.** Python-vs-TypeScript semantic clone detection is interesting research, not low-FP engineering.
+3. **Compare meaningful units, not arbitrary tiny windows.** Function, method, component, hook, Rust impl method, Python class method.
+4. **Raise thresholds.** Start with `minTokens: 80–120` and `minLines: 10–15`.
+5. **Require two signals for near-miss clones.** Example: token similarity ≥ 0.85 and AST shape hash/edit similarity ≥ 0.80.
+6. **Ignore import-only/header-only matches.** These are among the most common duplicate-code false positives.
+7. **Separate “new duplication” from “existing debt.”** Baseline current duplicates; fail CI only when a PR introduces new clone classes.
+8. **Sort by refactorability, not clone size alone.** Two 80-line test fixtures may be harmless; two 30-line business-rule functions may matter.
+
+---
+
+## Practical CI setup
+
+Use jscpd as the fast default:
+
+```bash
+npx jscpd \
+  --config .jscpd.json \
+  ./src ./apps ./packages ./crates
+```
+
+Then run PMD CPD as a second opinion on core source directories:
+
+```bash
+pmd cpd --minimum-tokens 100 --language ts --dir src --format text --skip-duplicate-files
+pmd cpd --minimum-tokens 100 --language python --dir . --format text --skip-duplicate-files
+pmd cpd --minimum-tokens 100 --language rust --dir crates --format text --skip-duplicate-files
+```
+
+For very large monorepos, build a persistent index keyed by Git blob SHA:
+
+```text
+file blob sha -> parsed units -> canonical hashes -> token shingles -> AST hashes
+```
+
+On each PR:
+
+```text
+changed files -> changed units -> compare against full index -> report only new clone classes
+```
+
+That is the fastest reliable architecture because unchanged code never gets reparsed.
+
+---
+
+## My strongest recommendation
+
+For your stack, the best known practical combo is:
+
+**jscpd with strict thresholds + PMD CPD confirmation + custom tree-sitter normalized AST hashing for high-confidence findings.**
+
+Use **jscpd** for breadth and speed, **PMD CPD** for independent validation, and **tree-sitter AST hashing** when you want the fewest false positives possible. Use **NiCad** for deeper Python audits. Avoid ML/embedding-only clone detection as a CI blocker.
+
+[1]: https://arxiv.org/abs/1512.06448 "[1512.06448] SourcererCC: Scaling Code Clone Detection to Big Code"
+[2]: https://wu-yueming.github.io/Files/ICSE2024_Toma.pdf "Machine Learning is All You Need: A Simple Token-based Approach for Effective Code Clone Detection"
+[3]: https://jscpd.dev/getting-started/supported-formats "Supported Formats - jscpd"
+[4]: https://github.com/kucherenko/jscpd "GitHub - kucherenko/jscpd: Copy/paste detector for programming source code. · GitHub"
+[5]: https://jscpd.dev/getting-started/configuration "Configuration - jscpd"
+[6]: https://www.reddit.com/r/typescript/comments/64yh26/tools_for_finding_duplication_in_typescript_code/ "Tools for finding duplication in TypeScript code? : r/typescript"
+[7]: https://docs.pmd-code.org/latest/pmd_languages_js_ts.html "JavaScript and TypeScript support | PMD Source Code Analyzer"
+[8]: https://pmd.github.io/pmd/pmd_userdocs_cpd.html "Finding duplicated code with CPD | PMD Source Code Analyzer"
+[9]: https://tree-sitter.github.io/tree-sitter/ "Introduction - Tree-sitter"
+[10]: https://github.com/camdencheek/tree-sitter-dockerfile?utm_source=chatgpt.com "camdencheek/tree-sitter-dockerfile"
+[11]: https://github.com/CordyJ/Open-NiCad "GitHub - CordyJ/Open-NiCad: NiCad Clone Detector · GitHub"
+[12]: https://www.cs.ucdavis.edu/~su/publications/icse07.pdf "icse07.dvi"
+

@@ -293,6 +293,7 @@ mod tests {
                 rerun_command: "test".into(),
                 suppresses_python_stack_caps: false,
             }],
+            copy_code: None,
         }
     }
 

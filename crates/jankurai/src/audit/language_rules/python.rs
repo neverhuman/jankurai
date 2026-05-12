@@ -363,6 +363,7 @@ mod tests {
             scope_paths: vec![],
             self_audit: false,
             boundary_reclassifications: vec![],
+            copy_code: None,
         }
     }
 

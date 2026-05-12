@@ -53,7 +53,7 @@ The audit is strict on purpose. It is not a general-purpose repo quality score. 
 | vibe placeholders in product code | 68 | replace TODO/stub/unimplemented/unreachable with real behavior or typed exceptions |
 | fallback soup in product code | 70 | replace fallback chains with explicit states, bounded retries, telemetry, docs |
 | future-hostile/dead-language in product runtime code | 64 | remove or rename dead/temporary/legacy wording, implement the state, or move copy/docs/generated/vendor text into an allowlisted context |
-| severe duplication in product code | 70 | extract one named boundary and test it before editing behavior |
+| severe duplication in product code | 70 | extract one named boundary and test it before editing behavior; hard classes must come from HLT-043 copy-code evidence, not crude line-window matches |
 | generated zone mutation risk | 76 | add generated zone manifest and repair generated files from source contracts |
 | direct DB access from wrong layer | 66 | move SQL and DB clients to `crates/adapters` or `db/` |
 | missing web e2e lane | 82 | add Playwright or equivalent e2e tests for critical user flows |

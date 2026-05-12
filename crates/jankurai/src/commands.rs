@@ -9,6 +9,7 @@ pub mod ci;
 pub mod conformance;
 pub mod context_data;
 pub mod context_pack;
+pub mod copy_code;
 pub mod coverage;
 pub mod doctor;
 pub mod exceptions;

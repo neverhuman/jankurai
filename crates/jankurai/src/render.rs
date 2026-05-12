@@ -92,6 +92,74 @@ pub fn render_markdown(report: &Report) -> String {
         };
         let _ = writeln!(out, "| `{}` | {} | {} |", rule.id, rule.max_score, mark);
     }
+    if let Some(copy_code) = &report.copy_code {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "## Copy-Code Redundancy");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "- Status: `{}` hard=`{}` warning=`{}` files=`{}`",
+            copy_code.status,
+            copy_code.summary.hard_classes,
+            copy_code.summary.warning_classes,
+            copy_code.summary.files_considered
+        );
+        let _ = writeln!(
+            out,
+            "- Policy: min-lines=`{}` min-tokens=`{}` max-findings=`{}` include-tests=`{}` strict=`{}`",
+            copy_code.policy.min_lines,
+            copy_code.policy.min_tokens,
+            copy_code.policy.max_findings,
+            copy_code.policy.include_tests,
+            copy_code.policy.strict
+        );
+        let _ = writeln!(
+            out,
+            "- Duplicate volume: lines=`{}` tokens=`{}` bytes=`{}`",
+            copy_code.summary.duplicate_lines,
+            copy_code.summary.duplicate_tokens,
+            copy_code.summary.duplicate_bytes
+        );
+        if !copy_code.notes.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(out, "- Notes:");
+            for note in &copy_code.notes {
+                let _ = writeln!(out, "  - {note}");
+            }
+        }
+        if !copy_code.classes.is_empty() {
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "| Kind | Severity | Language | Lines | Tokens | Instances | Reason |"
+            );
+            let _ = writeln!(out, "| --- | --- | --- | ---: | ---: | --- | --- |");
+            for class in &copy_code.classes {
+                let instances = class
+                    .instances
+                    .iter()
+                    .map(|instance| {
+                        format!(
+                            "{}:{}-{}",
+                            instance.path, instance.start_line, instance.end_line
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(
+                    out,
+                    "| `{:?}` | `{:?}` | `{}` | {} | {} | `{}` | `{}` |",
+                    class.kind,
+                    class.severity,
+                    class.language,
+                    class.duplicate_lines,
+                    class.duplicate_tokens,
+                    instances,
+                    class.reason
+                );
+            }
+        }
+    }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Dimensions");
     let _ = writeln!(out);

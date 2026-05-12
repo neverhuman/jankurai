@@ -34,13 +34,13 @@ fn init_repo() -> tempfile::TempDir {
     fs::create_dir_all(dir.path().join("agent")).unwrap();
     fs::write(
         dir.path().join("agent/JANKURAI_STANDARD.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
     fs::create_dir_all(dir.path().join("docs")).unwrap();
     fs::write(
         dir.path().join("docs/agent-native-standard.md"),
-        "Standard version: `0.8.0`\n",
+        "Standard version: `0.9.0`\n",
     )
     .unwrap();
 
@@ -313,8 +313,8 @@ fn max_rows_and_max_bytes_drop_oldest_rows() {
     let history = repo.path().join("target/jankurai/manual-history.jsonl");
     let row_a = serde_json::json!({
         "schema_version": "1.1.0",
-        "standard_version": "0.8.0",
-        "auditor_version": "0.8.0",
+        "standard_version": "0.9.0",
+        "auditor_version": "1.2.0",
         "generated_at": "1",
         "run_id": "1",
         "repo_id": "sha256:repo",
@@ -340,8 +340,8 @@ fn max_rows_and_max_bytes_drop_oldest_rows() {
     });
     let row_b = serde_json::json!({
         "schema_version": "1.1.0",
-        "standard_version": "0.8.0",
-        "auditor_version": "0.8.0",
+        "standard_version": "0.9.0",
+        "auditor_version": "1.2.0",
         "generated_at": "2",
         "run_id": "2",
         "repo_id": "sha256:repo",
@@ -367,8 +367,8 @@ fn max_rows_and_max_bytes_drop_oldest_rows() {
     });
     let row_c = serde_json::json!({
         "schema_version": "1.1.0",
-        "standard_version": "0.8.0",
-        "auditor_version": "0.8.0",
+        "standard_version": "0.9.0",
+        "auditor_version": "1.2.0",
         "generated_at": "3",
         "run_id": "3",
         "repo_id": "sha256:repo",
@@ -507,8 +507,8 @@ fn restore_filters_by_current_repo_id_and_writes_compact_local_history() {
     let rows = vec![
         serde_json::json!({
             "schema_version": "1.1.0",
-            "standard_version": "0.8.0",
-            "auditor_version": "0.8.0",
+            "standard_version": "0.9.0",
+            "auditor_version": "1.2.0",
             "generated_at": "1",
             "run_id": "1",
             "repo_id": current_repo_id,
@@ -534,8 +534,8 @@ fn restore_filters_by_current_repo_id_and_writes_compact_local_history() {
         }),
         serde_json::json!({
             "schema_version": "1.1.0",
-            "standard_version": "0.8.0",
-            "auditor_version": "0.8.0",
+            "standard_version": "0.9.0",
+            "auditor_version": "1.2.0",
             "generated_at": "2",
             "run_id": "2",
             "repo_id": "sha256:other",
@@ -561,8 +561,8 @@ fn restore_filters_by_current_repo_id_and_writes_compact_local_history() {
         }),
         serde_json::json!({
             "schema_version": "1.1.0",
-            "standard_version": "0.8.0",
-            "auditor_version": "0.8.0",
+            "standard_version": "0.9.0",
+            "auditor_version": "1.2.0",
             "generated_at": "3",
             "run_id": "3",
             "repo_id": current_repo_id,

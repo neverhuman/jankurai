@@ -78,6 +78,7 @@ fn ctx_with_files(files: Vec<FileInfo>) -> jankurai::audit::helpers::AuditContex
         scope_paths: vec![],
         self_audit: false,
         boundary_reclassifications: vec![],
+        copy_code: None,
     }
 }
 

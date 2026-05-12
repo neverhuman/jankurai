@@ -90,6 +90,17 @@ fn web_security_and_repo_rot_rules_are_registered() {
 }
 
 #[test]
+fn copy_code_rule_is_registered() {
+    let rule = rules::lookup("HLT-043-COPY-PASTE-BAD-BEHAVIOR")
+        .expect("HLT-043-COPY-PASTE-BAD-BEHAVIOR must exist in registry");
+    assert_eq!(rule.category, "copy-code");
+    assert_eq!(rule.lane, "copy-code");
+    assert_eq!(rule.cap_key, Some("severe-duplication-in-product-code"));
+    assert_eq!(rule.docs_url, "docs/BAD_COPY.md");
+    assert_eq!(rule.status, rules::RuleStatus::Stable);
+}
+
+#[test]
 fn language_bad_behavior_rules_are_registered() {
     for (rule_id, category, lane, cap_key) in [
         (

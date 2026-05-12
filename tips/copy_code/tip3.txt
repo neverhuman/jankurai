@@ -1,0 +1,315 @@
+## Best answer: use a **two-pass deterministic pipeline**
+
+For your stack — Python, Rust, Vite, TypeScript, Docker, React/TSX — the smartest practical setup is:
+
+**Pass 1: very fast polyglot token fingerprinting** with high thresholds and aggressive exclusions.
+**Pass 2: AST/code-unit validation** for the candidates you actually care about.
+**CI: fail only on strict exact/structural duplicates; report near-misses without blocking.**
+
+That gives you speed, broad language coverage, and very low false positives. “No false positives” is only realistic when you restrict the gate to large exact or structurally equivalent clones; once you ask for near-miss or semantic clones, relevance becomes a design judgment.
+
+Clone-detection research usually distinguishes Type-1 exact clones, Type-2 clones with renamed identifiers/literals, Type-3 near-miss clones with edits, and Type-4 semantic clones that perform the same computation with different syntax. For low false positives, gate on Type-1 and conservative Type-2; keep Type-3 as review-only; avoid Type-4 as an automated blocker. ([cs.usask.ca][1])
+
+---
+
+## 1. Fastest high-signal method: **token fingerprinting / rolling hashes / winnowing**
+
+This is the best first scan. It tokenizes code, hashes token windows, indexes fingerprints, and reports long repeated regions. It is extremely fast because it avoids naïve pairwise comparison across every file. The classic MOSS/winnowing work is still important here: it indexes fingerprints, compares documents through that index, supports ignoring boilerplate, and reduces false positives by using larger match thresholds. ([Theory at Stanford][2])
+
+### Best tool for your stack: **jscpd**
+
+Use **jscpd** as the first-pass scanner. It is open source, supports 150+ languages/formats, and explicitly lists formats relevant to your stack including JavaScript, JSX, TypeScript, TSX, Python, Rust, Docker, YAML, and related config formats. It uses Rabin-Karp-style detection and provides console, HTML, JSON, XML, and other report outputs. ([GitHub][3])
+
+Recommended `.jscpd.json` for low-noise first pass:
+
+```json
+{
+  "minLines": 10,
+  "minTokens": 80,
+  "reporters": ["console", "html", "json"],
+  "gitignore": true,
+  "ignore": [
+    "**/node_modules/**",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/coverage/**",
+    "**/.next/**",
+    "**/.turbo/**",
+    "**/target/**",
+    "**/__snapshots__/**",
+    "**/generated/**",
+    "**/*.generated.*",
+    "**/*.gen.*",
+    "**/*.min.js",
+    "**/migrations/**",
+    "**/fixtures/**",
+    "**/package-lock.json",
+    "**/pnpm-lock.yaml",
+    "**/yarn.lock",
+    "**/Cargo.lock"
+  ]
+}
+```
+
+Then run:
+
+```bash
+npx jscpd .
+```
+
+jscpd’s own config docs expose the knobs that matter for false-positive control: `minLines`, `minTokens`, `ignore`, `threshold`, reporters, `.gitignore` handling, and options for skipping local matches. ([jscpd][4])
+
+**My suggested starting thresholds:**
+
+| Area                  | `minLines` | `minTokens` | Why                                     |
+| --------------------- | ---------: | ----------: | --------------------------------------- |
+| Python business logic |      10–12 |      80–120 | Avoid import/setup noise                |
+| Rust                  |      10–15 |     100–150 | Avoid small helper/trait noise          |
+| TypeScript services   |      10–12 |      80–120 | Good default                            |
+| React/TSX             |      12–20 |     120–180 | JSX props/markup repeat a lot           |
+| Dockerfiles/YAML      |      12–20 |     120–200 | Config duplication is often intentional |
+
+For speed and reliability, this is usually the best “run it now” answer.
+
+---
+
+## 2. Smartest low-false-positive method: **AST fingerprinting / structural clone detection**
+
+Token matching is fast, but AST matching is smarter. It parses code into syntax trees, normalizes irrelevant details, and compares structural units like functions, methods, components, or blocks. This reduces junk matches because you are comparing meaningful code structures, not arbitrary text slices.
+
+### Best modern all-in-one option: **Qlty**
+
+Qlty’s duplication engine is written in Rust and is based on Tree-sitter. Its docs describe the approach as parsing ASTs, recursively fingerprinting nodes, retaining structural information while discarding literal information such as variable names, indexing fingerprints, outputting largest matches, and filtering small sections. That is exactly the shape of a good low-false-positive clone detector. ([Qlty Docs][5])
+
+Useful commands:
+
+```bash
+curl https://qlty.sh | sh
+qlty init
+qlty smells --all
+```
+
+For PR-only / changed-code analysis:
+
+```bash
+qlty smells --upstream origin/main
+```
+
+Qlty’s CLI docs say `qlty smells` detects code smells such as duplication and complexity, supports analyzing all files with `--all`, changed-code mode by default, upstream comparison, and test inclusion controls. Its quickstart also shows `qlty init` and `qlty smells --all`. ([Qlty Docs][6])
+
+This is the best “smart scanner” layer after jscpd: jscpd finds broad candidates fast; Qlty gives you AST-aware duplication findings with less arbitrary text noise.
+
+---
+
+## 3. Conservative exact/near-exact detector: **PMD CPD**
+
+PMD’s **Copy/Paste Detector** is a long-running, conservative option. It supports many languages, and its CPD-capable language list includes JavaScript/TypeScript, Python, and Rust. It is especially useful when you want a strict, old-school detector that can be run per language with high `--minimum-tokens`. ([PMD][7])
+
+Example runs:
+
+```bash
+pmd cpd --dir src --language typescript --minimum-tokens 100 --format text
+pmd cpd --dir .   --language python     --minimum-tokens 100 --format text
+pmd cpd --dir .   --language rust       --minimum-tokens 120 --format text
+```
+
+For the fewest false positives, **do not start with** `--ignore-identifiers` or `--ignore-literals`. PMD documents those as available options, but they are disabled by default; enabling them increases recall but can also create more “technically similar, maybe not worth refactoring” findings. ([PMD][8])
+
+Use CPD when you want a second opinion on strict Type-1/Type-2 duplication.
+
+---
+
+## 4. Best research-grade near-miss detector: **NiCad**
+
+For serious near-miss clone detection, especially in Python-heavy code, **NiCad** is one of the best-known research tools. Its paper describes it as scalable and flexible, with language-sensitive parsing, normalization, language-independent similarity comparison, XML/HTML output, and high precision/high recall for near-miss intentional clones. It supports thresholds such as exact `0.0`, up to `10%` changed lines, `20%`, and so on. 
+
+Use NiCad when you care about this kind of clone:
+
+```python
+# A
+if user.is_active and user.plan == "pro":
+    send_invoice(user)
+
+# B
+if account.enabled and account.tier == "pro":
+    send_billing_email(account)
+```
+
+That is not necessarily text-identical, but it may be a real abstraction opportunity.
+
+Tradeoff: NiCad is more specialized and heavier than jscpd/Qlty. I would not use it as the default CI gate for a mixed Vite/React/Rust/Python monorepo; I would use it for periodic deep audits.
+
+---
+
+## 5. Huge-codebase method: **SourcererCC-style indexed token bags**
+
+For massive repos or multi-repo scans, the best-known research direction is **indexed token-based clone detection**. SourcererCC is designed for very large codebases and internet-scale repositories, supports detection at file/method/statement/block granularity, and is language-agnostic at the token level. Its paper reports Type-1/2/3 detection using an optimized inverted index and filtering heuristics, scaling to hundreds of millions of lines in the evaluation. ([GitHub][9])
+
+Use this family of methods when:
+
+* You have millions of lines.
+* You need cross-repository clone detection.
+* You can invest in indexing and offline analysis.
+* You care more about scale than easy setup.
+
+For a normal product repo, jscpd + Qlty is simpler and usually enough.
+
+---
+
+## 6. Targeted duplicate-pattern verification: **ast-grep and Semgrep**
+
+These are not general-purpose clone detectors in the same sense as jscpd, CPD, NiCad, or SourcererCC. They are excellent when you already know the duplicate shape and want to find all variants.
+
+**ast-grep** is AST-based, Tree-sitter-powered, and designed for structural search, linting, and rewriting across many languages. Its patterns look like code and can use metavariables, which makes it great for finding repeated React component patterns, repeated error-handling blocks, or repeated Rust/Python idioms. ([GitHub][10])
+
+Example idea:
+
+```yaml
+# ast-grep style: find repeated manual null checks or duplicated React patterns
+rule:
+  pattern: |
+    if ($COND) {
+      return $EXPR
+    }
+```
+
+**Semgrep** is similar in spirit for static-analysis patterns: use it after you have identified a family of duplicate constructs and want deterministic detection across the repo. It supports many languages and is commonly used in CI/static-analysis workflows. ([GitHub][11])
+
+Use these as **validators and cleanup accelerators**, not as your only duplicate-code scanner.
+
+---
+
+## 7. Rust-specific promising option: **cargo-dupes**
+
+For Rust, `cargo-dupes` is interesting because it uses AST normalization: it parses Rust with `syn`, normalizes functions/methods/closures, replaces identifiers with positional placeholders, erases literal values while preserving types, preserves control-flow structure, and fingerprints normalized ASTs. It supports exact and near-duplicate detection, thresholds, excludes, JSON output, test exclusion, and CI checks. ([GitHub][12])
+
+Example:
+
+```bash
+cargo dupes --min-lines 10 --exclude-tests report
+cargo dupes check --max-exact 0 --max-exact-percent 5.0
+```
+
+Caveat: it is promising but still young. Its GitHub page showed very low stars and a recent release, so I would treat it as a Rust-specific supplement, not the primary monorepo scanner. ([GitHub][12])
+
+---
+
+## 8. Governance / dashboard option: **SonarQube or Qlty baseline gates**
+
+For ongoing engineering hygiene, use a baseline/new-code gate. Qlty advertises git-aware baseline analysis, monorepo support, suppression comments, parallelization, and caching; that is exactly what you want to avoid failing CI on old duplication while catching new duplication quickly. ([qlty.sh][13])
+
+SonarQube is useful as a governance layer too. Its duplication logic is intentionally thresholded; for non-Java languages, its documented duplication metric uses a minimum of 100 successive duplicated tokens spread over a minimum number of lines, which makes it more conservative than tiny line-based clone scanners. ([Sonar Documentation][14])
+
+Use governance tools to answer:
+
+* Did duplication increase this PR?
+* Which directories are getting worse?
+* Which duplication is new versus legacy?
+* Should CI fail?
+
+Do not rely on them as your only deep refactoring scanner.
+
+---
+
+# My recommended setup for your exact stack
+
+## Fastest useful scan today
+
+```bash
+npx jscpd .
+```
+
+Use the `.jscpd.json` above. Start with `minLines: 10`, `minTokens: 80`. For React/TSX, raise to `minTokens: 120–180` if you see JSX noise.
+
+## Smart structural scan
+
+```bash
+qlty init
+qlty smells --all
+```
+
+For PRs:
+
+```bash
+qlty smells --upstream origin/main
+```
+
+## Strict second opinion
+
+```bash
+pmd cpd --dir src --language typescript --minimum-tokens 100 --format text
+pmd cpd --dir . --language python --minimum-tokens 100 --format text
+pmd cpd --dir . --language rust --minimum-tokens 120 --format text
+```
+
+## Rust supplement
+
+```bash
+cargo dupes --min-lines 10 --exclude-tests report
+```
+
+---
+
+# The false-positive killer checklist
+
+The big win is not the tool; it is the pipeline:
+
+1. **Exclude generated/vendor/build output permanently**: `node_modules`, `dist`, `build`, `.next`, `.turbo`, `coverage`, `target`, generated clients, migrations, fixtures, snapshots, minified JS, lockfiles.
+
+2. **Raise minimum size aggressively**: below 8–10 lines or 60–80 tokens, most findings are imports, props, fixtures, test setup, or common boilerplate.
+
+3. **Use AST/code-unit matching for the gate**: functions, methods, components, closures, or blocks are better units than arbitrary line windows.
+
+4. **Separate exact duplicates from near-misses**: exact/structural clones can fail CI; near-misses should be report-only until reviewed.
+
+5. **Treat tests differently**: test duplication is often intentional. Either exclude tests or use higher thresholds.
+
+6. **Baseline existing duplication**: fail only on newly introduced duplication. This is the difference between a useful CI check and a noisy one.
+
+7. **Do not use LLM/embedding similarity as the detector of record**: use it to summarize candidates and propose refactors after deterministic tools find them. Semantic clone detection is inherently much harder; research notes that checking semantic similarity is very difficult and generally undecidable in the broad case. ([Computer Science UC Davis][15])
+
+---
+
+# Final ranking
+
+| Rank | Method                                 | Best tool(s)        | Speed              | False positives  | Use it for                        |
+| ---: | -------------------------------------- | ------------------- | ------------------ | ---------------- | --------------------------------- |
+|    1 | High-threshold token fingerprinting    | jscpd               | Excellent          | Low if tuned     | First full monorepo scan          |
+|    2 | AST fingerprinting / structural clones | Qlty                | Very good          | Lower            | Smart duplication findings        |
+|    3 | Conservative CPD token detection       | PMD CPD             | Good               | Low when strict  | Second opinion / CI               |
+|    4 | Near-miss research detector            | NiCad               | Medium             | Low–medium       | Deep audits, Python-heavy code    |
+|    5 | Large-scale indexed clone search       | SourcererCC         | Excellent at scale | Tunable          | Huge multi-repo scans             |
+|    6 | Pattern-specific structural search     | ast-grep, Semgrep   | Excellent          | Very low         | Known repeated patterns           |
+|    7 | Dashboard/new-code governance          | Qlty, SonarQube     | Good               | Low if baselined | PR gates and trend tracking       |
+|    8 | AI/embeddings                          | LLM-assisted review | Variable           | Higher           | Explaining/refactoring candidates |
+
+The strongest practical combo is:
+
+```text
+jscpd high-threshold scan
++ Qlty AST/code-smell scan
++ PMD CPD strict second opinion
++ baseline-only CI gate
++ optional NiCad/cargo-dupes for focused audits
+```
+
+That is the fastest reliable path to catching real duplication across Python, Rust, Vite, TypeScript, Docker, and React with the fewest false positives.
+
+[1]: https://www.cs.usask.ca/~croy/papers/2009/RCK_SCP_Clones.pdf?utm_source=chatgpt.com "https://www.cs.usask.ca/~croy/papers/2009/RCK_SCP_Clones.pdf"
+[2]: https://theory.stanford.edu/~aiken/publications/papers/sigmod03.pdf "sigmod.dvi"
+[3]: https://github.com/kucherenko/jscpd "GitHub - kucherenko/jscpd: Copy/paste detector for programming source code. · GitHub"
+[4]: https://jscpd.dev/getting-started/configuration "Configuration - jscpd"
+[5]: https://docs.qlty.sh/duplication "Duplication - Qlty Docs"
+[6]: https://docs.qlty.sh/cli/commands/smells "smells - Qlty Docs"
+[7]: https://pmd.github.io/pmd/tag_CpdCapableLanguage.html "CPD Capable Languages | PMD Source Code Analyzer"
+[8]: https://pmd.github.io/pmd/pmd_userdocs_cpd.html "Finding duplicated code with CPD | PMD Source Code Analyzer"
+[9]: https://github.com/Mondego/SourcererCC "GitHub - Mondego/SourcererCC: Sourcerer's Code Clone project · GitHub"
+[10]: https://github.com/ast-grep/ast-grep "GitHub - ast-grep/ast-grep: ⚡A CLI tool for code structural search, lint and rewriting. Written in Rust · GitHub"
+[11]: https://github.com/semgrep/semgrep?utm_source=chatgpt.com "semgrep/semgrep: Lightweight static analysis for many ..."
+[12]: https://github.com/mpecan/cargo-dupes "GitHub - mpecan/cargo-dupes: A cargo subcommand that detects duplicate and near-duplicate code blocks in Rust codebases using AST normalization · GitHub"
+[13]: https://qlty.sh/ "Qlty - Code Quality and Coverage"
+[14]: https://docs.sonarsource.com/sonarqube-server/2025.4/user-guide/code-metrics/metrics-definition?utm_source=chatgpt.com "Understanding measures and metrics | SonarQube Server ..."
+[15]: https://www.cs.ucdavis.edu/~su/publications/icse07.pdf "icse07.dvi"
+
