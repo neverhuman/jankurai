@@ -8,10 +8,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-if ! command -v rg >/dev/null 2>&1; then
-  echo "render-test-surface: ripgrep (rg) is required" >&2
-  exit 2
-fi
+# Pure-coreutils implementation (grep + awk + find). Avoids ripgrep so
+# the script runs on bare CI runners that have not installed extra tools.
 
 count_tests() {
   local pattern="$1"; shift
@@ -21,27 +19,26 @@ count_tests() {
   for f in "${files[@]}"; do
     [[ -e "$f" ]] || continue
     local n
-    n=$(rg -c "$pattern" "$f" 2>/dev/null || true)
+    n=$(grep -cE "$pattern" "$f" 2>/dev/null || true)
     [[ -z "$n" ]] && n=0
     total=$((total + n))
   done
   printf '%d' "$total"
 }
 
-collect_rust() {
-  local subpath="$1"
-  local files=()
-  while IFS= read -r f; do files+=("$f"); done < <(rg -l '#\[test\]' -g "$subpath" --type rust 2>/dev/null || true)
-  printf '%s\n' "${files[@]:-}"
-}
-
 # Workspace-wide totals
-TOTAL_TESTS=$(rg -c '#\[test\]' --type rust crates 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+TOTAL_TESTS=$(find crates -type f -name '*.rs' \
+    \( -path '*/tests/fixtures/*' -prune -o -print \) 2>/dev/null \
+  | xargs grep -lE '#\[test\]' 2>/dev/null \
+  | xargs grep -cE '#\[test\]' 2>/dev/null \
+  | awk -F: '{s+=$2} END{print s+0}')
 INTEGRATION_FILES=$(find crates -type f -name '*.rs' 2>/dev/null \
   | awk -F/ 'index($0, "/tests/") > 0 && index($0, "/fixtures/") == 0 && index($0, "/expected/") == 0' \
   | awk -F/ '{ for (i=1;i<=NF;i++) if ($i=="tests" && i==NF-1) print; }' \
   | wc -l | tr -d ' ')
-PLAYWRIGHT_TESTS=$(rg -c "^\s*test\(" packages/ux-qa/tests 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')
+PLAYWRIGHT_TESTS=$(find packages/ux-qa/tests -type f \( -name '*.spec.ts' -o -name '*.test.ts' \) 2>/dev/null \
+  | xargs grep -cE '^[[:space:]]*test\(' 2>/dev/null \
+  | awk -F: '{s+=$2} END{print s+0}')
 
 # Category buckets — each file mapped to exactly one bucket
 TESTS_DIR=crates/jankurai/tests
