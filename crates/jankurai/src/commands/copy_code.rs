@@ -157,7 +157,7 @@ fn run_rank(args: RankArgs) -> Result<()> {
         .iter()
         .filter(|c| matches_kind_filter(c, &args.kind))
         .collect();
-    rows.sort_by(|a, b| rank_value(b, key).cmp(&rank_value(a, key)));
+    rows.sort_by_key(|c| std::cmp::Reverse(rank_value(c, key)));
     rows.truncate(args.top);
     print_rank_table(&rows, key, &args);
     Ok(())
@@ -203,8 +203,8 @@ fn print_rank_table(rows: &[&CopyCodeClass], key: &str, args: &RankArgs) {
     );
     println!();
     println!(
-        "{:>4}  {:<26}  {:<10}  {:>5}  {:>10}  {:<6}  {}",
-        "#", "kind", "lang", "inst", "vol", "sev", "id"
+        "{:>4}  {:<26}  {:<10}  {:>5}  {:>10}  {:<6}  id",
+        "#", "kind", "lang", "inst", "vol", "sev"
     );
     for (i, c) in rows.iter().enumerate() {
         let sev = if c.hard_fail { "HARD" } else { "warn" };

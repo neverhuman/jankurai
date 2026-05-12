@@ -428,7 +428,7 @@ pub fn render_markdown(report: &CopyCodeReport) -> String {
     // Top-10 by total redundant lines.
     let top10: Vec<_> = {
         let mut sorted = report.classes.iter().collect::<Vec<_>>();
-        sorted.sort_by(|a, b| b.total_redundant_lines.cmp(&a.total_redundant_lines));
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.total_redundant_lines));
         sorted.into_iter().take(10).collect()
     };
     if !top10.is_empty() {
