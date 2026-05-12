@@ -77,4 +77,3 @@ fn run_plan(repo: &Path, out: Option<&str>, md: Option<&str>, target: &str) -> R
     }
     Ok(())
 }
-

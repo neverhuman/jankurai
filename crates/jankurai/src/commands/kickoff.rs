@@ -938,7 +938,6 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-
 fn dedupe_questions(values: Vec<ClarifyingQuestion>) -> Vec<ClarifyingQuestion> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();

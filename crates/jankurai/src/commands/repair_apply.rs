@@ -3,9 +3,9 @@ use super::repair::{
     increment_risk_summary, now_string, packet_eligibility, packet_risk, proof_lanes, push_unique,
     AppliedEdit, BlockedPacket, RepairArgs, RepairRun, RiskSummary, SkippedEdit,
 };
-use crate::commands::exceptions::repo_relative_path;
 use crate::audit::rules::{RepairEligibility, RepairRisk};
 use crate::commands::context_data::RepoCatalog;
+use crate::commands::exceptions::repo_relative_path;
 use crate::commands::repair_plan::{PlannedEdit, RepairPacket, RepairPlan};
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{bail, Context, Result};
@@ -504,7 +504,6 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{:x}", digest)
 }
-
 
 fn fixture_notes(
     applied_edits: &[AppliedEdit],

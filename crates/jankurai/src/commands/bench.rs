@@ -333,4 +333,3 @@ fn render_markdown(report: &BenchmarkReport) -> String {
     }
     out
 }
-

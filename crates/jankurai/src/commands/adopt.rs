@@ -295,7 +295,6 @@ fn read_existing_audit_score(repo: &Path) -> Option<i32> {
     value.get("score")?.as_i64().map(|score| score as i32)
 }
 
-
 fn render_markdown(plan: &AdoptionPlan) -> String {
     use std::fmt::Write;
     let mut out = String::new();

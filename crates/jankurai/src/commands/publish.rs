@@ -1,6 +1,7 @@
 //! Phase 12: consume validated bench / certification / governance JSON and emit a public evidence bundle.
 
 use crate::commands::release_data::load_release_data;
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -9,7 +10,6 @@ use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::commands::repair::now_string;
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -710,4 +710,3 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
-

@@ -1470,4 +1470,3 @@ fn git_head(repo: &Path) -> Result<String> {
         anyhow::bail!("unable to resolve git HEAD in {}", repo.display());
     }
 }
-

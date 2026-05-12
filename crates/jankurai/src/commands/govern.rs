@@ -138,4 +138,3 @@ fn render_markdown(policy: &GovernancePolicy) -> String {
     let _ = writeln!(out, "- RFC path: `{}`", policy.rfc_path);
     out
 }
-

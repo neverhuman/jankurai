@@ -321,7 +321,6 @@ pub(crate) fn repo_relative_path(repo: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-
 fn render_markdown(report: &ExceptionExpiryReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();

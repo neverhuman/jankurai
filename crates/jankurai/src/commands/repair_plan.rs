@@ -449,7 +449,6 @@ fn rollback_guidance(permission_profile: &str, path: &str, rule_id: &str) -> Str
     }
 }
 
-
 fn parent_prefix(path: &str) -> Option<String> {
     path.rsplit_once('/')
         .map(|(prefix, _)| format!("{prefix}/"))
@@ -478,4 +477,3 @@ fn string_or_array_field(value: &serde_json::Value, key: &str) -> Vec<String> {
         })
         .unwrap_or_default()
 }
-

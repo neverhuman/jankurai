@@ -300,4 +300,3 @@ fn render_markdown(plan: &CellPlan) -> String {
     let _ = writeln!(out, "- notes: `{}`", plan.notes.join(", "));
     out
 }
-

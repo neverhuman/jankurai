@@ -231,5 +231,3 @@ fn render_markdown(plan: &RegistryPlan) -> String {
     }
     out
 }
-
-

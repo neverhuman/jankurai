@@ -604,8 +604,6 @@ fn estimate_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4)
 }
 
-
-
 fn render_markdown(report: &OptimizationReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();

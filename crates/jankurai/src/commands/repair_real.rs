@@ -3,11 +3,11 @@ use super::repair::{
     increment_risk_summary, now_string, packet_eligibility, packet_risk, proof_lanes, push_unique,
     write_repair_run, AppliedEdit, BlockedPacket, RepairArgs, RepairRun, RiskSummary, SkippedEdit,
 };
-use crate::commands::exceptions::repo_relative_path;
 use super::repair_apply::{apply_planned_edit, packet_map, EditOutcome};
 use super::repair_git;
 use super::repair_pr;
 use crate::commands::context_data::RepoCatalog;
+use crate::commands::exceptions::repo_relative_path;
 use crate::commands::repair_plan::{PlannedEdit, RepairPlan};
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -399,4 +399,3 @@ fn normalize_edit_path(path: &str) -> Result<String> {
     }
     Ok(normalized)
 }
-

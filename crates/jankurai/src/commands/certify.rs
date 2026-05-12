@@ -311,4 +311,3 @@ fn render_markdown(certification: &Certification) -> String {
     }
     out
 }
-
