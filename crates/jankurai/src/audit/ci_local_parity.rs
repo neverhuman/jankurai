@@ -33,7 +33,7 @@ fn hard_findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
     let mut out = Vec::new();
 
     for workflow in workflow_files(ctx) {
-        if !calls_ops_ci_lane(&workflow) {
+        if !calls_ops_ci_lane(workflow) {
             out.push(finding(
                 HLT_RULE_ID,
                 "ci.local-parity.workflow-not-thin",
@@ -165,8 +165,7 @@ fn file_exists(ctx: &AuditContext, rel: &str) -> bool {
 fn workflow_anchor(ctx: &AuditContext) -> &FileInfo {
     workflow_files(ctx).into_iter().next().unwrap_or_else(|| {
         ctx.all_files
-            .iter()
-            .next()
+            .first()
             .expect("ctx has at least one file")
     })
 }
