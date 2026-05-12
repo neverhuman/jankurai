@@ -86,6 +86,29 @@ test-surface:
 test-surface-check:
     bash scripts/render-test-surface.sh --check
 
+# Local mirror of CI. Each recipe reproduces a GitHub Actions job so
+# breakage is caught before push, never first on GitHub.
+ci-doctor:
+    bash scripts/ci-doctor.sh
+
+ci-quick:
+    bash scripts/ci-local.sh quick
+
+ci-coverage:
+    bash scripts/ci-local.sh coverage
+
+ci-audit:
+    bash scripts/ci-local.sh audit
+
+ci-release:
+    bash scripts/ci-local.sh release
+
+ci:
+    bash scripts/ci-local.sh all
+
+zizmor:
+    zizmor .github/workflows
+
 tuiwright-test:
     cargo test -p tuiwright --lib
     cargo test -p tuiwright --test smoke -- --test-threads=1

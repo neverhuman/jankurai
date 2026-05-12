@@ -423,6 +423,7 @@ Known open-source gaps:
 - [Install guide](docs/install.md)
 - [Adoption guide](docs/adoption.md)
 - [Branch protection policy](docs/branch-protection.md)
+- [Running CI locally](docs/ci-local.md)
 - [Agent-native standard](docs/agent-native-standard.md)
 - [Architecture](docs/architecture.md)
 - [Testing and proof lanes](docs/testing.md)
