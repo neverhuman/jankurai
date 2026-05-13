@@ -1,6 +1,7 @@
 //! Phase 12: consume validated bench / certification / governance JSON and emit a public evidence bundle.
 
 use crate::commands::release_data::load_release_data;
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -10,7 +11,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct PublishArgs {
@@ -709,12 +709,4 @@ fn escape_xml(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-}
-
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }

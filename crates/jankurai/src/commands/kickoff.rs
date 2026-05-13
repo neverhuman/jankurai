@@ -1,10 +1,10 @@
 use crate::commands::context_data::{push_unique, GeneratedZone, RepoCatalog};
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct KickoffArgs {
@@ -936,14 +936,6 @@ fn join_paths(paths: &[String]) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }
 
 fn dedupe_questions(values: Vec<ClarifyingQuestion>) -> Vec<ClarifyingQuestion> {

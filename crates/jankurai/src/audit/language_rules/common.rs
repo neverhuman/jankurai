@@ -346,6 +346,39 @@ pub fn contains_secret_name(value: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+// SQL-specific constructor used by both sql.rs and sql_migration.rs, which share the same
+// proof-window/snippet evidence shape but differ only in their HLT_RULE_ID constant.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn sql_finding(
+    rule_id: &'static str,
+    detector_id: &'static str,
+    matched_term: &'static str,
+    file: &FileInfo,
+    line_no: usize,
+    line: &str,
+    problem: &str,
+    reason: &str,
+    agent_fix: &str,
+    proof_window: &'static str,
+) -> LanguageFinding {
+    let snippet = line.trim().chars().take(160).collect::<String>();
+    LanguageFinding::new(
+        rule_id,
+        matched_term,
+        file.rel_path.clone(),
+        Some(line_no),
+        snippet.clone(),
+        problem,
+        reason,
+        agent_fix,
+        vec![
+            format!("detector={detector_id}"),
+            format!("proof-window={proof_window}"),
+            format!("snippet={snippet}"),
+        ],
+    )
+}
+
 // Shared language-rule constructor keeps detector call sites explicit and fixture-readable.
 #[allow(clippy::too_many_arguments)]
 pub fn finding(

@@ -1,12 +1,12 @@
 use crate::audit::run_audit;
 use crate::commands::migrate;
+use crate::commands::repair::now_string;
 use crate::init;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{bail, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_OUT: &str = "target/jankurai/adoption-plan.json";
 pub const DEFAULT_MD: &str = "target/jankurai/adoption-plan.md";
@@ -293,13 +293,6 @@ fn read_existing_audit_score(repo: &Path) -> Option<i32> {
     let text = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value.get("score")?.as_i64().map(|score| score as i32)
-}
-
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".into())
 }
 
 fn render_markdown(plan: &AdoptionPlan) -> String {

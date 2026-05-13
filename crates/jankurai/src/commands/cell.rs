@@ -2,11 +2,11 @@ use crate::commands::cell_catalog::{
     manifest_for_cell, owner_for_cell, CellEvidence, CellManifest,
 };
 use crate::commands::context_data::RepoCatalog;
+use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct CellArgs {
@@ -299,12 +299,4 @@ fn render_markdown(plan: &CellPlan) -> String {
     let _ = writeln!(out);
     let _ = writeln!(out, "- notes: `{}`", plan.notes.join(", "));
     out
-}
-
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }

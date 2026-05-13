@@ -291,7 +291,7 @@ fn is_high_or_critical(severity: &str) -> bool {
     matches!(severity, "high" | "critical")
 }
 
-fn join_or_none(values: &[String]) -> String {
+pub(crate) fn join_or_none(values: &[String]) -> String {
     if values.is_empty() {
         "none".into()
     } else {

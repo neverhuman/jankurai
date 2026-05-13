@@ -5,20 +5,14 @@ use serde_json::Value;
 use std::fs;
 
 pub fn write_json(path: &str, content: &str) -> Result<()> {
-    if path != "-" {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        fs::write(path, content)?;
-    } else {
-        print!("{content}");
-    }
-    Ok(())
+    write_output(path, content)
 }
 
 pub fn write_markdown(path: &str, content: &str) -> Result<()> {
+    write_output(path, content)
+}
+
+fn write_output(path: &str, content: &str) -> Result<()> {
     if path != "-" {
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {

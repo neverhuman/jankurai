@@ -7,6 +7,7 @@ use super::repair_apply::{apply_planned_edit, packet_map, EditOutcome};
 use super::repair_git;
 use super::repair_pr;
 use crate::commands::context_data::RepoCatalog;
+use crate::commands::exceptions::repo_relative_path;
 use crate::commands::repair_plan::{PlannedEdit, RepairPlan};
 use anyhow::{bail, Context, Result};
 use std::fs;
@@ -132,7 +133,7 @@ pub fn run_real_apply(
         if let Err(error) = proof::run_prove(proof_args) {
             terminal_error = Some(error.context("real apply proof verification failed"));
         } else {
-            proof_evidence_index = Some(relative_repo_path(&args.repo, &evidence_index_path));
+            proof_evidence_index = Some(repo_relative_path(&args.repo, &evidence_index_path));
         }
     }
 
@@ -397,12 +398,4 @@ fn normalize_edit_path(path: &str) -> Result<String> {
         bail!("edit path must not be empty");
     }
     Ok(normalized)
-}
-
-fn relative_repo_path(repo: &Path, path: &Path) -> String {
-    path.strip_prefix(repo)
-        .ok()
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }

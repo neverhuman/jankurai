@@ -1,4 +1,6 @@
 use crate::commands::context_data::{push_unique, RepoCatalog};
+use crate::commands::repair::now_string;
+use crate::commands::score::join_or_none;
 use crate::model::{
     ArtifactDigest, ManifestFingerprints, ProofReceipt, RuleCoverage, STANDARD_VERSION,
 };
@@ -1466,21 +1468,5 @@ fn git_head(repo: &Path) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         anyhow::bail!("unable to resolve git HEAD in {}", repo.display());
-    }
-}
-
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
-}
-
-fn join_or_none(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".to_string()
-    } else {
-        values.join(", ")
     }
 }

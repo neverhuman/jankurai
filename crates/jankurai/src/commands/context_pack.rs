@@ -1,4 +1,5 @@
 use crate::commands::context_data::{push_unique, GeneratedZone, RepoCatalog};
+use crate::commands::score::join_or_none;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
 use jankurai_proofbind::{build_proofbind, ProofBindMode, ProofBindRequest};
@@ -932,14 +933,6 @@ fn normalize_paths(paths: &[PathBuf]) -> Vec<String> {
         push_unique(&mut out, text);
     }
     out
-}
-
-fn join_or_none(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".to_string()
-    } else {
-        values.join(", ")
-    }
 }
 
 fn path_matches(path: &str, prefix: &str) -> bool {

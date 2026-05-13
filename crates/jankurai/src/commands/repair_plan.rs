@@ -1,11 +1,12 @@
 use crate::audit::rules::{self, RepairEligibility, RepairRisk};
 use crate::commands::context_data::{push_unique, RepoCatalog};
+use crate::commands::repair::now_string;
+use crate::commands::score::join_or_none;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct RepairPlanArgs {
@@ -448,14 +449,6 @@ fn rollback_guidance(permission_profile: &str, path: &str, rule_id: &str) -> Str
     }
 }
 
-fn join_or_none(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".to_string()
-    } else {
-        values.join(", ")
-    }
-}
-
 fn parent_prefix(path: &str) -> Option<String> {
     path.rsplit_once('/')
         .map(|(prefix, _)| format!("{prefix}/"))
@@ -483,12 +476,4 @@ fn string_or_array_field(value: &serde_json::Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn now_string() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
 }
