@@ -26,6 +26,7 @@ pub enum OpenHandle {
 
 impl OpenHandle {
     /// Returns `true` for a write handle.
+    #[allow(dead_code)]
     pub fn is_write(&self) -> bool {
         matches!(self, OpenHandle::Write { .. })
     }
