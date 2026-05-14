@@ -123,3 +123,9 @@ tuiwright-test:
 
 tuiwright-demo:
     cargo run -p tuiwright-demo
+
+# jankurai-guard: cross-platform tests always run; the FUSE backend is
+# Linux-only and feature-gated, so its mount integration test runs there.
+guard-test:
+    cargo test -p jankurai-guard
+    if [ "$(uname -s)" = "Linux" ]; then cargo test -p jankurai-guard --features fuse --test fuse_mount -- --ignored; fi

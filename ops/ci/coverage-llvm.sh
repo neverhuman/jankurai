@@ -2,6 +2,8 @@
 # llvm-cov lane: produce lcov + json coverage artifacts.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+ensure_fuse_dev
+
 out_dir="${CI_ROOT}/target/coverage"
 ensure_dir "$out_dir"
 
