@@ -4,6 +4,8 @@
 # jankurai / audit job exactly.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+ensure_fuse_dev
+
 ensure_dir "${ARTIFACT_ROOT}"
 ensure_dir "${ARTIFACT_ROOT}/security"
 ensure_dir "${ARTIFACT_ROOT}/public"

@@ -3,6 +3,8 @@
 # Used by both jankurai.yml#test-matrix and `just ci-quick`.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+ensure_fuse_dev
+
 step "cargo fmt"
 cargo fmt --all -- --check
 

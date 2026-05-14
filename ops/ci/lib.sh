@@ -45,3 +45,20 @@ ensure_dir() {
 read_version() {
   tr -d '[:space:]' < "${CI_ROOT}/VERSION"
 }
+
+# Install libfuse on Linux so the jankurai-guard `fuse` feature compiles.
+# macOS needs nothing here: the `fuser` dependency is gated to
+# cfg(target_os = "linux"), so `--all-features` on macOS never links macFUSE.
+# Non-Linux hosts and Linux hosts that already have libfuse are a no-op.
+ensure_fuse_dev() {
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    return 0
+  fi
+  if pkg-config --exists fuse3 2>/dev/null || pkg-config --exists fuse 2>/dev/null; then
+    note "libfuse already present"
+    return 0
+  fi
+  step "Install libfuse3-dev"
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq libfuse3-dev pkg-config
+}
