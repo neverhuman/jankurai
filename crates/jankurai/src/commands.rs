@@ -1,5 +1,6 @@
 pub mod adopt;
 pub mod agent;
+pub mod audit_file;
 pub mod badge;
 pub mod bench;
 pub mod cell;

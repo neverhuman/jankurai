@@ -3,8 +3,8 @@ use jankurai::audit::policy::AuditMode;
 use jankurai::audit::{run_audit, run_audit_timed_with_options, AuditOptions};
 use jankurai::commands::copy_code::CopyCodeArgs;
 use jankurai::commands::{
-    adopt, agent, badge, bench, cell, certify, conformance, context_pack, copy_code, coverage,
-    doctor, exceptions, govern, history, hooks, init, kickoff, migrate, optimize, paper,
+    adopt, agent, audit_file, badge, bench, cell, certify, conformance, context_pack, copy_code,
+    coverage, doctor, exceptions, govern, history, hooks, init, kickoff, migrate, optimize, paper,
     postmortem, proof, proofbind, proofmark, publish, registry, repair, repair_plan, rules, rust,
     score, security, update, vibe, witness,
 };
@@ -35,6 +35,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     Audit(AuditArgs),
+    AuditFile(audit_file::AuditFileArgs),
     CopyCode(CopyCodeArgs),
     Adopt(AdoptArgs),
     Badge(BadgeCliArgs),
@@ -130,6 +131,10 @@ enum Commands {
     Vibe {
         #[command(subcommand)]
         command: VibeCommand,
+    },
+    Guard {
+        #[command(subcommand)]
+        command: jankurai_guard::GuardCommand,
     },
 }
 
@@ -1456,6 +1461,13 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Audit(args)) => {
             run_audit_and_write(args)?;
         }
+        Some(Commands::AuditFile(args)) => {
+            let code = audit_file::run(args)?;
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            std::io::stderr().flush().ok();
+            std::process::exit(code);
+        }
         Some(Commands::CopyCode(args)) => {
             copy_code::run(args)?;
         }
@@ -2068,6 +2080,9 @@ fn main() -> anyhow::Result<()> {
                 })?;
             }
         },
+        Some(Commands::Guard { command }) => {
+            jankurai_guard::run(command)?;
+        }
         None => {
             run_audit_and_write(cli.audit)?;
         }

@@ -22,6 +22,7 @@ pub mod prose;
 pub mod repo_rot;
 pub mod rule_analyzer;
 pub mod rules;
+pub mod save_gate;
 pub mod scan;
 pub mod security_artifact;
 pub mod ux_artifact;
@@ -111,7 +112,73 @@ pub fn run_audit_timed_with_options(
     timings.record_ms("metadata", inventory.timings.metadata_ms);
     timings.record_ms("text_capture", inventory.timings.text_capture_ms);
     timings.record_duration("inventory", inventory_started.elapsed());
-    let all_files = inventory.files;
+    run_audit_inner(
+        root,
+        inventory.files,
+        scope_paths,
+        &options,
+        changed,
+        started,
+        timings,
+    )
+}
+
+/// Options for [`run_candidate_audit`]: a single unsaved file change overlaid
+/// onto a scoped inventory so the audit engine can score it before it lands.
+#[derive(Debug, Clone)]
+pub struct CandidateAuditOptions {
+    /// The candidate file change to overlay onto the inventory.
+    pub overlay: fs::CandidateOverlay,
+    /// Repo-relative paths the audit should score (the candidate plus any
+    /// sibling files needed for context). Control files are added automatically.
+    pub scope_paths: Vec<String>,
+    /// Shared audit options.
+    pub options: AuditOptions,
+}
+
+/// Audits a single candidate file change without writing it to disk. The
+/// inventory is walked scoped to the candidate plus control files, the
+/// candidate bytes are overlaid in memory, and the full analyzer pipeline runs
+/// against that overlaid inventory.
+pub fn run_candidate_audit(
+    root: &Path,
+    opts: CandidateAuditOptions,
+) -> Result<(Report, AuditTimings)> {
+    let started = Instant::now();
+    let mut timings = AuditTimings::default();
+    let inventory_options = fs::InventoryOptions::from_policy(root);
+    let inventory_started = Instant::now();
+    let walk_paths = changed_fast_inventory_paths(&opts.scope_paths);
+    let mut inventory = fs::inventory_paths_detailed(root, &walk_paths, &inventory_options)?;
+    fs::apply_overlay(
+        &mut inventory.files,
+        &opts.overlay,
+        inventory_options.text_capture_chars,
+    );
+    timings.record_ms("walk", inventory.timings.walk_ms);
+    timings.record_ms("metadata", inventory.timings.metadata_ms);
+    timings.record_ms("text_capture", inventory.timings.text_capture_ms);
+    timings.record_duration("inventory", inventory_started.elapsed());
+    run_audit_inner(
+        root,
+        inventory.files,
+        opts.scope_paths,
+        &opts.options,
+        &[],
+        started,
+        timings,
+    )
+}
+
+fn run_audit_inner(
+    root: &Path,
+    all_files: Vec<FileInfo>,
+    scope_paths: Vec<String>,
+    options: &AuditOptions,
+    changed: &[PathBuf],
+    started: Instant,
+    mut timings: AuditTimings,
+) -> Result<(Report, AuditTimings)> {
     let scope_files = if scope_paths.is_empty() {
         all_files.clone()
     } else {
