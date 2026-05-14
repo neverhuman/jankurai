@@ -78,7 +78,7 @@ impl GuardFs {
         };
         let write_intent = flags & (libc::O_WRONLY | libc::O_RDWR) != 0;
         if write_intent {
-            let base = std::fs::read(self.backing_path(&rel)).unwrap_or_default();
+            let base = self.read_or_empty(&rel);
             let existed = self.backing_path(&rel).exists();
             let mut machine = if existed {
                 CommitMachine::existing_file(rel.clone(), base)

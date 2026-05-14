@@ -221,6 +221,15 @@ impl GuardFs {
     }
 }
 
+/// Reads bytes from the backing store for a repo-relative path, returning an
+/// empty vector when the file does not exist. Used to seed commit machines for
+/// unlink and rename operations where the pre-existing content is needed.
+impl GuardFs {
+    pub(super) fn read_or_empty(&self, rel: &std::path::Path) -> Vec<u8> {
+        std::fs::read(self.backing_path(rel)).unwrap_or_default()
+    }
+}
+
 /// Builds the poison header content from an audit decision.
 fn poison_content(
     decision: &crate::audit_client::GuardDecision,

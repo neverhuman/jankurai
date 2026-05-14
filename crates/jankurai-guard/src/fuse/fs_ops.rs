@@ -61,7 +61,7 @@ impl GuardFs {
             }
         };
         let rel = parent_rel.join(name);
-        let base = std::fs::read(self.backing_path(&rel)).unwrap_or_default();
+        let base = self.read_or_empty(&rel);
         let mut machine = CommitMachine::existing_file(rel.clone(), base);
         let boundary = machine.feed(FsEvent::Unlink);
         let errno = self.process_boundary(&mut inner, boundary);
@@ -94,7 +94,7 @@ impl GuardFs {
         };
         let from = from_parent.join(name);
         let to = to_parent.join(newname);
-        let base = std::fs::read(self.backing_path(&from)).unwrap_or_default();
+        let base = self.read_or_empty(&from);
         let mut machine = CommitMachine::existing_file(from.clone(), base);
         let boundary = machine.feed(FsEvent::Rename {
             from: from.clone(),
