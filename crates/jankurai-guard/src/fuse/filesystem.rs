@@ -138,7 +138,7 @@ impl GuardFs {
     ) {
         let mut inner = self.inner.lock().expect("guard fs mutex");
         let boundary = match inner.handles.get_mut(fh) {
-            Some(super::handles::OpenHandle::Write { machine, .. }) => machine.feed(event),
+            Some(OpenHandle::Write { machine, .. }) => machine.feed(event),
             _ => {
                 reply.ok();
                 return;

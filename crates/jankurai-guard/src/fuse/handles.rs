@@ -10,36 +10,21 @@
 
 use crate::transaction::CommitMachine;
 use std::collections::HashMap;
-use std::fs::File;
-use std::path::PathBuf;
 
 /// An open file as the guard tracks it.
 pub enum OpenHandle {
-    /// A read-only handle served straight from the backing store.
-    Read {
-        /// The backing-relative path being read.
-        rel_path: PathBuf,
-        /// The open backing file the reads are served from.
-        file: File,
-    },
+    /// A read-only handle. Reads are served directly from the backing store by
+    /// path; no file descriptor is cached here because every `read` call uses
+    /// the current backing state (including poison overlays).
+    Read,
     /// A write handle whose mutations are buffered and audited on commit.
     Write {
-        /// The backing-relative path being written.
-        rel_path: PathBuf,
         /// The pure commit-boundary state machine driving this handle.
         machine: CommitMachine,
     },
 }
 
 impl OpenHandle {
-    /// Returns the backing-relative path the handle refers to.
-    pub fn rel_path(&self) -> &PathBuf {
-        match self {
-            OpenHandle::Read { rel_path, .. } => rel_path,
-            OpenHandle::Write { rel_path, .. } => rel_path,
-        }
-    }
-
     /// Returns `true` for a write handle.
     pub fn is_write(&self) -> bool {
         matches!(self, OpenHandle::Write { .. })
@@ -71,6 +56,7 @@ impl HandleTable {
     }
 
     /// Borrows the handle for `fh`.
+    #[allow(dead_code)]
     pub fn get(&self, fh: u64) -> Option<&OpenHandle> {
         self.handles.get(&fh)
     }
@@ -87,6 +73,7 @@ impl HandleTable {
 
     /// Returns `true` when `fh` refers to a dirty write handle whose buffer
     /// still holds an un-committed mutation.
+    #[allow(dead_code)]
     pub fn is_dirty_write(&self, fh: u64) -> bool {
         matches!(
             self.handles.get(&fh),

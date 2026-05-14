@@ -78,10 +78,7 @@ impl GuardFs {
         };
         let write_intent = flags & (libc::O_WRONLY | libc::O_RDWR) != 0;
         if write_intent {
-            let base = match std::fs::read(self.backing_path(&rel)) {
-                Ok(b) => b,
-                Err(_) => Vec::new(),
-            };
+            let base = std::fs::read(self.backing_path(&rel)).unwrap_or_default();
             let existed = self.backing_path(&rel).exists();
             let mut machine = if existed {
                 CommitMachine::existing_file(rel.clone(), base)
@@ -91,21 +88,14 @@ impl GuardFs {
             if flags & libc::O_TRUNC != 0 {
                 machine.feed(FsEvent::Open { trunc: true });
             }
-            let fh = inner.handles.insert(OpenHandle::Write {
-                rel_path: rel,
-                machine,
-            });
+            let fh = inner.handles.insert(OpenHandle::Write { machine });
             reply.opened(fh, 0);
         } else {
-            match std::fs::File::open(self.backing_path(&rel)) {
-                Ok(file) => {
-                    let fh = inner.handles.insert(OpenHandle::Read {
-                        rel_path: rel,
-                        file,
-                    });
-                    reply.opened(fh, 0);
-                }
-                Err(_) => reply.error(libc::ENOENT),
+            if self.backing_path(&rel).exists() {
+                let fh = inner.handles.insert(OpenHandle::Read);
+                reply.opened(fh, 0);
+            } else {
+                reply.error(libc::ENOENT);
             }
         }
     }

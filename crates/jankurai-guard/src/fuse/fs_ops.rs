@@ -10,7 +10,7 @@
 use super::filesystem::GuardFs;
 use super::handles::OpenHandle;
 use crate::transaction::{CommitMachine, FsEvent};
-use fuser::{FileType, Filesystem, ReplyCreate, ReplyEmpty, ReplyWrite, Request};
+use fuser::{Filesystem, ReplyCreate, ReplyEmpty, ReplyWrite, Request};
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -46,10 +46,7 @@ impl GuardFs {
         let rel = parent_rel.join(name);
         let ino = inner.inodes.lookup(&rel);
         let machine = CommitMachine::new_file(rel.clone());
-        let fh = inner.handles.insert(OpenHandle::Write {
-            rel_path: rel,
-            machine,
-        });
+        let fh = inner.handles.insert(OpenHandle::Write { machine });
         reply.created(&TTL, &GuardFs::overlay_attr(ino, 0), 0, fh, 0);
     }
 
@@ -64,10 +61,7 @@ impl GuardFs {
             }
         };
         let rel = parent_rel.join(name);
-        let base = match std::fs::read(self.backing_path(&rel)) {
-            Ok(b) => b,
-            Err(_) => Vec::new(),
-        };
+        let base = std::fs::read(self.backing_path(&rel)).unwrap_or_default();
         let mut machine = CommitMachine::existing_file(rel.clone(), base);
         let boundary = machine.feed(FsEvent::Unlink);
         let errno = self.process_boundary(&mut inner, boundary);
@@ -100,10 +94,7 @@ impl GuardFs {
         };
         let from = from_parent.join(name);
         let to = to_parent.join(newname);
-        let base = match std::fs::read(self.backing_path(&from)) {
-            Ok(b) => b,
-            Err(_) => Vec::new(),
-        };
+        let base = std::fs::read(self.backing_path(&from)).unwrap_or_default();
         let mut machine = CommitMachine::existing_file(from.clone(), base);
         let boundary = machine.feed(FsEvent::Rename {
             from: from.clone(),
