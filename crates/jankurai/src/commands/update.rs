@@ -289,6 +289,49 @@ pub fn run(args: UpdateArgs) -> Result<()> {
     crate::render::write_markdown(&md_path.display().to_string(), &render_plan(&plan))?;
     write_state(&repo, &args, &plan)?;
 
+    // Outside an initialized repo: skip the plan dump and either upgrade or
+    // tell the user they're already on the latest version.
+    if plan.status == "not-initialized" {
+        let reexeced = std::env::var(UPGRADE_REEXEC_ENV).as_deref() == Ok("1");
+        if plan.self_update_available && !reexeced {
+            // Treat bare `jankurai update` from any directory as an upgrade.
+            let install_command = plan
+                .resolved_source
+                .as_ref()
+                .and_then(|s| s.install_command.as_ref())
+                .cloned();
+            if let Some(install_command) = install_command {
+                eprintln!(
+                    "upgrading jankurai {} → {}",
+                    plan.current_version,
+                    plan.latest_version.as_deref().unwrap_or("?")
+                );
+                let status = std::process::Command::new(&install_command[0])
+                    .args(&install_command[1..])
+                    .current_dir(&repo)
+                    .status()
+                    .context("run self-update command")?;
+                if !status.success() {
+                    bail!("self-update command failed with {}", status);
+                }
+                eprintln!("upgrade complete — restart jankurai to use the new version");
+                let receipt = build_receipt_stub(&repo, &plan, &args);
+                let _ = write_receipt(&repo, &receipt);
+                return Ok(());
+            }
+        }
+        if !args.quiet {
+            eprintln!(
+                "jankurai {} — already on latest{}",
+                plan.current_version,
+                if plan.latest_version.is_some() { "" } else { " (version check skipped — offline?)" }
+            );
+        }
+        let receipt = build_receipt_stub(&repo, &plan, &args);
+        let _ = write_receipt(&repo, &receipt);
+        return Ok(());
+    }
+
     if !args.quiet {
         println!("{}", render_plan(&plan));
     }
@@ -434,14 +477,29 @@ fn run_client_start(repo: &Path, args: &UpdateArgs) -> Result<()> {
 fn build_plan(repo: &Path, args: &UpdateArgs) -> Result<UpdatePlan> {
     let repo_has_jankurai = has_jankurai_files(repo);
     if !repo_has_jankurai {
+        // Still resolve version even outside an initialized repo so that
+        // `jankurai update` / `jankurai upgrade` work from any directory.
+        let resolved_source = resolve_source_context(repo, args, None).ok();
+        let cur = current_version();
+        let self_update_available = resolved_source
+            .as_ref()
+            .and_then(|s| s.latest_version.as_ref())
+            .and_then(|latest| Version::parse(latest).ok())
+            .zip(Version::parse(&cur).ok())
+            .map(|(latest, current)| latest > current)
+            .unwrap_or(false);
+        let latest_version = resolved_source
+            .as_ref()
+            .and_then(|s| s.latest_version.clone());
+        let reexec_command = build_reexec_command(repo, args).ok().map(|v| shell_join(&v));
         return Ok(UpdatePlan {
             schema_version: UPDATE_SCHEMA_VERSION.into(),
             command: "jankurai update".into(),
             status: "not-initialized".into(),
             generated_at: now_string(),
             repo_root: repo.display().to_string(),
-            current_version: current_version(),
-            latest_version: None,
+            current_version: cur,
+            latest_version,
             standard_version: STANDARD_VERSION.into(),
             auditor_version: AUDITOR_VERSION.into(),
             schema_contract_version: SCHEMA_VERSION.into(),
@@ -449,17 +507,17 @@ fn build_plan(repo: &Path, args: &UpdateArgs) -> Result<UpdatePlan> {
             target_stack_id: TARGET_STACK_ID.into(),
             update_channel: args.channel.clone(),
             source: args.source.clone(),
-            resolved_source: None,
+            resolved_source,
             offline: args.offline,
             client_start: args.client_start,
             self_update_requested: args.self_update,
-            self_update_available: false,
+            self_update_available,
             install_state: "not-initialized".into(),
             install_manifest_path: rel_path(repo, &install_manifest_path(repo)),
             state_path: rel_path(repo, &repo.join(&args.state)),
             plan_path: rel_path(repo, &repo.join(&args.out)),
             md_path: rel_path(repo, &repo.join(&args.md)),
-            reexec_command: None,
+            reexec_command,
             post_upgrade_score_command: Some(shell_join(&build_score_command(repo, args)?)),
             post_upgrade_score_mode: Some(args.score_mode.clone()),
             post_upgrade_score_json: Some(args.score_json.clone()),
