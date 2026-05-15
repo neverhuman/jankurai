@@ -7,6 +7,7 @@
 
 pub mod args;
 pub mod handlers;
+pub mod prompt;
 
 pub use args::{
     DoctorArgs, FailuresArgs, GuardCommand, InstallArgs, MountArgs, QuarantineAction,
