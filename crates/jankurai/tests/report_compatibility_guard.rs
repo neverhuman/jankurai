@@ -26,6 +26,7 @@ fn run_full_audit_export(repo: &Path, out_dir: &Path) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_jankurai"))
         .arg("audit")
         .arg(repo)
+        .arg("--full")
         .arg("--json")
         .arg(&json)
         .arg("--md")
