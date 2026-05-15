@@ -50,7 +50,7 @@ pub struct CopyCodePolicy {
     pub warning_only_roots: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CopyCodeSummary {
     pub files_scanned: usize,
     pub files_considered: usize,
@@ -140,6 +140,32 @@ pub struct CopyCodeReport {
     pub summary: CopyCodeSummary,
     pub classes: Vec<CopyCodeClass>,
     pub notes: Vec<String>,
+}
+
+impl CopyCodeReport {
+    pub fn empty() -> Self {
+        Self {
+            schema_version: COPY_CODE_SCHEMA_VERSION.into(),
+            generated_by: "jankurai copy-code".into(),
+            generated_at: String::new(),
+            repo: String::new(),
+            auditor_version: crate::model::AUDITOR_VERSION.into(),
+            status: "skipped".into(),
+            policy: CopyCodePolicy {
+                active_source_only: true,
+                include_tests: false,
+                min_lines: DEFAULT_MIN_LINES,
+                min_tokens: DEFAULT_MIN_TOKENS,
+                max_findings: DEFAULT_MAX_FINDINGS,
+                strict: false,
+                excluded_roots: vec![],
+                warning_only_roots: vec![],
+            },
+            summary: CopyCodeSummary::default(),
+            classes: vec![],
+            notes: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

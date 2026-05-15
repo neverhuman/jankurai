@@ -350,6 +350,12 @@ struct AuditArgs {
     score_history_max_bytes: usize,
     #[arg(long)]
     no_score_history: bool,
+    #[arg(long)]
+    full: bool,
+    #[arg(long, value_name = "SECS")]
+    smart_interval: Option<u64>,
+    #[arg(long, value_name = "FLOAT")]
+    smart_rate: Option<f64>,
 }
 
 #[derive(Args, Debug)]
@@ -2221,6 +2227,9 @@ fn run_init_bootstrap_commit(args: InitArgs) -> anyhow::Result<()> {
         no_score_history: false,
         changed_fast: false,
         timings_json: None,
+        full: true,
+        smart_interval: None,
+        smart_rate: None,
     })?;
     let score_trailers = score_trailers_from_report(&repo, &score_json)?;
 
@@ -2379,14 +2388,36 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
     }
     let progress = jankurai::ui::CliProgress::new("scoring repository", 8);
     progress.tick("resolve changed paths");
-    let changed = if let Some(base) = args.changed_from.as_deref() {
-        jankurai::audit::changed_paths_from_git(&args.repo, base)?
-    } else {
-        args.changed
-    };
-    if args.changed_fast && changed.is_empty() {
-        anyhow::bail!("--changed-fast requires --changed PATH or --changed-from REF");
-    }
+    let (changed, changed_fast_effective, save_smart_state) =
+        if let Some(base) = args.changed_from.as_deref() {
+            (jankurai::audit::changed_paths_from_git(&args.repo, base)?, args.changed_fast, false)
+        } else if !args.changed.is_empty() || args.changed_fast {
+            if args.changed_fast && args.changed.is_empty() {
+                anyhow::bail!("--changed-fast requires --changed PATH or --changed-from REF");
+            }
+            (args.changed.clone(), args.changed_fast, false)
+        } else {
+            use jankurai::audit::smart_scan::{decide, SmartScanConfig, SmartScanDecision};
+            let config = SmartScanConfig {
+                enabled: !args.full,
+                interval_secs: args.smart_interval.unwrap_or(3600),
+                roulette_rate: args.smart_rate.unwrap_or(0.10),
+            };
+            match decide(&args.repo, &config)? {
+                SmartScanDecision::Full { reason } => {
+                    eprintln!("[smart] full scan — {reason}");
+                    (vec![], false, true)
+                }
+                SmartScanDecision::Fast { paths } => {
+                    eprintln!("[smart] fast scan — {} changed files", paths.len());
+                    (paths, true, false)
+                }
+                SmartScanDecision::Skip => {
+                    eprintln!("[smart] no changes — last clean full scan still valid");
+                    return Ok(());
+                }
+            }
+        };
     progress.tick("load audit mode");
     let mode = AuditMode::parse(&args.mode)?;
     if matches!(mode, AuditMode::Ratchet) && args.baseline.is_none() {
@@ -2401,10 +2432,10 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
         AuditOptions {
             self_audit: args.self_audit,
             proof_receipts: args.proof_receipts.clone(),
-            changed_fast: args.changed_fast,
+            changed_fast: changed_fast_effective,
         },
     )?;
-    if args.changed_fast {
+    if changed_fast_effective {
         if let Some(git) = report.git.as_mut() {
             git.mode = "changed-fast".into();
         }
@@ -2459,7 +2490,7 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
         write_json(path, &jankurai::report::issues::repair_queue_jsonl(&report))?;
     }
     timings.record_duration("report_write", report_write_started.elapsed());
-    let write_history = !args.no_score_history && !args.changed_fast;
+    let write_history = !args.no_score_history && !changed_fast_effective;
     if write_history {
         let history_started = std::time::Instant::now();
         let policy = jankurai::score_history::ScoreHistoryPolicy::from_repo(&args.repo)
@@ -2528,7 +2559,7 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
         )
     );
     // Auto-update badge if agent/badge.toml is present and this is a full audit.
-    if !args.changed_fast {
+    if !changed_fast_effective {
         if let Err(e) = badge::run_from_config_after_audit(&args.repo, &args.json, &args.md) {
             eprintln!(
                 "{}",
@@ -2538,6 +2569,9 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
                 )
             );
         }
+    }
+    if save_smart_state {
+        let _ = jankurai::audit::smart_scan::save_state(&args.repo, &report);
     }
     enforce_audit_decision(&report, mode)?;
     Ok(())

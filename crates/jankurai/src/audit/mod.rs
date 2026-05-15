@@ -25,6 +25,7 @@ pub mod rules;
 pub mod save_gate;
 pub mod scan;
 pub mod security_artifact;
+pub mod smart_scan;
 pub mod ux_artifact;
 pub mod web_security;
 pub mod zyal;
@@ -200,11 +201,15 @@ fn run_audit_inner(
         copy_code: None,
     };
     let boundary_reclassifications = boundary_reclassification::evaluate(&base_ctx);
-    let copy_code = copy_code::scan_files(
-        root,
-        &base_ctx.all_files,
-        copy_code::CopyCodeOptions::default(),
-    );
+    let copy_code = if options.changed_fast {
+        copy_code::CopyCodeReport::empty()
+    } else {
+        copy_code::scan_files(
+            root,
+            &base_ctx.all_files,
+            copy_code::CopyCodeOptions::default(),
+        )
+    };
     let ctx = AuditContext {
         boundary_reclassifications,
         copy_code: Some(copy_code.clone()),

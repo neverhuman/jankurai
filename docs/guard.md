@@ -111,3 +111,19 @@ green on macOS without macFUSE.
   default.
 - The existing Git hooks (`jankurai hooks install`) remain as the commit-time
   backstop; the guard is the realtime layer, not a replacement for them.
+
+
+## Relationship to smart scan mode
+
+`jankurai audit .` and `jankurai guard` are complementary layers. The guard
+fires per-write in realtime; `jankurai audit .` runs the full 10-dimension score
+on demand or in CI.
+
+After a clean full audit (`hard_findings = 0`, `caps_applied = []`), `jankurai
+audit .` switches to **smart scan mode**: only the files reported by `git status`
+are re-audited. A full rescan is forced hourly (or on 10% of sessions) even in
+smart mode, so drift never accumulates. Use `--full` to force a complete scan at
+any time.
+
+The guard watcher does not replace smart scan — it runs on every single write,
+before `git status` can even accumulate a diff.

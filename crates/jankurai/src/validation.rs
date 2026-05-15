@@ -71,6 +71,7 @@ pub enum ArtifactSchema {
     CoverageAudit,
     ReadmeBadge,
     CopyCode,
+    AuditState,
 }
 
 impl ArtifactSchema {
@@ -139,6 +140,7 @@ impl ArtifactSchema {
             Self::CoverageAudit => "coverage-audit.schema.json",
             Self::ReadmeBadge => "readme-badge.schema.json",
             Self::CopyCode => "copy-code.schema.json",
+            Self::AuditState => "audit-state.schema.json",
         }
     }
 }

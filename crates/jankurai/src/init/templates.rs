@@ -453,7 +453,7 @@ pub const TEMPLATES: &[Template] = &[
     },
     Template {
         path: "agent/audit-policy.toml",
-        body: "minimum_score = 85\nfail_on = [\"critical\", \"high\"]\nadvisory_on = [\"medium\", \"low\"]\n\n[history]\nmax_rows = 500\nmax_bytes = 1048576\ndedupe = \"consecutive-equivalent\"\nmirror_env = \"JANKURAI_HISTORY_MIRROR\"\nmirror_required = false\nmirror_max_rows = 5000\n\n[scan]\nexcluded_paths = [\"tips/\"]\n",
+        body: "minimum_score = 85\nfail_on = [\"critical\", \"high\"]\nadvisory_on = [\"medium\", \"low\"]\n\n[history]\nmax_rows = 500\nmax_bytes = 1048576\ndedupe = \"consecutive-equivalent\"\nmirror_env = \"JANKURAI_HISTORY_MIRROR\"\nmirror_required = false\nmirror_max_rows = 5000\n\n[scan]\nexcluded_paths = [\"tips/\"]\n\n[smart_scan]\n# After a clean full scan, only scan git-status changed files by default.\nfull_scan_interval_secs = 3600\nroulette_rate = 0.10\n",
     },
     Template {
         path: "agent/security-policy.toml",
