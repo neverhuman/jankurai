@@ -324,7 +324,11 @@ pub fn run(args: UpdateArgs) -> Result<()> {
             eprintln!(
                 "jankurai {} — already on latest{}",
                 plan.current_version,
-                if plan.latest_version.is_some() { "" } else { " (version check skipped — offline?)" }
+                if plan.latest_version.is_some() {
+                    ""
+                } else {
+                    " (version check skipped — offline?)"
+                }
             );
         }
         let receipt = build_receipt_stub(&repo, &plan, &args);
@@ -491,7 +495,9 @@ fn build_plan(repo: &Path, args: &UpdateArgs) -> Result<UpdatePlan> {
         let latest_version = resolved_source
             .as_ref()
             .and_then(|s| s.latest_version.clone());
-        let reexec_command = build_reexec_command(repo, args).ok().map(|v| shell_join(&v));
+        let reexec_command = build_reexec_command(repo, args)
+            .ok()
+            .map(|v| shell_join(&v));
         return Ok(UpdatePlan {
             schema_version: UPDATE_SCHEMA_VERSION.into(),
             command: "jankurai update".into(),
