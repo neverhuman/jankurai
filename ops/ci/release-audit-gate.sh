@@ -29,6 +29,7 @@ jankurai security run . --strict --profile ci --out "${ARTIFACT_ROOT}/security/e
 
 step "Ratchet audit"
 jankurai audit . \
+  --full \
   --mode ratchet \
   --baseline "${CI_ROOT}/agent/baselines/main.repo-score.json" \
   --json "${ARTIFACT_ROOT}/repo-score.json" \

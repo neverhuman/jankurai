@@ -82,6 +82,7 @@ cargo test -p jankurai --test migration_prompt_verify --test migration_slice_ris
 
 step "Final jankurai audit (ratchet)"
 jankurai audit . \
+  --full \
   --mode ratchet \
   --baseline "$baseline" \
   --json "${ARTIFACT_ROOT}/repo-score.json" \
