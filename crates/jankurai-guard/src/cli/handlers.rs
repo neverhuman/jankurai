@@ -7,6 +7,7 @@ use super::args::{
     DoctorArgs, FailuresArgs, GuardCommand, InstallArgs, MountArgs, QuarantineAction,
     QuarantineArgs, RunArgs, StatusArgs, UnmountArgs, WatchArgs,
 };
+use super::prompt::maybe_show_fuse_prompt;
 use crate::audit_client::CliAuditClient;
 use crate::layout::GuardLayout;
 use crate::policy::GuardPolicy;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 
 /// Dispatches a parsed [`GuardCommand`].
 pub fn run(cmd: GuardCommand) -> Result<()> {
+    maybe_show_fuse_prompt();
     match cmd {
         GuardCommand::Mount(args) => run_mount(args),
         GuardCommand::Run(args) => run_run(args),
