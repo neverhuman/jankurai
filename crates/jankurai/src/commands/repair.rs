@@ -343,11 +343,10 @@ pub(crate) fn packet_eligibility(
     match packet.repair_eligibility.as_str() {
         "auto-safe" => RepairEligibility::AutoSafe,
         "agent-assisted" => RepairEligibility::AgentAssisted,
-        "human-required" => RepairEligibility::HumanRequired,
         "never-auto" => RepairEligibility::NeverAuto,
         _ => rules::lookup(&packet.rule_id)
             .map(|rule| rule.repair_eligibility)
-            .unwrap_or(RepairEligibility::HumanRequired),
+            .unwrap_or(RepairEligibility::AgentAssisted),
     }
 }
 

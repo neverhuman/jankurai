@@ -22,7 +22,7 @@ user explicitly asks for MASTER_PLAN or phase work.
 | VCOV-06 | Rule registry extension | done | `audit/rules.rs`, scan/findings, tests, docs | `cargo test -p jankurai --test rule_registry_smoke --test vibe_detector_fixtures` | rule registry export | detectors remain heuristic outside fixture families |
 | VCOV-07 | Tool adoption and CI | done | `agent/tool-adoption.toml`, workflow, docs | `just score` | uploaded vibe coverage artifacts | CI artifact proof requires hosted run |
 | VCOV-08 | Paper table integration | done | `paper/tex/*`, generated table | `just paper` | `paper/tex/generated/vibe_coverage_table.tex` | TeX table layout |
-| VCOV-09 | Version sweep | done | version manifests, changelog, docs | `just versions` | 0.6.1 / 1.4.1 bindings | historical v0.6.0 release notes remain intentionally unchanged |
+| VCOV-09 | Version sweep | done | version manifests, changelog, docs | `just versions` | 0.6.1 / 1.3.1 bindings | historical v0.6.0 release notes remain intentionally unchanged |
 | VCOV-10 | Generated audit artifacts | open | `agent/repo-score.json`, `agent/repo-score.md`, score history | `just score` | audit JSON/MD/history | dirty worktree affects report fingerprint |
 | VCOV-11 | Full validation | open | all owned paths | `just check` | target proof artifacts | environment-specific failures |
 | VCOV-12 | Final handoff | open | final response | n/a | changed path list and counts | none |

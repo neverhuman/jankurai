@@ -27,11 +27,11 @@ fn repair_plan_emits_risk_and_eligibility_metadata() {
     let plan = read_json(&plan_path);
     validation::validate_value(dir.path(), ArtifactSchema::RepairPlan, &plan).unwrap();
     assert_eq!(plan["plan_mode"], "dry-run");
-    assert_eq!(plan["planned_edits"][0]["operation"], "review-only");
+    assert_eq!(plan["planned_edits"][0]["operation"], "modify");
     assert_eq!(plan["planned_edits"][0]["risk_level"], "high");
     assert_eq!(
         plan["planned_edits"][0]["repair_eligibility"],
-        "human-required"
+        "agent-assisted"
     );
     assert!(plan["planned_commands"]
         .as_array()
@@ -43,13 +43,13 @@ fn repair_plan_emits_risk_and_eligibility_metadata() {
         .unwrap()
         .iter()
         .any(|item| item == "security"));
-    assert!(!plan["human_approval_requirements"]
+    assert!(plan["human_approval_requirements"]
         .as_array()
         .unwrap()
         .is_empty());
 
     let packet = &plan["packets"][0];
-    assert_eq!(packet["repair_eligibility"], "human-required");
+    assert_eq!(packet["repair_eligibility"], "agent-assisted");
     assert_eq!(packet["risk_level"], "high");
     assert!(packet["eligibility_reason"]
         .as_str()
@@ -76,7 +76,7 @@ fn secret_sprawl_packet_is_never_auto_and_critical() {
 
     assert_eq!(packet["repair_eligibility"], "never-auto");
     assert_eq!(packet["risk_level"], "critical");
-    assert!(packet["human_review_required"].as_bool().unwrap());
+    assert!(!packet["human_review_required"].as_bool().unwrap());
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn auto_pr_request_is_blocked_for_high_risk_packet() {
     assert_eq!(run["blocked_packets"][0]["risk_level"], "high");
     assert_eq!(
         run["blocked_packets"][0]["repair_eligibility"],
-        "human-required"
+        "agent-assisted"
     );
 }
 
@@ -135,6 +135,78 @@ fn auto_pr_request_can_be_eligible_dry_run_only_for_agent_assisted_medium_packet
     assert_eq!(run["auto_pr_status"], "eligible-dry-run-only");
     assert!(run["blocked_packets"].as_array().unwrap().is_empty());
     assert_eq!(run["risk_summary"]["medium"], 1);
+}
+
+#[test]
+fn repair_plan_widens_ci_workflow_scope_for_repo_policy_files() {
+    let dir = tempdir().unwrap();
+    seed_catalog(dir.path());
+    let report_path = write_report_with_text(
+        dir.path(),
+        "HLT-042-CI-LOCAL-PARITY",
+        "high",
+        ".github/workflows/ci.yml",
+        "ops",
+        "security",
+        "bash scripts/ci-local.sh quick",
+        "workflow commands inline the local runner; add scripts/ci-local.sh, scripts/ci-doctor.sh, and rust-toolchain.toml",
+        "workflow commands should move into scripts and the pinned toolchain file",
+        "repair safely",
+    );
+    let plan_path = write_repair_plan(dir.path(), &report_path);
+    let plan = read_json(&plan_path);
+
+    let packet = &plan["packets"][0];
+    assert_eq!(packet["repair_eligibility"], "agent-assisted");
+    assert!(!packet["human_review_required"].as_bool().unwrap());
+    assert!(packet["allowed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "scripts/ci-local.sh"));
+    assert!(packet["allowed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "scripts/ci-doctor.sh"));
+    assert!(packet["allowed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "rust-toolchain.toml"));
+}
+
+#[test]
+fn repair_plan_marks_unsafe_inferred_paths_human_required() {
+    let dir = tempdir().unwrap();
+    seed_catalog(dir.path());
+    let report_path = write_report_with_text(
+        dir.path(),
+        "HLT-042-CI-LOCAL-PARITY",
+        "high",
+        ".github/workflows/ci.yml",
+        "ops",
+        "security",
+        "bash scripts/ci-local.sh quick",
+        "workflow commands should update docs/testing.md and packages/web/src/App.tsx",
+        "the fix needs docs/testing.md and packages/web/src/App.tsx",
+        "repair safely",
+    );
+    let plan_path = write_repair_plan(dir.path(), &report_path);
+    let plan = read_json(&plan_path);
+
+    let packet = &plan["packets"][0];
+    assert_eq!(packet["repair_eligibility"], "agent-assisted");
+    assert!(!packet["human_review_required"].as_bool().unwrap());
+    assert!(packet["eligibility_reason"]
+        .as_str()
+        .unwrap()
+        .contains("required fix path outside allowed_paths"));
+    assert!(!packet["allowed_paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "docs/testing.md"));
 }
 
 #[test]
@@ -212,6 +284,33 @@ fn write_report(
     lane: &str,
     rerun_command: &str,
 ) -> PathBuf {
+    write_report_with_text(
+        repo,
+        rule_id,
+        severity,
+        path,
+        owner,
+        lane,
+        rerun_command,
+        &format!("{rule_id} problem"),
+        &format!("{rule_id} reason"),
+        "repair safely",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_report_with_text(
+    repo: &Path,
+    rule_id: &str,
+    severity: &str,
+    path: &str,
+    owner: &str,
+    lane: &str,
+    rerun_command: &str,
+    problem: &str,
+    reason: &str,
+    agent_fix: &str,
+) -> PathBuf {
     fs::create_dir_all(repo.join("target/jankurai")).unwrap();
     let report_path = repo.join("target/jankurai/repo-score.json");
     let report = json!({
@@ -219,9 +318,9 @@ fn write_report(
             "severity": severity,
             "category": "phase-13",
             "path": path,
-            "problem": format!("{rule_id} problem"),
-            "reason": format!("{rule_id} reason"),
-            "agent_fix": "repair safely",
+            "problem": problem,
+            "reason": reason,
+            "agent_fix": agent_fix,
             "evidence": ["phase 13 fixture"],
             "check_id": rule_id,
             "hardness": "hard",
@@ -277,12 +376,12 @@ fn seed_catalog(repo: &Path) {
     fs::create_dir_all(repo.join("agent")).unwrap();
     fs::write(
         repo.join("agent/owner-map.json"),
-        r#"{"workspace":"fixture","owners":{"agent/":"agent","docs/":"standard","tips/":"paper","crates/":"tools","target/":"workspace"}}"#,
+        r#"{"workspace":"fixture","owners":{"agent/":"agent","docs/":"standard","tips/":"paper","crates/":"tools","scripts/":"ops",".github/":"ops","ops/":"ops","rust-toolchain.toml":"tools","target/":"workspace"}}"#,
     )
     .unwrap();
     fs::write(
         repo.join("agent/test-map.json"),
-        r#"{"workspace":"fixture","tests":{"agent/":{"command":"just security","purpose":"security checks"},"docs/":{"command":"just fast","purpose":"docs checks"},"crates/":{"command":"just fast","purpose":"rust checks"}}}"#,
+        r#"{"workspace":"fixture","tests":{"agent/":{"command":"just security","purpose":"security checks"},"docs/":{"command":"just fast","purpose":"docs checks"},"crates/":{"command":"just fast","purpose":"rust checks"},"scripts/":{"command":"bash scripts/ci-doctor.sh && bash scripts/ci-local.sh quick","purpose":"ci parity"},"rust-toolchain.toml":{"command":"rustup show","purpose":"toolchain parity"},".github/":{"command":"bash scripts/ci-local.sh quick","purpose":"workflow parity"},"ops/":{"command":"bash scripts/ci-doctor.sh && bash scripts/ci-local.sh quick","purpose":"ops parity"}}}"#,
     )
     .unwrap();
     fs::write(

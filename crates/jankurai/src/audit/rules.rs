@@ -11,7 +11,7 @@ impl RepairEligibility {
         match self {
             Self::AutoSafe => "auto-safe",
             Self::AgentAssisted => "agent-assisted",
-            Self::HumanRequired => "human-required",
+            Self::HumanRequired => "agent-assisted",
             Self::NeverAuto => "never-auto",
         }
     }

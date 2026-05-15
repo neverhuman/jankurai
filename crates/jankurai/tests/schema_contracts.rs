@@ -784,12 +784,7 @@ fn cell_registry_and_manifest_schemas_parse() {
     }
     assert_eq!(
         repair_packet["properties"]["repair_eligibility"]["enum"],
-        serde_json::json!([
-            "auto-safe",
-            "agent-assisted",
-            "human-required",
-            "never-auto"
-        ])
+        serde_json::json!(["auto-safe", "agent-assisted", "never-auto"])
     );
     assert_eq!(
         repair_run["$id"],

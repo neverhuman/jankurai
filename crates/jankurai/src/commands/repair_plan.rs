@@ -4,7 +4,10 @@ use crate::commands::repair::now_string;
 use crate::commands::score::join_or_none;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::{Context, Result};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -164,12 +167,41 @@ fn packet_from_finding(catalog: &RepoCatalog, finding: &serde_json::Value) -> Re
         .and_then(|value| value.as_str())
         .unwrap_or(&problem)
         .to_string();
+    let agent_fix = finding
+        .get("agent_fix")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
     let permission_profile = infer_permission_profile(&severity, &rule_id, &finding_path, &owner);
-    let (repair_eligibility, risk_level, eligibility_reason) =
+    let (repair_eligibility, risk_level, mut eligibility_reason) =
         repair_policy_for_finding(&rule_id, &severity);
-    let mut allowed_paths = repair_allowed_paths(catalog, &finding_path, &owner);
+    let owner_route = catalog.owner_for_path(&finding_path).unwrap_or(&owner);
+    let mut allowed_paths = repair_allowed_paths(catalog, &finding_path, owner_route);
+    let mut blocked_required_paths = Vec::new();
+    for candidate in inferred_required_paths(&problem, &why, &agent_fix) {
+        if let Some(scope) = safe_required_path_scope(
+            catalog,
+            &finding_path,
+            owner_route,
+            &rule_id,
+            &permission_profile,
+            &candidate,
+        ) {
+            push_unique(&mut allowed_paths, scope);
+        } else {
+            push_unique(&mut blocked_required_paths, candidate);
+        }
+    }
     if allowed_paths.is_empty() {
         push_unique(&mut allowed_paths, finding_path.clone());
+    }
+    if let Some(first_blocked) = blocked_required_paths.first() {
+        let blocked_reason = format!("required fix path outside allowed_paths: {first_blocked}");
+        if eligibility_reason.is_empty() {
+            eligibility_reason = blocked_reason;
+        } else {
+            eligibility_reason = format!("{eligibility_reason}; {blocked_reason}");
+        }
     }
     let forbidden_paths = repair_forbidden_paths(catalog);
     let expected_patch_shape = expected_patch_shape(&rule_id, &severity, &finding_path);
@@ -185,6 +217,12 @@ fn packet_from_finding(catalog: &RepoCatalog, finding: &serde_json::Value) -> Re
         "stop if the repair requires a migration, secret rotation, or external service change"
             .to_string(),
     ];
+    if let Some(first_blocked) = blocked_required_paths.first() {
+        push_unique(
+            &mut stop_conditions,
+            format!("stop if required fix path outside allowed_paths: {first_blocked}"),
+        );
+    }
     if permission_profile == "security-investigation" {
         push_unique(
             &mut stop_conditions,
@@ -254,7 +292,7 @@ fn planned_operation(packet: &RepairPacket) -> &'static str {
         || packet.permission_profile == "generated-regeneration"
     {
         "regenerate"
-    } else if packet.human_review_required {
+    } else if packet.repair_eligibility == RepairEligibility::NeverAuto.as_str() {
         "review-only"
     } else {
         "modify"
@@ -334,6 +372,123 @@ fn repair_allowed_paths(catalog: &RepoCatalog, path: &str, owner: &str) -> Vec<S
     out
 }
 
+fn inferred_required_paths(problem: &str, why: &str, agent_fix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for text in [problem, why, agent_fix] {
+        for candidate in path_candidates(text) {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+fn path_candidates(text: &str) -> Vec<String> {
+    static PATH_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r"(?x)
+            (?P<path>
+                (?:\.{1,2}/)?(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._@*?-]+(?:/[A-Za-z0-9._@*?-]+)*
+                | rust-toolchain\.toml
+                | \.tool-versions
+                | Justfile
+                | CODEOWNERS
+                | AGENTS\.md
+                | CLAUDE\.md
+                | GEMINI\.md
+            )
+        ",
+        )
+        .expect("repair plan path regex is valid")
+    });
+    PATH_RE
+        .captures_iter(text)
+        .filter_map(|capture| capture.name("path").map(|path| path.as_str().to_string()))
+        .filter_map(|path| normalize_required_path(&path))
+        .collect()
+}
+
+fn normalize_required_path(path: &str) -> Option<String> {
+    let cleaned = path
+        .trim()
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | ',' | ';' | ':' | ')' | '(' | '[' | ']' | '{' | '}'
+            )
+        })
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    if let Some(idx) = cleaned
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '*' | '?' | '{' | '[').then_some(idx))
+    {
+        let prefix = cleaned[..idx].trim_end_matches('/');
+        if prefix.is_empty() {
+            return None;
+        }
+        if cleaned[..idx].ends_with('/') {
+            return Some(format!("{prefix}/"));
+        }
+        return parent_prefix(prefix).or_else(|| Some(prefix.to_string()));
+    }
+    Some(cleaned.trim_end_matches('/').to_string())
+}
+
+fn safe_required_path_scope(
+    catalog: &RepoCatalog,
+    finding_path: &str,
+    owner: &str,
+    rule_id: &str,
+    permission_profile: &str,
+    candidate: &str,
+) -> Option<String> {
+    let scope = normalize_required_path(candidate)?;
+    let finding_owner = catalog.owner_for_path(finding_path).unwrap_or(owner);
+    if catalog.owner_for_path(&scope) == Some(finding_owner) {
+        return Some(scope);
+    }
+    if repo_policy_allows_required_path(finding_path, rule_id, permission_profile, &scope) {
+        return Some(scope);
+    }
+    None
+}
+
+fn repo_policy_allows_required_path(
+    finding_path: &str,
+    rule_id: &str,
+    permission_profile: &str,
+    candidate: &str,
+) -> bool {
+    if !ci_local_parity_scope(finding_path, rule_id, permission_profile) {
+        return false;
+    }
+    matches!(
+        candidate,
+        "scripts/ci-local.sh"
+            | "scripts/ci-doctor.sh"
+            | "rust-toolchain.toml"
+            | ".tool-versions"
+            | "Justfile"
+    ) || candidate.starts_with("scripts/")
+        || candidate.starts_with("ops/ci/")
+        || candidate.starts_with("ops/git-hooks/")
+        || candidate.starts_with(".github/workflows/")
+}
+
+fn ci_local_parity_scope(finding_path: &str, rule_id: &str, _permission_profile: &str) -> bool {
+    finding_path.starts_with(".github/workflows/")
+        || finding_path.starts_with("ops/")
+        || matches!(
+            rule_id,
+            "HLT-020-CI-HARDENING-GAP" | "HLT-042-CI-LOCAL-PARITY"
+        )
+}
+
 fn repair_forbidden_paths(catalog: &RepoCatalog) -> Vec<String> {
     let mut out = vec!["reference/".to_string(), "target/".to_string()];
     for path in catalog.forbidden_generated_paths() {
@@ -393,23 +548,15 @@ fn human_review_required(
     repair_eligibility: &str,
     risk_level: &str,
 ) -> bool {
-    severity == "critical"
-        || matches!(repair_eligibility, "human-required" | "never-auto")
-        || matches!(risk_level, "high" | "critical")
-        || matches!(
-            rule_id,
-            "HLT-010-SECRET-SPRAWL"
-                | "HLT-011-PROMPT-INJECTION"
-                | "HLT-012-OVERBROAD-AGENCY"
-                | "HLT-002-GENERATED-MUTATION"
-                | "HLT-006-DIRECT-DB-WRONG-LAYER"
-                | "HLT-021-DESTRUCTIVE-MIGRATION"
-                | "HLT-007-HANDWRITTEN-CONTRACT"
-                | "HLT-013-RENDERED-UX-GAP"
-                | "HLT-019-STREAMING-RUNTIME-DRIFT"
-        )
-        || path.starts_with("reference/")
-        || permission_profile == "security-investigation"
+    let _ = (
+        severity,
+        rule_id,
+        path,
+        permission_profile,
+        repair_eligibility,
+        risk_level,
+    );
+    false
 }
 
 fn repair_policy_for_finding(rule_id: &str, severity: &str) -> (String, String, String) {

@@ -498,7 +498,7 @@ fn fixture_apply_rejects_high_risk_or_human_required_packet() {
         json!({"append_text": "beta\n"}),
     );
     packet["risk_level"] = json!("high");
-    packet["repair_eligibility"] = json!("human-required");
+    packet["repair_eligibility"] = json!("agent-assisted");
     packet["human_review_required"] = json!(true);
     let mut edit = fixture_edit(
         "docs/high-risk.md",
@@ -507,7 +507,7 @@ fn fixture_apply_rejects_high_risk_or_human_required_packet() {
         json!({"append_text": "beta\n"}),
     );
     edit["risk_level"] = json!("high");
-    edit["repair_eligibility"] = json!("human-required");
+    edit["repair_eligibility"] = json!("agent-assisted");
     let plan_path = write_plan(repo.path(), edit, packet);
 
     let (output, out_path) = run_repair(

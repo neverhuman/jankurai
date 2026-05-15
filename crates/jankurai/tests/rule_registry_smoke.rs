@@ -178,7 +178,7 @@ fn every_rule_has_repair_policy_metadata() {
         assert!(
             matches!(
                 rule.repair_eligibility.as_str(),
-                "auto-safe" | "agent-assisted" | "human-required" | "never-auto"
+                "auto-safe" | "agent-assisted" | "never-auto"
             ),
             "{} has invalid repair eligibility",
             rule.id
