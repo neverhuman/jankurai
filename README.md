@@ -172,6 +172,100 @@ Jankurai treats agent behavior as repository policy, not chat convention.
 
 The project does not send repository contents to a hosted Jankurai service. The CLI inspects local files and writes local artifacts. Any external tools you run through your coding agent remain governed by that agent and your environment.
 
+## Jankurai Guard — Realtime Agent Write Enforcement
+
+`jankurai guard` intercepts agent file writes and runs `jankurai audit-file` on each candidate **before it reaches the repository**. Agents that produce bad output (TODO markers, secrets, failing severity rules) see the file reverted, a language-aware compile-error header injected, and a failure banner written to their PTY — no per-agent configuration required.
+
+### Backends
+
+| Backend | Platforms | How it works |
+| --- | --- | --- |
+| **Watcher** (default) | macOS, Linux, Windows | `notify`-based post-write detect-and-revert. Reverts to last-good snapshot within ~150 ms. Cannot prevent the initial save, but enforces before the agent can read the result. |
+| **FUSE** | Linux only | True pre-write blocking via a FUSE filesystem. Writes are intercepted at the commit boundary — the backing repository is never touched on block. |
+
+### Install — macOS (watcher mode, no setup)
+
+No dependencies. Watcher mode works immediately after the standard install:
+
+```bash
+cargo install --path crates/jankurai --locked
+jankurai guard watch <repo>
+```
+
+### Install — macOS (FUSE pre-write blocking)
+
+Requires macFUSE (a kernel extension). Install once; no binary rebuild needed:
+
+```bash
+brew install --cask macfuse
+```
+
+After install, open **System Settings → Privacy & Security** and approve the macFUSE kernel extension. Restart your terminal, then:
+
+```bash
+jankurai guard mount <repo>
+```
+
+> **Note:** macFUSE requires kernel extension approval and a restart on first install. Apple Silicon Macs may require disabling SIP for unsigned kernel extensions — see the [macFUSE documentation](https://github.com/osxfuse/osxfuse/wiki/FUSE-on-macOS) for details. Watcher mode is available on macOS without any kernel changes.
+
+### Install — Ubuntu / Debian (FUSE pre-write blocking)
+
+Install the FUSE dev library, then rebuild with the `guard-fuse` feature:
+
+```bash
+sudo apt-get install libfuse3-dev
+cargo install --path crates/jankurai --locked --features guard-fuse
+```
+
+Then mount:
+
+```bash
+jankurai guard mount <repo>
+```
+
+### First-run detection
+
+On the first `jankurai guard` invocation, if FUSE is not installed, the guard prints the exact command for your platform and continues in watcher mode automatically. The prompt appears once and is suppressed via `~/.jankurai/guard-fuse-prompted` on subsequent runs.
+
+### Quick start
+
+```bash
+# Watcher mode — works on macOS and Linux with no extra setup
+jankurai guard watch <repo>
+
+# Run an agent inside the guard (PTY injection enabled)
+jankurai guard run -- claude
+
+# Check guard status
+jankurai guard status <repo>
+
+# View the most recent block report
+jankurai guard failures --last
+```
+
+### Enforcement modes
+
+| Mode | Behavior |
+| --- | --- |
+| `observe` | Report only — never reverts or modifies files. |
+| `enforce` | Revert + quarantine + poison + PTY banner (default). |
+| `strict` | Enforce + lock path until the failure report is acknowledged. |
+
+Mode resolves as: CLI flag > `agent/guard-policy.toml` > `enforce`.
+
+### Audit-file save-gate engine
+
+`jankurai audit-file` is the engine the guard calls per write. It can also be invoked directly for scripting and pre-commit hooks:
+
+```bash
+# Audit a staged file before commit (exit 3 = block)
+jankurai audit-file . --path src/main.rs --candidate src/main.rs --op modify
+```
+
+Exit codes: `0` pass · `2` advisory · `3` block · `4` error.
+
+See [docs/guard.md](docs/guard.md) for the full architecture, poison format, PTY injection details, and policy file reference.
+
 ## GitHub Action
 
 Run Jankurai in GitHub Actions with the Marketplace action tag:
@@ -270,6 +364,7 @@ Jankurai works as a local control plane over a few repeatable surfaces:
 | Surface | Commands |
 | --- | --- |
 | Adoption and drift | `adopt`, `init`, `update`, `doctor` |
+| Agent write enforcement | `guard watch`, `guard mount`, `guard run`, `guard status`, `guard doctor`, `guard install`, `guard failures`, `guard quarantine`, `audit-file` |
 | Intent intake | `kickoff` (no-write handoff, read-first files, ownership boundaries, proof lanes, stop conditions, and next commands) |
 | Bounded agent context | `context-pack`, `adapters verify`, `adapters sync`, `agent verify`, `hooks install` |
 | Proof and evidence | `lane`, `proof`, `prove`, `proof-verify` |
@@ -289,6 +384,7 @@ Jankurai ships as a Rust workspace of focused crates. Install the core CLI with 
 | Crate | Purpose |
 | --- | --- |
 | [`jankurai`](crates/jankurai) | Audit CLI and standard enforcement engine. Scores repositories, generates findings, routes proof obligations, and writes JSON/Markdown evidence. |
+| [`jankurai-guard`](crates/jankurai-guard) | Realtime agent write enforcement runtime. Watcher backend (macOS + Linux) and FUSE backend (Linux, `--features guard-fuse`). Intercepts writes, runs `audit-file`, reverts/poisons on block. |
 | [`jankurai-proofbind`](crates/jankurai-proofbind) | Semantic surface routing and proof obligation binding. Maps changed paths to owners, proof lanes, and generated-zone policies. |
 | [`jankurai-proofmark`](crates/jankurai-proofmark) | Changed-behavior proof receipt engine. Validates that proof plans produce runnable commands and writes audit-ready receipts. |
 
@@ -438,6 +534,7 @@ Known open-source gaps:
 - [Agent-native standard](docs/agent-native-standard.md)
 - [Architecture](docs/architecture.md)
 - [Testing and proof lanes](docs/testing.md)
+- [Jankurai Guard — realtime agent write enforcement](docs/guard.md)
 - [Tuiwright TUI testing](docs/tuiwright.md)
 - [Merge witness](docs/merge-witness.md)
 - [Rolling score](docs/rolling-score.md)
