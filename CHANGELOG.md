@@ -4,7 +4,7 @@ All notable user-facing changes should be recorded here.
 
 Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, and agent-facing contracts should still receive compatibility notes when they change.
 
-## 1.3.1 - 2026-05-15
+## 1.4.2 - 2026-05-15
 
 ### Changed
 
