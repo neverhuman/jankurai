@@ -2390,7 +2390,11 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
     progress.tick("resolve changed paths");
     let (changed, changed_fast_effective, save_smart_state) =
         if let Some(base) = args.changed_from.as_deref() {
-            (jankurai::audit::changed_paths_from_git(&args.repo, base)?, args.changed_fast, false)
+            (
+                jankurai::audit::changed_paths_from_git(&args.repo, base)?,
+                args.changed_fast,
+                false,
+            )
         } else if !args.changed.is_empty() || args.changed_fast {
             if args.changed_fast && args.changed.is_empty() {
                 anyhow::bail!("--changed-fast requires --changed PATH or --changed-from REF");

@@ -76,11 +76,19 @@ fn clean_state(commit: &str) -> SmartScanState {
 }
 
 fn always_full() -> SmartScanConfig {
-    SmartScanConfig { enabled: false, interval_secs: 3600, roulette_rate: 0.0 }
+    SmartScanConfig {
+        enabled: false,
+        interval_secs: 3600,
+        roulette_rate: 0.0,
+    }
 }
 
 fn smart_cfg() -> SmartScanConfig {
-    SmartScanConfig { enabled: true, interval_secs: 3600, roulette_rate: 0.0 }
+    SmartScanConfig {
+        enabled: true,
+        interval_secs: 3600,
+        roulette_rate: 0.0,
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -159,11 +167,13 @@ fn timer_expired_elects_full() {
     let mut state = clean_state(&sha);
     state.last_full_scan_at = 1_000_000;
     write_state(dir.path(), &state);
-    let cfg = SmartScanConfig { enabled: true, interval_secs: 1, roulette_rate: 0.0 };
+    let cfg = SmartScanConfig {
+        enabled: true,
+        interval_secs: 1,
+        roulette_rate: 0.0,
+    };
     let decision = decide(dir.path(), &cfg).unwrap();
-    assert!(
-        matches!(decision, SmartScanDecision::Full { reason } if reason == "interval elapsed")
-    );
+    assert!(matches!(decision, SmartScanDecision::Full { reason } if reason == "interval elapsed"));
 }
 
 #[test]
@@ -171,9 +181,16 @@ fn roulette_rate_one_always_full() {
     let dir = empty_git_repo();
     let sha = commit_file(dir.path(), "x.txt", "hello");
     write_state(dir.path(), &clean_state(&sha));
-    let cfg = SmartScanConfig { enabled: true, interval_secs: 0, roulette_rate: 1.0 };
+    let cfg = SmartScanConfig {
+        enabled: true,
+        interval_secs: 0,
+        roulette_rate: 1.0,
+    };
     for _ in 0..10 {
-        assert!(matches!(decide(dir.path(), &cfg).unwrap(), SmartScanDecision::Full { .. }));
+        assert!(matches!(
+            decide(dir.path(), &cfg).unwrap(),
+            SmartScanDecision::Full { .. }
+        ));
     }
 }
 

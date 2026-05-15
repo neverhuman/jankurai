@@ -74,27 +74,43 @@ pub enum SmartScanDecision {
 /// when git status is empty and the state is valid.
 pub fn decide(root: &Path, config: &SmartScanConfig) -> Result<SmartScanDecision> {
     if !config.enabled {
-        return Ok(SmartScanDecision::Full { reason: "--full requested" });
+        return Ok(SmartScanDecision::Full {
+            reason: "--full requested",
+        });
     }
     let state = match load_state(root) {
         Some(s) => s,
-        None => return Ok(SmartScanDecision::Full { reason: "no prior state" }),
+        None => {
+            return Ok(SmartScanDecision::Full {
+                reason: "no prior state",
+            })
+        }
     };
     let head = current_commit(root);
     if head.as_deref() != Some(state.last_full_scan_commit.as_str()) {
-        return Ok(SmartScanDecision::Full { reason: "HEAD moved since last full scan" });
+        return Ok(SmartScanDecision::Full {
+            reason: "HEAD moved since last full scan",
+        });
     }
     if state.last_full_hard_findings > 0 || !state.last_full_caps.is_empty() {
-        return Ok(SmartScanDecision::Full { reason: "prior scan had findings" });
+        return Ok(SmartScanDecision::Full {
+            reason: "prior scan had findings",
+        });
     }
     if state.last_full_auditor_version != crate::model::AUDITOR_VERSION {
-        return Ok(SmartScanDecision::Full { reason: "auditor version changed" });
+        return Ok(SmartScanDecision::Full {
+            reason: "auditor version changed",
+        });
     }
     if config.interval_secs > 0 && elapsed_since(state.last_full_scan_at) > config.interval_secs {
-        return Ok(SmartScanDecision::Full { reason: "interval elapsed" });
+        return Ok(SmartScanDecision::Full {
+            reason: "interval elapsed",
+        });
     }
     if roulette(config.roulette_rate) {
-        return Ok(SmartScanDecision::Full { reason: "periodic check" });
+        return Ok(SmartScanDecision::Full {
+            reason: "periodic check",
+        });
     }
     let changed = git_status_changed_files(root)?;
     if changed.is_empty() {
@@ -198,7 +214,11 @@ fn now_unix_secs() -> i64 {
 
 fn elapsed_since(then: i64) -> u64 {
     let now = now_unix_secs();
-    if now > then { (now - then) as u64 } else { 0 }
+    if now > then {
+        (now - then) as u64
+    } else {
+        0
+    }
 }
 
 /// Returns true approximately `rate * 100`% of the time, using sub-second
