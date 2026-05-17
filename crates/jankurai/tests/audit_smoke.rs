@@ -286,6 +286,67 @@ fn free_prose_words_do_not_emit_findings_or_repair_tasks() {
 }
 
 #[test]
+fn smart_audit_false_positive_tuning_keeps_db_violations_visible() {
+    let dir = tempdir().unwrap();
+    write_audit_notice_fixture(dir.path());
+    fs::create_dir_all(dir.path().join("apps/api/src")).unwrap();
+    fs::write(
+        dir.path().join("apps/api/src/router.rs"),
+        [
+            "#[cfg(test)]",
+            "mod tests {",
+            "    #[test]",
+            "    fn smoke() {",
+            "        // TODO fallback legacy stub stale shim",
+            "        let fallback = choose_default();",
+            "        let settings = Settings { params: fallback };",
+            "    }",
+            "}",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/db_client.ts"),
+        "export const query = \"SELECT * FROM users\";\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("CHANGELOG.md"),
+        "Use `grep -rEn 'sk-|sk_|hf_|AIza|gsk_'` to audit secrets.\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+    let hlt001 = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule_id.as_deref() == Some("HLT-001-DEAD-MARKER"))
+        .collect::<Vec<_>>();
+    let hlt010 = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule_id.as_deref() == Some("HLT-010-SECRET-SPRAWL"))
+        .collect::<Vec<_>>();
+    let hlt006 = report
+        .findings
+        .iter()
+        .filter(|finding| finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        hlt001.is_empty(),
+        "benign comment/test scaffolding should not trip HLT-001"
+    );
+    assert!(hlt010.is_empty(), "regex examples should not trip HLT-010");
+    assert!(
+        !hlt006.is_empty(),
+        "direct DB access in apps/web should still be visible"
+    );
+}
+
+#[test]
 fn trusted_policy_markdown_still_scans_security_words() {
     let dir = tempdir().unwrap();
     write_audit_notice_fixture(dir.path());

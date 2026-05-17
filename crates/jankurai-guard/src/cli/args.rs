@@ -42,7 +42,7 @@ pub struct MountArgs {
     /// Mount point for the guarded view.
     #[arg(long, default_value = "mnt/jankurai-guard")]
     pub mount_point: PathBuf,
-    /// Stay in the foreground instead of daemonizing.
+    /// Compatibility no-op: mount sessions already stay in the foreground.
     #[arg(long)]
     pub foreground: bool,
 }

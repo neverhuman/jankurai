@@ -7,7 +7,7 @@
 #   quick     ops/ci/quality-gates.sh       (jankurai.yml#test-matrix)
 #   coverage  ops/ci/coverage-llvm.sh       (jankurai.yml#coverage-llvm)
 #   audit     ops/ci/audit.sh               (jankurai.yml#audit)
-#   release   ops/ci/release-audit-gate.sh  (release.yml#audit-gate)
+#   release   ops/ci/release-audit-gate.sh  (release.yml#audit-gate, includes coverage)
 #   container ops/ci/run-in-container.sh    (audit lane inside ubuntu image)
 #   all       quick + coverage + audit
 set -euo pipefail

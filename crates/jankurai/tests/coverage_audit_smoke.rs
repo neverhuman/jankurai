@@ -265,6 +265,17 @@ hard_survivors_on_changed_paths = 1
     let (output, audit) = run_coverage(repo.path(), &[]);
     assert!(output.status.success());
     assert!(audit["findings"].as_array().unwrap().is_empty());
+
+    copy_fixture(
+        repo.path(),
+        "cargo_mutants_native.json",
+        "coverage/mutants.json",
+    );
+    let (output, audit) = run_coverage(repo.path(), &[]);
+    assert!(output.status.success());
+    assert_eq!(audit["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(audit["findings"][0]["path"], "crates/demo/src/lib.rs");
+    assert_eq!(audit["findings"][0]["line"], 8);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Release audit gate: tag-vs-VERSION check, quality gates, strict security
-# lane, ratchet audit, SARIF artifact. Mirrors release.yml#audit-gate.
+# Release audit gate: tag-vs-VERSION check, coverage/mutation evidence,
+# quality gates, strict security lane, ratchet audit, and SARIF artifact.
+# Mirrors release.yml#audit-gate.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ensure_dir "${ARTIFACT_ROOT}"
@@ -20,6 +21,9 @@ bash "$(dirname "${BASH_SOURCE[0]}")/security-tools.sh"
 
 step "Quality gates"
 bash "$(dirname "${BASH_SOURCE[0]}")/quality-gates.sh"
+
+step "Coverage and mutation evidence"
+bash "$(dirname "${BASH_SOURCE[0]}")/coverage-llvm.sh"
 
 step "Install local jankurai"
 cargo install --path crates/jankurai --locked --force

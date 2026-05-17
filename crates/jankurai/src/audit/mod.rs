@@ -26,6 +26,7 @@ pub mod save_gate;
 pub mod scan;
 pub mod security_artifact;
 pub mod smart_scan;
+pub mod source_context;
 pub mod ux_artifact;
 pub mod web_security;
 pub mod zyal;

@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 pub const STANDARD_VERSION: &str = "0.9.0";
-pub const AUDITOR_VERSION: &str = "1.4.2";
+pub const AUDITOR_VERSION: &str = "1.4.3";
 pub const SCHEMA_VERSION: &str = "1.9.0";
 pub const PAPER_EDITION: &str = "2026.05-ed8";
 pub const TARGET_STACK_ID: &str = "rust-ts-vite-react-postgres-bounded-python";

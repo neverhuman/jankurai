@@ -75,10 +75,7 @@ phase13:
     cargo run -p jankurai -- exceptions expire . --warning-days 7 --strict --out target/jankurai/p13-exception-expiry.json --md target/jankurai/p13-exception-expiry.md
 
 cov:
-    mkdir -p target/coverage
-    cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/coverage/lcov.info
-    cargo llvm-cov report --json --output-path target/coverage/coverage.json
-    cargo llvm-cov report --summary-only | tee target/coverage/summary.txt
+    bash ops/ci/coverage-llvm.sh
 
 test-surface:
     bash scripts/render-test-surface.sh

@@ -1420,6 +1420,7 @@ fn mutation_outcome_from_value(
     let object = value.as_object()?;
     let raw_status = object
         .get("status")
+        .or_else(|| object.get("summary"))
         .or_else(|| object.get("outcome"))
         .or_else(|| object.get("result"))
         .and_then(Value::as_str)?;
@@ -1433,6 +1434,11 @@ fn mutation_outcome_from_value(
                     string_field(object, &["path", "file", "filename", "source_file"])
                 })
         })
+        .or_else(|| {
+            cargo_mutants_scenario(object, |mutant| {
+                string_field(mutant, &["path", "file", "filename", "source_file"])
+            })
+        })
         .or_else(|| parent_path.map(ToString::to_string))
         .unwrap_or_default();
     let line = object
@@ -1440,6 +1446,8 @@ fn mutation_outcome_from_value(
         .or_else(|| object.get("start_line"))
         .and_then(Value::as_u64)
         .map(|line| line as usize)
+        .or_else(|| line_from_span(object))
+        .or_else(|| cargo_mutants_scenario(object, line_from_span))
         .or_else(|| {
             object
                 .get("location")
@@ -1449,6 +1457,11 @@ fn mutation_outcome_from_value(
                 .map(|line| line as usize)
         });
     let message = string_field(object, &["name", "mutatorName", "description", "id"])
+        .or_else(|| {
+            cargo_mutants_scenario(object, |mutant| {
+                string_field(mutant, &["name", "mutatorName", "description", "id"])
+            })
+        })
         .unwrap_or_else(|| raw_status.to_string());
     Some(MutationOutcome {
         path: normalize_rel_string(&path),
@@ -1456,6 +1469,31 @@ fn mutation_outcome_from_value(
         status,
         message,
     })
+}
+
+fn cargo_mutants_scenario<T>(
+    object: &serde_json::Map<String, Value>,
+    f: impl FnOnce(&serde_json::Map<String, Value>) -> Option<T>,
+) -> Option<T> {
+    object
+        .get("scenario")
+        .and_then(Value::as_object)
+        .and_then(|scenario| {
+            scenario
+                .get("Mutant")
+                .or_else(|| scenario.get("mutant"))
+                .and_then(Value::as_object)
+        })
+        .and_then(f)
+}
+
+fn line_from_span(object: &serde_json::Map<String, Value>) -> Option<usize> {
+    object
+        .get("span")
+        .and_then(|span| span.get("start"))
+        .and_then(|start| start.get("line"))
+        .and_then(Value::as_u64)
+        .map(|line| line as usize)
 }
 
 fn normalize_mutation_status(status: &str) -> Option<String> {

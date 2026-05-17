@@ -4,6 +4,7 @@
 //! leaves in place at `critical` severity do.
 
 use super::fs::{CandidateOverlay, OverlayOp};
+use super::scan;
 use super::{run_candidate_audit, AuditOptions, CandidateAuditOptions};
 use crate::model::{Finding, Report};
 use anyhow::{bail, Result};
@@ -155,6 +156,10 @@ pub fn evaluate(req: SaveGateRequest) -> Result<SaveGateDecision> {
         .as_ref()
         .map(|r| findings_for_path(r, &req.rel_path))
         .unwrap_or_default();
+    let mut candidate_findings = candidate_findings;
+    candidate_findings.extend(candidate_todo_comment_findings(&req));
+    let mut baseline_findings = baseline_findings;
+    baseline_findings.extend(baseline_todo_comment_findings(&req));
     let buckets = classify(&candidate_findings, &baseline_findings, &fail_on);
     Ok(build_decision(
         &req,
@@ -341,6 +346,60 @@ fn severity_rank(severity: &str) -> i32 {
         "low" => 1,
         _ => 0,
     }
+}
+
+fn candidate_todo_comment_findings(req: &SaveGateRequest) -> Vec<Finding> {
+    let Some(bytes) = req.candidate_bytes.as_deref() else {
+        return vec![];
+    };
+    todo_comment_findings_from_bytes(&req.rel_path, bytes)
+}
+
+fn baseline_todo_comment_findings(req: &SaveGateRequest) -> Vec<Finding> {
+    let bytes: Option<Vec<u8>> = match &req.baseline_bytes {
+        Some(bytes) => Some(bytes.clone()),
+        None => std::fs::read(req.root.join(&req.rel_path)).ok(),
+    };
+    let Some(bytes) = bytes else {
+        return vec![];
+    };
+    todo_comment_findings_from_bytes(&req.rel_path, &bytes)
+}
+
+fn todo_comment_findings_from_bytes(rel_path: &str, bytes: &[u8]) -> Vec<Finding> {
+    let file = super::fs::file_info_from_candidate(rel_path, bytes, 4096);
+    let hits =
+        scan::pattern_hits_filtered(&[file], scan::TODO_PATTERNS, Some("HLT-001-DEAD-MARKER"));
+    hits
+        .into_iter()
+        .map(|hit| Finding {
+            severity: "high".into(),
+            category: "audit".into(),
+            path: hit.path.clone(),
+            problem: hit.problem.clone(),
+            agent_fix: "replace TODO/placeholder markers with implemented behavior or a tracked exception record".into(),
+            evidence: vec![format!(
+                "{}:{} {}",
+                hit.path,
+                hit.line.unwrap_or(1),
+                hit.text
+            )],
+            check_id: "HLT-001-DEAD-MARKER:audit".into(),
+            hardness: "hard".into(),
+            confidence: 1.0,
+            evidence_kind: "string-match".into(),
+            rerun_command: String::new(),
+            fingerprint: String::new(),
+            rule_id: Some("HLT-001-DEAD-MARKER".into()),
+            tlr: None,
+            lane: None,
+            docs_url: None,
+            owner: None,
+            line: hit.line,
+            matched_term: hit.matched_term,
+            reason: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@
 //! - the **mount** is the guarded view the agent sees (the repo path itself in
 //!   watcher mode, a FUSE mountpoint in FUSE mode),
 //! - the **backing** store at `~/.jankurai/backing/<repo-id>` holds the real
-//!   repository — only the daemon writes here in FUSE mode,
+//!   repository — only the guard session writes here in FUSE mode,
 //! - the **state** dir at `~/.jankurai/state/<repo-id>` holds guard state:
 //!   candidates, snapshots, poison views, denials and the pidfile.
 //!
@@ -86,7 +86,7 @@ impl GuardLayout {
         Ok(())
     }
 
-    /// Path to the daemon pidfile.
+    /// Path to the guard session pidfile.
     pub fn pidfile(&self) -> PathBuf {
         self.state.join("guard.pid")
     }

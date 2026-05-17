@@ -23,6 +23,11 @@ Implemented v1 parsers:
 - `jankurai-json`
 - `generic-json-summary`
 
+The Jankurai repo's local CI requires `cargo-mutants` because
+`agent/coverage-sources.toml` expects changed-code mutation evidence at
+`target/mutants/mutants.out/outcomes.json`. Run `just ci-coverage` to generate
+that file; do not hand-write it.
+
 Future parser candidates include Cobertura, JaCoCo, Istanbul JSON, Playwright JSON, Storybook test runner JSON, Schemathesis reports, Pact verification output, SQLFluff JSON, Squawk JSON, Syft CycloneDX/SPDX, and Grype JSON.
 
 Avoid archived or stale tools as primary proof sources. Dredd, for example, should be treated as legacy unless a project already has reviewed local evidence and an owner-backed migration plan; its GitHub repository was archived on November 8, 2024: <https://github.com/apiaryio/dredd>.

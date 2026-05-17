@@ -59,6 +59,7 @@ check_cmd python3 "brew install python"
 check_cargo_subcommand fmt "rustup component add rustfmt"
 check_cargo_subcommand clippy "rustup component add clippy"
 check_cargo_subcommand llvm-cov "cargo install cargo-llvm-cov --locked"
+check_cargo_subcommand mutants "cargo install cargo-mutants --locked"
 
 # Security lane
 check_cmd gitleaks "brew install gitleaks"
