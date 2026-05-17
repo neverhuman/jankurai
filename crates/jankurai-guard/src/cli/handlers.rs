@@ -74,19 +74,21 @@ fn run_mount(args: MountArgs) -> Result<()> {
     policy.mode = resolve_mode(&layout, &policy, args.mode);
     let audit = Arc::new(CliAuditClient::from_policy(&policy));
     let bus = Arc::new(crate::feedback::DenialBus::new());
-    let session = fuse::mount(layout.clone(), policy.clone(), audit, bus)?;
+    let _session = fuse::mount(layout.clone(), policy.clone(), audit, bus)?;
     state::write_pidfile(&layout)?;
     GuardState::new(&layout.repo_id, policy.mode, "fuse").save(&layout)?;
-    println!("guard mount: mounted at {}", layout.mount.display());
+    println!(
+        "guard mount: mounted at {} (foreground session, Ctrl-C to stop)",
+        layout.mount.display()
+    );
     if args.foreground {
-        // Hold the session open until interrupted.
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
-        }
+        println!("guard mount: --foreground is retained for compatibility and is now the default");
     }
-    session.unmount();
-    state::remove_pidfile(&layout)?;
-    Ok(())
+    // Hold the FUSE session open until the user ends this terminal session. The
+    // guard intentionally does not daemonize.
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// `guard run`: launch an agent under the guard.
@@ -226,15 +228,15 @@ fn run_unmount(args: UnmountArgs) -> Result<()> {
     }
     match state::read_pidfile(&layout) {
         Some(pid) if state::pid_is_live(pid) => {
-            // Signal the daemon to tear the mount down.
+            // Signal the foreground guard session to tear the mount down.
             // SAFETY: `pid` is live (confirmed by `pid_is_live` signal-0 check above).
             // SIGTERM is always safe to deliver to our own process; ESRCH is benign.
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
-            println!("guard unmount: signalled daemon pid {pid}");
+            println!("guard unmount: signalled guard session pid {pid}");
         }
-        _ => println!("guard unmount: no live guard daemon recorded"),
+        _ => println!("guard unmount: no live guard session recorded"),
     }
     state::remove_pidfile(&layout)?;
     Ok(())

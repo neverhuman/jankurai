@@ -10,7 +10,7 @@ between local work and the remote merge gate.
 | ---------------- | ------------------------------------------- | --------------- |
 | `just ci-doctor` | prereq check — no CI equivalent             | < 1 s           |
 | `just ci-quick`  | `jankurai / test (ubuntu-latest, macos-latest)` | 5–10 min    |
-| `just ci-coverage` | `jankurai / coverage (llvm-cov)`          | 5–10 min        |
+| `just ci-coverage` | `jankurai / coverage (llvm-cov + cargo-mutants)` | 10–20 min |
 | `just ci-audit`  | `jankurai / audit`                          | 15–25 min       |
 | `just ci-release`| `release / audit-gate`                      | 10–20 min       |
 | `just ci`        | quick + coverage + audit                    | 25–40 min       |
@@ -30,6 +30,7 @@ Typical installs the doctor will ask for:
 ```bash
 rustup component add rustfmt clippy llvm-tools-preview
 cargo install cargo-llvm-cov --locked
+cargo install cargo-mutants --locked
 cargo install cargo-audit --locked
 cargo install zizmor --locked
 brew install gitleaks syft just gh jq ripgrep
@@ -46,17 +47,33 @@ The test-matrix job:
 
 1. `cargo fmt --all -- --check`
 2. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-3. `cargo test --workspace --all-targets --all-features --locked`
-4. `bash scripts/render-test-surface.sh --check` — README chart is in sync
+3. `cargo test --workspace --exclude tuiwright --all-targets --all-features --locked`
+4. `cargo test -p tuiwright --all-targets --locked -- --test-threads=1` — PTY smoke tests run serially to avoid local terminal race flakes.
+5. `bash scripts/render-test-surface.sh --check` — README chart is in sync
 
 ### `just ci-coverage`
-The coverage-llvm job. Needs `cargo-llvm-cov` installed.
+The coverage job. Needs `cargo-llvm-cov` and `cargo-mutants` installed.
 
 ```bash
 cargo llvm-cov --workspace --all-features --locked --lcov --output-path target/coverage/lcov.info
 cargo llvm-cov report --json --output-path target/coverage/coverage.json
 cargo llvm-cov report --summary-only
+cargo mutants --in-diff target/jankurai/coverage/mutation.diff --output target/mutants --workspace --all-features
 ```
+
+The script also copies LCOV to the paths consumed by `jankurai coverage audit`:
+
+- `target/llvm-cov/lcov.info`
+- `target/jankurai/coverage/rust-lcov.info`
+
+Mutation evidence is written in the current cargo-mutants layout:
+
+- `target/mutants/mutants.out/outcomes.json`
+- `target/jankurai/coverage/mutation.diff`
+- `target/jankurai/coverage/mutants-list.json`
+
+When the git diff has no Rust mutants, the lane writes an empty outcomes file
+instead of leaving the mutation source missing. A survivor still fails the lane.
 
 ### `just ci-audit`
 The full audit job:

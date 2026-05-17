@@ -2,6 +2,7 @@ use super::helpers::*;
 use super::language_rules;
 use super::language_rules::common::{contains_unqualified_python_builtin_call, python_code_lines};
 use super::prose;
+use super::source_context;
 use crate::model::FileInfo;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -31,16 +32,12 @@ pub const TODO_PATTERNS: &[&str] = &[
 /// fields like `retry_after_seconds`, so it has been replaced with hostile-only
 /// phrases (`silent retry`, `unbounded retry`, `retry forever`).
 pub const FALLBACK_PATTERNS: &[&str] = &[
-    "fallback",
     "best effort",
-    "try again",
     "silent retry",
     "unbounded retry",
     "retry forever",
     "except Exception",
     "except:",
-    "unwrap_or_default(",
-    "or_else(",
     "return null",
     "return undefined",
 ];
@@ -506,20 +503,68 @@ pub fn pattern_hits(files: &[FileInfo], patterns: &[&str]) -> Vec<FindingHit> {
 }
 
 pub fn todo_hits(ctx: &AuditContext) -> Vec<FindingHit> {
-    pattern_hits_filtered(
-        &product_code_files(ctx),
-        TODO_PATTERNS,
-        Some("HLT-001-DEAD-MARKER"),
-    )
+    let mut hits = vec![];
+    for file in product_code_files(ctx) {
+        for line in source_context::source_lines(&file) {
+            if line.comment_only || line.test_scaffold {
+                continue;
+            }
+            let active = line.active_code.trim();
+            if active.is_empty() {
+                continue;
+            }
+            if let Some(pattern) = TODO_PATTERNS
+                .iter()
+                .find(|pattern| pattern_matches_with_boundary(active, pattern).is_some())
+            {
+                if pattern_needs_word_boundary(pattern)
+                    && source_context::term_only_appears_in_local_binding(active, pattern)
+                {
+                    continue;
+                }
+                hits.push(FindingHit {
+                    path: file.rel_path.clone(),
+                    line: Some(line.line_no),
+                    text: active.chars().take(160).collect(),
+                    matched_term: Some((*pattern).to_string()),
+                    agent_fix: String::new(),
+                    problem: active.chars().take(160).collect(),
+                });
+                if hits.len() >= 20 {
+                    return hits;
+                }
+            }
+        }
+    }
+    hits
 }
 
 pub fn fallback_hits(ctx: &AuditContext) -> Vec<FindingHit> {
-    let mut hits = pattern_hits_filtered(
-        &product_code_files(ctx),
-        FALLBACK_PATTERNS,
-        Some("HLT-001-DEAD-MARKER"),
-    );
-    hits.retain(|hit| !line_looks_like_framework_fallback_service(&hit.text));
+    let mut hits = vec![];
+    for file in product_code_files(ctx) {
+        for line in source_context::source_lines(&file) {
+            if line.comment_only || line.test_scaffold {
+                continue;
+            }
+            let active = line.active_code.trim();
+            if active.is_empty() || line_looks_like_framework_fallback_service(active) {
+                continue;
+            }
+            if line_has_error_hiding_fallback(active) {
+                hits.push(FindingHit {
+                    path: file.rel_path.clone(),
+                    line: Some(line.line_no),
+                    text: active.chars().take(160).collect(),
+                    matched_term: Some("fallback soup".into()),
+                    agent_fix: String::new(),
+                    problem: active.chars().take(160).collect(),
+                });
+                if hits.len() >= 20 {
+                    break;
+                }
+            }
+        }
+    }
     if hits.len() <= 1 {
         vec![]
     } else {
@@ -530,6 +575,107 @@ pub fn fallback_hits(ctx: &AuditContext) -> Vec<FindingHit> {
 fn line_looks_like_framework_fallback_service(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     lower.contains("fallback_service(") || lower.contains(".fallback_service(")
+}
+
+fn line_has_error_hiding_fallback(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let line_trimmed = lower.trim();
+
+    if lower.contains("silent retry")
+        || lower.contains("unbounded retry")
+        || lower.contains("retry forever")
+        || lower.contains("best effort")
+        || lower.contains("return null")
+        || lower.contains("return undefined")
+    {
+        return true;
+    }
+
+    if lower.contains("except:")
+        || lower.contains("except exception")
+        || lower.contains("catch all")
+        || lower.contains("swallow error")
+        || lower.contains("ignore error")
+        || lower.contains("silence error")
+    {
+        return true;
+    }
+
+    if lower.contains(".ok().unwrap_or")
+        || lower.contains("unwrap_or_default(")
+        || lower.contains("unwrap_or_else(")
+        || lower.contains("or_else(")
+    {
+        if is_deterministic_path_normalization(&lower) {
+            return false;
+        }
+        if lower.contains("unwrap_or(candidate)") {
+            return false;
+        }
+        return has_fallible_source_marker(&lower)
+            || line_trimmed.contains("default")
+            || line_trimmed.contains("empty")
+            || line_trimmed.contains("none")
+            || line_trimmed.contains("null")
+            || line_trimmed.contains("undefined");
+    }
+
+    FALLBACK_PATTERNS
+        .iter()
+        .any(|pattern| pattern_matches_with_boundary(line_trimmed, pattern).is_some())
+        && (has_fallible_source_marker(&lower)
+            || lower.contains("fallback:")
+            || lower.contains("error")
+            || lower.contains("retry"))
+}
+
+fn has_fallible_source_marker(lower: &str) -> bool {
+    [
+        "read_to_string",
+        "read_dir",
+        "read(",
+        "open(",
+        "parse(",
+        "from_str",
+        "from_slice",
+        "deserialize",
+        "json",
+        "env::var",
+        "try_from",
+        "load(",
+        "lookup",
+        "fetch(",
+        "request",
+        "connect(",
+        "recv(",
+        "send(",
+        "query(",
+        "run(",
+        "execute(",
+        "decode(",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn is_deterministic_path_normalization(lower: &str) -> bool {
+    [
+        "file_name",
+        "basename",
+        "stem",
+        "extension",
+        "parent",
+        "strip_prefix",
+        "strip_suffix",
+        "split_once",
+        "rsplit_once",
+        "components",
+        "canonicalize",
+        "normalize",
+        "to_str",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Matches an `api_key:` style assignment. Capture group 1 holds the right-hand-side
@@ -543,13 +689,7 @@ static SECRET_ASSIGNMENT: Lazy<Regex> = Lazy::new(|| {
     .expect("secret regex is valid")
 });
 
-const HIGH_ENTROPY_PREFIXES: &[&str] = &["AKIA", "ghp_", "sk-", "xoxb-", "xoxa-", "xoxp-", "eyJ"];
-
 /// Returns true when an assignment RHS looks like a real literal credential.
-///
-/// Accepts:
-/// - a quoted string ('"', "'", "`")
-/// - any of `HIGH_ENTROPY_PREFIXES` after stripping leading quotes/whitespace
 ///
 /// Rejects bare identifier paths like `model.api_key` or `config.token`.
 pub fn secret_assignment_value_is_secret_like(value: &str) -> bool {
@@ -557,10 +697,11 @@ pub fn secret_assignment_value_is_secret_like(value: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    if source_context::extract_high_confidence_secret_literal(trimmed).is_some() {
+        return true;
+    }
     let first = trimmed.as_bytes()[0];
     if first == b'"' || first == b'\'' || first == b'`' {
-        // Inspect the string contents to catch empty placeholders like "" or '' that should
-        // not flag, and short test fixtures like "x".
         let close = first;
         let body = &trimmed[1..];
         let end = body
@@ -568,12 +709,10 @@ pub fn secret_assignment_value_is_secret_like(value: &str) -> bool {
             .iter()
             .position(|&b| b == close)
             .unwrap_or(body.len());
-        let content = &body[..end];
-        return content.len() >= 8;
+        let content = body[..end].trim();
+        return content.len() >= 10;
     }
-    HIGH_ENTROPY_PREFIXES
-        .iter()
-        .any(|prefix| trimmed.starts_with(prefix))
+    false
 }
 
 pub fn secret_hits(ctx: &AuditContext) -> Vec<FindingHit> {
@@ -589,28 +728,11 @@ pub fn secret_hits(ctx: &AuditContext) -> Vec<FindingHit> {
         {
             continue;
         }
-        for (idx, line) in file.text.lines().enumerate() {
-            let strong_token = [
-                "AKIA",
-                "ghp_",
-                "xoxb-",
-                "xoxa-",
-                "xoxp-",
-                "sk-",
-                "-----BEGIN ",
-            ]
-            .iter()
-            .any(|needle| {
-                // For ambiguous short prefixes like "sk-", require non-word char before it
-                // to avoid false positives such as "risk-repo".
-                if matches!(*needle, "sk-" | "xoxb-" | "xoxa-" | "xoxp-") {
-                    line.match_indices(needle)
-                        .any(|(i, _)| i == 0 || !line.as_bytes()[i - 1].is_ascii_alphanumeric())
-                } else {
-                    line.contains(needle)
-                }
-            });
-            let assignment_match = SECRET_ASSIGNMENT.captures(line).and_then(|caps| {
+        for line in source_context::source_lines(file) {
+            let raw = line.raw.trim();
+            let active = line.active_code.trim();
+            let literal_match = source_context::extract_high_confidence_secret_literal(raw);
+            let assignment_match = SECRET_ASSIGNMENT.captures(active).and_then(|caps| {
                 caps.get(1).and_then(|rhs| {
                     if secret_assignment_value_is_secret_like(rhs.as_str()) {
                         Some(())
@@ -619,22 +741,18 @@ pub fn secret_hits(ctx: &AuditContext) -> Vec<FindingHit> {
                     }
                 })
             });
-            if strong_token
-                || assignment_match.is_some()
-                || (line.to_ascii_lowercase().contains("eyj")
-                    && line.to_ascii_lowercase().contains("token"))
-            {
+            if literal_match.is_some() || assignment_match.is_some() {
                 if super::language_rules::common::nearby_allow(
                     &file.text,
-                    idx + 1,
+                    line.line_no,
                     "HLT-010-SECRET-SPRAWL",
                 ) {
                     continue;
                 }
-                let problem = line.trim().chars().take(160).collect::<String>();
+                let problem = literal_match.unwrap_or_else(|| active.chars().take(160).collect());
                 hits.push(FindingHit {
                     path: file.rel_path.clone(),
-                    line: Some(idx + 1),
+                    line: Some(line.line_no),
                     text: problem.clone(),
                     matched_term: Some("secret-like material".into()),
                     agent_fix: "remove the credential, rotate the secret, and replace it with a config reference or test fixture that cannot be used as a live credential".into(),
@@ -1681,15 +1799,25 @@ pub fn future_hostile_hits(ctx: &AuditContext) -> Vec<FindingHit> {
         if is_future_hostile_allowlisted(&file) {
             continue;
         }
-        for (idx, line) in file.text.lines().enumerate() {
+        for line in source_context::source_lines(&file) {
+            if line.comment_only || line.test_scaffold {
+                continue;
+            }
+            let active = line.active_code.trim();
+            if active.is_empty() {
+                continue;
+            }
             if let Some((term, _regex)) = future_hostile_term_regexes()
                 .iter()
-                .find(|(_, regex)| regex.is_match(line))
+                .find(|(_, regex)| regex.is_match(active))
             {
+                if source_context::term_only_appears_in_local_binding(active, term) {
+                    continue;
+                }
                 out.push(FindingHit {
                     path: file.rel_path.clone(),
-                    line: Some(idx + 1),
-                    text: line.to_string(),
+                    line: Some(line.line_no),
+                    text: active.to_string(),
                     matched_term: Some(term.clone()),
                     agent_fix: "remove or rename the marker, implement the intended behavior, model a typed unsupported state, or move docs/generated/vendor/product-copy text into an allowlisted context".into(),
                     problem: format!("future-hostile/dead-language term `{}` appears", term),
@@ -2127,20 +2255,38 @@ mod tests {
     }
 
     #[test]
-    fn fallback_hits_ignores_framework_fallback_service_and_keeps_real_fallbacks() {
-        let text = "let policy = \"unbounded retry\";\n// fallback: use typed state\nrouter.fallback_service(handler);\n";
-        let ctx = make_ctx(vec![product_file("apps/api/src/router.rs", text)]);
+    fn fallback_hits_skips_comment_only_lines_and_keeps_real_error_hiding_fallbacks() {
+        let text = [
+            "let policy = \"silent retry\";",
+            "let mode = \"best effort\";",
+            "let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();",
+            "// fallback: use typed state",
+            "router.fallback_service(handler);",
+        ]
+        .join("\n");
+        let ctx = make_ctx(vec![product_file("apps/api/src/router.rs", &text)]);
         let hits = fallback_hits(&ctx);
-        assert_eq!(hits.len(), 2, "expected only the real fallback markers");
-        assert!(
-            hits.iter()
-                .all(|hit| !hit.text.contains("fallback_service")),
-            "framework fallback_service API should not be reported"
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected only the real error-hiding fallback markers"
         );
-        assert!(hits.iter().any(|hit| hit.text.contains("unbounded retry")));
-        assert!(hits
-            .iter()
-            .any(|hit| hit.text.contains("fallback: use typed state")));
+        assert!(
+            hits.iter().all(|hit| !hit.text.contains("file_name")),
+            "deterministic path parsing should not be reported"
+        );
+        assert!(hits.iter().any(|hit| hit.text.contains("silent retry")));
+        assert!(hits.iter().any(|hit| hit.text.contains("best effort")));
+    }
+
+    #[test]
+    fn fallback_hits_skips_unwrap_or_candidate_defaults() {
+        let text = "let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or(candidate);\n";
+        let ctx = make_ctx(vec![product_file("apps/api/src/router.rs", text)]);
+        assert!(
+            fallback_hits(&ctx).is_empty(),
+            "unwrap_or(candidate) should not be considered fallback soup"
+        );
     }
 
     #[test]
@@ -2166,6 +2312,47 @@ mod tests {
         assert!(
             !matched.is_empty(),
             "expected at least one TODO/placeholder pattern to match"
+        );
+    }
+
+    #[test]
+    fn todo_hits_ignores_comments_and_test_scaffolding() {
+        let text = [
+            "#[cfg(test)]",
+            "mod tests {",
+            "    #[test]",
+            "    fn smoke() {",
+            "        // TODO: stub fallback legacy stale shim",
+            "        let fallback = 1;",
+            "    }",
+            "}",
+        ]
+        .join("\n");
+        let ctx = make_ctx(vec![product_file("crates/app/src/lib.rs", &text)]);
+        assert!(
+            todo_hits(&ctx).is_empty(),
+            "comment-only TODOs inside Rust test scaffolding should be ignored"
+        );
+    }
+
+    #[test]
+    fn future_hostile_hits_keep_runtime_strings_but_skip_local_bindings_and_comments() {
+        let text = [
+            "pub const MODE: &str = \"legacy mode\";",
+            "let fallback = choose_default();",
+            "Settings { params: fallback }",
+            "// stale shim fallback stub",
+        ]
+        .join("\n");
+        let ctx = make_ctx(vec![product_file("apps/api/src/config.rs", &text)]);
+        let hits = future_hostile_hits(&ctx);
+        assert!(
+            hits.iter().any(|hit| hit.text.contains("legacy mode")),
+            "runtime string marker should remain visible"
+        );
+        assert!(
+            hits.iter().all(|hit| !hit.text.contains("let fallback")),
+            "local binding-only fallback should not be reported"
         );
     }
 
@@ -2203,10 +2390,21 @@ mod tests {
         }
     }
 
+    fn synthetic_secret(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn quoted_synthetic_secret(parts: &[&str]) -> String {
+        format!("\"{}\"", synthetic_secret(parts))
+    }
+
     #[test]
     fn nearby_allow_suppresses_secret_hit() {
-        let text = "// jankurai:allow HLT-010-SECRET-SPRAWL reason=test fixture expires=2099-12-31\nlet api_key = \"sk-test-AAAAAAAAAAAAAAAA\";\n";
-        let ctx = make_ctx(vec![product_file("apps/api/src/keys.rs", text)]);
+        let text = format!(
+            "// jankurai:allow HLT-010-SECRET-SPRAWL reason=test fixture expires=2099-12-31\nlet api_key = \"{}\";\n",
+            synthetic_secret(&["sk", "-test-AAAAAAAAAAAAAAAA"])
+        );
+        let ctx = make_ctx(vec![product_file("apps/api/src/keys.rs", &text)]);
         let hits = secret_hits(&ctx);
         assert!(
             hits.is_empty(),
@@ -2286,21 +2484,29 @@ mod tests {
     #[test]
     fn secret_assignment_accepts_literal_string_secrets() {
         assert!(secret_assignment_value_is_secret_like(
-            "\"sk-proj-AAAAAAAA\""
+            &quoted_synthetic_secret(&["sk", "-proj-AAAAAAAAAAAAAAAAAAAA"])
         ));
         assert!(secret_assignment_value_is_secret_like(
-            "\"eyJhbGciOiJIUzI1NiJ9.AAAA.BBB\""
+            &quoted_synthetic_secret(&["eyJ", "hbGciOiJIUzI1NiJ9.AAAAAAAAAA.BBBBBBBBBB"])
         ));
-        assert!(secret_assignment_value_is_secret_like("'abcdefgh12345678'"));
+        assert!(secret_assignment_value_is_secret_like(
+            &quoted_synthetic_secret(&["AK", "IAABCDEFGHIJKLMNOP"])
+        ));
     }
 
     #[test]
     fn secret_assignment_accepts_high_entropy_unquoted_prefixes() {
-        assert!(secret_assignment_value_is_secret_like("AKIAEXAMPLEKEY"));
-        assert!(secret_assignment_value_is_secret_like("ghp_AAAAAAAA"));
-        assert!(secret_assignment_value_is_secret_like("sk-test-AAAAAAAA"));
         assert!(secret_assignment_value_is_secret_like(
-            "eyJhbGciOiJIUzI1NiJ9"
+            &synthetic_secret(&["gh", "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        ));
+        assert!(secret_assignment_value_is_secret_like(
+            &synthetic_secret(&["sk", "-test-aaaaaaaaaaaaaaaa"])
+        ));
+        assert!(secret_assignment_value_is_secret_like(
+            &synthetic_secret(&["xox", "b-1234567890-abcdefghijklmnop"])
+        ));
+        assert!(secret_assignment_value_is_secret_like(
+            &synthetic_secret(&["eyJ", "hbGciOiJIUzI1NiJ9.AAAAAAAAAA.BBBBBBBBBB"])
         ));
     }
 
@@ -2319,8 +2525,11 @@ mod tests {
 
     #[test]
     fn secret_hits_flags_literal_string_credential() {
-        let text = "let cfg = Cfg { api_key: \"sk-proj-AAAAAAAAAAAA\" };\n";
-        let ctx = make_ctx(vec![product_file("apps/api/src/cfg.rs", text)]);
+        let text = format!(
+            "let cfg = Cfg {{ api_key: \"{}\" }};\n",
+            synthetic_secret(&["sk", "-proj-AAAAAAAAAAAAAAAAAAAA"])
+        );
+        let ctx = make_ctx(vec![product_file("apps/api/src/cfg.rs", &text)]);
         let hits = secret_hits(&ctx);
         assert!(
             !hits.is_empty(),
@@ -2330,12 +2539,32 @@ mod tests {
 
     #[test]
     fn secret_hits_flags_jwt_access_token() {
-        let text = "let cfg = Cfg { access_token: \"eyJhbGciOiJIUzI1NiJ9.AAAA.BBBB\" };\n";
-        let ctx = make_ctx(vec![product_file("apps/api/src/cfg.rs", text)]);
+        let text = format!(
+            "let cfg = Cfg {{ access_token: \"{}\" }};\n",
+            synthetic_secret(&["eyJ", "hbGciOiJIUzI1NiJ9.AAAAAAAAAA.BBBBBBBBBB"])
+        );
+        let ctx = make_ctx(vec![product_file("apps/api/src/cfg.rs", &text)]);
         let hits = secret_hits(&ctx);
         assert!(
             !hits.is_empty(),
             "literal JWT access_token should flag HLT-010"
         );
+    }
+
+    #[test]
+    fn secret_hits_ignores_regex_scan_examples_but_flags_real_literals() {
+        let example = product_file(
+            "CHANGELOG.md",
+            "Use `grep -rEn 'sk-|sk_|hf_|AIza|gsk_'` to audit samples.\n",
+        );
+        let literal_text = format!(
+            "Rotate `{}` immediately.\n",
+            synthetic_secret(&["sk", "-proj-AAAAAAAAAAAAAAAAAAAA"])
+        );
+        let literal = product_file("CHANGELOG.md", &literal_text);
+        let example_ctx = make_ctx(vec![example]);
+        let literal_ctx = make_ctx(vec![literal]);
+        assert!(secret_hits(&example_ctx).is_empty());
+        assert!(!secret_hits(&literal_ctx).is_empty());
     }
 }

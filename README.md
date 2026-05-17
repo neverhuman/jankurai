@@ -174,63 +174,69 @@ The project does not send repository contents to a hosted Jankurai service. The 
 
 ## Jankurai Guard — Realtime Agent Write Enforcement
 
-`jankurai guard` intercepts agent file writes and runs `jankurai audit-file` on each candidate **before it reaches the repository**. Agents that produce bad output (TODO markers, secrets, failing severity rules) see the file reverted, a language-aware compile-error header injected, and a failure banner written to their PTY — no per-agent configuration required.
+`jankurai guard` runs `jankurai audit-file` on candidate file writes and makes failures hard for an agent to miss. The default workflow does **not** install or depend on a long-running daemon: use `audit-file` from hooks, `guard run -- <agent>` for one supervised agent session, or `guard watch <repo>` as a foreground terminal process you can stop with `Ctrl-C`.
+
+When a write fails, the agent sees the file reverted or poisoned, a language-aware compile-error header injected, and a failure banner written to its PTY when launched through `guard run`.
+
+### Recommended No-Daemon Workflows
+
+```bash
+# Script/editor/pre-commit save gate: one file in, one decision out
+jankurai audit-file . --path src/main.rs --candidate src/main.rs --op modify
+
+# One supervised agent session; guard exits when the agent exits
+jankurai guard run -- claude
+
+# Foreground watcher session; stop with Ctrl-C
+jankurai guard watch .
+```
 
 ### Backends
 
 | Backend | Platforms | How it works |
 | --- | --- | --- |
-| **Watcher** (default) | macOS, Linux, Windows | `notify`-based post-write detect-and-revert. Reverts to last-good snapshot within ~150 ms. Cannot prevent the initial save, but enforces before the agent can read the result. |
-| **FUSE** | Linux only | True pre-write blocking via a FUSE filesystem. Writes are intercepted at the commit boundary — the backing repository is never touched on block. |
+| **audit-file** | macOS, Linux, Windows | Single-file decision engine for editor hooks, pre-commit hooks, and scripted save gates. No resident process. |
+| **Watcher** (default) | macOS, Linux, Windows | Foreground `notify` session. Detects post-write changes, then reverts to last-good snapshot or poisons the file. |
+| **FUSE** | Linux only | Foreground FUSE session. True pre-write blocking via a guarded mount; the backing repository is never touched on block. |
 
-### Install — macOS (watcher mode, no setup)
+### macOS: no macFUSE requirement
 
-No dependencies. Watcher mode works immediately after the standard install:
+macOS works with `audit-file`, `guard run`, and watcher mode immediately after the standard install:
 
 ```bash
 cargo install --path crates/jankurai --locked
-jankurai guard watch <repo>
+jankurai audit-file . --path src/main.rs --candidate src/main.rs --op modify
+jankurai guard run -- claude
+jankurai guard watch .
 ```
 
-### Install — macOS (FUSE pre-write blocking)
+This release does not link a macFUSE backend. Installing macFUSE is not required and will not make `jankurai guard mount` available on macOS. That is intentional until a macOS mount backend can be shipped and tested without kernel-extension surprises.
 
-Requires macFUSE (a kernel extension). Install once; no binary rebuild needed:
+### Linux: optional FUSE pre-write blocking
 
-```bash
-brew install --cask macfuse
-```
-
-After install, open **System Settings → Privacy & Security** and approve the macFUSE kernel extension. Restart your terminal, then:
-
-```bash
-jankurai guard mount <repo>
-```
-
-> **Note:** macFUSE requires kernel extension approval and a restart on first install. Apple Silicon Macs may require disabling SIP for unsigned kernel extensions — see the [macFUSE documentation](https://github.com/osxfuse/osxfuse/wiki/FUSE-on-macOS) for details. Watcher mode is available on macOS without any kernel changes.
-
-### Install — Ubuntu / Debian (FUSE pre-write blocking)
-
-Install the FUSE dev library, then rebuild with the `guard-fuse` feature:
+Linux users who want kernel-level pre-write blocking can install FUSE and build the optional backend:
 
 ```bash
 sudo apt-get install libfuse3-dev
 cargo install --path crates/jankurai --locked --features guard-fuse
 ```
 
-Then mount:
+Then run the mount as a foreground session:
 
 ```bash
-jankurai guard mount <repo>
+jankurai guard mount . --mount-point /tmp/jankurai-guard
 ```
+
+Keep that terminal open and point the agent/editor at `/tmp/jankurai-guard`. Stop with `Ctrl-C`. No background daemon is installed.
 
 ### First-run detection
 
-On the first `jankurai guard` invocation, if FUSE is not installed, the guard prints the exact command for your platform and continues in watcher mode automatically. The prompt appears once and is suppressed via `~/.jankurai/guard-fuse-prompted` on subsequent runs.
+On the first `jankurai guard` invocation, the guard prints one platform-specific note when FUSE is unavailable and then continues in watcher mode automatically. The prompt appears once and is suppressed via `~/.jankurai/guard-fuse-prompted` on subsequent runs. Use `jankurai guard doctor .` to check the current backend, mount, hook, and session status.
 
 ### Quick start
 
 ```bash
-# Watcher mode — works on macOS and Linux with no extra setup
+# Watcher mode — works on macOS and Linux with no extra setup; foreground only
 jankurai guard watch <repo>
 
 # Run an agent inside the guard (PTY injection enabled)
@@ -473,7 +479,7 @@ CI — the build fails if the chart drifts from reality.
 <!-- TEST_SURFACE_START -->
 _Generated by `scripts/render-test-surface.sh` — do not edit by hand._
 
-- **Total `#[test]` functions:** 725 across the Rust workspace
+- **Total `#[test]` functions:** 733 across the Rust workspace
 - **Integration test files:** 74
 - **Playwright tests (`@jankurai/ux-qa`):** 20
 
@@ -485,17 +491,17 @@ docker         █                        3
 sql            ████                     18
 comments       ███████                  29
 security       █████                    20
-boundaries     ████████                 30
+boundaries     ███████                  30
 ci             █                        4
 git            ██                       8
 release        █                        5
 migration      ██████████████           56
-ux-qa          ██████████               38
+ux-qa          █████████                38
 proof          █████                    20
-audit          ████████████████████████ 90
-conformance    █████                    19
+audit          ████████████████████████ 92
+conformance    ████                     19
 vibe           ███                      12
-phases         ████████████████████     75
+phases         ███████████████████      75
 ```
 <!-- TEST_SURFACE_END -->
 

@@ -1,6 +1,6 @@
 //! `guard doctor`: a preflight that checks whether the environment can run the
 //! guard — FUSE availability, backing-directory permissions, mount presence,
-//! daemon liveness, and whether the git hooks are installed. Output is human-
+//! session liveness, and whether the git hooks are installed. Output is human-
 //! readable or `--json`.
 
 use crate::layout::GuardLayout;
@@ -48,7 +48,7 @@ impl DoctorReport {
             check_backing(layout),
             check_state_dir(layout),
             check_mount(layout),
-            check_daemon(layout),
+            check_session(layout),
             check_git_hooks(layout),
         ];
         Self {
@@ -168,23 +168,23 @@ fn check_mount(layout: &GuardLayout) -> DoctorCheck {
     }
 }
 
-/// Checks whether a recorded daemon pid is still alive.
-fn check_daemon(layout: &GuardLayout) -> DoctorCheck {
+/// Checks whether a recorded guard session pid is still alive.
+fn check_session(layout: &GuardLayout) -> DoctorCheck {
     match state::read_pidfile(layout) {
         Some(pid) if state::pid_is_live(pid) => DoctorCheck {
-            name: "daemon".to_string(),
+            name: "session".to_string(),
             level: CheckLevel::Ok,
-            detail: format!("daemon pid {pid} is live"),
+            detail: format!("guard session pid {pid} is live"),
         },
         Some(pid) => DoctorCheck {
-            name: "daemon".to_string(),
+            name: "session".to_string(),
             level: CheckLevel::Warn,
             detail: format!("pidfile names pid {pid} but it is not running (outdated)"),
         },
         None => DoctorCheck {
-            name: "daemon".to_string(),
+            name: "session".to_string(),
             level: CheckLevel::Warn,
-            detail: "no guard daemon is running".to_string(),
+            detail: "no guard session is running".to_string(),
         },
     }
 }

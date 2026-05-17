@@ -9,6 +9,11 @@ or a shell script, because it intercepts at the filesystem and process layer
 rather than through any agent's hook API. `AGENTS.md`-style guidance is advisory
 and agents skip it; the guard is not advisory.
 
+The recommended workflow does not require a long-running daemon. Use
+`jankurai audit-file` for hooks and editor integrations, `jankurai guard run --
+<agent>` for one supervised agent session, or `jankurai guard watch <repo>` as a
+foreground terminal process. Stop foreground guard sessions with `Ctrl-C`.
+
 ## Two pieces
 
 ### 1. `jankurai audit-file` — the single-file save-gate
@@ -45,15 +50,16 @@ CLI:
 
 | Backend | Platforms | When the audit runs | What it guarantees |
 |---|---|---|---|
+| **audit-file** | macOS + Linux + Windows | Caller-provided candidate bytes | One candidate in, one save-gate decision out. No resident process. |
 | **Watcher** | macOS + Linux | Just after the write lands | Detects the change in milliseconds, then reverts to last-good / quarantines / poisons. Cannot block the write itself. |
-| **FUSE** | Linux | Before the bytes reach the real repo | The write is buffered; on a block the real repo is never touched. True pre-save blocking. |
+| **FUSE** | Linux | Before the bytes reach the real repo | Foreground guarded mount. The write is buffered; on a block the real repo is never touched. True pre-save blocking. |
 
 ```
 jankurai guard watch <repo>      # cross-platform: detect-and-react
-jankurai guard mount <repo>      # Linux: guarded FUSE mount, block-before-write
-jankurai guard run -- <agent>    # mount-or-watch, launch the agent, inject feedback
+jankurai guard mount <repo>      # Linux: foreground FUSE mount, block-before-write
+jankurai guard run -- <agent>    # foreground watcher, launch the agent, inject feedback
 jankurai guard status            # mount liveness, mode, blocked files
-jankurai guard doctor            # check libfuse/macFUSE, backing perms, hooks
+jankurai guard doctor            # check backend, backing perms, hooks, session
 jankurai guard install <repo>    # one-time layout + policy scaffold
 ```
 
@@ -85,16 +91,51 @@ flag > policy file > `enforce`.
 ## Platforms
 
 - **Linux** uses `libfuse` for the FUSE backend. Install `libfuse3-dev` (CI does
-  this automatically via `ops/ci/lib.sh`'s `ensure_fuse_dev`).
-- **macOS** uses the watcher backend by default. The FUSE backend would require
-  macFUSE, a kernel extension that needs administrator approval, so it is not
-  the default and is not exercised in CI. macOS users get full guard semantics
-  (intercept, audit, revert, poison) through the watcher backend; they do not
-  get kernel-level pre-save blocking.
+  this automatically via `ops/ci/lib.sh`'s `ensure_fuse_dev`), then build with
+  `cargo install --path crates/jankurai --locked --features guard-fuse`.
+  `jankurai guard mount . --mount-point /tmp/jankurai-guard` runs in the
+  foreground; point the agent/editor at the mount and stop it with `Ctrl-C`.
+- **macOS** uses `audit-file`, `guard run`, and the watcher backend. This
+  release does not link a macFUSE backend, so installing macFUSE is not required
+  and will not make `guard mount` available. This avoids kernel-extension
+  approval and crash-prone resident process expectations until a macOS mount
+  backend is implemented and tested directly.
 
 The `fuse` Cargo feature gates the FUSE backend, and the `fuser` dependency is
 scoped to `cfg(target_os = "linux")`, so `cargo build --all-features` stays
 green on macOS without macFUSE.
+
+## macOS Setup
+
+Use the no-daemon paths:
+
+```
+jankurai audit-file . --path src/main.rs --candidate src/main.rs --op modify
+jankurai guard run -- claude
+jankurai guard watch .
+jankurai guard doctor .
+```
+
+For editor integrations, call `audit-file` with the candidate buffer before the
+editor commits the save. For agents, prefer `guard run -- <agent>` so the
+watcher lifetime is tied to that agent process.
+
+## Linux FUSE Setup
+
+Use FUSE only when you need true pre-write blocking:
+
+```
+sudo apt-get install libfuse3-dev pkg-config
+cargo install --path crates/jankurai --locked --features guard-fuse
+jankurai guard doctor .
+jankurai guard mount . --mount-point /tmp/jankurai-guard
+```
+
+Keep the mount command in the foreground. Edit through
+`/tmp/jankurai-guard`; the backing repo is updated only after the save-gate
+passes. Stop with `Ctrl-C`. If the process is interrupted and the mount remains,
+run `jankurai guard unmount .` or the platform `fusermount3 -u
+/tmp/jankurai-guard`.
 
 ## Honest limits
 

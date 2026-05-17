@@ -4,6 +4,31 @@ All notable user-facing changes should be recorded here.
 
 Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, and agent-facing contracts should still receive compatibility notes when they change.
 
+## Unreleased
+
+No user-facing changes yet.
+
+## 1.4.3 - 2026-05-17
+
+### Fixed
+
+- Tuned HLT-001 and HLT-010 scans to avoid context-blind false positives from
+  comments, test scaffolding, changelog prose, local variable names, and regex
+  examples while preserving runtime marker, direct DB, and token-literal hits.
+- Updated coverage evidence to recognize the current cargo-mutants
+  `target/mutants/mutants.out/outcomes.json` format and native
+  `scenario.Mutant` outcome shape.
+
+### Changed
+
+- Local and GitHub coverage CI now generate both Rust LCOV and changed-code
+  cargo-mutants evidence, so `jankurai coverage audit` no longer reports a
+  missing Rust mutation source after the producer lane runs.
+- Guard documentation and first-run prompts now lead with no-daemon workflows:
+  `audit-file`, `guard run`, foreground watcher sessions, and Linux-only
+  foreground FUSE mounts. macOS no longer advertises unsupported macFUSE
+  pre-write blocking.
+
 ## 1.4.2 - 2026-05-15
 
 ### Changed
@@ -13,10 +38,6 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
   `eligibility_reason`.
 - Repair packets keep scope and proof receipts explicit while leaving the
   user or agent to decide execution difficulty.
-
-## Unreleased
-
-No user-facing changes yet.
 
 ## 1.3.0 - 2026-05-12
 

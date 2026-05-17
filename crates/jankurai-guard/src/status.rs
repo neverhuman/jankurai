@@ -1,5 +1,5 @@
 //! `guard status`: reports the live state of a guarded repository — backend
-//! mode, daemon liveness, mount presence, the list of currently-blocked files —
+//! mode, session liveness, mount presence, the list of currently-blocked files —
 //! in either a human-readable or `--json` form.
 
 use crate::layout::GuardLayout;
@@ -22,9 +22,9 @@ pub struct GuardStatus {
     pub mode: Option<String>,
     /// When the recorded session started, if any.
     pub started_at: Option<String>,
-    /// The daemon pid from the pidfile, if present.
+    /// The guard session pid from the pidfile, if present.
     pub daemon_pid: Option<u32>,
-    /// Whether that daemon process appears to be alive.
+    /// Whether that guard session process appears to be alive.
     pub daemon_live: bool,
     /// Whether the strict-mode marker is present.
     pub strict_marker: bool,
@@ -100,7 +100,7 @@ impl GuardStatus {
             self.started_at.as_deref().unwrap_or("-")
         ));
         out.push_str(&format!(
-            "  daemon  : {}\n",
+            "  session : {}\n",
             match self.daemon_pid {
                 Some(pid) if self.daemon_live => format!("pid {pid} (live)"),
                 Some(pid) => format!("pid {pid} (outdated)"),

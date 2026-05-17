@@ -3,7 +3,7 @@
 //!
 //! - `guard-state.json` — the [`GuardState`] document (mode, started-at, the
 //!   quarantine index, the blocked-file list),
-//! - `guard.pid` — the daemon pidfile,
+//! - `guard.pid` — the foreground guard-session pidfile,
 //! - `STRICT_MODE` — a marker that keeps strict enforcement on across restarts.
 
 use crate::feedback::now_rfc3339;
@@ -35,7 +35,7 @@ pub struct GuardState {
     pub version: String,
     /// Stable identifier of the guarded repository.
     pub repo_id: String,
-    /// Operating mode the daemon is running in.
+    /// Operating mode the guard session is running in.
     pub mode: GuardMode,
     /// RFC 3339 timestamp the session started.
     pub started_at: String,
@@ -112,7 +112,7 @@ pub fn write_pidfile(layout: &GuardLayout) -> Result<(), GuardError> {
     Ok(())
 }
 
-/// Reads the daemon pid from `layout`'s pidfile, returning `None` when the
+/// Reads the guard session pid from `layout`'s pidfile, returning `None` when the
 /// pidfile is absent or unparseable.
 pub fn read_pidfile(layout: &GuardLayout) -> Option<u32> {
     let text = fs::read_to_string(layout.pidfile()).ok()?;

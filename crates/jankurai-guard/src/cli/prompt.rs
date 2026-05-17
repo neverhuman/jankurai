@@ -37,16 +37,16 @@ fn print_fuse_notice() {
     eprintln!(
         "\n\
          ┌─────────────────────────────────────────────────────────────┐\n\
-         │  jankurai guard — FUSE not installed                        │\n\
+         │  jankurai guard — using no-daemon watcher mode              │\n\
          │                                                              │\n\
-         │  For pre-write blocking on macOS, install macFUSE:          │\n\
-         │    brew install --cask macfuse                               │\n\
+         │  This release does not link a macFUSE backend. Installing   │\n\
+         │  macFUSE is not required for Jankurai on macOS.             │\n\
          │                                                              │\n\
-         │  After install: System Settings → Privacy & Security        │\n\
-         │  → approve the macFUSE kernel extension, then restart.      │\n\
+         │  Use `jankurai audit-file` for hooks or `jankurai guard     │\n\
+         │  run -- <agent>` for one supervised agent session.          │\n\
          │                                                              │\n\
-         │  Watcher mode is active (detects and reverts writes).       │\n\
-         │  This notice appears once. Re-run after FUSE install.       │\n\
+         │  Watcher mode is active: it detects and reverts writes.     │\n\
+         │  This notice appears once.                                  │\n\
          └─────────────────────────────────────────────────────────────┘\n"
     );
     #[cfg(target_os = "linux")]
@@ -55,10 +55,11 @@ fn print_fuse_notice() {
          ┌─────────────────────────────────────────────────────────────┐\n\
          │  jankurai guard — FUSE dev library not found                │\n\
          │                                                              │\n\
-         │  For pre-write blocking, install libfuse3 and rebuild:      │\n\
+         │  For Linux pre-write blocking, install libfuse3 and rebuild:│\n\
          │    sudo apt-get install libfuse3-dev                         │\n\
          │    cargo install jankurai --features guard-fuse             │\n\
          │                                                              │\n\
+         │  No daemon is started. Watch/run stay in the foreground.    │\n\
          │  Watcher mode is active (detects and reverts writes).       │\n\
          │  This notice appears once. Re-run after rebuild.            │\n\
          └─────────────────────────────────────────────────────────────┘\n"

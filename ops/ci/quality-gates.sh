@@ -12,7 +12,10 @@ step "cargo clippy"
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 step "cargo test --workspace"
-cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --exclude tuiwright --all-targets --all-features --locked
+
+step "cargo test -p tuiwright --serial"
+cargo test -p tuiwright --all-targets --locked -- --test-threads=1
 
 step "README test surface in sync"
 bash "${CI_ROOT}/scripts/render-test-surface.sh" --check
