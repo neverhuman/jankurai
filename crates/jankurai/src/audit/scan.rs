@@ -2496,18 +2496,18 @@ mod tests {
 
     #[test]
     fn secret_assignment_accepts_high_entropy_unquoted_prefixes() {
-        assert!(secret_assignment_value_is_secret_like(
-            &synthetic_secret(&["gh", "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa"])
-        ));
-        assert!(secret_assignment_value_is_secret_like(
-            &synthetic_secret(&["sk", "-test-aaaaaaaaaaaaaaaa"])
-        ));
-        assert!(secret_assignment_value_is_secret_like(
-            &synthetic_secret(&["xox", "b-1234567890-abcdefghijklmnop"])
-        ));
-        assert!(secret_assignment_value_is_secret_like(
-            &synthetic_secret(&["eyJ", "hbGciOiJIUzI1NiJ9.AAAAAAAAAA.BBBBBBBBBB"])
-        ));
+        assert!(secret_assignment_value_is_secret_like(&synthetic_secret(
+            &["gh", "p_aaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+        )));
+        assert!(secret_assignment_value_is_secret_like(&synthetic_secret(
+            &["sk", "-test-aaaaaaaaaaaaaaaa"]
+        )));
+        assert!(secret_assignment_value_is_secret_like(&synthetic_secret(
+            &["xox", "b-1234567890-abcdefghijklmnop"]
+        )));
+        assert!(secret_assignment_value_is_secret_like(&synthetic_secret(
+            &["eyJ", "hbGciOiJIUzI1NiJ9.AAAAAAAAAA.BBBBBBBBBB"]
+        )));
     }
 
     #[test]
