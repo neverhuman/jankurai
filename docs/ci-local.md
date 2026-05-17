@@ -12,7 +12,7 @@ between local work and the remote merge gate.
 | `just ci-quick`  | `jankurai / test (ubuntu-latest, macos-latest)` | 5–10 min    |
 | `just ci-coverage` | `jankurai / coverage (llvm-cov + cargo-mutants)` | 10–20 min |
 | `just ci-audit`  | `jankurai / audit`                          | 15–25 min       |
-| `just ci-release`| `release / audit-gate`                      | 10–20 min       |
+| `just ci-release`| `release / audit-gate`                      | 20–35 min       |
 | `just ci`        | quick + coverage + audit                    | 25–40 min       |
 | `just zizmor`    | zizmor scan portion of the security lane    | < 5 s           |
 
@@ -91,8 +91,10 @@ The full audit job:
 11. `jankurai audit . --mode ratchet --baseline agent/baselines/main.repo-score.json`
 
 ### `just ci-release`
-The release.yml `audit-gate` job. Optionally set `LOCAL_RELEASE_TAG=v1.0.0`
-to also assert `VERSION` matches the tag.
+The release.yml `audit-gate` job. It regenerates Rust LCOV and cargo-mutants
+evidence before the ratchet audit, so tag releases do not depend on stale local
+`target/` files or PR artifacts. Optionally set `LOCAL_RELEASE_TAG=v1.0.0` to
+also assert `VERSION` matches the tag.
 
 ### `just zizmor`
 Static analysis of GitHub workflows. Run before pushing any `.github/workflows/`

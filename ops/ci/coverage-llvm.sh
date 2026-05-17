@@ -46,6 +46,11 @@ write_empty_mutation_outcomes() {
   printf '{\n  "outcomes": []\n}\n' > "$mutation_outcomes"
 }
 
+write_empty_mutation_list() {
+  ensure_dir "$(dirname "$mutation_list")"
+  printf '[]\n' > "$mutation_list"
+}
+
 write_mutation_diff() {
   : > "$mutation_diff"
   if ! git -C "$CI_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -72,6 +77,40 @@ write_mutation_diff() {
   git -C "$CI_ROOT" diff --no-ext-diff --binary HEAD > "$mutation_diff"
 }
 
+read_mutant_count() {
+  python3 - "$mutation_list" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+raw = path.read_text(encoding="utf-8").strip() if path.exists() else ""
+if not raw:
+    path.write_text("[]\n", encoding="utf-8")
+    print(0)
+    raise SystemExit(0)
+
+try:
+    data = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"invalid cargo mutants list JSON in {path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if isinstance(data, list):
+    print(len(data))
+elif isinstance(data, dict):
+    for key in ("mutants", "scenarios", "outcomes"):
+        value = data.get(key)
+        if isinstance(value, list):
+            print(len(value))
+            break
+    else:
+        print(0)
+else:
+    print(0)
+PY
+}
+
 step "cargo llvm-cov --workspace"
 ensure_llvm_tool_env
 cargo llvm-cov --workspace --all-features --locked \
@@ -91,19 +130,12 @@ step "cargo mutants --in-diff"
 write_mutation_diff
 if [[ ! -s "$mutation_diff" ]]; then
   note "no git diff found; writing empty mutation outcomes"
+  write_empty_mutation_list
   write_empty_mutation_outcomes
 else
   cargo mutants --list --json --in-diff "$mutation_diff" --output "${CI_ROOT}/target/mutants" \
     --workspace --all-features > "$mutation_list"
-  mutant_count=$(
-    python3 - "$mutation_list" <<'PY'
-import json
-import sys
-with open(sys.argv[1], encoding="utf-8") as fh:
-    data = json.load(fh)
-print(len(data) if isinstance(data, list) else 0)
-PY
-  )
+  mutant_count="$(read_mutant_count)"
   if [[ "$mutant_count" -eq 0 ]]; then
     note "diff produced no Rust mutants; writing empty mutation outcomes"
     write_empty_mutation_outcomes
@@ -115,4 +147,5 @@ PY
       --timeout "${CARGO_MUTANTS_TIMEOUT:-120}" -- --test-threads=1
   fi
 fi
+assert_nonempty "$mutation_list"
 assert_nonempty "$mutation_outcomes"
