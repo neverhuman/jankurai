@@ -490,7 +490,13 @@ fn cap_excerpt(s: &str, max: usize) -> String {
     if t.len() <= max {
         t.to_string()
     } else {
-        t[t.len().saturating_sub(max)..].to_string()
+        let mut start = t.len().saturating_sub(max);
+        // Slice by char boundary; otherwise multi-byte UTF-8 chars (e.g.
+        // cargo deny's box-drawing output) panic at `t[start..]`.
+        while start < t.len() && !t.is_char_boundary(start) {
+            start += 1;
+        }
+        t[start..].to_string()
     }
 }
 
