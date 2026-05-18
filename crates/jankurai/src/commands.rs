@@ -12,6 +12,7 @@ pub mod context_data;
 pub mod context_pack;
 pub mod copy_code;
 pub mod coverage;
+pub mod diff_audit;
 pub mod doctor;
 pub mod exceptions;
 pub mod govern;

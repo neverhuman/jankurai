@@ -4,9 +4,9 @@ use jankurai::audit::{run_audit, run_audit_timed_with_options, AuditOptions};
 use jankurai::commands::copy_code::CopyCodeArgs;
 use jankurai::commands::{
     adopt, agent, audit_file, badge, bench, cell, certify, conformance, context_pack, copy_code,
-    coverage, doctor, exceptions, govern, history, hooks, init, kickoff, migrate, optimize, paper,
-    postmortem, proof, proofbind, proofmark, publish, registry, repair, repair_plan, rules, rust,
-    score, security, update, vibe, witness,
+    coverage, diff_audit, doctor, exceptions, govern, history, hooks, init, kickoff, migrate,
+    optimize, paper, postmortem, proof, proofbind, proofmark, publish, registry, repair,
+    repair_plan, rules, rust, score, security, update, vibe, witness,
 };
 use jankurai::render::{render_markdown, write_json, write_markdown};
 use jankurai::report::issues::IssueFormat;
@@ -64,6 +64,12 @@ enum Commands {
     Proof(ProofPlanArgs),
     Prove(ProveArgs),
     ProofVerify(ProofVerifyArgs),
+    /// Fast pre-PR / pre-push audit scoped to the diff vs a base ref.
+    /// Composes `proof` (lane routing) + `audit` (changed-fast scoring) and
+    /// fails on hard findings or new caps. See `commands::diff_audit` for
+    /// details.
+    #[command(name = "diff-audit")]
+    DiffAudit(DiffAuditCliArgs),
     #[command(name = "proofbind")]
     ProofBind {
         #[command(subcommand)]
@@ -731,6 +737,42 @@ struct ProofVerifyArgs {
     out: String,
     #[arg(long, value_name = "PATH")]
     md: String,
+}
+
+#[derive(Args, Debug)]
+struct DiffAuditCliArgs {
+    /// Repo root (defaults to current directory).
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    /// Base ref to diff against. Defaults follow env precedence:
+    /// `JANKURAI_DIFF_BASE` → `origin/$GITHUB_BASE_REF` →
+    /// `$CI_MERGE_REQUEST_DIFF_BASE_SHA` → `origin/main`.
+    #[arg(long, value_name = "REF")]
+    base_ref: Option<String>,
+    /// Output directory for all artifacts (default `target/jankurai/diff/`).
+    #[arg(long, value_name = "PATH", default_value = "target/jankurai/diff")]
+    out_dir: PathBuf,
+    /// Explicit path for the audit JSON output (overrides `out_dir`).
+    #[arg(long, value_name = "PATH")]
+    json: Option<String>,
+    /// Explicit path for the audit Markdown output (overrides `out_dir`).
+    #[arg(long, value_name = "PATH")]
+    md: Option<String>,
+    /// Explicit path for the proof plan JSON output (overrides `out_dir`).
+    #[arg(long, value_name = "PATH")]
+    proof_out: Option<String>,
+    /// Explicit path for the proof plan Markdown output (overrides `out_dir`).
+    #[arg(long, value_name = "PATH")]
+    proof_md: Option<String>,
+    /// Explicit path for the changed-files manifest (overrides `out_dir`).
+    #[arg(long, value_name = "PATH")]
+    changed_list: Option<String>,
+    /// Skip the proof routing step (useful when `agent/owner-map.json` is absent).
+    #[arg(long)]
+    skip_proof: bool,
+    /// Never exit non-zero, even on hard findings. Use for report-only lanes.
+    #[arg(long)]
+    advisory_only: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1763,6 +1805,20 @@ fn main() -> anyhow::Result<()> {
                 evidence_index: args.evidence_index,
                 out: args.out,
                 md: args.md,
+            })?;
+        }
+        Some(Commands::DiffAudit(args)) => {
+            diff_audit::run(diff_audit::DiffAuditArgs {
+                repo: args.repo,
+                base_ref: args.base_ref,
+                out_dir: args.out_dir,
+                json: args.json,
+                md: args.md,
+                proof_out: args.proof_out,
+                proof_md: args.proof_md,
+                changed_list_out: args.changed_list,
+                skip_proof: args.skip_proof,
+                advisory_only: args.advisory_only,
             })?;
         }
         Some(Commands::ProofBind { command }) => match command {
