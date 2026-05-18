@@ -8,6 +8,44 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 No user-facing changes yet.
 
+## 1.5.0 - 2026-05-18
+
+### Added
+
+- `jankurai diff-audit` subcommand — fast pre-PR / pre-push lane that composes
+  `proof` (lane routing) + `audit` (changed-fast scoring) on the diff vs a
+  base ref. Replaces hand-rolled shell wrappers in downstream repos with one
+  versioned, testable binary path. Implementation lives at
+  `crates/jankurai/src/commands/diff_audit.rs`.
+  - Base-ref resolution precedence: `--base-ref` > `JANKURAI_DIFF_BASE` >
+    `origin/$GITHUB_BASE_REF` (GHA PR) >
+    `$CI_MERGE_REQUEST_DIFF_BASE_SHA` (GitLab MR) > `origin/main`.
+  - Collects changed files from `committed-vs-base ∪ staged ∪ worktree` so
+    pre-commit hooks see the staged set, not just history.
+  - Writes `target/jankurai/diff/{changed.lst,diff-score.{json,md},
+    proof-plan.{json,md}}`. The audit JSON uses the existing `RepoScore`
+    schema, so existing SARIF / JUnit / step-summary renderers ingest the
+    diff-scoped report unchanged.
+  - Exits non-zero on hard findings (`high|critical|error`) or new caps,
+    unless `--advisory-only` is set. `--skip-proof` for repos without
+    `agent/owner-map.json`. `--out-dir` to relocate artifacts.
+  - Honors `JANKURAI_SKIP_HOOKS=1` (no-op exit 0) so pre-commit / pre-push
+    hooks share one bypass token. Internally bypasses CI git wrappers
+    (`JERYU_GIT_BYPASS=1`, `JERYU_GIT_INTERNAL=1`) for diff collection so
+    audit decisions stay consistent under wrapper layers.
+- `crates/jankurai/tests/diff_audit_smoke.rs` — 4 integration smoke tests
+  covering `--help`, the no-changes path, a benign worktree change, and the
+  skip-hooks short-circuit. Plus 3 unit tests inside
+  `commands/diff_audit.rs` for the env-precedence resolver and the changed
+  list writer.
+
+### Changed
+
+- Bumped the auditor release to `1.5.0`. Report schema and standard
+  compatibility versions unchanged — the new subcommand reuses the existing
+  RepoScore schema. `proofbind` and `proofmark` sub-crates remain at
+  `0.8.0` (untouched by this PR).
+
 ## 1.4.3 - 2026-05-17
 
 ### Fixed
