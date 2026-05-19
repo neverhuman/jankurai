@@ -138,6 +138,9 @@ Stop or fix first when any condition is true:
 - no one-command fast validation
 - path has no owner-map entry
 - path has no test-map entry
+- agent-authored audit masking hides tracked Rust/core files, broad source
+  roots, generated-zone policy, ignore lists, or post-audit
+  `caps_applied`/`findings`/`issues` output
 - non-generated file exceeds hard LOC max without an exception
 - generated file would need hand edit
 - public API/schema changes without contract regeneration

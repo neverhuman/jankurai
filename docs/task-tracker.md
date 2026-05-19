@@ -1,6 +1,6 @@
 # Jankurai Task Tracker
 
-Last updated: 2026-05-04
+Last updated: 2026-05-19
 Owner: agent
 
 This is the living tracker for the remaining program work. It is not a second roadmap. It keeps the long-horizon plan visible while we close the last hardening gaps and preserve receipts.
@@ -37,6 +37,7 @@ Working execution status:
 | P02-5 | Fixture corpus | open | Add positive, negative, and edge fixtures for the semantic rule families that still rely on smoke-level coverage. | `cargo test -p jankurai --test rule_registry_smoke --test audit_smoke` |
 | P02-6 | Rule registry parity | open | Keep `rules export`, `rules verify`, the standard docs, and the emitted registry aligned. | `cargo test -p jankurai --test rule_registry_smoke` |
 | P02-7 | Receipt honesty | open | Reconcile the Phase 02 receipt and phase feedback status so the tracker reflects the real state after the hardening pass lands. | `git diff --check`, phase log append |
+| P02-8 | Audit masking hard block | open | Add central detection that blocks agent-authored masks for tracked Rust/core files and post-audit filtering of caps/findings/issues. | GitHub/GitLab issue templates plus fixture-backed audit/gate tests |
 
 ## Deferred But Tracked
 
