@@ -8,6 +8,16 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 No user-facing changes yet.
 
+## 1.5.1 - 2026-05-19
+
+### Fixed
+
+- Re-sync version bindings missed in the 1.5.0 release. `Cargo.toml` moved to
+  `1.5.0` but `VERSION`, `AUDITOR_VERSION`, `agent/standard-version.toml`,
+  `packages/ux-qa/package.json`, `package-lock.json`, and the standard-version
+  template stayed at `1.4.3`, breaking the `versions_smoke` test and the
+  `release-audit-gate` tag/VERSION check. No code behavior change.
+
 ## 1.5.0 - 2026-05-18
 
 ### Added
