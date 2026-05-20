@@ -2258,7 +2258,7 @@ mod tests {
     #[test]
     fn generated_zone_protected_paths_do_not_suppress_protected_sources() {
         let dir = tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".jankurai")).unwrap();
+        std::fs::create_dir_all(dir.path().join("agent")).unwrap();
         std::fs::write(
             dir.path().join("agent/generated-zones.toml"),
             r#"[[zone]]

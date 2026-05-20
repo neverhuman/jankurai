@@ -17,7 +17,7 @@ Agent verification is first-class now:
 jankurai agent verify
 jankurai adapters verify
 jankurai context-pack --task "..." --out target/jankurai/context-pack.json
-jankurai repair-plan --from agent/repo-score.json --out target/jankurai/repair-plan.json
+jankurai repair-plan --from .jankurai/repo-score.json --out target/jankurai/repair-plan.json
 ```
 
 Durable policy belongs in `docs/` or `agent/`, not in per-tool prompt forks.

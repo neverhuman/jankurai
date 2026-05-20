@@ -108,7 +108,7 @@ For agent repair work, use the narrow packet commands:
 
 ```bash
 jankurai context-pack --task "repair agent context routing" --out target/jankurai/context-pack.json
-jankurai repair-plan --from agent/repo-score.json --out target/jankurai/repair-plan.json
+jankurai repair-plan --from .jankurai/repo-score.json --out target/jankurai/repair-plan.json
 ```
 
 ## Greenfield Sequence

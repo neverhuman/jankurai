@@ -679,6 +679,10 @@ pub fn has_web_surface(ctx: &AuditContext) -> bool {
             && (f.text.contains("\"react\"")
                 || f.text.contains("\"vite\"")
                 || f.text.contains("\"storybook\""));
+        let react_source_hint = matches!(f.suffix.as_str(), ".tsx" | ".jsx")
+            && (f.text.contains("from \"react\"")
+                || f.text.contains("from 'react'")
+                || f.text.contains("React."));
         !f.rel_path.starts_with("docs/")
             && !f.rel_path.starts_with("paper/")
             && !f.rel_path.starts_with("reference/")
@@ -689,7 +693,8 @@ pub fn has_web_surface(ctx: &AuditContext) -> bool {
                 || f.rel_path.starts_with("ui")
                 || f.rel_path.starts_with("packages/web")
                 || f.rel_path.starts_with("packages/ui")
-                || manifest_web_hint)
+                || manifest_web_hint
+                || react_source_hint)
     })
 }
 
