@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 # Thin orchestration only. The executable source of truth lives in
-# ops/ci/release-*.sh — the same scripts run via `just ci-release`.
+# ops/ci/release-*.sh — the same scripts run via `just ci-release*`.
 
 jobs:
   audit-gate:
@@ -71,17 +71,23 @@ jobs:
     needs: audit-gate
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            subject_path: dist/*.tar.gz
           - target: aarch64-apple-darwin
             os: macos-latest
+            subject_path: dist/*.pkg
           # x86_64-apple-darwin dropped: macos-13 free-runner queue is saturated.
           # Apple Silicon users get aarch64-apple-darwin; Intel-mac users build
-          # from source via `cargo install --path crates/jankurai --locked`.
+          # from source via the release installer fallback.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -91,19 +97,51 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22
+        with:
+          cosign-release: v2.4.1
+
       - name: Build release artifact
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           TARGET: ${{ matrix.target }}
+          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 || '' }}
+          APPLE_DEVELOPER_ID_APPLICATION_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_APPLICATION_PASSWORD || '' }}
+          APPLE_DEVELOPER_ID_APPLICATION_IDENTITY: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY || '' }}
+          APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 || '' }}
+          APPLE_DEVELOPER_ID_INSTALLER_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_INSTALLER_PASSWORD || '' }}
+          APPLE_DEVELOPER_ID_INSTALLER_IDENTITY: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_INSTALLER_IDENTITY || '' }}
+          APPLE_NOTARYTOOL_APPLE_ID: ${{ matrix.os == 'macos-latest' && secrets.APPLE_NOTARYTOOL_APPLE_ID || '' }}
+          APPLE_NOTARYTOOL_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_NOTARYTOOL_PASSWORD || '' }}
+          APPLE_NOTARYTOOL_TEAM_ID: ${{ matrix.os == 'macos-latest' && secrets.APPLE_NOTARYTOOL_TEAM_ID || '' }}
+          APPLE_KEYCHAIN_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_KEYCHAIN_PASSWORD || '' }}
         run: bash ops/ci/release-build.sh
 
-      - name: Upload build artifact
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+        with:
+          subject-path: ${{ matrix.subject_path }}
+
+      - name: Upload Linux build artifact
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: jankurai-${{ matrix.target }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.tar.gz.sigstore.bundle
+
+      - name: Upload macOS build artifact
+        if: matrix.target == 'aarch64-apple-darwin'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: jankurai-${{ matrix.target }}
+          path: |
+            dist/*.pkg
+            dist/*.pkg.sha256
+            dist/*.pkg.sigstore.bundle
 
   publish:
     name: publish release

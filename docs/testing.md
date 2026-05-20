@@ -6,6 +6,7 @@ Testing is routed proof. Agents should not guess which tests matter.
 | --- | --- |
 | `fast` | deterministic local proof for most edits |
 | `contract` | API/schema generation and drift checks |
+| `contract-drift` | boundary manifest, generated-contract, and public API drift proof |
 | `db` | migrations, constraints, schema drift |
 | `db-migration-analyze` | migration liability report from `jankurai migrate --analyze` (routed for `db/migrations/` in `agent/test-map.json`) |
 | `web` | TypeScript typecheck, component tests, rendered UX QA |
@@ -30,12 +31,33 @@ Jankurai flags destructive statements in SQL files under migration roots (for ex
 
 **SARIF:** audit exports map repo-relative rule `docs_url` paths (for example `docs/testing.md`) to an absolute GitHub `blob/main/...` URL in each rule's `helpUri`. Finding regions include matching `startLine`/`endLine` and a `snippet` from evidence or a short `problem` excerpt.
 
+## Repair Receipts And Telemetry
+
+When a proof lane fails, keep the next agent on the shortest possible rerun path.
+
+- Emit structured errors instead of only free-form prose whenever the tool can do it.
+- Record the failing command, exit code, changed paths, artifact paths, and rerun command in the receipt.
+- Prefer typed telemetry or JSON envelopes under `target/jankurai/` over ad hoc log spam.
+- Surface the repair hint, docs URL, and common fixes together so the next rerun is obvious.
+- If the lane writes a receipt or summary, make it point at the exact proof command the next agent should trust.
+
+## Budgets, Quotas, And Stops
+
+Paid work or unbounded work needs an explicit ceiling before it starts.
+
+- State the budget in time, runner minutes, tokens, API calls, or dollars.
+- State the quota or cap that will stop the run.
+- State the kill switch or stop condition that aborts the work once the cap is hit.
+- Capture evidence of the stop in the receipt so the next agent can tell a planned stop from a silent failure.
+- Do not keep retrying a paid job after the cap is reached without a fresh approval receipt.
+
 For this workspace:
 
 - `jankurai kickoff` is the no-write first-hour intake command. It writes `target/jankurai/kickoff.json` and `target/jankurai/kickoff.md`, surfaces read-first files, ownership boundaries, proof lanes, generated-zone and forbidden-path constraints, clarifying questions, expected receipts, and next commands, and keeps route decisions conservative until the repo facts are visible.
 - `just versions` checks version and artifact bindings through the Rust auditor.
 - `just ux-qa` builds and tests the optional Playwright geometry runtime.
 - `just fast` writes a deterministic audit snapshot under `target/jankurai/`.
+- `just contract-drift` runs the boundary manifest smoke test, contract source smoke test, and public API drift hook before contract or generated-client changes land.
 - `just score` writes local generated audit outputs at `.jankurai/repo-score.json` and `.jankurai/repo-score.md`; these files are ignored and are not accepted ratchet baselines.
 - `jankurai copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md` writes the copy-code redundancy report used for HLT-043 routing.
 - Accepted ratchet and public badge baselines live under `agent/baselines/`. CI copies the reviewed baseline to `target/jankurai/accepted-baseline.json` before the final audit.

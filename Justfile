@@ -59,6 +59,11 @@ security:
 security-strict:
     cargo run -p jankurai -- security run . --strict --profile ci --out target/jankurai/security/evidence.json
 
+contract-drift:
+    cargo test -p jankurai --test boundaries_manifest_smoke
+    cargo test -p jankurai --test contract_source_smoke
+    cargo semver-checks check-release
+
 security-bash:
     bash tools/security-lane.sh
 
@@ -103,6 +108,12 @@ ci-audit:
 
 ci-release:
     bash scripts/ci-local.sh release
+
+ci-release-build:
+    bash scripts/ci-local.sh release-build
+
+ci-release-publish:
+    bash scripts/ci-local.sh release-publish
 
 ci:
     bash scripts/ci-local.sh all

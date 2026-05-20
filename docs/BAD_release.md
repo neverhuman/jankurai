@@ -36,7 +36,7 @@ A release should answer these questions without detective work:
 | What changed? | Changelog, release notes, linked PRs/issues, and breaking-change notes. |
 | Who approved it? | Required reviews, CODEOWNERS where applicable, release approver, and CI identity. |
 | What ran? | CI run, required checks, security lane, tests, and post-release verification. |
-| What artifact shipped? | Package/image/binary identifier plus digest, checksum, signature, SBOM, provenance, or attestation. |
+| What artifact shipped? | Package/image/binary/installer identifier plus digest, checksum, signature, SBOM, provenance, attestation, or notarization evidence. |
 | How is it recovered? | Rollback or roll-forward plan, previous known-good version, monitoring threshold, and incident owner. |
 
 ## Inexcusable Behavior
@@ -63,7 +63,10 @@ owner, expiry, residual risk, and compensating proof:
 `HLT-025-RELEASE-READINESS-GAP` checks that release-capable projects have the
 expected release structure and launch-gate evidence. The current minimum
 structure is a version source, changelog, release process doc, automation or
-command policy, integrity/provenance policy, and rollback guidance.
+command policy, integrity/provenance policy, and rollback guidance. For
+installer-first releases, the evidence should also name the immutable tag, the
+CI-built artifact paths, the sha256 file, the Sigstore bundle, the GitHub
+artifact attestation, and the notarized macOS pkg when applicable.
 
 `HLT-037-RELEASE-BAD-BEHAVIOR` is detector-backed and looks for high-confidence
 release hazards in release scripts, publish scripts, package scripts, and CI
@@ -77,7 +80,7 @@ release workflows:
 | Mutable latest-only artifacts | `docker push ...:latest`, `git tag latest`. |
 | Secret-bearing artifacts | Archives or release uploads that include `.env`, `.npmrc`, `.pypirc`, `.ssh`, private keys, or secret-named paths. |
 | Unverified release creation | `gh release create` without tag verification evidence. |
-| Missing integrity evidence | Publish commands without checksum, SBOM, provenance, signature, attestation, or Jankurai witness evidence. |
+| Missing integrity evidence | Publish commands without checksum, SBOM, provenance, signature, attestation, notarization, or Jankurai witness evidence. |
 | Untrusted privileged publishing | Release/publish commands in `pull_request_target` or privilege-bridged workflows with write tokens or secrets. |
 
 The detector skips docs, paper sources, tips, reference material, generated
@@ -92,7 +95,7 @@ from becoming executable policy.
    migration steps, security notes, and known issues.
 3. Build artifacts in CI from a clean, reviewed commit and immutable tag.
 4. Attach checksums and supply-chain evidence such as SBOM, provenance,
-   signature, or attestation.
+   signature, attestation, notarization, and installer metadata.
 5. Restrict release workflows to protected branches or protected tags.
 6. Use short-lived, least-privilege publishing credentials or trusted
    publishing/OIDC where available.
