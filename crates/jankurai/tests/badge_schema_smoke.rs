@@ -20,6 +20,7 @@ fn badge_command_emits_readme_schema_valid_json() {
     )
     .unwrap();
     fs::write(repo.path().join("README.md"), "# fixture\n").unwrap();
+    fs::create_dir_all(repo.path().join(".jankurai")).unwrap();
     fs::write(
         repo.path().join("Justfile"),
         "fast:\n    echo ok\ncheck:\n    echo ok\n",
@@ -48,7 +49,7 @@ fn badge_command_emits_readme_schema_valid_json() {
     report_value["decision"]["hard_findings"] = serde_json::json!(0);
     report_value["decision"]["soft_findings"] = serde_json::json!(0);
     fs::write(
-        repo.path().join("agent/repo-score.json"),
+        repo.path().join(".jankurai/repo-score.json"),
         serde_json::to_string_pretty(&report_value).unwrap(),
     )
     .unwrap();

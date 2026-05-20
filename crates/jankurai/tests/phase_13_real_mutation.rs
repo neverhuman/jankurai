@@ -35,9 +35,9 @@ purpose = "fixture proof"
     fs::write(
         repo.join("agent/generated-zones.toml"),
         r#"[[zone]]
-path = "agent/repo-score.json"
+path = ".jankurai/repo-score.json"
 source = "crates/jankurai"
-command = "cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
+command = "cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
 read_only = false
 "#,
     )

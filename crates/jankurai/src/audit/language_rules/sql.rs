@@ -113,7 +113,7 @@ fn hard_findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
 }
 
 fn sql_files(ctx: &AuditContext) -> Vec<FileInfo> {
-    let zone_paths = crate::audit::helpers::generated_zone_paths(ctx);
+    let zone_paths = crate::audit::helpers::generated_zone_suppression_paths(ctx);
     ctx.all_files
         .iter()
         .filter(|file| is_sql_candidate(file, &zone_paths))

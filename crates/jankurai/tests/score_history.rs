@@ -148,8 +148,8 @@ fn append_creates_valid_jsonl_and_csv_rows() {
     let written = append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, Some(&csv), None, false),
     )
     .unwrap();
@@ -178,8 +178,8 @@ fn history_latest_and_export_emit_stable_contracts() {
     append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, None, false),
     )
     .unwrap();
@@ -243,16 +243,16 @@ fn consecutive_equivalent_rows_are_not_duplicated() {
     append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, None, false),
     )
     .unwrap();
     append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, None, false),
     )
     .unwrap();
@@ -270,8 +270,8 @@ fn changed_score_and_finding_counts_create_new_rows() {
     append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, None, false),
     )
     .unwrap();
@@ -282,8 +282,8 @@ fn changed_score_and_finding_counts_create_new_rows() {
     append_score_history_with_options(
         repo.path(),
         &changed_score,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, None, false),
     )
     .unwrap();
@@ -297,8 +297,8 @@ fn changed_score_and_finding_counts_create_new_rows() {
     append_score_history_with_options(
         repo.path(),
         &changed_findings,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, None, false),
     )
     .unwrap();
@@ -335,8 +335,8 @@ fn max_rows_and_max_bytes_drop_oldest_rows() {
         "report_fingerprint": "sha256:a",
         "input_fingerprint": "sha256:ia",
         "policy_fingerprint": "sha256:pa",
-        "repo_score_json_path": "agent/repo-score.json",
-        "repo_score_md_path": "agent/repo-score.md"
+        "repo_score_json_path": ".jankurai/repo-score.json",
+        "repo_score_md_path": ".jankurai/repo-score.md"
     });
     let row_b = serde_json::json!({
         "schema_version": "1.1.0",
@@ -362,8 +362,8 @@ fn max_rows_and_max_bytes_drop_oldest_rows() {
         "report_fingerprint": "sha256:b",
         "input_fingerprint": "sha256:ib",
         "policy_fingerprint": "sha256:pb",
-        "repo_score_json_path": "agent/repo-score.json",
-        "repo_score_md_path": "agent/repo-score.md"
+        "repo_score_json_path": ".jankurai/repo-score.json",
+        "repo_score_md_path": ".jankurai/repo-score.md"
     });
     let row_c = serde_json::json!({
         "schema_version": "1.1.0",
@@ -389,8 +389,8 @@ fn max_rows_and_max_bytes_drop_oldest_rows() {
         "report_fingerprint": "sha256:c",
         "input_fingerprint": "sha256:ic",
         "policy_fingerprint": "sha256:pc",
-        "repo_score_json_path": "agent/repo-score.json",
-        "repo_score_md_path": "agent/repo-score.md"
+        "repo_score_json_path": ".jankurai/repo-score.json",
+        "repo_score_md_path": ".jankurai/repo-score.md"
     });
     write_history_rows(&history, &[row_a, row_b, row_c]);
 
@@ -436,8 +436,8 @@ fn malformed_local_jsonl_returns_line_numbered_error() {
             "minimum_score": 85,
             "caps_applied": [],
             "report_fingerprint": "sha256:test",
-            "repo_score_json_path": "agent/repo-score.json",
-            "repo_score_md_path": "agent/repo-score.md"
+            "repo_score_json_path": ".jankurai/repo-score.json",
+            "repo_score_md_path": ".jankurai/repo-score.md"
         })
         .to_string()
             + "\nnot-json\n",
@@ -457,8 +457,8 @@ fn mirror_sink_receives_rows_and_missing_mirror_is_advisory_only() {
     append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, Some(&mirror), false),
     )
     .unwrap();
@@ -471,8 +471,8 @@ fn mirror_sink_receives_rows_and_missing_mirror_is_advisory_only() {
     let result = append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, Some(&missing_mirror), false),
     );
     assert!(result.is_ok());
@@ -490,8 +490,8 @@ fn mirror_required_mode_fails() {
     let result = append_score_history_with_options(
         repo.path(),
         &report,
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         append_options(&history, None, Some(&mirror), true),
     );
     assert!(result.is_err());
@@ -529,8 +529,8 @@ fn restore_filters_by_current_repo_id_and_writes_compact_local_history() {
             "report_fingerprint": "sha256:a",
             "input_fingerprint": "sha256:ia",
             "policy_fingerprint": "sha256:pa",
-            "repo_score_json_path": "agent/repo-score.json",
-            "repo_score_md_path": "agent/repo-score.md"
+            "repo_score_json_path": ".jankurai/repo-score.json",
+            "repo_score_md_path": ".jankurai/repo-score.md"
         }),
         serde_json::json!({
             "schema_version": "1.1.0",
@@ -556,8 +556,8 @@ fn restore_filters_by_current_repo_id_and_writes_compact_local_history() {
             "report_fingerprint": "sha256:b",
             "input_fingerprint": "sha256:ib",
             "policy_fingerprint": "sha256:pb",
-            "repo_score_json_path": "agent/repo-score.json",
-            "repo_score_md_path": "agent/repo-score.md"
+            "repo_score_json_path": ".jankurai/repo-score.json",
+            "repo_score_md_path": ".jankurai/repo-score.md"
         }),
         serde_json::json!({
             "schema_version": "1.1.0",
@@ -583,8 +583,8 @@ fn restore_filters_by_current_repo_id_and_writes_compact_local_history() {
             "report_fingerprint": "sha256:c",
             "input_fingerprint": "sha256:ic",
             "policy_fingerprint": "sha256:pc",
-            "repo_score_json_path": "agent/repo-score.json",
-            "repo_score_md_path": "agent/repo-score.md"
+            "repo_score_json_path": ".jankurai/repo-score.json",
+            "repo_score_md_path": ".jankurai/repo-score.md"
         }),
     ];
     write_history_rows(&mirror, &rows);

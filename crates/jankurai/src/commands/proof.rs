@@ -395,7 +395,10 @@ fn execute_proof_plan(args: ProveArgs, plan: ProofPlan, plan_path_str: String) -
             &args.repo,
             "target/jankurai/security/evidence.json",
         ),
-        repo_score_json_path: optional_repo_relative_existing(&args.repo, "agent/repo-score.json"),
+        repo_score_json_path: optional_repo_relative_existing(
+            &args.repo,
+            ".jankurai/repo-score.json",
+        ),
         coverage_audit_path: optional_repo_relative_existing(
             &args.repo,
             "target/jankurai/coverage/coverage-audit.json",

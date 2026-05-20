@@ -203,15 +203,15 @@ fn score_history_schemas_parse_and_fixture_validate() {
         "report_fingerprint": "sha256:report",
         "input_fingerprint": "sha256:input",
         "policy_fingerprint": "sha256:policy",
-        "repo_score_json_path": "agent/repo-score.json",
-        "repo_score_md_path": "agent/repo-score.md"
+        "repo_score_json_path": ".jankurai/repo-score.json",
+        "repo_score_md_path": ".jankurai/repo-score.md"
     });
     validation::validate_value(&repo, ArtifactSchema::ScoreHistoryEntry, &entry).unwrap();
 
     let export = serde_json::json!({
         "schema_version": "1.1.0",
         "command": "jankurai history export",
-        "history": "agent/score-history.jsonl",
+        "history": ".jankurai/score-history.jsonl",
         "window": 3,
         "source": "auto",
         "repo_id": "sha256:repo",
@@ -1508,10 +1508,10 @@ fn update_plan_and_receipt_schemas_expose_optional_version_fields() {
             "reason": "local checkout is newer"
         },
         "reexec_command": "cargo run -p jankurai -- update . --offline",
-        "post_upgrade_score_command": "cargo run -p jankurai -- score . --json agent/repo-score.json --md agent/repo-score.md",
+        "post_upgrade_score_command": "cargo run -p jankurai -- score . --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         "post_upgrade_score_mode": "standard",
-        "post_upgrade_score_json": "agent/repo-score.json",
-        "post_upgrade_score_md": "agent/repo-score.md",
+        "post_upgrade_score_json": ".jankurai/repo-score.json",
+        "post_upgrade_score_md": ".jankurai/repo-score.md",
         "warnings": ["manual review queued"],
         "actions": [{
             "path": "agent/jankurai-install.toml",
@@ -1558,10 +1558,10 @@ fn update_plan_and_receipt_schemas_expose_optional_version_fields() {
             "reason": "local checkout is newer"
         },
         "reexec_command": "cargo run -p jankurai -- update . --offline",
-        "post_upgrade_score_command": "cargo run -p jankurai -- score . --json agent/repo-score.json --md agent/repo-score.md",
+        "post_upgrade_score_command": "cargo run -p jankurai -- score . --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         "post_upgrade_score_mode": "standard",
-        "post_upgrade_score_json": "agent/repo-score.json",
-        "post_upgrade_score_md": "agent/repo-score.md",
+        "post_upgrade_score_json": ".jankurai/repo-score.json",
+        "post_upgrade_score_md": ".jankurai/repo-score.md",
         "actions": [{
             "path": "agent/jankurai-install.toml",
             "action": "update",

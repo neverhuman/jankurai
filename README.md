@@ -75,7 +75,7 @@ Expected artifacts:
 | Full | `jankurai init . --level full --dry-run` | Full scaffold after review and `--yes`. | You want owner maps, proof lanes, generated-zone policy, docs, contracts/db placeholders, CI, and hooks. |
 | Ratchet | `jankurai ci install . --github --mode ratchet --baseline <file>` | CI gate. | The team has accepted a baseline and wants to block regression. |
 
-Ratchet mode is impossible without an accepted baseline. Start in observe or advisory mode, generate reports under `target/jankurai/`, then copy a reviewed clean report to `agent/baselines/main.repo-score.json` in a dedicated baseline update. Ignored `agent/repo-score.*` files are local generated outputs, not trusted ratchet inputs.
+Ratchet mode is impossible without an accepted baseline. Start in observe or advisory mode, generate reports under `target/jankurai/`, then copy a reviewed clean report to `agent/baselines/main.repo-score.json` in a dedicated baseline update. Ignored `.jankurai/repo-score.*` files are local generated outputs, not trusted ratchet inputs.
 
 ## Fresh Agent Kickoff
 

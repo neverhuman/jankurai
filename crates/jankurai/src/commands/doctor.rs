@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::postmortem::parse_failure_mode;
+use crate::local_state;
 use crate::validation::{self, ArtifactSchema};
 
 pub struct DoctorArgs {
@@ -27,13 +28,13 @@ pub fn run(args: DoctorArgs) -> Result<()> {
         "agent/generated-zones.toml",
         "agent/proof-lanes.toml",
         "agent/standard-version.toml",
-        "agent/repo-score.json",
-        "agent/repo-score.md",
+        ".jankurai/repo-score.json",
+        ".jankurai/repo-score.md",
         "agent/boundaries.toml",
         "agent/security-policy.toml",
         "tools/security-lane.sh",
     ] {
-        push_file_check(&repo, &mut diagnostics, rel);
+        push_local_or_legacy_file_check(&repo, &mut diagnostics, rel);
     }
 
     if repo.join("db").exists() {
@@ -250,6 +251,28 @@ fn push_file_check(repo: &Path, diagnostics: &mut Vec<Diagnostic>, rel: &str) {
             check_id: format!("file:{rel}"),
             severity: "high".into(),
             path: rel.into(),
+            message: "missing required jankurai control file".into(),
+        });
+    }
+}
+
+fn push_local_or_legacy_file_check(
+    repo: &Path,
+    diagnostics: &mut Vec<Diagnostic>,
+    local_rel: &str,
+) {
+    let legacy_rel = match local_rel {
+        ".jankurai/repo-score.json" => Some("agent/repo-score.json"),
+        ".jankurai/repo-score.md" => Some("agent/repo-score.md"),
+        _ => None,
+    };
+    if repo.join(local_rel).exists() || legacy_rel.is_some_and(|rel| repo.join(rel).exists()) {
+        diagnostics.push(ok(local_rel, "present"));
+    } else {
+        diagnostics.push(Diagnostic {
+            check_id: format!("file:{local_rel}"),
+            severity: "high".into(),
+            path: local_rel.into(),
             message: "missing required jankurai control file".into(),
         });
     }
@@ -501,7 +524,11 @@ fn check_root_score_artifacts(repo: &Path, diagnostics: &mut Vec<Diagnostic>) {
 }
 
 fn check_stale_score(repo: &Path, diagnostics: &mut Vec<Diagnostic>) {
-    let score = repo.join("agent/repo-score.json");
+    let score = local_state::preferred_repo_path(
+        repo,
+        local_state::SCORE_JSON,
+        Some(local_state::LEGACY_SCORE_JSON),
+    );
     let policy = repo.join("agent/audit-policy.toml");
     if let (Ok(score_meta), Ok(policy_meta)) = (score.metadata(), policy.metadata()) {
         if let (Ok(score_time), Ok(policy_time)) = (score_meta.modified(), policy_meta.modified()) {
@@ -509,7 +536,7 @@ fn check_stale_score(repo: &Path, diagnostics: &mut Vec<Diagnostic>) {
                 diagnostics.push(Diagnostic {
                     check_id: "stale-score".into(),
                     severity: "medium".into(),
-                    path: "agent/repo-score.json".into(),
+                    path: local_state::SCORE_JSON.into(),
                     message: "score file is older than audit policy".into(),
                 });
             }

@@ -97,7 +97,7 @@ Operational surfaces:
 - Badge and paper publication: README badge state is generated from
   `agent/badge.toml`, the tracked accepted baseline under
   `agent/baselines/`, and the installed `jankurai` binary. Ignored
-  `agent/repo-score.*` files are local generated outputs and must not be used
+  `.jankurai/repo-score.*` files are local generated outputs and must not be used
   as public badge or ratchet sources. The README citation block must link to
   `paper/jankurai.pdf`. Public
   repository scan tables are generated from the tracked source JSON and must
@@ -241,7 +241,7 @@ DO NOT EDIT BY HAND.
 ```
 
 Structured generated artifacts that cannot legally carry comments, including
-`agent/repo-score.json` and native lockfiles such as `package-lock.json`, must
+`.jankurai/repo-score.json` and native lockfiles such as `package-lock.json`, must
 carry equivalent machine-readable identity in their native schema. Required
 identity includes generator/schema metadata and version fields for reports, or
 the package-manager lockfile shape for lockfiles.
@@ -308,7 +308,7 @@ conversation, treat that plan as controlling. Do not route it through local phas
 or master-plan files unless the user explicitly names those local files. Before
 broad validation, run `jankurai lane` or `jankurai proof` against changed paths
 to choose the smallest credible proof lane. For audit requests, run
-`cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md`.
+`cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md`.
 
 ## Kickoff Route
 
@@ -401,7 +401,7 @@ jankurai kickoff . --intent "<change request>" --out target/jankurai/kickoff.jso
 jankurai context-pack . --changed <path> --max-tokens 6000 --out target/jankurai/context-pack.json --md target/jankurai/context-pack.md
 jankurai prove . --changed <path> --plan-out target/jankurai/proof-plan.json --plan-md target/jankurai/proof-plan.md
 jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md
-jankurai witness . --changed-from origin/main --baseline agent/repo-score.json --out target/jankurai/merge-witness.json --md target/jankurai/merge-witness.md
+jankurai witness . --changed-from origin/main --baseline agent/baselines/main.repo-score.json --out target/jankurai/merge-witness.json --md target/jankurai/merge-witness.md
 ```
 
 Ratchet mode requires an accepted baseline. Merge witness is the PR receipt:

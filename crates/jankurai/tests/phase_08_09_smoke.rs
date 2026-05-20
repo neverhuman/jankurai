@@ -115,7 +115,7 @@ fn context_pack_flags_generated_changed_paths_for_human_review() {
         .arg("--task")
         .arg("update generated repo score evidence")
         .arg("--changed")
-        .arg("agent/repo-score.json")
+        .arg(".jankurai/repo-score.json")
         .arg("--out")
         .arg(&out)
         .status()
@@ -132,13 +132,13 @@ fn context_pack_flags_generated_changed_paths_for_human_review() {
         .iter()
         .any(|item| item.as_str().unwrap().contains("generated output")));
     let decision = &value["scope_decisions"][0];
-    assert_eq!(decision["path"], "agent/repo-score.json");
+    assert_eq!(decision["path"], ".jankurai/repo-score.json");
     assert_eq!(decision["decision"], "read-only");
     assert!(decision["generated_zone"].as_bool().unwrap());
     assert_eq!(decision["generated_source"], "crates/jankurai");
     assert_eq!(
         decision["generated_command"],
-        "cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
+        "cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
     );
     assert!(value["stop_conditions"]
         .as_array()
@@ -239,7 +239,7 @@ fn repair_plan_schema_rejects_missing_packets() {
     seed_catalog(dir.path());
     let bad = json!({
         "schema_version": "1.0.0",
-        "source_report": "agent/repo-score.json",
+        "source_report": ".jankurai/repo-score.json",
         "generated_at": "0",
         "target_stack_id": "jankurai:v0.4",
     });
@@ -302,15 +302,15 @@ fn seed_catalog(repo: &std::path::Path) {
     .unwrap();
     fs::write(
         repo.join("agent/test-map.json"),
-        r#"{"workspace":"fixture","tests":{"agent/":{"command":"cargo test -p jankurai","purpose":"agent checks"},"docs/":{"command":"cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md","purpose":"audit"}}}"#,
+        r#"{"workspace":"fixture","tests":{"agent/":{"command":"cargo test -p jankurai","purpose":"agent checks"},"docs/":{"command":"cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md","purpose":"audit"}}}"#,
     )
     .unwrap();
     fs::write(
         repo.join("agent/generated-zones.toml"),
         r#"[[zone]]
-path = "agent/repo-score.json"
+path = ".jankurai/repo-score.json"
 source = "crates/jankurai"
-command = "cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
+command = "cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
 read_only = false
 "#,
     )

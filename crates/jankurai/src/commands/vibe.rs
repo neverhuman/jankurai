@@ -421,7 +421,7 @@ fn validate_source_shape(
                 );
             }
             if !issue.artifacts.iter().any(|artifact| {
-                artifact == "agent/repo-score.json" || artifact == "agent/repo-score.md"
+                artifact == ".jankurai/repo-score.json" || artifact == ".jankurai/repo-score.md"
             }) {
                 bail!(
                     "{} detector-backed coverage lacks audit report artifact evidence",

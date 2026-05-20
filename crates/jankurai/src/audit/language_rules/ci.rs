@@ -280,7 +280,7 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
         );
     }
     if text_lower.contains("baseline-score.json")
-        || (text_lower.contains("cp agent/repo-score.json")
+        || (text_lower.contains("cp .jankurai/repo-score.json")
             && text_lower.contains("target/jankurai"))
     {
         push_once(
@@ -290,7 +290,7 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
                 RULE_ID,
                 "ci.ratchet.self-generated-baseline",
                 file,
-                find_line(file, &["baseline-score.json", "cp agent/repo-score.json"]).unwrap_or(1),
+                find_line(file, &["baseline-score.json", "cp .jankurai/repo-score.json"]).unwrap_or(1),
                 "ratchet workflow creates a baseline from the candidate run",
                 "candidate evidence can hide score regressions",
                 "copy a reviewed accepted baseline from agent/baselines or origin/main before the final audit",

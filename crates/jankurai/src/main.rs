@@ -302,9 +302,9 @@ enum AgentCommand {
 struct AuditArgs {
     #[arg(default_value = ".", value_parser = parse_repo_arg)]
     repo: PathBuf,
-    #[arg(long, value_name = "PATH", default_value = "agent/repo-score.json")]
+    #[arg(long, value_name = "PATH", default_value = ".jankurai/repo-score.json")]
     json: String,
-    #[arg(long, value_name = "PATH", default_value = "agent/repo-score.md")]
+    #[arg(long, value_name = "PATH", default_value = ".jankurai/repo-score.md")]
     md: String,
     #[arg(long)]
     changed: Vec<PathBuf>,
@@ -341,7 +341,7 @@ struct AuditArgs {
     #[arg(
         long,
         value_name = "PATH",
-        default_value = "target/jankurai/score-history.jsonl"
+        default_value = ".jankurai/score-history.jsonl"
     )]
     score_history: String,
     #[arg(long, value_name = "PATH")]
@@ -1218,7 +1218,11 @@ struct ScoreDiffArgs {
 
 #[derive(Args, Debug)]
 struct ScoreTrendArgs {
-    #[arg(long, value_name = "PATH", default_value = "agent/score-history.jsonl")]
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = ".jankurai/score-history.jsonl"
+    )]
     history: PathBuf,
     #[arg(long, default_value_t = 30)]
     window: usize,
@@ -2632,6 +2636,9 @@ fn run_audit_and_write(args: AuditArgs) -> anyhow::Result<()> {
     }
     if save_smart_state {
         let _ = jankurai::audit::smart_scan::save_state(&args.repo, &report);
+    }
+    if changed_fast_effective {
+        return Ok(());
     }
     enforce_audit_decision(&report, mode)?;
     Ok(())

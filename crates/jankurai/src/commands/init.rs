@@ -97,6 +97,7 @@ fn apply_templates(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
+        ensure_automated_write_allowed(&rel)?;
         if path.exists() {
             if crate::init::adapters::is_adapter_path(&rel)
                 && existing_generated_adapter_needs_write(
@@ -183,6 +184,13 @@ fn apply_templates(
     }
     progress.finish("init complete");
     Ok(actions)
+}
+
+fn ensure_automated_write_allowed(rel: &str) -> Result<()> {
+    if crate::audit::fs::is_read_only_exception_path(rel) {
+        bail!("automated writes to docs/exceptions are blocked; edit the exception file manually");
+    }
+    Ok(())
 }
 
 fn existing_generated_adapter_needs_write(

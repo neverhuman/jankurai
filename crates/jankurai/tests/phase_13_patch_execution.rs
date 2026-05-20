@@ -11,6 +11,7 @@ fn binary_path() -> PathBuf {
 
 fn seed_fixture_repo(repo: &Path) {
     fs::create_dir_all(repo.join("agent")).unwrap();
+    fs::create_dir_all(repo.join(".jankurai")).unwrap();
     fs::write(
         repo.join("agent/owner-map.json"),
         r#"{"workspace":"fixture","owners":{"agent/":"agent","docs/":"standard","paper/":"paper","reference/":"read-only","target/":"workspace","crates/":"tools"}}"#,
@@ -33,9 +34,19 @@ purpose = "fixture proof"
     fs::write(
         repo.join("agent/generated-zones.toml"),
         r#"[[zone]]
-path = "agent/repo-score.json"
+path = ".jankurai/repo-score.json"
 source = "crates/jankurai"
-command = "cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
+command = "cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
+read_only = false
+"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join("agent/generated-zones.toml"),
+        r#"[[zone]]
+path = ".jankurai/repo-score.json"
+source = "crates/jankurai"
+command = "cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
 read_only = false
 "#,
     )
@@ -446,19 +457,24 @@ fn fixture_apply_rejects_path_escape() {
 fn fixture_apply_rejects_generated_zone() {
     let repo = tempdir().unwrap();
     seed_fixture_repo(repo.path());
-    fs::write(repo.path().join("agent/repo-score.json"), "{\"score\":0}\n").unwrap();
+    fs::create_dir_all(repo.path().join(".jankurai")).unwrap();
+    fs::write(
+        repo.path().join(".jankurai/repo-score.json"),
+        "{\"score\":0}\n",
+    )
+    .unwrap();
     let plan_path = write_plan(
         repo.path(),
         fixture_edit(
-            "agent/repo-score.json",
+            ".jankurai/repo-score.json",
             "sha256:generated",
             "append-text",
             json!({"append_text": "ignored\n"}),
         ),
         allowed_packet(
-            "agent/repo-score.json",
+            ".jankurai/repo-score.json",
             "sha256:generated",
-            &["agent/"],
+            &["agent/", ".jankurai/"],
             json!({"append_text": "ignored\n"}),
         ),
     );

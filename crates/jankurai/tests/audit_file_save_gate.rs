@@ -257,6 +257,42 @@ fn advisory_mode_never_blocks() {
 }
 
 #[test]
+fn docs_exceptions_paths_are_blocked_for_automation() {
+    let repo = tempdir().unwrap();
+    write_target_repo(repo.path());
+
+    let output = audit_file(
+        repo.path(),
+        &[
+            "--path",
+            "docs/exceptions/0001-current.md",
+            "--candidate",
+            "-",
+            "--op",
+            "create",
+            "--mode",
+            "save-gate",
+            "--format",
+            "json",
+        ],
+        Some(b"---\ncode: HB_SQL_SHIM\n---\n"),
+    );
+
+    assert_eq!(
+        exit_code(&output),
+        3,
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["verdict"], "block");
+    assert!(value["summary"]
+        .as_str()
+        .unwrap()
+        .contains("read-only to automation"));
+}
+
+#[test]
 fn missing_candidate_file_exits_4() {
     let repo = tempdir().unwrap();
     write_target_repo(repo.path());

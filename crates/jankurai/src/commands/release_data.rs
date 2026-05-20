@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::local_state;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StandardVersionManifest {
     pub standard: String,
@@ -73,7 +75,11 @@ pub fn load_release_data(repo: &Path) -> Result<ReleaseData> {
 }
 
 pub fn read_repo_score(repo: &Path) -> Result<Option<RepoScoreSummary>> {
-    let score_path = repo.join("agent/repo-score.json");
+    let score_path = local_state::preferred_repo_path(
+        repo,
+        local_state::SCORE_JSON,
+        Some(local_state::LEGACY_SCORE_JSON),
+    );
     if !score_path.exists() {
         return Ok(None);
     }

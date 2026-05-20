@@ -35,7 +35,7 @@ paper:
 score:
     mkdir -p target/jankurai/coverage
     cargo run -p jankurai -- coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md
-    cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md --score-history agent/score-history.jsonl --score-history-csv agent/score-history.csv
+    cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md --score-history .jankurai/score-history.jsonl --score-history-csv .jankurai/score-history.csv
 
 audit-fast base="origin/main":
     cargo run -p jankurai -- audit . --changed-fast --changed-from {{base}} --json target/jankurai/audit-fast.json --md target/jankurai/audit-fast.md --timings-json target/jankurai/audit-timings.json

@@ -1,12 +1,12 @@
 # Rolling Score
 
-The rolling score is Jankurai's trust ledger. Each audit can append a compact JSONL row to `agent/score-history.jsonl` and a CSV companion. The dedicated history interface is the stable surface for external tools and recovery workflows.
+The rolling score is Jankurai's trust ledger. Each audit can append a compact JSONL row to `.jankurai/score-history.jsonl` and a CSV companion. The dedicated history interface is the stable surface for external tools and recovery workflows.
 
 Compare an accepted baseline to a candidate report:
 
 ```bash
 jankurai score diff \
-  --base agent/baseline-score.json \
+  --base agent/baselines/main.repo-score.json \
   --head target/jankurai/repo-score.json \
   --out target/jankurai/score-diff.json \
   --md target/jankurai/score-diff.md
@@ -16,7 +16,7 @@ Summarize the recent ledger:
 
 ```bash
 jankurai score trend \
-  --history agent/score-history.jsonl \
+  --history .jankurai/score-history.jsonl \
   --window 30 \
   --out target/jankurai/score-trend.json \
   --md target/jankurai/score-trend.md

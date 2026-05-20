@@ -5,8 +5,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-pub const DEFAULT_SCORE_JSON: &str = "agent/repo-score.json";
-pub const DEFAULT_SCORE_MD: &str = "agent/repo-score.md";
+pub const DEFAULT_SCORE_JSON: &str = ".jankurai/repo-score.json";
+pub const DEFAULT_SCORE_MD: &str = ".jankurai/repo-score.md";
 pub const DEFAULT_BADGE_SVG: &str = "agent/jankurai-badge.svg";
 pub const DEFAULT_BADGE_JSON: &str = "agent/jankurai-badge.json";
 pub const DEFAULT_README: &str = "README.md";

@@ -335,7 +335,7 @@ fn is_comment_scannable_file(file: &FileInfo) -> bool {
 }
 
 fn scannable_files(ctx: &AuditContext) -> Vec<&FileInfo> {
-    let zone_paths = crate::audit::helpers::generated_zone_paths(ctx);
+    let zone_paths = crate::audit::helpers::generated_zone_suppression_paths(ctx);
     ctx.all_files
         .iter()
         .filter(|file| {

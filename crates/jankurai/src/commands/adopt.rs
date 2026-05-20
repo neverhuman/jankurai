@@ -174,12 +174,12 @@ fn recommend_profile(
 
 fn safe_commands(mode: &str, recommended_profile: &str) -> Vec<String> {
     let mut commands = vec![
-        "jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md".into(),
+        "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md".into(),
         "jankurai adopt . --mode observe --out target/jankurai/adoption-plan.json --md target/jankurai/adoption-plan.md".into(),
         format!("jankurai init . --profile {recommended_profile} --dry-run --plan-json target/jankurai/init-plan.json"),
         "jankurai ci install . --github --mode observe --dry-run".into(),
-        "jankurai score trend --history agent/score-history.jsonl --out target/jankurai/score-trend.json --md target/jankurai/score-trend.md".into(),
-        "jankurai witness . --changed-from origin/main --baseline agent/repo-score.json --out target/jankurai/merge-witness.json --md target/jankurai/merge-witness.md".into(),
+        "jankurai score trend --history .jankurai/score-history.jsonl --out target/jankurai/score-trend.json --md target/jankurai/score-trend.md".into(),
+        "jankurai witness . --changed-from origin/main --baseline .jankurai/repo-score.json --out target/jankurai/merge-witness.json --md target/jankurai/merge-witness.md".into(),
     ];
     if mode == "ratchet" {
         commands.push(
@@ -262,7 +262,7 @@ fn next_tool_command(id: &str) -> String {
     match id {
         "audit-ci" => "jankurai ci install . --github --mode observe".into(),
         "proof-routing" => {
-            "cargo run -p jankurai -- audit . --mode ratchet --baseline agent/repo-score.json --json agent/repo-score.json --md agent/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl".into()
+            "cargo run -p jankurai -- audit . --mode ratchet --baseline .jankurai/repo-score.json --json .jankurai/repo-score.json --md .jankurai/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl".into()
         }
         "security" => "cargo run -p jankurai -- security run . --out target/jankurai/security/evidence.json".into(),
         "ux-qa" => "jankurai ux audit --config agent/ux-qa.toml --out target/jankurai/ux-qa.json".into(),
@@ -270,7 +270,7 @@ fn next_tool_command(id: &str) -> String {
             "cargo run -p jankurai -- migrate . --analyze --json target/jankurai/migration-report.json".into()
         }
         "contract-drift" => {
-            "cargo run -p jankurai -- audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md".into()
+            "cargo run -p jankurai -- audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md".into()
         }
         "copy-code" => {
             "cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md".into()
@@ -289,7 +289,7 @@ fn risk_tier(score: u32) -> &'static str {
 }
 
 fn read_existing_audit_score(repo: &Path) -> Option<i32> {
-    let path = repo.join("agent/repo-score.json");
+    let path = repo.join(".jankurai/repo-score.json");
     let text = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value.get("score")?.as_i64().map(|score| score as i32)
