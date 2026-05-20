@@ -18,8 +18,11 @@ fn release_workflow_exposes_attestation_and_signed_artifacts() {
     let yaml: YamlValue = serde_yaml::from_str(&text).expect("release workflow parses as YAML");
 
     assert_eq!(yaml["name"].as_str(), Some("release"));
-    assert!(text.contains("actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661"));
+    assert!(
+        text.contains("actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661")
+    );
     assert!(text.contains("sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22"));
+    assert!(!text.contains("Swatinem/rust-cache"));
     assert!(text.contains("id-token: write"));
     assert!(text.contains("attestations: write"));
     assert!(text.contains("dist/*.tar.gz.sha256"));
