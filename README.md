@@ -22,7 +22,15 @@ Jankurai is not a model, hosted AI service, or "open source AI" system. It is re
 
 ## Install
 
-Prerequisites: `git` and a Rust toolchain with `cargo` on `PATH`.
+Preferred path: release installer with release-tag verification, GitHub
+artifact attestation, sha256, and Sigstore bundle checks.
+
+```bash
+curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.5.1/jankurai-installer.sh \
+  | JANKURAI_RELEASE_TAG=v1.5.1 bash
+```
+
+Fallback source install:
 
 ```bash
 git clone https://github.com/neverhuman/jankurai.git
@@ -201,7 +209,8 @@ jankurai guard watch .
 
 ### macOS: no macFUSE requirement
 
-macOS works with `audit-file`, `guard run`, and watcher mode immediately after the standard install:
+macOS works with `audit-file`, `guard run`, and watcher mode immediately after
+the verified release install or the source fallback:
 
 ```bash
 cargo install --path crates/jankurai --locked
@@ -214,7 +223,8 @@ This release does not link a macFUSE backend. Installing macFUSE is not required
 
 ### Linux: optional FUSE pre-write blocking
 
-Linux users who want kernel-level pre-write blocking can install FUSE and build the optional backend:
+Linux users who want kernel-level pre-write blocking can install FUSE and build
+the optional backend:
 
 ```bash
 sudo apt-get install libfuse3-dev
@@ -383,7 +393,10 @@ The loop is intentionally ordinary: changed paths map to owners and proof lanes,
 
 ## Toolkit
 
-Jankurai ships as a Rust workspace of focused crates. Install the core CLI with `cargo install --path crates/jankurai --locked`; companion crates are available as library dependencies or standalone binaries.
+Jankurai ships as a Rust workspace of focused crates. Install the core CLI with
+the release installer first, then use `cargo install --path crates/jankurai --locked`
+when you need the source fallback; companion crates are available as library
+dependencies or standalone binaries.
 
 ### Core Crates
 

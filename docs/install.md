@@ -1,8 +1,20 @@
 # Installing jankurai
 
 Jankurai adoption is no-write first, advisory by default, and ratcheted only
-after a baseline exists. Until public packaging lands, clone and install from
-source:
+after a baseline exists. The preferred install path is the release-shipped
+installer, which verifies the immutable tag, GitHub artifact attestation,
+sha256 checksum, and Sigstore bundle before it installs the binary:
+
+Prerequisites for the installer path: `curl`, `gh`, `cosign`, and `sudo`
+permission for the macOS pkg installer if you are on macOS.
+
+```bash
+curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.5.1/jankurai-installer.sh \
+  | JANKURAI_RELEASE_TAG=v1.5.1 bash
+```
+
+If you need the fallback source install, clone the repo and build from the
+workspace:
 
 ```bash
 git clone https://github.com/neverhuman/jankurai.git
@@ -17,7 +29,9 @@ For demos or logs, force rich output with `JANKURAI_COLOR=always` and
 `JANKURAI_PROGRESS=always`.
 
 `jankurai version` prints the installed CLI/version/source diagnostics and the
-recommended upgrade command.
+recommended upgrade command. The installer path prefers the notarized macOS
+`pkg` or the Linux tarball produced by release CI; source install remains the
+fallback for air-gapped or tool-minimal environments.
 
 ## Optional: pre-commit hooks
 

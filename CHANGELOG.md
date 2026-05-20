@@ -6,7 +6,13 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 ## Unreleased
 
-No user-facing changes yet.
+### Added
+
+- Installer-first release packaging: release builds now produce signed Linux
+  tarballs, notarized macOS `.pkg` artifacts, Sigstore bundles, GitHub artifact
+  attestations, a release-shipped `jankurai-installer.sh`, and refreshable
+  Homebrew formula metadata. The installer verifies release immutability,
+  checksum, Sigstore bundle, and GitHub attestation before installing.
 
 ## 1.5.1 - 2026-05-19
 

@@ -13,6 +13,8 @@ between local work and the remote merge gate.
 | `just ci-coverage` | `jankurai / coverage (llvm-cov + cargo-mutants)` | 10–20 min |
 | `just ci-audit`  | `jankurai / audit`                          | 15–25 min       |
 | `just ci-release`| `release / audit-gate`                      | 20–35 min       |
+| `just ci-release-build` | `release / build`                  | 15–30 min       |
+| `just ci-release-publish` | `release / publish`              | 5–10 min        |
 | `just ci`        | quick + coverage + audit                    | 25–40 min       |
 | `just zizmor`    | zizmor scan portion of the security lane    | < 5 s           |
 
@@ -95,6 +97,16 @@ The release.yml `audit-gate` job. It regenerates Rust LCOV and cargo-mutants
 evidence before the ratchet audit, so tag releases do not depend on stale local
 `target/` files or PR artifacts. Optionally set `LOCAL_RELEASE_TAG=v1.0.0` to
 also assert `VERSION` matches the tag.
+
+### `just ci-release-build`
+The release.yml build matrix. It expects `LOCAL_RELEASE_TAG=vX.Y.Z` and will
+produce either a signed Linux tarball or a notarized macOS `.pkg` for the
+current host target, plus sha256 and Sigstore bundle sidecars.
+
+### `just ci-release-publish`
+The release.yml publish job. It expects `LOCAL_RELEASE_TAG=vX.Y.Z` and
+`GH_TOKEN` so it can stage the release notes, installer script, and Homebrew
+formula metadata before publishing the immutable tag.
 
 ### `just zizmor`
 Static analysis of GitHub workflows. Run before pushing any `.github/workflows/`

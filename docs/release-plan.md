@@ -19,6 +19,38 @@ for rare dated advanced-ML/data exceptions under `python/ai-service`.
 | Templates | greenfield repo template, migration template, exception catalog template | teams starting or converting repos | versioned with the standard |
 | Benchmark suite | repair tasks, drift tasks, token-use tasks | researchers and skeptics | dataset versioning |
 
+## macOS Release Checklist
+
+Before shipping the macOS installer path, confirm all of the following are present and documented in the release job or handoff:
+
+- Signing certificate secrets from `ops/ci/release-macos-sign.sh`
+  - `APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64`
+  - `APPLE_DEVELOPER_ID_APPLICATION_PASSWORD`
+  - `APPLE_DEVELOPER_ID_APPLICATION_IDENTITY`
+  - `APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64`
+  - `APPLE_DEVELOPER_ID_INSTALLER_PASSWORD`
+  - `APPLE_DEVELOPER_ID_INSTALLER_IDENTITY`
+- Notarization secrets from `ops/ci/release-macos-sign.sh`
+  - `APPLE_NOTARYTOOL_APPLE_ID`
+  - `APPLE_NOTARYTOOL_PASSWORD`
+  - `APPLE_NOTARYTOOL_TEAM_ID`
+- Release publication token
+  - `GH_TOKEN` for `gh release create` and release verification
+- Runner prerequisites
+  - `security`
+  - `xcrun`
+  - `pkgbuild`
+  - `productsign`
+  - `codesign`
+  - `pkgutil`
+- Expected macOS release artifacts
+  - notarized `.pkg`
+  - `.pkg.sha256`
+  - `.pkg.sigstore.bundle`
+  - artifact attestation
+
+The release job should fail closed if any required secret or tool is missing. Do not treat a partial signing environment as acceptable release evidence.
+
 ## Version Model
 
 Use separate versions because the paper, rules, and tooling will move at different speeds.

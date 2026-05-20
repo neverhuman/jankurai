@@ -26,10 +26,15 @@ CI acts as the primary gatekeeper before code merges to main. It runs a comprehe
 ### Release (Nightly / CD)
 The release pipeline generates immutable provenance and supply chain artifacts.
 - **Required:**
+  - `GitHub artifact attestations` (release provenance for binaries/packages)
   - `Syft` (SBOM generation)
   - `Grype` / `Trivy` (Container and artifact vulnerability scanning)
   - `OpenSSF Scorecard` (Posture scanning)
-  - `SLSA/Cosign` (Release provenance signing)
+  - `SLSA/Cosign` (Release provenance signing and blob verification)
+  - `Apple notarization` (macOS pkg trust chain)
+- **Shipped assets:**
+  - `jankurai-installer.sh` (explicit installer entrypoint)
+  - `Homebrew formula metadata` (source fallback / tap refresh)
 
 ## Configuration
 The tool matrix is configured in `agent/security-policy.toml`. 

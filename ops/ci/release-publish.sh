@@ -1,18 +1,28 @@
 #!/usr/bin/env bash
-# Release publish: extract CHANGELOG slice and run `gh release create`.
-# Requires GH_TOKEN in env (the workflow injects ${{ github.token }}).
+# Release publish: extract CHANGELOG slice, stage release metadata, and run
+# `gh release create` on immutable tag assets.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 if [[ -z "${RELEASE_TAG:-}" ]]; then
-  fail "RELEASE_TAG must be set, e.g. RELEASE_TAG=v1.1.0"
+  fail "RELEASE_TAG must be set, e.g. RELEASE_TAG=v1.5.1"
 fi
 if [[ -z "${GH_TOKEN:-}" ]]; then
   fail "GH_TOKEN must be exported for gh release create"
 fi
 
 version="${RELEASE_TAG#v}"
+expected_version="$(read_version)"
 dist="${CI_ROOT}/dist"
 notes_file="${dist}/RELEASE_NOTES.md"
+installer_src="${CI_ROOT}/jankurai-installer.sh"
+installer_dst="${dist}/jankurai-installer.sh"
+formula_src="${CI_ROOT}/ops/homebrew/jankurai.rb"
+formula_dst="${dist}/jankurai-homebrew.rb"
+
+if [[ "${version}" != "${expected_version}" ]]; then
+  fail "RELEASE_TAG (${RELEASE_TAG} -> ${version}) does not match VERSION (${expected_version})"
+fi
+
 ensure_dir "${dist}"
 
 step "Extract release notes from CHANGELOG"
@@ -29,10 +39,35 @@ if [[ ! -s "${notes_file}" ]]; then
 fi
 assert_nonempty "${notes_file}"
 
+step "Stage installer and Homebrew formula metadata"
+cp "${installer_src}" "${installer_dst}"
+sed "s/__RELEASE_TAG__/${RELEASE_TAG}/g" "${formula_src}" > "${formula_dst}"
+
+step "sha256 for installer metadata"
+(
+  cd "${dist}" && shasum -a 256 "jankurai-installer.sh" > "jankurai-installer.sh.sha256"
+)
+(
+  cd "${dist}" && shasum -a 256 "jankurai-homebrew.rb" > "jankurai-homebrew.rb.sha256"
+)
+
 step "Gather release assets"
 shopt -s nullglob
 assets=()
-for f in "${dist}"/*.tar.gz "${dist}"/*.tar.gz.sha256 "${dist}/audit"/repo-score.json "${dist}/audit"/repo-score.md; do
+for f in \
+  "${dist}"/*.tar.gz \
+  "${dist}"/*.tar.gz.sha256 \
+  "${dist}"/*.tar.gz.sigstore.bundle \
+  "${dist}"/*.pkg \
+  "${dist}"/*.pkg.sha256 \
+  "${dist}"/*.pkg.sigstore.bundle \
+  "${installer_dst}" \
+  "${installer_dst}.sha256" \
+  "${formula_dst}" \
+  "${formula_dst}.sha256" \
+  "${dist}/audit"/repo-score.json \
+  "${dist}/audit"/repo-score.md
+do
   [[ -e "$f" ]] && assets+=("$f")
 done
 if [[ ${#assets[@]} -eq 0 ]]; then
@@ -51,3 +86,6 @@ gh release create "${RELEASE_TAG}" \
   --verify-tag \
   ${prerelease} \
   "${assets[@]}"
+
+step "gh release verify ${RELEASE_TAG}"
+gh release verify "${RELEASE_TAG}" -R "${GITHUB_REPOSITORY:-neverhuman/jankurai}"
