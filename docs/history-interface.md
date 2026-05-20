@@ -6,13 +6,13 @@ Jankurai keeps a bounded score ledger for external consumers that want trend plo
 
 ```bash
 jankurai history latest \
-  --history agent/score-history.jsonl \
+  --history .jankurai/score-history.jsonl \
   --out -
 ```
 
 ```bash
 jankurai history export \
-  --history agent/score-history.jsonl \
+  --history .jankurai/score-history.jsonl \
   --window 200 \
   --out target/jankurai/history-export.json \
   --md target/jankurai/history-export.md
@@ -20,7 +20,7 @@ jankurai history export \
 
 ```bash
 jankurai history compact \
-  --history agent/score-history.jsonl \
+  --history .jankurai/score-history.jsonl \
   --max-rows 500 \
   --max-bytes 1048576
 ```
@@ -29,7 +29,7 @@ jankurai history compact \
 jankurai history restore \
   --mirror "$JANKURAI_HISTORY_MIRROR" \
   --repo-id auto \
-  --out agent/score-history.jsonl
+  --out .jankurai/score-history.jsonl
 ```
 
 `jankurai score trend` remains the compact summary command and uses the same history loader as `history export`.
@@ -85,4 +85,4 @@ Optional override env vars:
 
 If the local history file is lost, restore from the mirror and then compact it back to the local defaults. If the mirror is missing rows for the current repo ID, restore fails with a clear error instead of inventing data.
 
-External plotting tools should read `history latest` for the latest point and `history export` for a bounded window. Do not scrape `agent/repo-score.json` for trend plots.
+External plotting tools should read `history latest` for the latest point and `history export` for a bounded window. Do not scrape `.jankurai/repo-score.json` for trend plots.

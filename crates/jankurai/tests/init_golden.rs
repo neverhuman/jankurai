@@ -20,8 +20,8 @@ fn assert_command_success(command: &mut Command) {
 }
 
 fn assert_audit_and_doctor(repo: &Path) {
-    let json = repo.join("agent/repo-score.json");
-    let md = repo.join("agent/repo-score.md");
+    let json = repo.join(".jankurai/repo-score.json");
+    let md = repo.join(".jankurai/repo-score.md");
     assert_command_success(
         Command::new(binary_path())
             .arg("audit")
@@ -367,11 +367,11 @@ edition = "2021"
         "{pre_commit_text}"
     );
     assert!(
-        !pre_commit_text.contains("agent/repo-score.json"),
+        !pre_commit_text.contains(".jankurai/repo-score.json"),
         "{pre_commit_text}"
     );
     assert!(
-        !pre_commit_text.contains("agent/score-history.jsonl"),
+        !pre_commit_text.contains(".jankurai/score-history.jsonl"),
         "{pre_commit_text}"
     );
     let prepare_text = fs::read_to_string(prepare).unwrap();
@@ -623,6 +623,12 @@ fn init_plan_paths_match_profile_manifest_for_all_bundled_profiles() {
             .filter_map(|p| p.as_str().map(String::from))
             .collect();
         expected.sort();
+        assert!(
+            !expected
+                .iter()
+                .any(|path| path.starts_with("docs/exceptions/")),
+            "profile {profile}: exception records must be edited manually, not generated"
+        );
 
         let create_paths: Vec<_> = value["actions"]
             .as_array()

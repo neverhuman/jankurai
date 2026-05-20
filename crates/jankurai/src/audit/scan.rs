@@ -768,7 +768,9 @@ pub fn secret_hits(ctx: &AuditContext) -> Vec<FindingHit> {
 }
 
 fn is_tracked_auditor_score_artifact(path: &str) -> bool {
-    path == "agent/repo-score.json"
+    path == ".jankurai/repo-score.json"
+        || path == ".jankurai/repo-score.md"
+        || path == "agent/repo-score.json"
         || path == "agent/repo-score.md"
         || (path.starts_with("agent/baselines/") && path.ends_with(".repo-score.json"))
 }
@@ -1602,7 +1604,9 @@ fn package_lock_json_has_native_shape(content: &str) -> bool {
 
 fn structured_generated_identity(path: &str, content: &str) -> bool {
     match path {
-        "agent/repo-score.json" => repo_score_json_has_generated_identity(content),
+        ".jankurai/repo-score.json" | "agent/repo-score.json" => {
+            repo_score_json_has_generated_identity(content)
+        }
         "package-lock.json" => package_lock_json_has_native_shape(content),
         _ => false,
     }
@@ -1610,6 +1614,12 @@ fn structured_generated_identity(path: &str, content: &str) -> bool {
 
 fn generated_zone_has_identity(path: &str, content: &str) -> bool {
     generated_text_header_has_marker(content) || structured_generated_identity(path, content)
+}
+
+fn generated_zone_manifest_present(ctx: &AuditContext) -> bool {
+    ctx.all_files
+        .iter()
+        .any(|f| f.rel_path == GENERATED_ZONES_MANIFEST)
 }
 
 /// Returns findings when `agent/generated-zones.toml` exists, parses as zone rows, and any
@@ -1667,35 +1677,56 @@ pub fn generated_zone_issues(ctx: &AuditContext) -> Vec<FindingHit> {
         .filter(|f| f.is_generated && f.is_code)
         .cloned()
         .collect::<Vec<_>>();
-    if generated.is_empty() {
-        return vec![];
-    }
     let mut issues = vec![];
-    if !ctx
-        .all_files
-        .iter()
-        .any(|f| f.rel_path == GENERATED_ZONES_MANIFEST)
-    {
-        issues.push(FindingHit::new(
-            &generated[0].rel_path,
-            1,
-            "generated code exists without `agent/generated-zones.toml` ownership rules",
-        ));
+    for path in crate::audit::helpers::generated_zone_protected_paths(ctx) {
+        issues.push(FindingHit {
+            path: GENERATED_ZONES_MANIFEST.into(),
+            line: Some(1),
+            text: format!(
+                "generated zone declaration `{path}` targets protected source or control-plane code"
+            ),
+            matched_term: Some("protected-generated-zone".into()),
+            agent_fix: "remove the protected path from `agent/generated-zones.toml` or move the generated output to a derived artifact root that does not shadow tracked source or control-plane files".into(),
+            problem: format!(
+                "generated zone declaration `{path}` targets protected source or control-plane code"
+            ),
+        });
+        issues.push(FindingHit {
+            path: path.clone(),
+            line: Some(1),
+            text: format!(
+                "generated zone declaration `{path}` targets protected source or control-plane code"
+            ),
+            matched_term: Some("protected-generated-zone".into()),
+            agent_fix: "remove the protected path from `agent/generated-zones.toml` or move the generated output to a derived artifact root that does not shadow tracked source or control-plane files".into(),
+            problem: format!(
+                "generated zone declaration `{path}` targets protected source or control-plane code"
+            ),
+        });
     }
-    for file in generated {
-        if !generated_zone_has_identity(&file.rel_path, &file.text) {
+    if !generated.is_empty() {
+        if !generated_zone_manifest_present(ctx) {
             issues.push(FindingHit::new(
-                &file.rel_path,
+                &generated[0].rel_path,
                 1,
-                "generated file lacks a clear generated/do-not-edit marker",
+                "generated code exists without `agent/generated-zones.toml` ownership rules",
             ));
         }
-        if !pattern_hits(std::slice::from_ref(&file), TODO_PATTERNS).is_empty() {
-            issues.push(FindingHit::new(
-                &file.rel_path,
-                1,
-                "generated file contains TODO/stub markers",
-            ));
+        for file in generated {
+            if !generated_zone_has_identity(&file.rel_path, &file.text) {
+                issues.push(FindingHit::new(
+                    &file.rel_path,
+                    1,
+                    "generated file lacks a clear generated/do-not-edit marker",
+                ));
+            }
+            if !pattern_hits(std::slice::from_ref(&file), TODO_PATTERNS).is_empty() {
+                issues.push(FindingHit::new(
+                    &file.rel_path,
+                    1,
+                    "generated file contains TODO/stub markers",
+                ));
+            }
         }
     }
     issues
@@ -1727,6 +1758,55 @@ pub fn wrong_layer_db_hits(ctx: &AuditContext) -> Vec<FindingHit> {
                 1,
                 "DB marker in non-adapter layer",
             ));
+        }
+    }
+    hits
+}
+
+/// Detects repo-local report post-processing that strips or rewrites the
+/// canonical `caps_applied`, `findings`, or `issues` fields instead of
+/// preserving the source report shape.
+pub fn report_post_processing_issues(ctx: &AuditContext) -> Vec<FindingHit> {
+    if !ctx.self_audit {
+        return vec![];
+    }
+    let mut hits = vec![];
+    if let Some(file) = ctx
+        .all_files
+        .iter()
+        .find(|f| f.rel_path == "crates/jankurai/src/commands/badge.rs")
+    {
+        if file.text.contains("caps_applied")
+            && file.text.contains("findings")
+            && file.text.contains("unwrap_or(0)")
+        {
+            hits.push(FindingHit {
+                path: file.rel_path.clone(),
+                line: first_line_containing(&file.text, "caps_applied").or(Some(1)),
+                text: "badge post-processing defaults missing `caps_applied`/`findings` to zero instead of preserving the report fields".into(),
+                matched_term: Some("caps_applied/findings fallback".into()),
+                agent_fix: "require the canonical report fields or fail closed when they are absent; do not silently zero out report evidence".into(),
+                problem: "badge post-processing rewrites or strips `caps_applied` and `findings`".into(),
+            });
+        }
+    }
+    if let Some(file) = ctx
+        .all_files
+        .iter()
+        .find(|f| f.rel_path == "crates/jankurai/src/commands/paper.rs")
+    {
+        if file.text.contains("row.get(\"issues\")")
+            && (file.text.contains("finding_count(row)")
+                || file.text.contains("row[\"finding_count\"]"))
+        {
+            hits.push(FindingHit {
+                path: file.rel_path.clone(),
+                line: first_line_containing(&file.text, "finding_count(row)").or(Some(1)),
+                text: "paper post-processing rewrites missing `issues` from `finding_count` instead of preserving the source row shape".into(),
+                matched_term: Some("issues fallback".into()),
+                agent_fix: "require the canonical `issues` field in the source rows or emit a hard error when it is missing".into(),
+                problem: "paper post-processing rewrites or strips `issues`".into(),
+            });
         }
     }
     hits
@@ -2129,6 +2209,7 @@ pub fn event_contract_path_hits(ctx: &AuditContext) -> Vec<FindingHit> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn generated_path_dir_prefixes_remain_recognized() {
@@ -2172,6 +2253,125 @@ mod tests {
         // similar names that should not match the suffix pattern
         assert!(!is_generated_or_reference_path("apps/web/sst-env.ts"));
         assert!(!is_generated_or_reference_path("apps/web/regen.ts"));
+    }
+
+    #[test]
+    fn generated_zone_protected_paths_do_not_suppress_protected_sources() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("agent")).unwrap();
+        std::fs::write(
+            dir.path().join("agent/generated-zones.toml"),
+            r#"[[zone]]
+path = "crates/foo/src/lib.rs"
+source = "contracts/openapi.yaml"
+command = "cargo run -p jankurai -- generate"
+"#,
+        )
+        .unwrap();
+        let ctx = AuditContext {
+            root: dir.path().to_path_buf(),
+            all_files: vec![
+                FileInfo {
+                    rel_path: "agent/generated-zones.toml".into(),
+                    name: "generated-zones.toml".into(),
+                    suffix: ".toml".into(),
+                    size: 0,
+                    line_count: 1,
+                    text: r#"[[zone]]
+path = "crates/foo/src/lib.rs"
+source = "contracts/openapi.yaml"
+command = "cargo run -p jankurai -- generate"
+"#
+                    .into(),
+                    is_generated: false,
+                    is_code: false,
+                },
+                FileInfo {
+                    rel_path: "crates/foo/src/lib.rs".into(),
+                    name: "lib.rs".into(),
+                    suffix: ".rs".into(),
+                    size: 0,
+                    line_count: 1,
+                    text: "pub fn demo() {\n    // TODO: fix me\n}\n".into(),
+                    is_generated: false,
+                    is_code: true,
+                },
+            ],
+            scope_files: vec![],
+            scope_paths: vec![],
+            self_audit: true,
+            boundary_reclassifications: vec![],
+            copy_code: None,
+        };
+        let protected = crate::audit::helpers::generated_zone_protected_paths(&ctx);
+        assert_eq!(protected, vec!["crates/foo/src/lib.rs".to_string()]);
+        let suppression = crate::audit::helpers::generated_zone_suppression_paths(&ctx);
+        assert!(suppression.is_empty());
+        let issues = generated_zone_issues(&ctx);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "agent/generated-zones.toml"));
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "crates/foo/src/lib.rs"));
+    }
+
+    #[test]
+    fn report_post_processing_issues_detects_fallback_shape_changes() {
+        let ctx = AuditContext {
+            root: std::path::PathBuf::from("/repo"),
+            all_files: vec![
+                FileInfo {
+                    rel_path: "crates/jankurai/src/commands/badge.rs".into(),
+                    name: "badge.rs".into(),
+                    suffix: ".rs".into(),
+                    size: 0,
+                    line_count: 1,
+                    text: r#"
+let findings = value
+    .get("findings")
+    .and_then(Value::as_array)
+    .map(Vec::len)
+    .unwrap_or(0);
+let caps = value
+    .get("caps_applied")
+    .and_then(Value::as_array)
+    .map(Vec::len)
+    .unwrap_or(0);
+"#
+                    .into(),
+                    is_generated: false,
+                    is_code: true,
+                },
+                FileInfo {
+                    rel_path: "crates/jankurai/src/commands/paper.rs".into(),
+                    name: "paper.rs".into(),
+                    suffix: ".rs".into(),
+                    size: 0,
+                    line_count: 1,
+                    text: r#"
+fn finding_count(row: &Value) -> Result<u64> {
+    if row.get("issues").is_some() {
+        integer(&row["issues"])
+    } else {
+        integer(&row["finding_count"])
+    }
+}
+"#
+                    .into(),
+                    is_generated: false,
+                    is_code: true,
+                },
+            ],
+            scope_files: vec![],
+            scope_paths: vec![],
+            self_audit: true,
+            boundary_reclassifications: vec![],
+            copy_code: None,
+        };
+        let hits = report_post_processing_issues(&ctx);
+        assert!(hits.iter().any(|hit| hit.path.ends_with("badge.rs")));
+        assert!(hits.iter().any(|hit| hit.path.ends_with("paper.rs")));
     }
 
     fn product_file(rel_path: &str, text: &str) -> FileInfo {

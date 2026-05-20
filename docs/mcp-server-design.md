@@ -12,7 +12,7 @@ Jankurai is currently a CLI-first tool. The CLI is the single source of truth fo
 
 Once implemented, the MCP server will expose the following immutable or frequently accessed metadata as Resources:
 
-- **`jankurai://report`**: The current `agent/repo-score.json` or equivalent generated audit.
+- **`jankurai://report`**: The current `.jankurai/repo-score.json` or equivalent generated audit.
 - **`jankurai://findings`**: A filtered view of open findings from the latest report.
 - **`jankurai://owner-map`**: The contents of `agent/owner-map.json`.
 - **`jankurai://test-map`**: The contents of `agent/test-map.json`.

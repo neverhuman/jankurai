@@ -214,7 +214,7 @@ fn new_planner_commands_emit_stable_json_and_markdown() {
         &plan_path,
         serde_json::json!({
             "schema_version": "1.0.0",
-            "source_report": "agent/repo-score.json",
+            "source_report": ".jankurai/repo-score.json",
             "generated_at": "0",
             "target_stack_id": "jankurai:v0.4",
             "plan_mode": "dry-run",
@@ -450,9 +450,9 @@ purpose = "fixture proof"
     fs::write(
         repo.path().join("agent/generated-zones.toml"),
         r#"[[zone]]
-path = "agent/repo-score.json"
+path = ".jankurai/repo-score.json"
 source = "crates/jankurai"
-command = "cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md"
+command = "cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
 read_only = false
 "#,
     )
@@ -463,7 +463,7 @@ read_only = false
         &plan_path,
         serde_json::json!({
             "schema_version": "1.0.0",
-            "source_report": "agent/repo-score.json",
+            "source_report": ".jankurai/repo-score.json",
             "generated_at": "0",
             "target_stack_id": "jankurai:v0.4",
             "plan_mode": "dry-run",
@@ -517,7 +517,7 @@ read_only = false
         .as_array()
         .unwrap()
         .iter()
-        .any(|link| link == "agent/repo-score.json"));
+        .any(|link| link == ".jankurai/repo-score.json"));
     assert!(draft["pr_body"]
         .as_str()
         .unwrap()

@@ -50,6 +50,8 @@ pub fn build_plan(
         filter_profile_manifest(profile_manifest, selected_level),
         selected_level,
     );
+    let (profile_manifest, read_only_exception_paths) =
+        strip_read_only_exception_paths(profile_manifest);
     let profile = profile_manifest.id.clone();
     let mut paths = profile_manifest.generated_paths.clone();
     paths.sort();
@@ -76,6 +78,12 @@ pub fn build_plan(
         warnings.push(format!(
             "existing files left intact: {}",
             existing.join(", ")
+        ));
+    }
+    if !read_only_exception_paths.is_empty() {
+        warnings.push(format!(
+            "exception records are human-managed and not generated automatically: {}",
+            read_only_exception_paths.join(", ")
         ));
     }
     Ok(InitPlan {
@@ -393,6 +401,30 @@ fn filter_profile_manifest(
     manifest
 }
 
+fn strip_read_only_exception_paths(
+    mut manifest: super::profiles::ProfileManifest,
+) -> (super::profiles::ProfileManifest, Vec<String>) {
+    let mut removed = Vec::new();
+    manifest.generated_paths.retain(|path| {
+        if crate::audit::fs::is_read_only_exception_path(path) {
+            removed.push(path.clone());
+            return false;
+        }
+        true
+    });
+    let generated: BTreeSet<&str> = manifest
+        .generated_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
+    manifest.merge_policy = manifest
+        .merge_policy
+        .into_iter()
+        .filter(|(path, _)| generated.contains(path.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    (manifest, removed)
+}
+
 fn augment_for_repo(
     repo: &Path,
     mut manifest: super::profiles::ProfileManifest,
@@ -525,7 +557,7 @@ fn level_validation_commands(level: InitLevel) -> Vec<String> {
         InitLevel::Agents => vec!["jankurai adapters verify".into()],
         InitLevel::Score => vec![
             "jankurai doctor --fail-on critical".into(),
-            "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md"
+            "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
                 .into(),
         ],
         InitLevel::Ci => vec![

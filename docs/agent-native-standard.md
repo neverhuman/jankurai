@@ -38,7 +38,7 @@ Every repository claiming `HL3` or higher MUST include:
   legacy forms that should be renamed.
 - `agent/generated-zones.toml` or equivalent generated-file manifest.
 - `agent/standard-version.toml` binding paper, standard, audit, schema, and artifact versions.
-- `agent/repo-score.json` produced by CI.
+- `.jankurai/repo-score.json` produced by CI.
 - one command for fast validation.
 - one command for full validation.
 - CI job that runs the jankurai audit on every pull request.
@@ -191,7 +191,7 @@ repo/
     owner-map.json
     test-map.json
     generated-zones.toml
-    agent/repo-score.json
+    .jankurai/repo-score.json
   apps/
     web/                 # TypeScript, React, Vite, generated clients only
     api/                 # Rust Axum/Tower HTTP or ConnectRPC edge
@@ -280,7 +280,7 @@ DO NOT EDIT BY HAND.
 
 Structured generated artifacts that cannot legally carry comment headers MUST
 carry equivalent generated identity in their native format. For example,
-`agent/repo-score.json` is valid when its schema URL, generated timestamp, and
+`.jankurai/repo-score.json` is valid when its schema URL, generated timestamp, and
 standard/auditor/schema version fields are present. Native lockfiles such as
 `package-lock.json` are valid when the package-manager lockfile shape validates.
 Arbitrary JSON without recognized generated identity is still treated as an
@@ -434,7 +434,7 @@ CI MUST run jankurai audit on every pull request and default branch push for rep
 
 Minimum outputs:
 
-- `agent/repo-score.json`
+- `.jankurai/repo-score.json`
 - markdown summary attached to CI job
 - PR comment or check annotation for high findings
 - optional SARIF for code scanning; SARIF is a planned output format for the v0.x auditor line

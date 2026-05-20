@@ -214,7 +214,7 @@ repo/
     proof-lanes.toml
     generated-zones.toml
     audit-policy.toml
-    agent/repo-score.json
+    .jankurai/repo-score.json
   apps/
     web/
       AGENTS.md

@@ -430,7 +430,7 @@ fn hard_findings(ctx: &AuditContext) -> Vec<LanguageFinding> {
 }
 
 fn rust_files(ctx: &AuditContext) -> Vec<crate::model::FileInfo> {
-    let zone_paths = crate::audit::helpers::generated_zone_paths(ctx);
+    let zone_paths = crate::audit::helpers::generated_zone_suppression_paths(ctx);
     product_code_files(ctx)
         .into_iter()
         .filter(|file| {

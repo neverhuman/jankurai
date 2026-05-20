@@ -32,6 +32,24 @@ const EXCLUDED_DIRS: &[&str] = &[
 
 const EXCLUDED_AGENT_STATE_DIRS: &[&str] = &[".antigravity", "antigravity"];
 const CURSOR_ALLOWED_PREFIXES: &[&str] = &[".cursor/rules/"];
+const PROTECTED_DIR_PREFIXES: &[&str] = &[".github/", "agent/", "crates/", "tools/"];
+const PROTECTED_ROOT_FILES: &[&str] = &[
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CODEOWNERS",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "Justfile",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "VERSION",
+    "package-lock.json",
+    "package.json",
+];
+const READ_ONLY_EXCEPTION_DIR: &str = "docs/exceptions";
 
 pub fn inventory_repo(root: &Path) -> Result<Vec<FileInfo>> {
     Ok(inventory_repo_detailed(root, &InventoryOptions::from_policy(root))?.files)
@@ -47,12 +65,14 @@ pub fn inventory_repo_detailed(root: &Path, options: &InventoryOptions) -> Resul
     let mut paths: Vec<PathBuf> = Vec::new();
     let filter_root = root.to_path_buf();
     let filter_options = options.clone();
-    for entry in WalkBuilder::new(root)
+    let mut builder = WalkBuilder::new(root);
+    builder
         .hidden(false)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
-        .max_depth(None)
+        .git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
+        .max_depth(None);
+    for entry in builder
         .filter_entry(move |entry| {
             let Ok(rel) = entry.path().strip_prefix(&filter_root) else {
                 return true;
@@ -107,11 +127,18 @@ pub fn inventory_paths_detailed(
         } else if abs.is_dir() {
             let filter_root = root.to_path_buf();
             let filter_options = options.clone();
-            for entry in WalkBuilder::new(&abs)
-                .hidden(false)
-                .git_ignore(true)
-                .git_exclude(true)
-                .git_global(true)
+            let protected_dir = is_inventory_protected_path(rel);
+            let mut builder = WalkBuilder::new(&abs);
+            builder.hidden(false);
+            if protected_dir {
+                builder
+                    .git_ignore(false)
+                    .git_exclude(false)
+                    .git_global(false);
+            } else {
+                builder.git_ignore(true).git_exclude(true).git_global(true);
+            }
+            for entry in builder
                 .filter_entry(move |entry| {
                     let Ok(rel) = entry.path().strip_prefix(&filter_root) else {
                         return true;
@@ -226,6 +253,9 @@ fn file_seed(root: &Path, rel: &Path) -> Option<FileSeed> {
 
 fn should_skip(path: &Path, options: &InventoryOptions) -> bool {
     let rel = path.to_string_lossy().replace('\\', "/");
+    if is_inventory_protected_path(&rel) {
+        return false;
+    }
     if rel.starts_with(".cursor/")
         && rel != ".cursor/rules"
         && !CURSOR_ALLOWED_PREFIXES.iter().any(|p| rel.starts_with(p))
@@ -254,6 +284,48 @@ fn should_skip(path: &Path, options: &InventoryOptions) -> bool {
         let s = c.as_os_str().to_string_lossy();
         EXCLUDED_DIRS.contains(&s.as_ref())
     })
+}
+
+fn normalize_repo_path(path: &str) -> String {
+    path.trim()
+        .trim_start_matches("./")
+        .replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
+pub fn is_inventory_protected_path(path: &str) -> bool {
+    let rel = normalize_repo_path(path);
+    PROTECTED_ROOT_FILES.contains(&rel.as_str())
+        || PROTECTED_DIR_PREFIXES.iter().any(|prefix| {
+            let trimmed = prefix.trim_end_matches('/');
+            rel == trimmed || rel.starts_with(prefix)
+        })
+}
+
+pub fn is_read_only_exception_path(path: &str) -> bool {
+    let rel = normalize_repo_path(path);
+    rel == READ_ONLY_EXCEPTION_DIR
+        || rel.starts_with(&format!("{READ_ONLY_EXCEPTION_DIR}/"))
+        || rel.contains(&format!("/{READ_ONLY_EXCEPTION_DIR}/"))
+        || rel.ends_with(&format!("/{READ_ONLY_EXCEPTION_DIR}"))
+}
+
+pub fn is_generated_zone_protected_path(path: &str) -> bool {
+    let rel = normalize_repo_path(path);
+    if rel == ".jankurai/repo-score.json"
+        || rel == ".jankurai/repo-score.md"
+        || rel == "agent/repo-score.json"
+        || rel == "agent/repo-score.md"
+        || rel.starts_with("agent/baselines/")
+        || rel == "Cargo.lock"
+        || rel == "package-lock.json"
+        || rel == "pnpm-lock.yaml"
+        || rel == "yarn.lock"
+    {
+        return false;
+    }
+    is_inventory_protected_path(&rel)
 }
 
 fn read_text_sample(path: &Path, max_capture_chars: usize) -> Result<(String, usize)> {

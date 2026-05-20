@@ -344,10 +344,11 @@ advisory_tools = ["gitleaks"]
         r#"{"workspace":"fixture","tests":{".":{"command":"true","purpose":"smoke"}}}"#,
     )
     .unwrap();
+    fs::create_dir_all(dir.path().join(".jankurai")).unwrap();
     fs::write(
         dir.path().join("agent/generated-zones.toml"),
         r#"[[zone]]
-path = "agent/repo-score.json"
+path = ".jankurai/repo-score.json"
 source = "fixture"
 command = "true"
 read_only = true
@@ -370,8 +371,8 @@ standard_version = "0.0.0"
 "#,
     )
     .unwrap();
-    fs::write(dir.path().join("agent/repo-score.json"), "{}\n").unwrap();
-    fs::write(dir.path().join("agent/repo-score.md"), "# score\n").unwrap();
+    fs::write(dir.path().join(".jankurai/repo-score.json"), "{}\n").unwrap();
+    fs::write(dir.path().join(".jankurai/repo-score.md"), "# score\n").unwrap();
 
     let json = dir.path().join("score.json");
     let md = dir.path().join("score.md");
@@ -436,7 +437,7 @@ standard_version = "0.0.0"
             .arg("--mode")
             .arg("ratchet")
             .arg("--baseline")
-            .arg("agent/repo-score.json")
+            .arg(".jankurai/repo-score.json")
             .arg("--min-score")
             .arg("85"),
     );

@@ -40,9 +40,9 @@ fn seed_catalog(repo: &std::path::Path) {
     fs::write(
         repo.join("agent/generated-zones.toml"),
         r#"[[zone]]
-path = "agent/repo-score.json"
+path = ".jankurai/repo-score.json"
 source = "crates/jankurai"
-command = "cargo run -p jankurai -- audit . --json agent/repo-score.json --md agent/repo-score.md"
+command = "cargo run -p jankurai -- audit . --json .jankurai/repo-score.json --md .jankurai/repo-score.md"
 read_only = false
 "#,
     )
@@ -238,7 +238,12 @@ fn prove_writes_receipts_and_logs() {
         r#"{"schema_version":1,"generated_by":"jankurai coverage audit","repo_root":".","config_path":"agent/coverage-sources.toml","strict":false,"changed_from":null,"summary":{"status":"pass","sources_total":0,"sources_present":0,"sources_missing":0,"hard_findings":0,"soft_findings":0},"sources":[],"findings":[]}"#,
     )
     .unwrap();
-    fs::write(repo.path().join("agent/repo-score.json"), "{\"score\":0}\n").unwrap();
+    fs::create_dir_all(repo.path().join(".jankurai")).unwrap();
+    fs::write(
+        repo.path().join(".jankurai/repo-score.json"),
+        "{\"score\":0}\n",
+    )
+    .unwrap();
     fs::write(work.join("jankurai.sarif"), "{}\n").unwrap();
     fs::write(work.join("summary.md"), "# summary\n").unwrap();
     fs::write(
@@ -299,7 +304,7 @@ generated_type_paths = []
     );
     assert_eq!(
         evidence_value["repo_score_json_path"],
-        "agent/repo-score.json"
+        ".jankurai/repo-score.json"
     );
     assert_eq!(
         evidence_value["coverage_audit_path"],

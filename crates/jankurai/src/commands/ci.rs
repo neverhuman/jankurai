@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn ratchet_workflow_uses_installed_jankurai_and_score_gate() {
-        let rendered = workflow("ratchet", 85, Some("agent/repo-score.json"));
+        let rendered = workflow("ratchet", 85, Some(".jankurai/repo-score.json"));
         assert!(rendered.contains("cargo install jankurai --locked"));
         assert!(rendered.contains("--mode ratchet"));
         assert!(rendered.contains("target/jankurai/accepted-baseline.json"));

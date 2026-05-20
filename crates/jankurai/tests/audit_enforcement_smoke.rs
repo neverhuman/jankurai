@@ -3,6 +3,8 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+use jankurai::audit::fs::{inventory_repo_detailed, InventoryOptions};
+
 fn binary_path() -> &'static str {
     env!("CARGO_BIN_EXE_jankurai")
 }
@@ -122,6 +124,93 @@ fn invalid_policy_severity_fails_loading() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid audit policy severity"));
+}
+
+#[test]
+fn direct_file_exclusion_does_not_hide_tracked_rust() {
+    let repo = tempdir().unwrap();
+    write_base_repo(repo.path());
+    fs::create_dir_all(repo.path().join("crates/foo/src")).unwrap();
+    fs::write(
+        repo.path().join("crates/foo/src/lib.rs"),
+        "pub fn hidden() {\n    let marker = \"legacy\";\n    let _ = marker;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("agent/audit-policy.toml"),
+        r#"
+minimum_score = 0
+[scan]
+excluded_paths = ["crates/foo/src/lib.rs"]
+"#,
+    )
+    .unwrap();
+
+    let report = jankurai::audit::run_audit(repo.path(), &[]).unwrap();
+    assert!(report.findings.iter().any(|finding| {
+        finding.path == "crates/foo/src/lib.rs"
+            && finding.rule_id.as_deref() == Some("HLT-001-DEAD-MARKER")
+    }));
+}
+
+#[test]
+fn broad_root_exclusion_does_not_hide_tracked_rust() {
+    let repo = tempdir().unwrap();
+    write_base_repo(repo.path());
+    fs::create_dir_all(repo.path().join("crates/foo/src")).unwrap();
+    fs::write(
+        repo.path().join("crates/foo/src/lib.rs"),
+        "pub fn hidden() {\n    let marker = \"legacy\";\n    let _ = marker;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("agent/audit-policy.toml"),
+        r#"
+minimum_score = 0
+[scan]
+extra_excluded_globs = ["crates/**"]
+"#,
+    )
+    .unwrap();
+
+    let report = jankurai::audit::run_audit(repo.path(), &[]).unwrap();
+    assert!(report.findings.iter().any(|finding| {
+        finding.path == "crates/foo/src/lib.rs"
+            && finding.rule_id.as_deref() == Some("HLT-001-DEAD-MARKER")
+    }));
+}
+
+#[test]
+fn control_plane_exclusions_do_not_hide_agents_or_workflows() {
+    let repo = tempdir().unwrap();
+    write_base_repo(repo.path());
+    fs::create_dir_all(repo.path().join(".github/workflows")).unwrap();
+    fs::write(
+        repo.path().join(".github/workflows/ci.yml"),
+        "name: ci\njobs:\n  audit:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@master\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("agent/audit-policy.toml"),
+        r#"
+minimum_score = 0
+[scan]
+excluded_paths = ["AGENTS.md", ".github/"]
+"#,
+    )
+    .unwrap();
+
+    let report = jankurai::audit::run_audit(repo.path(), &[]).unwrap();
+    let inventory =
+        inventory_repo_detailed(repo.path(), &InventoryOptions::from_policy(repo.path())).unwrap();
+    assert!(!report
+        .caps_applied
+        .iter()
+        .any(|cap| cap == "no-root-agent-instructions"));
+    assert!(inventory
+        .files
+        .iter()
+        .any(|file| file.rel_path == ".github/workflows/ci.yml"));
 }
 
 #[test]

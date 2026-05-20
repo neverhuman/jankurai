@@ -145,7 +145,7 @@ fn advisory_hits(ctx: &AuditContext) -> Vec<LanguageFinding> {
 }
 
 fn typescript_files(ctx: &AuditContext) -> Vec<&FileInfo> {
-    let zone_paths = crate::audit::helpers::generated_zone_paths(ctx);
+    let zone_paths = crate::audit::helpers::generated_zone_suppression_paths(ctx);
     ctx.all_files
         .iter()
         .filter(|file| is_typescript_surface(file, &zone_paths))

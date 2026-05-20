@@ -75,6 +75,13 @@ fn decide(args: &AuditFileArgs) -> Result<SaveGateDecision> {
     if rel_path.is_empty() {
         bail!("--path must not be empty");
     }
+    let mode = SaveGateMode::parse(&args.mode)?;
+    if crate::audit::fs::is_read_only_exception_path(&rel_path) {
+        return Ok(crate::audit::save_gate::block_exception_write(
+            &rel_path,
+            mode.as_str(),
+        ));
+    }
     let op = parse_op(&args.op, args.rename_from.as_deref())?;
     let candidate_bytes = read_candidate(args, &root, &rel_path, &op)?;
     let baseline_bytes = match &args.baseline {
@@ -83,7 +90,6 @@ fn decide(args: &AuditFileArgs) -> Result<SaveGateDecision> {
         }
         None => None,
     };
-    let mode = SaveGateMode::parse(&args.mode)?;
     evaluate(SaveGateRequest {
         root,
         rel_path,

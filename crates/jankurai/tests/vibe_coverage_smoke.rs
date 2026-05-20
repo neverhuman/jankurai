@@ -10,6 +10,13 @@ fn repo_root() -> PathBuf {
         .join("..")
 }
 
+fn seed_repo_score_artifacts(repo: &Path) {
+    let state_dir = repo.join(".jankurai");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(state_dir.join("repo-score.json"), "{\"score\":0}\n").unwrap();
+    fs::write(state_dir.join("repo-score.md"), "# score\n").unwrap();
+}
+
 fn run_vibe_coverage(repo: &Path, out_dir: &Path) -> Value {
     let json = out_dir.join("vibe-coverage.json");
     let md = out_dir.join("vibe-coverage.md");
@@ -60,6 +67,7 @@ fn run_vibe_coverage(repo: &Path, out_dir: &Path) -> Value {
 #[test]
 fn validates_all_source_rows_and_report_schema() {
     let repo = repo_root();
+    seed_repo_score_artifacts(&repo);
     let tmp = tempfile::tempdir().unwrap();
     let report = run_vibe_coverage(&repo, tmp.path());
 
@@ -102,6 +110,7 @@ fn validates_all_source_rows_and_report_schema() {
 #[test]
 fn validate_subcommand_fails_no_rows() {
     let repo = repo_root();
+    seed_repo_score_artifacts(&repo);
     let output = Command::new(env!("CARGO_BIN_EXE_jankurai"))
         .arg("vibe")
         .arg("validate")

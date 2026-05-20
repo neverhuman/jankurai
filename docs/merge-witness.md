@@ -5,7 +5,7 @@
 ```bash
 jankurai witness . \
   --changed-from origin/main \
-  --baseline agent/repo-score.json \
+  --baseline .jankurai/repo-score.json \
   --out target/jankurai/merge-witness.json \
   --md target/jankurai/merge-witness.md
 ```

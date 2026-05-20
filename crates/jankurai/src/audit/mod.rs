@@ -775,7 +775,7 @@ fn build_findings(
         }
     }
     if caps_applied.contains(&"no-jankurai-audit-lane-in-ci".into()) {
-        b.add("high", "audit", ".github/workflows", "CI does not run the jankurai audit lane", "add a CI job that runs `jankurai . --json agent/repo-score.json --md agent/repo-score.md` and uploads both artifacts", vec!["audit output must stay JSON plus Markdown for agent repair routing".into()], None, None);
+        b.add("high", "audit", ".github/workflows", "CI does not run the jankurai audit lane", "add a CI job that runs `jankurai . --json .jankurai/repo-score.json --md .jankurai/repo-score.md` and uploads both artifacts", vec!["audit output must stay JSON plus Markdown for agent repair routing".into()], None, None);
     }
 
     for hit in scan::manifest_parse_findings(ctx) {
@@ -894,6 +894,20 @@ fn build_findings(
     if !scan::generated_zone_issues(ctx).is_empty() {
         let hit = scan::generated_zone_issues(ctx)[0].clone();
         b.add_with_rule("HLT-002-GENERATED-MUTATION", &hit.path, "generated zone is not protected strongly enough against hand edits", "add `agent/generated-zones.toml`, require generated/do-not-edit markers, and route repairs to the source contract", vec![hit.problem.clone()], hit.line, None, None);
+    }
+    if ctx.self_audit {
+        for hit in scan::report_post_processing_issues(ctx) {
+            b.add(
+                "medium",
+                "audit",
+                &hit.path,
+                &hit.problem,
+                &hit.agent_fix,
+                vec![hit.text.clone()],
+                None,
+                hit.line,
+            );
+        }
     }
     for hit in scan::generated_zone_manifest_metadata_issues(ctx) {
         b.add(
@@ -1464,6 +1478,7 @@ fn changed_fast_inventory_paths(scope_paths: &[String]) -> Vec<String> {
         "AGENTS.md",
         "CLAUDE.md",
         "GEMINI.md",
+        "CHANGELOG.md",
         "Justfile",
         "Cargo.toml",
         "Cargo.lock",
@@ -1475,6 +1490,16 @@ fn changed_fast_inventory_paths(scope_paths: &[String]) -> Vec<String> {
         "go.sum",
         "agent",
         ".github/workflows",
+        "docs/architecture.md",
+        "docs/artifact-contracts.md",
+        "docs/boundaries.md",
+        "docs/branch-protection.md",
+        "docs/release-plan.md",
+        "docs/security-tool-matrix.md",
+        "docs/testing.md",
+        "ops/AGENTS.md",
+        "ops/ci",
+        "ops/git-hooks",
     ] {
         paths.insert(path.to_string());
     }

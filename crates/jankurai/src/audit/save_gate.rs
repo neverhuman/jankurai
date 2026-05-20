@@ -134,6 +134,9 @@ pub struct SaveGateRequest {
 
 /// Audits a candidate file change and returns a delta-based decision.
 pub fn evaluate(req: SaveGateRequest) -> Result<SaveGateDecision> {
+    if crate::audit::fs::is_read_only_exception_path(&req.rel_path) {
+        return Ok(block_exception_write(&req.rel_path, req.mode.as_str()));
+    }
     let scope = vec![req.rel_path.clone()];
     let candidate_overlay = CandidateOverlay {
         rel_path: req.rel_path.clone(),
@@ -253,6 +256,54 @@ fn classify(candidate: &[Finding], baseline: &[Finding], fail_on: &[String]) -> 
         }
     }
     buckets
+}
+
+pub fn block_exception_write(rel_path: &str, mode: &str) -> SaveGateDecision {
+    let finding = exception_write_finding(rel_path);
+    SaveGateDecision {
+        schema: SAVE_GATE_SCHEMA,
+        verdict: SaveGateVerdict::Block,
+        exit_code: 3,
+        path: rel_path.into(),
+        mode: mode.into(),
+        candidate_score: 0,
+        baseline_score: None,
+        summary: "docs/exceptions is read-only to automation; edit exception records manually and keep the dated front matter reviewable".into(),
+        blocking: BlockingFindings {
+            new_hard_findings: vec![finding],
+            worsened_findings: vec![],
+            always_block_findings: vec![],
+        },
+        advisory: AdvisoryFindings::default(),
+        preexisting_findings: vec![],
+        rerun_command: "edit the exception file manually, then re-run the original command after human review".into(),
+    }
+}
+
+fn exception_write_finding(rel_path: &str) -> Finding {
+    Finding {
+        severity: "high".into(),
+        category: "audit".into(),
+        path: rel_path.into(),
+        problem: "automation is not allowed to write exception records under docs/exceptions"
+            .into(),
+        agent_fix: "use a manual editor and keep the dated exception front matter current".into(),
+        evidence: vec![rel_path.into()],
+        check_id: "exception-write-block".into(),
+        hardness: "hard".into(),
+        confidence: 1.0,
+        evidence_kind: "policy".into(),
+        rerun_command: String::new(),
+        fingerprint: String::new(),
+        rule_id: None,
+        tlr: None,
+        lane: None,
+        docs_url: None,
+        owner: None,
+        line: None,
+        matched_term: Some("docs/exceptions".into()),
+        reason: Some("exception files are reserved for manual review".into()),
+    }
 }
 
 /// Intermediate classification result.

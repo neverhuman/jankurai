@@ -172,7 +172,7 @@ fn first_job_line(file: &FileInfo) -> usize {
 }
 
 fn file_exists(ctx: &AuditContext, rel: &str) -> bool {
-    ctx.all_files.iter().any(|file| file.rel_path == rel)
+    ctx.root.join(rel).is_file() || ctx.all_files.iter().any(|file| file.rel_path == rel)
 }
 
 fn workflow_anchor(ctx: &AuditContext) -> &FileInfo {
@@ -183,6 +183,9 @@ fn workflow_anchor(ctx: &AuditContext) -> &FileInfo {
 }
 
 fn has_rust_workspace(ctx: &AuditContext) -> bool {
+    if ctx.root.join("Cargo.toml").is_file() {
+        return true;
+    }
     ctx.all_files
         .iter()
         .any(|file| file.rel_path == "Cargo.toml" || file.rel_path.ends_with("/Cargo.toml"))

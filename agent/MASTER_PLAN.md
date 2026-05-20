@@ -74,7 +74,7 @@ or the equivalent `jankurai proof` command when the phase requires receipt writi
 For audit requests, run:
 
 ```bash
-cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md
 ```
 
 Keep proof receipts, command output, SARIF, screenshots, and volatile evidence under `target/jankurai/`. Keep canonical cross-agent phase history under `tips/phases/logs/`.

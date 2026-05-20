@@ -14,6 +14,11 @@ pub fn write_markdown(path: &str, content: &str) -> Result<()> {
 
 fn write_output(path: &str, content: &str) -> Result<()> {
     if path != "-" {
+        if crate::audit::fs::is_read_only_exception_path(path) {
+            anyhow::bail!(
+                "automated writes to docs/exceptions are blocked; edit the exception file manually"
+            );
+        }
         if let Some(parent) = std::path::Path::new(path).parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent)?;
@@ -626,4 +631,19 @@ pub fn render_markdown(report: &Report) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn markdown_write_blocks_exception_paths() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("docs/exceptions/0001.md");
+        let err = write_markdown(path.to_str().unwrap(), "# exception").unwrap_err();
+        assert!(err.to_string().contains("docs/exceptions"));
+        assert!(!path.exists());
+    }
 }

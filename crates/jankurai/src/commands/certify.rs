@@ -8,6 +8,8 @@ use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::local_state;
+
 #[derive(Debug, Clone)]
 pub struct CertifyArgs {
     pub repo: PathBuf,
@@ -70,7 +72,11 @@ pub fn run(args: CertifyArgs) -> Result<()> {
 
 pub fn build_certification(repo: &Path) -> Result<Certification> {
     let release = load_release_data(repo)?;
-    let score_path = repo.join("agent/repo-score.json");
+    let score_path = local_state::preferred_repo_path(
+        repo,
+        local_state::SCORE_JSON,
+        Some(local_state::LEGACY_SCORE_JSON),
+    );
     let score = read_repo_score(repo)?;
     let evidence_root = if score_path.exists() {
         repo.to_path_buf()

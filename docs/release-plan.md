@@ -76,7 +76,7 @@ Operational receipts are volatile evidence, not source material.
 
 - `jankurai doctor` and `jankurai init` write receipts under `target/jankurai/receipts/<action>-<unix-seconds>.json`
 - release closeouts should cite the command, changed paths, and the receipt path
-- the canonical score artifacts remain `agent/repo-score.json` and `agent/repo-score.md`
+- the canonical local score artifacts remain `.jankurai/repo-score.json` and `.jankurai/repo-score.md`
 - `target/jankurai/` is the shared scratch root for audit, doctor, init, UX, and future proof outputs
 
 Use those receipts to make phase handoffs and release evidence reproducible without promoting them into tracked source files.
@@ -109,7 +109,7 @@ Minimum CI lanes:
 
 | Lane | Required command shape |
 | --- | --- |
-| `audit` | `cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md` |
+| `audit` | `cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md` |
 | `fast` | one deterministic command for local agent edits |
 | `contracts` | generated API/schema drift check |
 | `security` | secret scan, dependency scan, SBOM/SCA where available |
@@ -204,8 +204,8 @@ Ship the release surface as one product:
 | Audit exports | JSON, Markdown, SARIF, JUnit, GitHub summary, repair queue JSONL, issue export |
 | Install | idempotent `init --profile --ide --mode --dry-run --yes --diff` |
 | Doctor | stale score, root artifact, path leak, echo-only proof, UX artifact, boundary, and paper-source checks |
-| CI | `jankurai ci install --github --mode ratchet --baseline agent/repo-score.json --min-score 85` |
-| Merge witness | `jankurai witness . --changed-from origin/main --baseline agent/repo-score.json` |
+| CI | `jankurai ci install --github --mode ratchet --baseline .jankurai/repo-score.json --min-score 85` |
+| Merge witness | `jankurai witness . --changed-from origin/main --baseline .jankurai/repo-score.json` |
 | Boundaries | authoritative streaming and queue manifest with Kafka brownfield exception shape |
 | UX QA | route-matrix and Storybook audit commands with artifact-backed proof |
 
@@ -315,7 +315,7 @@ The paper should include a ranking graph, a concrete winner architecture, and th
 The first public experience should be:
 
 ```bash
-cargo run -p jankurai -- . --json agent/repo-score.json --md agent/repo-score.md
+cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md
 ```
 
 No bootstrap. No service. No API key. No dependency install. Immediate findings.

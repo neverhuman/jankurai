@@ -55,8 +55,9 @@ serde = "1"
     fs::create_dir_all(repo.join("src")).unwrap();
     fs::write(repo.join("src/lib.rs"), "pub fn ready() {}\n").unwrap();
     fs::create_dir_all(repo.join("agent")).unwrap();
+    fs::create_dir_all(repo.join(".jankurai")).unwrap();
     fs::write(
-        repo.join("agent/repo-score.json"),
+        repo.join(".jankurai/repo-score.json"),
         json!({
             "findings": [
                 {

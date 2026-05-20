@@ -15,7 +15,11 @@ This workspace is writing and validating the paper:
 - Treat `reference/` as read-only source material.
 - Do not hand-edit generated artifacts unless the generator/source is changed.
 - Keep root guidance short; put durable detail in `docs/` or `agent/`.
-- Use `cargo run -p jankurai -- audit . --json agent/repo-score.json --md agent/repo-score.md`
+- Agents must not hide audit failures by adding Rust files, core files, or broad
+  source roots to masking/exclusion policy, generated-zone shields, ignore
+  lists, or post-audit filters. Only the user may intentionally edit audit
+  masking policy by manual, visible review.
+- Use `cargo run -p jankurai -- audit . --json .jankurai/repo-score.json --md .jankurai/repo-score.md`
   for the audit lane. After a clean full scan this defaults to a smart fast scan (git-status
   changed files only). Use `--full` to force a complete scan. Use `jankurai copy-code .`
   for an explicit copy-code check (not included in fast scans).

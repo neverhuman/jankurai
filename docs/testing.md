@@ -36,7 +36,7 @@ For this workspace:
 - `just versions` checks version and artifact bindings through the Rust auditor.
 - `just ux-qa` builds and tests the optional Playwright geometry runtime.
 - `just fast` writes a deterministic audit snapshot under `target/jankurai/`.
-- `just score` writes local generated audit outputs at `agent/repo-score.json` and `agent/repo-score.md`; these files are ignored and are not accepted ratchet baselines.
+- `just score` writes local generated audit outputs at `.jankurai/repo-score.json` and `.jankurai/repo-score.md`; these files are ignored and are not accepted ratchet baselines.
 - `jankurai copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md` writes the copy-code redundancy report used for HLT-043 routing.
 - Accepted ratchet and public badge baselines live under `agent/baselines/`. CI copies the reviewed baseline to `target/jankurai/accepted-baseline.json` before the final audit.
 - `just conformance` runs the observed seed fixture suite, validates the

@@ -150,9 +150,9 @@ pub const TOOL_ADOPTION_CATALOG: &[ToolAdoptionCatalogEntry] = &[
         id: "audit-ci",
         category: "audit",
         replaced_tools: &["manual repo scoring", "ad hoc score gates"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_audit_ci_applicable,
     },
     ToolAdoptionCatalogEntry {
@@ -161,7 +161,7 @@ pub const TOOL_ADOPTION_CATALOG: &[ToolAdoptionCatalogEntry] = &[
         replaced_tools: &["ad hoc proof lane selection", "manual proof receipts"],
         local_command: "jankurai proof . --changed-from origin/main --out target/jankurai/proof-plan.json --md target/jankurai/proof-plan.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md", "target/jankurai/repair-queue.jsonl"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md", "target/jankurai/repair-queue.jsonl"],
         applicability: tool_proof_routing_applicable,
     },
     ToolAdoptionCatalogEntry {
@@ -261,9 +261,9 @@ pub const TOOL_ADOPTION_CATALOG: &[ToolAdoptionCatalogEntry] = &[
         id: "contract-drift",
         category: "contract",
         replaced_tools: &["handwritten contract drift checks", "openapi diff"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_contract_drift_applicable,
     },
     ToolAdoptionCatalogEntry {
@@ -297,45 +297,45 @@ pub const TOOL_ADOPTION_CATALOG: &[ToolAdoptionCatalogEntry] = &[
         id: "authz-matrix",
         category: "security",
         replaced_tools: &["manual authz matrix review"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_authz_matrix_applicable,
     },
     ToolAdoptionCatalogEntry {
         id: "input-boundary",
         category: "security",
         replaced_tools: &["manual unsafe sink review"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_input_boundary_applicable,
     },
     ToolAdoptionCatalogEntry {
         id: "agent-tool-supply",
         category: "security",
         replaced_tools: &["manual MCP/tool trust review"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_agent_tool_supply_applicable,
     },
     ToolAdoptionCatalogEntry {
         id: "release-readiness",
         category: "release",
         replaced_tools: &["manual launch checklist"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_release_readiness_applicable,
     },
     ToolAdoptionCatalogEntry {
         id: "cost-budget",
         category: "release",
         replaced_tools: &["manual spend review"],
-        local_command: "jankurai audit . --mode advisory --json agent/repo-score.json --md agent/repo-score.md",
+        local_command: "jankurai audit . --mode advisory --json .jankurai/repo-score.json --md .jankurai/repo-score.md",
         ci_command: "jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md",
-        artifact_paths: &["agent/repo-score.json", "agent/repo-score.md"],
+        artifact_paths: &[".jankurai/repo-score.json", ".jankurai/repo-score.md"],
         applicability: tool_cost_budget_applicable,
     },
 ];
@@ -674,6 +674,15 @@ pub fn has_rust_integration_tests(ctx: &AuditContext) -> bool {
 
 pub fn has_web_surface(ctx: &AuditContext) -> bool {
     ctx.all_files.iter().any(|f| {
+        let manifest_web_hint = (f.rel_path == "package.json"
+            || f.rel_path.ends_with("/package.json"))
+            && (f.text.contains("\"react\"")
+                || f.text.contains("\"vite\"")
+                || f.text.contains("\"storybook\""));
+        let react_source_hint = matches!(f.suffix.as_str(), ".tsx" | ".jsx")
+            && (f.text.contains("from \"react\"")
+                || f.text.contains("from 'react'")
+                || f.text.contains("React."));
         !f.rel_path.starts_with("docs/")
             && !f.rel_path.starts_with("paper/")
             && !f.rel_path.starts_with("reference/")
@@ -684,10 +693,8 @@ pub fn has_web_surface(ctx: &AuditContext) -> bool {
                 || f.rel_path.starts_with("ui")
                 || f.rel_path.starts_with("packages/web")
                 || f.rel_path.starts_with("packages/ui")
-                || (prose::allows_word_scan(f)
-                    && (f.text.contains("react")
-                        || f.text.contains("vite")
-                        || f.text.contains("storybook"))))
+                || manifest_web_hint
+                || react_source_hint)
     })
 }
 
@@ -976,11 +983,31 @@ pub fn generated_zone_paths(ctx: &AuditContext) -> Vec<String> {
         .collect()
 }
 
+/// Returns the generated-zone paths that are safe to use as suppression hints
+/// for language scans. Paths that point at protected control-plane or source
+/// roots stay visible to the auditor even if they are declared here.
+pub fn generated_zone_suppression_paths(ctx: &AuditContext) -> Vec<String> {
+    generated_zone_paths(ctx)
+        .into_iter()
+        .filter(|zone| !crate::audit::fs::is_generated_zone_protected_path(zone))
+        .collect()
+}
+
+/// Returns generated-zone paths that target protected source or control-plane
+/// roots. These declarations are always suspicious because they can hide files
+/// that should remain audit-visible.
+pub fn generated_zone_protected_paths(ctx: &AuditContext) -> Vec<String> {
+    generated_zone_paths(ctx)
+        .into_iter()
+        .filter(|zone| crate::audit::fs::is_generated_zone_protected_path(zone))
+        .collect()
+}
+
 /// Returns true when `rel_path` matches any declared `[[zone]] path` from the
 /// generated-zones manifest. Matches both exact paths and directory prefixes,
 /// honoring trailing-slash semantics in `path_matches_prefix`.
 pub fn path_in_generated_zone(ctx: &AuditContext, rel_path: &str) -> bool {
-    let zones = generated_zone_paths(ctx);
+    let zones = generated_zone_suppression_paths(ctx);
     if zones.is_empty() {
         return false;
     }

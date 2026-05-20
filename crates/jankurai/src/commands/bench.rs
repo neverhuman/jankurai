@@ -241,7 +241,7 @@ pub fn build_benchmark_report(repo: &Path, suite: &BenchmarkSuite) -> Result<Ben
                 metrics,
                 evidence: vec![
                     fixture.path.clone(),
-                    "agent/repo-score.json".to_string(),
+                    ".jankurai/repo-score.json".to_string(),
                     "agent/standard-version.toml".to_string(),
                 ],
                 notes,

@@ -344,7 +344,11 @@ fn dependency_findings(repo: &Path) -> Result<Vec<OptimizationFinding>> {
 
 fn dead_code_findings(repo: &Path) -> Result<Vec<OptimizationFinding>> {
     let mut out = Vec::new();
-    let score_path = repo.join("agent/repo-score.json");
+    let score_path = crate::local_state::preferred_repo_path(
+        repo,
+        crate::local_state::SCORE_JSON,
+        Some(crate::local_state::LEGACY_SCORE_JSON),
+    );
     if !score_path.exists() {
         return Ok(out);
     }
@@ -503,7 +507,11 @@ fn filter_findings(findings: Vec<OptimizationFinding>, mode: &str) -> Vec<Optimi
 }
 
 fn read_repo_score_findings(repo: &Path) -> Result<Option<Vec<serde_json::Value>>> {
-    let path = repo.join("agent/repo-score.json");
+    let path = crate::local_state::preferred_repo_path(
+        repo,
+        crate::local_state::SCORE_JSON,
+        Some(crate::local_state::LEGACY_SCORE_JSON),
+    );
     if !path.exists() {
         return Ok(None);
     }
@@ -540,7 +548,7 @@ fn finding_path(value: &serde_json::Value) -> String {
     value
         .get("path")
         .and_then(|value| value.as_str())
-        .unwrap_or("agent/repo-score.json")
+        .unwrap_or(".jankurai/repo-score.json")
         .to_string()
 }
 
