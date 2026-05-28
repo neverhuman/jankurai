@@ -137,6 +137,7 @@ exit 0
     let cmds = value["commands"].as_array().unwrap();
     assert_eq!(cmds.len(), 2, "{cmds:?}");
     assert_eq!(cmds[0]["label"], "step-a");
+    assert_eq!(cmds[0]["tool"], "t1");
     assert_eq!(cmds[0]["status"], "ran");
     assert_eq!(cmds[0]["required_by_policy"], true);
     assert_eq!(cmds[0]["blocking"], false);

@@ -88,6 +88,7 @@ fn required_tool_failure_exits_nonzero_and_records_real_exit_code() {
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     validation::validate_value(repo.path(), ArtifactSchema::SecurityEvidence, &value).unwrap();
     assert_eq!(value["exit_code"], 7);
+    assert_eq!(value["commands"][0]["tool"], "gitleaks");
     assert_eq!(value["commands"][0]["status"], "failed");
     assert_eq!(value["commands"][0]["exit_code"], 7);
 
