@@ -55,6 +55,31 @@ fn sequence_texts(value: &YamlValue) -> Vec<String> {
         .collect()
 }
 
+fn need_job_names(value: &YamlValue) -> Vec<String> {
+    value
+        .as_sequence()
+        .unwrap_or_else(|| panic!("expected YAML sequence: {value:?}"))
+        .iter()
+        .map(|item| {
+            if let Some(name) = item.as_str() {
+                return name.to_string();
+            }
+            let mapping = item
+                .as_mapping()
+                .unwrap_or_else(|| panic!("expected need mapping or string: {item:?}"));
+            mapping
+                .iter()
+                .find_map(|(key, value)| {
+                    (key.as_str() == Some("job"))
+                        .then(|| value.as_str())
+                        .flatten()
+                })
+                .unwrap_or_else(|| panic!("missing job name in need mapping: {item:?}"))
+                .to_string()
+        })
+        .collect()
+}
+
 #[test]
 fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
     let text = read(".gitlab-ci.yml");
@@ -130,6 +155,8 @@ fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
     assert!(text.contains("bash ops/ci/release-build.sh"));
     assert!(text.contains("bash ops/ci/release-publish.sh"));
     assert!(text.contains("bash ops/ci/post-main-shadow.sh"));
+    assert!(text.contains("TARGET: x86_64-unknown-linux-gnu"));
+    assert!(text.contains("TARGET: aarch64-apple-darwin"));
 
     assert!(text.contains("target/jankurai/repo-score.json"));
     assert!(text.contains("target/jankurai/repo-score.md"));
@@ -148,7 +175,7 @@ fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
         ]
     );
 
-    let release_needs = sequence_strings(top_level(top_level(&yaml, "release_publish"), "needs"));
+    let release_needs = need_job_names(top_level(top_level(&yaml, "release_publish"), "needs"));
     assert_eq!(
         release_needs,
         vec![
@@ -158,12 +185,9 @@ fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
         ]
     );
 
-    assert!(top_level(top_level(&yaml, "release_build_macos"), "tags")
-        .as_sequence()
-        .expect("macOS job tags")
-        .iter()
-        .any(|tag| tag.as_str() == Some("macos")));
-
+    assert!(!text.contains("tags:"));
+    assert!(!text.contains("when: manual"));
+    assert!(!text.contains("optional: true"));
     assert_eq!(
         top_level(top_level(&yaml, "post_main_shadow"), "allow_failure").as_bool(),
         Some(true)

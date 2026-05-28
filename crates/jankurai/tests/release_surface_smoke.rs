@@ -88,6 +88,37 @@ fn ci_local_script_exposes_shadow_lane_for_post_main_mirror() {
 }
 
 #[test]
+fn node_tools_script_provisions_pinned_node_for_npm_parity() {
+    let text = read("ops/ci/node-tools.sh");
+
+    assert!(text.contains("NODE_VERSION"));
+    assert!(text.contains("setup_${node_major}.x"));
+    assert!(text.contains("nodejs"));
+    assert!(text.contains("brew install"));
+    assert!(text.contains("bootstrap did not make node/npm available"));
+}
+
+#[test]
+fn security_tools_script_bootstraps_node_before_security_scans() {
+    let text = read("ops/ci/security-tools.sh");
+
+    assert!(text.contains("node-tools.sh"));
+    assert!(text.contains("Node.js toolchain"));
+    assert!(text.contains("cargo-audit"));
+    assert!(text.contains("zizmor"));
+    assert!(text.contains("gitleaks"));
+}
+
+#[test]
+fn audit_script_bootstraps_node_before_npm_ci() {
+    let text = read("ops/ci/audit.sh");
+
+    let node_bootstrap = text.find("node-tools.sh").expect("node bootstrap");
+    let npm_ci = text.find("step \"npm ci\"").expect("npm ci step");
+    assert!(node_bootstrap < npm_ci);
+}
+
+#[test]
 fn post_main_shadow_script_is_local_origin_only_and_jeryu_backed() {
     let text = read("ops/ci/post-main-shadow.sh");
 

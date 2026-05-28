@@ -3,6 +3,9 @@
 # already on PATH at the required version.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+step "Node.js toolchain ${NODE_VERSION}"
+bash "$(dirname "${BASH_SOURCE[0]}")/node-tools.sh"
+
 want_version() {
   local cmd="$1" want="$2"
   if ! command -v "$cmd" >/dev/null 2>&1; then return 1; fi

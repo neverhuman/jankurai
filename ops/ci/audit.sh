@@ -11,6 +11,9 @@ ensure_dir "${ARTIFACT_ROOT}/security"
 ensure_dir "${ARTIFACT_ROOT}/public"
 ensure_dir "${ARTIFACT_ROOT}/coverage"
 
+step "Node.js toolchain ${NODE_VERSION}"
+bash "$(dirname "${BASH_SOURCE[0]}")/node-tools.sh"
+
 step "npm ci"
 npm ci
 
