@@ -9,6 +9,8 @@ through the separate local phase workflow unless the user explicitly names it.
 This workspace is writing and validating the paper:
 `Jankurai: A Versioned Repository Conformance Standard for Trustworthy AI-Assisted Merge`.
 
+Access contract: local agent workspaces use `~/.jeryu/access.toml`, `jeryu access doctor`, and `jeryu access repair --repo . --yes`; do not install/use `glab`, scrape credential stores, or keep HTTP local GitLab origins.
+
 ## Rules
 
 - Keep new files inside the repository root.
