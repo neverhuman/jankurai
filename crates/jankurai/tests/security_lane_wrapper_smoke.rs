@@ -144,16 +144,16 @@ fn ci_security_lane_scans_a_source_snapshot_without_mutating_workspace() {
         .unwrap();
     assert!(status.success());
 
-    fs::write(repo.path().join("junk.txt"), "should be removed by git clean\n").unwrap();
+    fs::write(
+        repo.path().join("junk.txt"),
+        "should be removed by git clean\n",
+    )
+    .unwrap();
     assert!(repo.path().join("junk.txt").exists());
 
     let bin_dir = tempdir().unwrap();
     let gitleaks = bin_dir.path().join("gitleaks");
-    fs::write(
-        &gitleaks,
-        "#!/usr/bin/env bash\necho gitleaks-ok\nexit 0\n",
-    )
-    .unwrap();
+    fs::write(&gitleaks, "#!/usr/bin/env bash\necho gitleaks-ok\nexit 0\n").unwrap();
     let mut perms = fs::metadata(&gitleaks).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&gitleaks, perms).unwrap();
