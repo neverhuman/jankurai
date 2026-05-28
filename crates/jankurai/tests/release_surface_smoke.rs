@@ -119,6 +119,16 @@ fn audit_script_bootstraps_node_before_npm_ci() {
 }
 
 #[test]
+fn coverage_script_adds_cargo_home_bin_before_tool_checks() {
+    let text = read("ops/ci/coverage-llvm.sh");
+
+    assert!(text.contains("cargo_bin_dir"));
+    assert!(text.contains("CARGO_HOME"));
+    assert!(text.contains("cargo-llvm-cov"));
+    assert!(text.contains("cargo-mutants"));
+}
+
+#[test]
 fn post_main_shadow_script_is_local_origin_only_and_jeryu_backed() {
     let text = read("ops/ci/post-main-shadow.sh");
 

@@ -4,6 +4,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ensure_fuse_dev
 
+cargo_bin_dir="${CARGO_HOME:-${HOME}/.cargo}/bin"
+case ":${PATH}:" in
+  *":${cargo_bin_dir}:"*) ;;
+  *) export PATH="${cargo_bin_dir}:${PATH}" ;;
+esac
+
 out_dir="${CI_ROOT}/target/coverage"
 ensure_dir "$out_dir"
 ensure_dir "${CI_ROOT}/target/llvm-cov"
