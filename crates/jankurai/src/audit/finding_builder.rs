@@ -2,6 +2,7 @@ use super::helpers::*;
 use super::rule_analyzer::FindingDraft;
 use super::rules;
 use crate::model::*;
+use crate::validation;
 use sha2::{Digest, Sha256};
 
 pub struct FindingBuilder<'a> {
@@ -316,17 +317,19 @@ fn owner_for_path(ctx: &AuditContext, rel_path: &str) -> Option<String> {
     }
 
     if let Ok(text) = std::fs::read_to_string(ctx.root.join("agent/owner-map.json")) {
-        if let Ok(parsed) = serde_json::from_str::<OwnerMapFile>(&text) {
-            let mut entries: Vec<_> = parsed.owners.iter().collect();
-            entries.sort_by(|a, b| {
-                b.0.len()
-                    .cmp(&a.0.len())
-                    .then_with(|| a.0.cmp(b.0))
-                    .then_with(|| a.1.cmp(b.1))
-            });
-            for (prefix, owner) in entries {
-                if rel_path == prefix || rel_path.starts_with(prefix) {
-                    return Some((*owner).clone());
+        if let Ok(value) = validation::parse_json_value_strict(&text) {
+            if let Ok(parsed) = serde_json::from_value::<OwnerMapFile>(value) {
+                let mut entries: Vec<_> = parsed.owners.iter().collect();
+                entries.sort_by(|a, b| {
+                    b.0.len()
+                        .cmp(&a.0.len())
+                        .then_with(|| a.0.cmp(b.0))
+                        .then_with(|| a.1.cmp(b.1))
+                });
+                for (prefix, owner) in entries {
+                    if rel_path == prefix || rel_path.starts_with(prefix) {
+                        return Some((*owner).clone());
+                    }
                 }
             }
         }

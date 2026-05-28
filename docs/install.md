@@ -9,8 +9,8 @@ Prerequisites for the installer path: `curl`, `gh`, `cosign`, and `sudo`
 permission for the macOS pkg installer if you are on macOS.
 
 ```bash
-curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.5.1/jankurai-installer.sh \
-  | JANKURAI_RELEASE_TAG=v1.5.1 bash
+curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.6.0/jankurai-installer.sh \
+  | JANKURAI_RELEASE_TAG=v1.6.0 bash
 ```
 
 If you need the fallback source install, clone the repo and build from the

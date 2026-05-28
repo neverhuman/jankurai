@@ -27,7 +27,7 @@ ensure_dir() {
 
 usage() {
   cat <<'EOF'
-usage: jankurai-installer.sh [--repo owner/name] [--tag vX.Y.Z] [--install-dir path]
+usage: jankurai-installer.sh [--repo owner/name] [--tag vX.Y.Z] [--install-dir path] [--verify-only] [--print-asset-name]
 
 Environment variables:
   JANKURAI_RELEASE_REPO   release repository, default: neverhuman/jankurai
@@ -39,12 +39,16 @@ EOF
 repo="${JANKURAI_RELEASE_REPO:-neverhuman/jankurai}"
 tag="${JANKURAI_RELEASE_TAG:-${RELEASE_TAG:-}}"
 install_dir="${JANKURAI_INSTALL_DIR:-${HOME}/.local/bin}"
+verify_only=0
+print_asset_name=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo) repo="${2:?missing repo value}"; shift 2 ;;
     --tag) tag="${2:?missing tag value}"; shift 2 ;;
     --install-dir) install_dir="${2:?missing install-dir value}"; shift 2 ;;
+    --verify-only) verify_only=1; shift ;;
+    --print-asset-name) print_asset_name=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "unknown argument: $1" ;;
   esac
@@ -80,6 +84,11 @@ checksum_url="${artifact_url}.sha256"
 bundle_url="${artifact_url}.sigstore.bundle"
 workdir="$(mktemp -d)"
 trap 'rm -rf "${workdir}"' EXIT
+
+if [[ "${print_asset_name}" == "1" ]]; then
+  printf '%s\n' "${artifact_name}"
+  exit 0
+fi
 
 download() {
   local url="$1"
@@ -124,6 +133,12 @@ cosign verify-blob "${workdir}/${artifact_name}" \
   --bundle "${workdir}/${artifact_name}.sigstore.bundle" \
   --certificate-identity "https://github.com/${repo}/.github/workflows/release.yml@refs/tags/${tag}" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+
+if [[ "${verify_only}" == "1" ]]; then
+  step "Verify-only mode"
+  note "release artifact verified; install skipped by request"
+  exit 0
+fi
 
 case "${os}" in
   darwin)

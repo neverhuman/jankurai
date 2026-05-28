@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Local-CI entrypoint. Delegates to the same ops/ci/*.sh scripts that
-# .github/workflows/*.yml invoke, so local and remote runs are identical
-# (modulo runner-environment differences listed in docs/ci-local.md).
+# .github/workflows/*.yml and .gitlab-ci.yml invoke, so local and remote runs
+# stay aligned (modulo runner-environment differences listed in docs/ci-local.md).
 #
 # Lanes (selectable via $1):
 #   quick          ops/ci/quality-gates.sh       (jankurai.yml#test-matrix)
@@ -10,6 +10,7 @@
 #   release        ops/ci/release-audit-gate.sh  (release.yml#audit-gate, includes coverage)
 #   release-build  ops/ci/release-build.sh       (release.yml#build, secret-gated)
 #   release-publish ops/ci/release-publish.sh     (release.yml#publish, secret-gated)
+#   shadow         ops/ci/post-main-shadow.sh    (GitLab main deploy shadow)
 #   container      ops/ci/run-in-container.sh    (audit lane inside ubuntu image)
 #   all            quick + coverage + audit
 set -euo pipefail
@@ -26,13 +27,14 @@ case "$LANE" in
   release)   RELEASE_TAG="${LOCAL_RELEASE_TAG:-}" bash ops/ci/release-audit-gate.sh ;;
   release-build) RELEASE_TAG="${LOCAL_RELEASE_TAG:-}" TARGET="${LOCAL_RELEASE_TARGET:-}" bash ops/ci/release-build.sh ;;
   release-publish) RELEASE_TAG="${LOCAL_RELEASE_TAG:-}" GH_TOKEN="${GH_TOKEN:-}" bash ops/ci/release-publish.sh ;;
+  shadow) bash ops/ci/post-main-shadow.sh ;;
   container) bash ops/ci/run-in-container.sh "bash ops/ci/${2:-audit.sh}" ;;
   all)
     bash ops/ci/quality-gates.sh
     bash ops/ci/coverage-llvm.sh
     bash ops/ci/audit.sh
     ;;
-  *) echo "usage: $0 {quick|coverage|audit|release|release-build|release-publish|container|all}" >&2; exit 2 ;;
+  *) echo "usage: $0 {quick|coverage|audit|release|release-build|release-publish|shadow|container|all}" >&2; exit 2 ;;
 esac
 
 printf '\n\033[1;32mlocal CI lane "%s" passed\033[0m\n' "$LANE"

@@ -1,0 +1,346 @@
+## Best single improvement: add a **Platform Truth / Installability Proof Lane**
+
+I would **not** add another broad lint rule, another HLT heuristic, or another subjective “best practice” checker right now. Jankurai already has a strong mission and a lot of the correct machinery: proof lanes, generated-zone controls, security boundaries, ratchets, receipts, CI artifacts, SARIF, security evidence, release attestations, and local/remote CI parity. The README frames the project exactly as an “anti-vibe coding standard and local audit CLI” whose loop is “find vibe artifacts, prove the merge, repair the repo,” and it explicitly emphasizes repository-local evidence receipts rather than unverifiable claims. ([GitHub][1])
+
+The highest-value, lowest-false-positive improvement is:
+
+> **No install, platform, release, or support claim is allowed unless Jankurai can prove it with an executable receipt for the exact commit/tag.**
+
+Call it:
+
+```text
+jankurai release-proof
+# or
+jankurai platform-proof
+```
+
+This should become a first-class proof lane, not just a release script convention.
+
+---
+
+## Why this is the best improvement
+
+The most concrete current trust gap is not “missing more checks.” It is that Jankurai’s public contract can drift from what a user can actually install and run.
+
+The open issue #16 is the clearest signal: the README’s v1.5.1 installer URL was reported as 404, the release asset set did not include `jankurai-installer.sh`, and the documented source install path failed on Windows because `jankurai-guard` was a required dependency using Unix-only APIs without proper platform gating. ([GitHub][2])
+
+That class of bug is especially damaging for Jankurai because Jankurai’s whole promise is evidence-backed agent-first governance. If the tool says “preferred install path,” “fallback source install,” “Windows audit-file support,” or “release-tag verification,” then the repo should emit a machine-readable proof that those exact claims worked for the exact tag. The current release workflow already has many strong pieces—release audit gate, pinned actions, artifact attestations, sha256 assets, Sigstore bundles, and a publish job—but it still needs a final consumer-perspective proof that the release can actually be installed the way the docs say. ([GitHub][3])
+
+The source now appears to stage the installer and Homebrew metadata in `release-publish.sh`, compute sha256 files, gather release assets, create the GitHub release, and run `gh release verify`. That is good script intent. The missing piece is turning this into a **Jankurai-native receipt** that proves the published consumer surface, not merely that the release script tried to publish assets. ([GitHub][4])
+
+---
+
+## The improvement in one sentence
+
+Add a required release/platform proof lane that verifies:
+
+```text
+README install commands
++ declared platform support
++ release asset inventory
++ sha256/Sigstore/GitHub attestation verification
++ source-install smoke tests
++ core-vs-guard platform boundary
+= one deterministic installability receipt
+```
+
+No heuristics. No subjective scoring. No false-positive-prone style detection.
+
+---
+
+## What it should check
+
+### 1. A single platform contract file
+
+Add one canonical file:
+
+```text
+agent/platform-support.toml
+```
+
+Example shape:
+
+```toml
+schema = 1
+
+[release]
+version_source = "VERSION"
+installer_asset = "jankurai-installer.sh"
+requires_sha256 = true
+requires_sigstore_bundle = true
+requires_github_attestation = true
+
+[platform.linux_x86_64]
+tier = "supported"
+install = "release"
+artifact = "jankurai-{version}-x86_64-unknown-linux-gnu.tar.gz"
+smoke = [
+  "jankurai version",
+  "jankurai audit --help",
+  "jankurai guard --help"
+]
+
+[platform.macos_aarch64]
+tier = "supported"
+install = "release"
+artifact = "jankurai-{version}-aarch64-apple-darwin.pkg"
+smoke = [
+  "jankurai version",
+  "jankurai audit --help",
+  "jankurai guard --help"
+]
+
+[platform.windows_x86_64]
+tier = "core-supported"
+install = "source"
+artifact = ""
+smoke = [
+  "cargo install --path crates/jankurai --locked",
+  "jankurai version",
+  "jankurai audit --help"
+]
+
+[platform.windows_x86_64.unsupported]
+guard = "guard run/watch/fuse are not supported on Windows"
+```
+
+This file becomes the source of truth. The README, install docs, release workflow, and CLI help should all be checked against it.
+
+The key design principle is simple:
+
+> If Windows is supported, prove it.
+> If Windows is not supported, state that explicitly and prove the docs do not imply support.
+
+That avoids false positives because the gate only validates explicit promises.
+
+---
+
+### 2. README install-command proof
+
+Jankurai should extract or reference the README install snippets and prove them.
+
+For example, the current README advertises a release installer path and a fallback source install path. ([GitHub][1]) The proof lane should verify:
+
+```text
+- The installer asset exists for the release tag.
+- The installer sha256 exists.
+- The installer references the same version as VERSION.
+- The fallback `cargo install --path crates/jankurai --locked` works on every platform where docs imply it works.
+- Unsupported platforms are explicitly marked unsupported.
+```
+
+This catches broken docs without inventing a new lint rule.
+
+---
+
+### 3. Release asset inventory proof
+
+The release proof should compare the expected asset list from `agent/platform-support.toml` against the actual GitHub release.
+
+It should emit:
+
+```text
+target/jankurai/release-proof.json
+target/jankurai/release-proof.md
+```
+
+The JSON should include:
+
+```json
+{
+  "schema": 1,
+  "repo": "neverhuman/jankurai",
+  "tag": "v1.5.1",
+  "commit": "...",
+  "version_file": "1.5.1",
+  "assets": {
+    "expected": [],
+    "present": [],
+    "missing": [],
+    "unexpected": []
+  },
+  "checksums": {
+    "verified": [],
+    "failed": []
+  },
+  "attestations": {
+    "verified": [],
+    "failed": []
+  },
+  "platforms": {
+    "linux_x86_64": "pass",
+    "macos_aarch64": "pass",
+    "windows_x86_64": "core-pass-guard-unsupported"
+  },
+  "docs": {
+    "install_snippets_verified": true,
+    "unsupported_claims_consistent": true
+  }
+}
+```
+
+GitHub’s artifact attestation docs say attestations establish where and how software was built, and that consumers can verify the provenance/integrity of the software they consume. ([GitHub Docs][5]) Jankurai should lean into that by proving not just “we generated attestations,” but “we verified the artifacts a user would actually download.”
+
+---
+
+### 4. Core CLI / Guard boundary proof
+
+The biggest code-design win is separating the **portable core CLI** from **platform-specific guard capabilities**.
+
+Right now, the issue reports that `jankurai-guard` is required by the `jankurai` binary and fails on Windows because Unix-only APIs are pulled into the build. ([GitHub][2]) The architectural fix is:
+
+```text
+crates/jankurai        = portable core CLI
+crates/jankurai-guard  = platform-gated guard implementation
+```
+
+Concretely:
+
+```toml
+# crates/jankurai/Cargo.toml
+
+[target.'cfg(unix)'.dependencies]
+jankurai-guard = { path = "../jankurai-guard" }
+
+[target.'cfg(not(unix))'.dependencies]
+# no jankurai-guard dependency
+```
+
+Then keep the command surface stable:
+
+```text
+jankurai audit        # works everywhere core is supported
+jankurai version      # works everywhere core is supported
+jankurai prove        # works everywhere core is supported
+jankurai guard        # works where supported; typed unsupported receipt elsewhere
+```
+
+On unsupported platforms, do **not** remove the command in a confusing way. Return a clean machine-readable error:
+
+```json
+{
+  "code": "JANKURAI_PLATFORM_UNSUPPORTED",
+  "command": "guard",
+  "platform": "windows-x86_64",
+  "supported": false,
+  "reason": "guard run/watch/fuse require Unix platform APIs",
+  "fallback": "core audit/proof commands are supported"
+}
+```
+
+That is agent-friendly, user-friendly, and much simpler than scattered ad hoc `cfg` patches.
+
+---
+
+## How it plugs into CI
+
+The current CI is already structured well: thin GitHub workflow orchestration delegates to `ops/ci/*.sh`, uses pinned actions, runs quality gates, coverage/mutation, strict security, uploads SARIF, and publishes Jankurai evidence artifacts. ([GitHub][6])
+
+So the change should follow that same pattern:
+
+```text
+ops/ci/platform-proof.sh
+ops/ci/release-install-proof.sh
+```
+
+Then add a job like:
+
+```yaml
+installability-proof:
+  name: installability proof
+  runs-on: ubuntu-latest
+  needs: publish
+  permissions:
+    contents: read
+    id-token: write
+    attestations: read
+  steps:
+    - uses: actions/checkout@<pinned-sha>
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+
+    - name: Verify published install surface
+      env:
+        RELEASE_TAG: ${{ github.ref_name }}
+        GH_TOKEN: ${{ github.token }}
+      run: bash ops/ci/release-install-proof.sh
+
+    - name: Upload installability proof
+      uses: actions/upload-artifact@<pinned-sha>
+      with:
+        name: release-installability-proof
+        path: |
+          target/jankurai/release-proof.json
+          target/jankurai/release-proof.md
+```
+
+For PRs, do **not** run the full release download path on every change. That would be noisy and wasteful. Instead:
+
+```text
+PR gate:
+  run when changed files touch README/install docs/release scripts/Cargo.toml/guard/workflows
+
+Tag gate:
+  always required
+
+Nightly:
+  full cross-platform install proof, including Windows
+```
+
+That keeps it low-noise.
+
+---
+
+## Why this has very low false-positive risk
+
+This improvement does not ask Jankurai to guess whether code is “good.” It checks objective facts:
+
+```text
+Does the documented asset exist?
+Does the checksum match?
+Does the attestation verify?
+Does the documented install command run?
+Does the claimed platform build?
+Does the unsupported-platform message match the support contract?
+```
+
+A failure is not a subjective finding. It means the repo made a promise that is not mechanically true.
+
+That makes it a better fit than adding another code-smell detector, complexity heuristic, or broad semantic rule. It strengthens the trust model without increasing HLT false-positive surface.
+
+---
+
+## Why this advances the mission
+
+This one improvement touches every part of the mission:
+
+| Mission area             | Value added                                                                                                      |
+| ------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| Agent-first engineering  | Agents cannot safely edit install docs, release scripts, or platform code unless the proof receipt stays green.  |
+| CI                       | Turns installability into a required CI/release artifact, not a manual release checklist.                        |
+| Security                 | Verifies provenance/checksums/attestations from the consumer perspective, not only from the builder perspective. |
+| Code design              | Forces a clean boundary between portable core CLI and platform-specific Guard implementation.                    |
+| Unit testing             | Adds small deterministic smoke tests and fixture tests instead of huge flaky integration suites.                 |
+| Complexity reduction     | Replaces scattered platform assumptions with one platform contract file.                                         |
+| False-positive reduction | Checks explicit claims only; no heuristic judgment.                                                              |
+
+---
+
+## My recommended canonical phrase for the standard
+
+```text
+No proof, no merge.
+No receipt, no trust.
+No platform claim without an installability proof.
+```
+
+That is the best next improvement I would make: **a Jankurai-native Installability Proof Lane that binds docs, release assets, platform support, provenance, and core/guard architecture into one deterministic receipt.**
+
+[1]: https://github.com/neverhuman/jankurai/ "GitHub - neverhuman/jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[2]: https://github.com/neverhuman/jankurai/issues/16 "v1.5.1 source install fails on Windows; installer script missing from release assets · Issue #16 · neverhuman/jankurai · GitHub"
+[3]: https://raw.githubusercontent.com/neverhuman/jankurai/main/.github/workflows/release.yml "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/neverhuman/jankurai/main/ops/ci/release-publish.sh "raw.githubusercontent.com"
+[5]: https://docs.github.com/en/actions/concepts/security/artifact-attestations?utm_source=chatgpt.com "Artifact attestations"
+[6]: https://raw.githubusercontent.com/neverhuman/jankurai/main/.github/workflows/jankurai.yml "raw.githubusercontent.com"
+

@@ -6,8 +6,8 @@ Install from the release installer first, then fall back to source builds if
 you need to work from the workspace directly:
 
 ```bash
-curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.5.1/jankurai-installer.sh \
-  | JANKURAI_RELEASE_TAG=v1.5.1 bash
+curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.6.0/jankurai-installer.sh \
+  | JANKURAI_RELEASE_TAG=v1.6.0 bash
 jankurai --version
 ```
 

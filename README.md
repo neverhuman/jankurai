@@ -26,8 +26,8 @@ Preferred path: release installer with release-tag verification, GitHub
 artifact attestation, sha256, and Sigstore bundle checks.
 
 ```bash
-curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.5.1/jankurai-installer.sh \
-  | JANKURAI_RELEASE_TAG=v1.5.1 bash
+curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.6.0/jankurai-installer.sh \
+  | JANKURAI_RELEASE_TAG=v1.6.0 bash
 ```
 
 Fallback source install:
@@ -598,7 +598,7 @@ Jankurai is licensed under the [MIT License](LICENSE).
 
 This repository is the working source for the paper *Jankurai: Merge Witnesses for Evidence-Carrying AI-Assisted Pull Requests*.
 
-Current release: standard `0.9.0`, auditor/action `1.2.0`, schema `1.8.0`, paper edition `2026.05-ed8`.
+Current release: standard `0.9.0`, auditor/action `1.6.0`, schema `1.9.0`, paper edition `2026.05-ed8`.
 
 Public thesis line: *Find the vibe. Prove the merge. Repair the repo.*
 

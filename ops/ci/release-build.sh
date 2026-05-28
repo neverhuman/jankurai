@@ -6,7 +6,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 if [[ -z "${RELEASE_TAG:-}" ]]; then
-  fail "RELEASE_TAG must be set, e.g. RELEASE_TAG=v1.5.1"
+  fail "RELEASE_TAG must be set, e.g. RELEASE_TAG=v1.6.0"
 fi
 
 target="${TARGET:-$(rustc -vV | awk '/^host:/ {print $2}')}"

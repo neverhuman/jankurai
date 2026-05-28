@@ -1,0 +1,309 @@
+## Best improvement: add a **Release Install Contract** proof lane
+
+My strongest recommendation is **not** another static detector. Jankurai already has a broad rule catalog and release-security policy. The highest-value, lowest-false-positive improvement is a deterministic **consumer install proof** that verifies the exact ways users are told to install Jankurai: release assets, installer script, checksum/signature/provenance checks, source install fallback, and platform support claims.
+
+This fits the mission perfectly: Jankurai says it exists to make AI-assisted merge auditable, with local evidence for what changed, who owns it, proof lanes, receipts, missing evidence, repair queue, and merge decision. It also explicitly defines “proof” as repository-local evidence receipts, not abstract claims.  The core standard already includes proof receipts, merge witnesses, repair queues, waivers, evidence indexes, stable rule IDs, and a closed decision enum. 
+
+### Why this is the best improvement
+
+There is already a real-world signal: the open issue reports that the documented v1.5.1 Windows install paths failed, including a missing `jankurai-installer.sh` release asset and a Windows `cargo install` failure caused by Unix-only code paths in `jankurai-guard`. ([GitHub][1]) That is exactly the kind of failure Jankurai should catch before users do: not a subjective style issue, not a noisy heuristic, but a concrete proof gap in a release path.
+
+The current release pipeline is already sophisticated. The workflow has audit, build, artifact attestation, and publish stages; the build matrix covers Linux x86_64 and Apple Silicon macOS, with comments explaining that Intel macOS users fall back to source install.  The publish script now stages the installer and Homebrew metadata, generates sha256 files, gathers release assets, creates the release with `--verify-tag`, and runs `gh release verify`.  The installer itself verifies the GitHub release, artifact attestation, sha256 checksum, and Sigstore bundle before installing. 
+
+The gap is that these are **release-production checks**, not a first-class **release-consumer contract**. They prove that artifacts can be built and published; they do not fully prove that every documented install path works from a clean user-like environment.
+
+## The improvement
+
+Add a new command and CI lane:
+
+```bash
+jankurai release verify-install . \
+  --tag "$RELEASE_TAG" \
+  --contract agent/release-install.toml \
+  --out target/jankurai/release-install.json \
+  --md target/jankurai/release-install.md
+```
+
+This would produce a release proof receipt that answers:
+
+```text
+For this tag, on each declared supported platform:
+- Which install path is documented?
+- Which artifact or source path is required?
+- Does the asset exist?
+- Does the checksum match?
+- Does provenance/signature verification pass when required?
+- Does the installed binary run?
+- Does `jankurai version` match the tag?
+- Does a tiny smoke audit run successfully?
+- If a platform is unsupported, is that explicitly declared and documented?
+```
+
+This should emit `pass`, `review`, or `release_fail`. That lines up cleanly with the existing merge-witness decision model, where `release_fail` is already reserved for release-contract extensions. 
+
+## Why it avoids false positives
+
+This should be a **contract verifier**, not a pattern scanner.
+
+It should only block on objective facts:
+
+```text
+block / release_fail:
+- declared required release asset is missing
+- checksum mismatch
+- installer exits nonzero
+- installed binary cannot run
+- installed version does not match release tag
+- source install path is documented as supported but fails in CI
+- supported platform has neither a binary install path nor a working source fallback
+```
+
+It should not block on environment-sensitive or optional checks unless the contract marks them required:
+
+```text
+review:
+- GitHub attestation API temporarily unavailable
+- cosign/gh unavailable in local developer run
+- optional platform smoke not configured
+- unsupported platform is documented, but the docs could be clearer
+```
+
+This is important because Jankurai’s release policy already tries to avoid noisy findings: its release-bad-behavior detector explicitly skips docs, paper sources, reference material, generated outputs, tests, fixtures, and examples so it does not punish explanatory text.  The install contract should follow the same philosophy: fail only when the repository made a concrete support promise that the release cannot satisfy.
+
+## Proposed contract file
+
+Add:
+
+```toml
+# agent/release-install.toml
+
+schema_version = 1
+release_repo = "neverhuman/jankurai"
+version_command = "jankurai version"
+
+[docs]
+readme = "README.md"
+release_doc = "docs/release-plan.md"
+
+[[install_path]]
+id = "linux-x86_64-installer"
+os = "ubuntu-latest"
+target = "x86_64-unknown-linux-gnu"
+support = "required"
+method = "installer"
+asset = "jankurai-${version}-x86_64-unknown-linux-gnu.tar.gz"
+checksum = "jankurai-${version}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+sigstore_bundle = "jankurai-${version}-x86_64-unknown-linux-gnu.tar.gz.sigstore.bundle"
+installer_asset = "jankurai-installer.sh"
+smoke = [
+  "jankurai version",
+  "jankurai versions",
+  "jankurai audit . --mode observe --json target/jankurai/install-smoke.json --md target/jankurai/install-smoke.md",
+]
+
+[[install_path]]
+id = "macos-aarch64-installer"
+os = "macos-latest"
+target = "aarch64-apple-darwin"
+support = "required"
+method = "pkg"
+asset = "jankurai-${version}-aarch64-apple-darwin.pkg"
+checksum = "jankurai-${version}-aarch64-apple-darwin.pkg.sha256"
+sigstore_bundle = "jankurai-${version}-aarch64-apple-darwin.pkg.sigstore.bundle"
+smoke = [
+  "jankurai version",
+  "jankurai versions",
+]
+
+[[install_path]]
+id = "windows-source-install"
+os = "windows-latest"
+target = "x86_64-pc-windows-msvc"
+support = "required" # or "unsupported", but then README must say so
+method = "source"
+command = "cargo install --path crates/jankurai --locked --force"
+smoke = [
+  "jankurai.exe version",
+]
+```
+
+The key design choice is `support = "required" | "unsupported" | "advisory"`.
+
+That gives maintainers an honest path with no false positives:
+
+```text
+If Windows is supported:
+  prove it in CI.
+
+If Windows is not supported:
+  declare it unsupported and make the README/release docs match.
+
+If Windows core CLI is supported but guard is not:
+  source install must pass, and guard subcommands should return a clean
+  “not supported on Windows” message instead of failing compilation.
+```
+
+## Minimal engineering diff
+
+I would implement this in four small layers.
+
+### 1. Add a release-install verifier
+
+New files:
+
+```text
+crates/jankurai/src/commands/release_install.rs
+crates/jankurai/src/release_install/
+  contract.rs
+  asset_plan.rs
+  runner.rs
+  receipt.rs
+  markdown.rs
+schemas/release-install.schema.json
+```
+
+The command should read `agent/release-install.toml`, resolve `${version}` and `${tag}`, and emit both JSON and Markdown receipts.
+
+Receipt shape:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "decision": "release_fail",
+  "release_tag": "v1.5.2",
+  "version": "1.5.2",
+  "commit": "abc123",
+  "platform": "windows-latest",
+  "target": "x86_64-pc-windows-msvc",
+  "install_path": "windows-source-install",
+  "checks": [
+    {
+      "id": "source-install",
+      "command": "cargo install --path crates/jankurai --locked --force",
+      "status": "fail",
+      "exit_code": 101,
+      "evidence": "target/jankurai/release-install/windows-source-install.log"
+    }
+  ],
+  "agent_fix_queue": [
+    {
+      "rule": "release-install-contract",
+      "path": "crates/jankurai-guard",
+      "action": "cfg-gate Unix-only guard paths or make guard optional so core CLI source-install works on Windows"
+    }
+  ]
+}
+```
+
+### 2. Add CI jobs that test the exact user paths
+
+Add to `.github/workflows/release.yml`:
+
+```yaml
+  verify-install-contract:
+    name: verify install contract (${{ matrix.os }})
+    needs: publish
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Verify release install contract
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          cargo run -p jankurai -- release verify-install . \
+            --tag "$RELEASE_TAG" \
+            --contract agent/release-install.toml \
+            --out target/jankurai/release-install.json \
+            --md target/jankurai/release-install.md
+```
+
+Because the project already prefers thin GitHub Actions orchestration backed by local scripts, I would also add a local mirror. The current local CI entrypoint already delegates to the same `ops/ci/*.sh` scripts that workflows invoke.  The Justfile already exposes local release lanes such as `ci-release`, `ci-release-build`, and `ci-release-publish`. 
+
+Add:
+
+```text
+ops/ci/release-install-contract.sh
+scripts/ci-local.sh release-install
+just ci-release-install
+```
+
+### 3. Fix the Windows/source-install class of failures
+
+The open issue identifies a specific design problem: `jankurai-guard` is a required dependency of the main binary, while several guard paths use Unix-only APIs unconditionally. ([GitHub][1])
+
+I would repair that in the least risky way:
+
+```text
+- Core `jankurai` CLI must compile on Windows.
+- Guard functionality that depends on Unix PTY/process semantics can be cfg-gated.
+- Windows guard commands can return a structured “unsupported on this platform” error.
+- Watch/debounce code should use portable `Metadata::modified()` instead of Unix mtime APIs where possible.
+- Unix permission changes should live behind `#[cfg(unix)]`.
+- PTY raw-mode code should live behind a Unix platform module.
+```
+
+This preserves the agent-first guard model without making Windows users unable to install the auditor. The installer docs can then say, truthfully:
+
+```text
+Windows: audit, score, proof, conformance, and release verification are supported.
+Guard run/mount is Unix-only until a Windows backend is implemented.
+```
+
+That is a better product shape than “the whole CLI fails to compile.”
+
+### 4. Bind it into release policy
+
+Jankurai’s release policy already says release work should be immutable, traceable, tested, documented, verifiable, and recoverable.  It also says release-capable projects need a version source, changelog, release process, automation or command policy, integrity policy, and rollback guidance.  For installer-first releases, the policy already expects evidence such as immutable tag, CI-built artifacts, sha256, Sigstore bundle, GitHub attestation, and notarized macOS package when applicable. 
+
+So I would add one more required release evidence item:
+
+```text
+Release Install Contract:
+  target/jankurai/release-install.json
+  target/jankurai/release-install.md
+```
+
+And I would make `HLT-025-RELEASE-READINESS-GAP` aware of this receipt only for projects that declare release/install support. Missing install proof should be advisory in normal audit, but `release_fail` in release workflows.
+
+## What this catches immediately
+
+This improvement would have caught issue #16 before publication:
+
+```text
+1. README says installer URL works.
+2. Contract says `jankurai-installer.sh` is required.
+3. Release verifier checks the published release asset list.
+4. Missing asset => release_fail.
+
+1. README/source fallback says `cargo install --path crates/jankurai --locked --force`.
+2. Contract marks Windows source install as supported.
+3. Windows CI runs that exact command.
+4. Unix-only guard compilation failure => release_fail.
+```
+
+No heuristic. No subjective severity guess. No fragile text scan. Just “the documented command works” or “it does not.”
+
+## Final recommendation
+
+Build **Release Install Contract** as the next high-leverage improvement.
+
+It adds value because it protects the first user experience, dogfoods Jankurai’s “proof receipt” philosophy, converts release/install promises into machine-checkable evidence, and turns a real current failure class into a durable regression test. It avoids false positives because it only validates explicit support claims and concrete artifacts/commands, not inferred intent.
+
+[1]: https://github.com/neverhuman/jankurai/issues/16 "v1.5.1 source install fails on Windows; installer script missing from release assets · Issue #16 · neverhuman/jankurai · GitHub"
+

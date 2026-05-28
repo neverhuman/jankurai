@@ -1,0 +1,288 @@
+## Best improvement: add an **Install Proof Lane**
+
+I would not add another subjective “bad pattern” rule right now. Jankurai already has a strong proof-oriented control plane: its stated loop is “find vibe artifacts, prove the merge, repair the repo,” and it explicitly frames proof as repository-local evidence receipts, not vibes or model judgment. ([GitHub][1]) It also already has serious CI gates: fmt, clippy, workspace tests, TUI tests, README test-surface sync, security, UX, coverage, proofbind/proofmark, witness build, and final ratchet audit.  
+
+The highest-value low-noise improvement is to make Jankurai prove that **the documented install paths and published release assets actually work**. This is especially important because the README tells users to install via a release-hosted `jankurai-installer.sh`, then offers `cargo install --path crates/jankurai --locked` as fallback. ([GitHub][1]) There is already a concrete open issue showing both paths can fail: the installer URL returned 404 for v1.5.1, and source install failed on Windows because `jankurai-guard` is a required dependency that uses Unix-only APIs without enough `cfg` gating. ([GitHub][2])
+
+This is the perfect Jankurai-style improvement because it is **deterministic**. It does not infer intent, judge style, or create false positives. It only asks: “Can a user install the thing exactly the way we told them to?”
+
+---
+
+## Why this beats adding more lint rules
+
+The current project is already rich in checks and receipts. The release workflow has an audit gate, build matrix, artifact upload, and publish job. ([GitHub][3]) The release build script asserts per-target artifacts exist, including sha256 and Sigstore bundle sidecars.  The publish script stages the installer and Homebrew metadata, then gathers assets for `gh release create`. 
+
+The gap is that the publish script only fails if **zero** assets are found; it does not prove that every asset promised by the README, installer, and release contract exists.  The existing installer itself is security-conscious: it verifies the GitHub release, artifact attestation, sha256 checksum, and Sigstore bundle before installing.  But CI should prove that this installer is actually present in the release and that it can resolve the right artifact names before users discover otherwise.
+
+So the best next feature is:
+
+> **Install Proof Lane:** a release/install witness that verifies documented install commands, release asset inventory, checksums, signatures, and source-install compatibility across the supported platform matrix.
+
+---
+
+## What I would build
+
+### 1. Add a canonical release asset manifest
+
+Create a checked-in manifest, for example:
+
+```toml
+# agent/release-assets.toml
+schema_version = "1.0.0"
+
+[release]
+version_file = "VERSION"
+installer = "jankurai-installer.sh"
+homebrew_formula = "jankurai-homebrew.rb"
+
+required_static_assets = [
+  "jankurai-installer.sh",
+  "jankurai-installer.sh.sha256",
+  "jankurai-homebrew.rb",
+  "jankurai-homebrew.rb.sha256",
+  "repo-score.json",
+  "repo-score.md",
+]
+
+[[targets]]
+triple = "x86_64-unknown-linux-gnu"
+kind = "tar.gz"
+required_sidecars = ["sha256", "sigstore.bundle"]
+
+[[targets]]
+triple = "aarch64-apple-darwin"
+kind = "pkg"
+required_sidecars = ["sha256", "sigstore.bundle"]
+```
+
+Then add `ops/ci/release-assets.sh` that expands this manifest using `VERSION` and validates:
+
+```bash
+bash ops/ci/release-assets.sh local --dist dist --tag "$RELEASE_TAG"
+bash ops/ci/release-assets.sh remote --repo neverhuman/jankurai --tag "$RELEASE_TAG"
+```
+
+Local mode should fail if any expected file is missing or empty. Remote mode should call `gh release view "$RELEASE_TAG" --json assets` and compare exact asset names. It should also `curl -fsI` the documented installer URL, because the v1.5.1 issue was a real 404. ([GitHub][2])
+
+This removes a major blind spot in the current `release-publish.sh`, where assets are appended opportunistically and only an empty asset set is considered fatal. 
+
+---
+
+### 2. Add `--verify-only` and `--print-asset-name` to `jankurai-installer.sh`
+
+The installer already computes the release artifact name from OS, architecture, and tag.  Expose that logic directly:
+
+```bash
+jankurai-installer.sh --tag v1.5.2 --print-asset-name
+jankurai-installer.sh --tag v1.5.2 --verify-only
+```
+
+`--print-asset-name` lets tests ensure the installer, release build script, and manifest all agree on artifact names.
+
+`--verify-only` should download the artifact, checksum, and Sigstore bundle; verify GitHub release status, attestation, sha256, and Sigstore; then skip the final install step. That makes macOS release verification practical in CI without requiring `sudo installer`.
+
+The installer already has the hard parts: release verification, asset download, attestation verification, sha256 verification, and Sigstore verification.  The improvement is to make those checks reusable as a proof lane.
+
+---
+
+### 3. Add a source-install smoke matrix
+
+Add a job to `.github/workflows/jankurai.yml`:
+
+```yaml
+source-install:
+  name: source install (${{ matrix.os }})
+  runs-on: ${{ matrix.os }}
+  timeout-minutes: 20
+  strategy:
+    fail-fast: false
+    matrix:
+      os: [ubuntu-latest, macos-latest, windows-latest]
+  steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        persist-credentials: false
+    - name: Install Rust toolchain
+      run: rustup show
+    - name: cargo install source package
+      shell: bash
+      run: |
+        cargo install --path crates/jankurai --locked --root "$RUNNER_TEMP/jankurai-install" --force
+        "$RUNNER_TEMP/jankurai-install/bin/jankurai" version
+```
+
+Then add a tiny fixture audit:
+
+```bash
+"$RUNNER_TEMP/jankurai-install/bin/jankurai" audit examples/minimal \
+  --mode observe \
+  --json target/jankurai/install-smoke-score.json \
+  --md target/jankurai/install-smoke-score.md
+```
+
+This should not run heavyweight UX, mutation, or Playwright checks. It only proves that the shipped CLI can be installed and invoked.
+
+---
+
+### 4. Make the core CLI build on Windows, while keeping guard honest
+
+The open issue identifies Unix-only code inside `jankurai-guard` and notes that `jankurai-guard` is a required dependency of the `jankurai` binary. ([GitHub][2]) The cleanest low-risk fix is **not** to implement full Windows guard enforcement immediately. It is to make the core CLI installable on Windows while returning clear unsupported-platform errors for guard operations that are not ready.
+
+Recommended minimal design:
+
+```rust
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    perms.set_mode(perms.mode() | 0o755);
+    std::fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+```
+
+For `libc::termios`, `tcgetattr`, `tcsetattr`, and `STDIN_FILENO`, isolate raw-terminal setup behind `#[cfg(unix)]`. On Windows, `guard run` can return:
+
+```text
+jankurai guard run is not supported on Windows yet; use jankurai audit-file, hooks, or CI audit.
+```
+
+For `Metadata::mtime()`, prefer portable Rust:
+
+```rust
+let modified = metadata.modified().ok();
+```
+
+This keeps behavior truthful and avoids pretending Windows guard enforcement exists before it is tested. The source-install smoke matrix then guarantees the main CLI does not regress.
+
+---
+
+### 5. Emit install proof receipts
+
+Add:
+
+```text
+target/jankurai/install-proof.json
+target/jankurai/install-proof.md
+```
+
+Example JSON shape:
+
+```json
+{
+  "schema_version": "1.0.0",
+  "release_tag": "v1.5.2",
+  "version": "1.5.2",
+  "checked_at": "2026-05-27T00:00:00Z",
+  "local_assets": {
+    "status": "passed",
+    "missing": []
+  },
+  "remote_assets": {
+    "status": "passed",
+    "missing": []
+  },
+  "installer": {
+    "linux_x86_64": {
+      "asset": "jankurai-1.5.2-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "passed",
+      "sigstore": "passed",
+      "attestation": "passed"
+    },
+    "macos_aarch64": {
+      "asset": "jankurai-1.5.2-aarch64-apple-darwin.pkg",
+      "sha256": "passed",
+      "sigstore": "passed",
+      "attestation": "passed",
+      "install": "verify_only"
+    }
+  },
+  "source_install": {
+    "ubuntu-latest": "passed",
+    "macos-latest": "passed",
+    "windows-latest": "passed"
+  }
+}
+```
+
+Then include these receipts in the release audit artifacts. The existing workflow already uploads many Jankurai evidence files, including scores, SARIF, proofbind/proofmark receipts, witness graph, UX, coverage, and security evidence. ([GitHub][4]) This install proof receipt belongs in that same evidence bundle.
+
+---
+
+## File-level patch plan
+
+I would make the change in these files:
+
+```text
+agent/
+  release-assets.toml                       # new canonical release asset contract
+
+ops/ci/
+  release-assets.sh                         # new local/remote manifest verifier
+  release-publish.sh                        # call manifest verifier before and after gh release create
+  release-build.sh                          # optionally write install-proof partials
+  lib.sh                                    # shared require_nonempty_asset / json helpers
+
+jankurai-installer.sh
+  # add --verify-only
+  # add --print-asset-name
+  # add structured receipt output
+
+.github/workflows/
+  jankurai.yml                              # add lightweight source-install matrix
+  release.yml                               # publish install-proof artifacts / verify remote assets
+
+scripts/
+  ci-local.sh                               # add install-proof lane
+
+Justfile
+  ci-install-proof:
+      bash scripts/ci-local.sh install-proof
+
+crates/jankurai-guard/src/
+  platform.rs                               # new cfg-specific helpers
+  cli/handlers.rs                           # cfg set_executable / unsupported Windows guard ops
+  pty/launcher.rs                           # cfg terminal raw mode
+  state.rs                                  # cfg pid signaling
+  watch/debounce.rs                         # portable metadata.modified()
+
+crates/jankurai/tests/
+  install_contract.rs                       # README/VERSION/installer/manifest coherence
+```
+
+---
+
+## The exact failure conditions
+
+To keep false positives low, the lane should only fail on objective facts:
+
+| Check                   | Fails only when                                                      |
+| ----------------------- | -------------------------------------------------------------------- |
+| README install command  | referenced release asset URL is missing                              |
+| Local release manifest  | required asset file is absent or zero bytes                          |
+| Remote release manifest | published release lacks an exact required asset name                 |
+| Installer asset naming  | installer-computed name disagrees with release manifest/build script |
+| sha256                  | checksum verification fails                                          |
+| Sigstore                | bundle verification fails                                            |
+| GitHub attestation      | `gh attestation verify` fails                                        |
+| Source install          | `cargo install --path crates/jankurai --locked` fails                |
+| Smoke invocation        | installed binary cannot run `version` or minimal `audit`             |
+
+No heuristics. No guessing. No “maybe this is bad code.” Only proof.
+
+---
+
+## Why this is the best next improvement
+
+This would catch the current open install failure directly, strengthen the trust boundary around releases, and convert a public README claim into machine-checked evidence. It also reinforces Jankurai’s own philosophy: proof lanes, receipts, and no-proof-no-merge governance. The project already audits code quality and security deeply; the biggest credibility gain now is proving that a new user can actually install and run the tool exactly as documented.
+
+[1]: https://github.com/neverhuman/jankurai/ "GitHub - neverhuman/jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[2]: https://github.com/neverhuman/jankurai/issues/16 "v1.5.1 source install fails on Windows; installer script missing from release assets · Issue #16 · neverhuman/jankurai · GitHub"
+[3]: https://github.com/neverhuman/jankurai/blob/main/.github/workflows/release.yml "jankurai/.github/workflows/release.yml at main · neverhuman/jankurai · GitHub"
+[4]: https://github.com/neverhuman/jankurai/blob/main/.github/workflows/jankurai.yml "jankurai/.github/workflows/jankurai.yml at main · neverhuman/jankurai · GitHub"
+

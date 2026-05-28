@@ -115,6 +115,9 @@ ci-release-build:
 ci-release-publish:
     bash scripts/ci-local.sh release-publish
 
+ci-shadow:
+    bash scripts/ci-local.sh shadow
+
 ci:
     bash scripts/ci-local.sh all
 

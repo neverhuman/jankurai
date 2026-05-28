@@ -1,8 +1,10 @@
 use anyhow::{bail, Context, Result};
 use regex::Regex;
+use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -200,15 +202,23 @@ pub fn validate_audit_policy_toml_text(repo: &Path, text: &str) -> Result<Value>
 }
 
 pub fn validate_owner_map_json_text(repo: &Path, text: &str) -> Result<Value> {
-    let v: Value = serde_json::from_str(text).context("parse agent/owner-map.json")?;
+    let v = parse_json_value_strict(text)
+        .map_err(|err| anyhow::anyhow!("parse agent/owner-map.json: {err}"))?;
     validate_value(repo, ArtifactSchema::OwnerMap, &v)?;
     Ok(v)
 }
 
 pub fn validate_test_map_json_text(repo: &Path, text: &str) -> Result<Value> {
-    let v: Value = serde_json::from_str(text).context("parse agent/test-map.json")?;
+    let v = parse_json_value_strict(text)
+        .map_err(|err| anyhow::anyhow!("parse agent/test-map.json: {err}"))?;
     validate_value(repo, ArtifactSchema::TestMap, &v)?;
     Ok(v)
+}
+
+pub fn parse_json_value_strict(text: &str) -> Result<Value> {
+    serde_json::from_str::<StrictJsonValue>(text)
+        .map(|value| value.0)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
 }
 
 pub fn validate_generated_zones_toml_text(repo: &Path, text: &str) -> Result<Value> {
@@ -851,4 +861,92 @@ fn schema_root(_repo: &Path) -> PathBuf {
         .join("..")
         .join("..")
         .join("schemas")
+}
+
+#[derive(Debug, Clone)]
+struct StrictJsonValue(Value);
+
+impl<'de> Deserialize<'de> for StrictJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictJsonVisitor)
+    }
+}
+
+struct StrictJsonVisitor;
+
+impl<'de> Visitor<'de> for StrictJsonVisitor {
+    type Value = StrictJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("valid JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Bool(v)))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(v.into())))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Number(v.into())))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(v)
+            .map(|n| StrictJsonValue(Value::Number(n)))
+            .ok_or_else(|| E::custom("invalid JSON number"))
+    }
+
+    fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(v.to_string())))
+    }
+
+    fn visit_borrowed_str<E>(self, v: &'de str) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(v.to_string())))
+    }
+
+    fn visit_string<E>(self, v: String) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::String(v)))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(StrictJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element::<StrictJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(StrictJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some((key, value)) = map.next_entry::<String, StrictJsonValue>()? {
+            if values.contains_key(&key) {
+                return Err(de::Error::custom(format!("duplicate JSON key `{key}`")));
+            }
+            values.insert(key, value.0);
+        }
+        Ok(StrictJsonValue(Value::Object(values)))
+    }
 }

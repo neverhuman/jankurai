@@ -53,6 +53,8 @@ fn release_publish_script_stages_installer_and_formula_metadata() {
 
     assert!(text.contains("jankurai-installer.sh"));
     assert!(text.contains("jankurai-homebrew.rb"));
+    assert!(text.contains("audit/repo-score.json"));
+    assert!(text.contains("audit/repo-score.md"));
     assert!(text.contains("__RELEASE_TAG__"));
     assert!(text.contains("gh release create"));
     assert!(text.contains("--verify-tag"));
@@ -70,8 +72,30 @@ fn installer_script_verifies_release_provenance_before_installing() {
     assert!(text.contains("cosign verify-blob"));
     assert!(text.contains("JANKURAI_RELEASE_TAG"));
     assert!(text.contains("JANKURAI_INSTALL_DIR"));
+    assert!(text.contains("--verify-only"));
+    assert!(text.contains("--print-asset-name"));
     assert!(text.contains("sudo installer -pkg"));
     assert!(text.contains("tar -xzf"));
+}
+
+#[test]
+fn ci_local_script_exposes_shadow_lane_for_post_main_mirror() {
+    let text = read("scripts/ci-local.sh");
+
+    assert!(text.contains("shadow) bash ops/ci/post-main-shadow.sh ;;"));
+    assert!(text.contains("release-publish"));
+    assert!(text.contains("GitLab"));
+}
+
+#[test]
+fn post_main_shadow_script_is_local_origin_only_and_jeryu_backed() {
+    let text = read("ops/ci/post-main-shadow.sh");
+
+    assert!(text.contains("ssh://git@127.0.0.1:2224/root/jankurai.git"));
+    assert!(text.contains(".jeryu/local/repos/jankurai.toml"));
+    assert!(text.contains("jeryu repo shadow --repo root/jankurai"));
+    assert!(text.contains("CI_COMMIT_BRANCH"));
+    assert!(text.contains("CI_COMMIT_SHA"));
 }
 
 #[test]

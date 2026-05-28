@@ -4,7 +4,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 if [[ -z "${RELEASE_TAG:-}" ]]; then
-  fail "RELEASE_TAG must be set, e.g. RELEASE_TAG=v1.5.1"
+  fail "RELEASE_TAG must be set, e.g. RELEASE_TAG=v1.6.0"
 fi
 if [[ -z "${GH_TOKEN:-}" ]]; then
   fail "GH_TOKEN must be exported for gh release create"
@@ -54,19 +54,25 @@ step "sha256 for installer metadata"
 step "Gather release assets"
 shopt -s nullglob
 assets=()
+required_assets=(
+  "${dist}/audit/repo-score.json"
+  "${dist}/audit/repo-score.md"
+  "${installer_dst}"
+  "${installer_dst}.sha256"
+  "${formula_dst}"
+  "${formula_dst}.sha256"
+)
+for f in "${required_assets[@]}"; do
+  assert_nonempty "$f"
+  assets+=("$f")
+done
 for f in \
   "${dist}"/*.tar.gz \
   "${dist}"/*.tar.gz.sha256 \
   "${dist}"/*.tar.gz.sigstore.bundle \
   "${dist}"/*.pkg \
   "${dist}"/*.pkg.sha256 \
-  "${dist}"/*.pkg.sigstore.bundle \
-  "${installer_dst}" \
-  "${installer_dst}.sha256" \
-  "${formula_dst}" \
-  "${formula_dst}.sha256" \
-  "${dist}/audit"/repo-score.json \
-  "${dist}/audit"/repo-score.md
+  "${dist}"/*.pkg.sigstore.bundle
 do
   [[ -e "$f" ]] && assets+=("$f")
 done

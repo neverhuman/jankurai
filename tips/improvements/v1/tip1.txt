@@ -1,0 +1,200 @@
+## Best improvement: add a **Control-Plane Map Integrity** gate
+
+The highest-value, lowest-false-positive improvement I would add is a deterministic validator for **duplicate and shadowed keys in Jankurai’s own canonical control-plane maps**, especially `agent/test-map.json`, owner maps, proof maps, generated-zone manifests, and any release/evidence manifests.
+
+Jankurai’s mission is built around making AI-assisted merges auditable: the repo should be able to answer what changed, who owns it, which proof lanes apply, which receipts exist, what evidence is missing, what repair is queued, and why the merge passed/reviewed/blocked/ratcheted/release-failed.  Its Core standard explicitly includes owner maps, test/proof maps, proof receipts, merge witnesses, repair queues, evidence indexes, stable rule IDs, and a closed decision enum.  So the maps that route files to proof lanes are not “just config”; they are part of the trust root.
+
+### Why this is the best next improvement
+
+The repo already has strong foundations: thin CI orchestration backed by local `ops/ci/*.sh` scripts, pinned actions, read-only checkout credentials, coverage evidence, mutation artifacts, security evidence, SARIF upload, release provenance, Sigstore bundles, and a composite GitHub Action that emits score, SARIF, summary, and repair queue outputs.      
+
+That means the next improvement should not be another broad heuristic. Broad “code smell” detectors can create false positives. A control-plane duplicate-key gate is different: it is exact, mechanical, and directly tied to whether agents and CI are proving the right thing.
+
+The key observation: the fetched `agent/test-map.json` content appears to define the same `"ops/"` route more than once: one entry routes `ops/` to local CI parity, while a later `ops/` entry routes it to security. Because ordinary JSON parsers usually keep the last duplicate key and silently discard the earlier one, this can erase a proof route without looking broken in normal parsing. 
+
+That is exactly the kind of **false-green** risk Jankurai exists to prevent.
+
+## Proposed feature
+
+Add a new rule:
+
+```text
+JKR-CP-001: duplicate-control-plane-key
+```
+
+Purpose:
+
+```text
+Canonical agent/test/owner/proof/release maps must not contain duplicate object keys.
+Duplicate keys create ambiguous or last-write-wins proof routing and can silently
+drop evidence obligations.
+```
+
+Scope for v1 should be deliberately narrow:
+
+```text
+agent/*.json
+agent/**/*.json
+conformance/**/*.json
+schemas/**/*.schema.json
+.github/dependabot.yml
+.github/workflows/*.yml
+action.yml
+```
+
+For v1, I would make the JSON duplicate-key check mandatory only for Jankurai-owned control-plane files:
+
+```text
+agent/owner-map.json
+agent/test-map.json
+agent/proof-map.json
+agent/generated-zones.json
+agent/baselines/*.json
+conformance/**/expected*.json
+schemas/*.schema.json
+```
+
+For YAML, I would start with advisory reporting only unless the YAML file is one of:
+
+```text
+action.yml
+.github/workflows/*.yml
+```
+
+This keeps the rule low-noise and avoids penalizing external examples or intentionally weird fixtures.
+
+## Finding shape
+
+Every finding should be machine-repairable:
+
+```json
+{
+  "rule_id": "JKR-CP-001",
+  "title": "Duplicate control-plane key",
+  "severity": "high",
+  "path": "agent/test-map.json",
+  "object": "/tests",
+  "key": "ops/",
+  "first_line": 123,
+  "duplicate_line": 187,
+  "risk": "The later key can silently replace the earlier proof-lane route.",
+  "agent_fix": "Merge the duplicate entries or split them into narrower non-overlapping routes such as ops/ci/ and ops/security/."
+}
+```
+
+That matches Jankurai’s style: exact path, exact evidence, exact repair. The audit rubric already emphasizes deterministic proof lanes, security/supply-chain posture, low duplication, repair evidence, and agent-friendly exceptions rather than vague quality scoring. 
+
+## Concrete first repair
+
+For the apparent `agent/test-map.json` duplicate, I would not merge everything into one heavy `ops/` command. That would slow agents down and weaken locality. I would split the routes:
+
+```json
+"ops/ci/": {
+  "command": "bash scripts/ci-local.sh quick",
+  "purpose": "verify ops/ci/*.sh lanes still run the same gates CI executes"
+},
+"ops/security/": {
+  "command": "just security",
+  "purpose": "verify ops security routing remains visible to the audit"
+}
+```
+
+Or, if `ops/security/` does not exist, route the actual security surface instead:
+
+```json
+"tools/security-lane.sh": {
+  "command": "just security",
+  "purpose": "verify security lane script remains aligned with CI evidence generation"
+}
+```
+
+This gives agents smaller, more accurate proof targets and removes ambiguous last-write-wins behavior.
+
+## Implementation sketch
+
+Add a small module, not a broad framework:
+
+```text
+crates/jankurai/src/audit/control_plane_integrity.rs
+```
+
+Core behavior:
+
+```text
+1. Select only canonical control-plane files.
+2. Parse the file normally first to ensure it is valid JSON/YAML.
+3. For JSON, scan the raw text with a tiny token walker that:
+   - honors strings and escapes,
+   - tracks object/array nesting,
+   - records object keys by JSON pointer,
+   - reports any second occurrence of the same key in the same object.
+4. Do not use serde_json::Value alone, because it loses duplicate-key evidence.
+5. Emit structured findings into repo-score JSON, Markdown, SARIF, and repair queue.
+```
+
+Wire it into:
+
+```text
+jankurai doctor --fail-on high
+jankurai audit . --mode advisory
+jankurai audit-file agent/test-map.json
+```
+
+Add tests:
+
+```text
+crates/jankurai/tests/control_plane_integrity.rs
+crates/jankurai/tests/fixtures/control-plane/duplicate-test-map.json
+crates/jankurai/tests/fixtures/control-plane/clean-test-map.json
+```
+
+Test cases:
+
+```text
+- duplicate key in /tests is high severity
+- duplicate key reports first and second line
+- identical key in different objects is allowed
+- duplicate-looking strings inside values are ignored
+- non-control fixture JSON is not hard-failed by default
+- current agent/test-map.json has no duplicate route after repair
+```
+
+Then add the route to `agent/test-map.json`:
+
+```json
+"crates/jankurai/src/audit/control_plane_integrity.rs": {
+  "command": "cargo test -p jankurai --test control_plane_integrity && cargo run -p jankurai -- doctor --fail-on high",
+  "purpose": "verify canonical control-plane maps cannot silently shadow owner, test, proof, or release routing"
+}
+```
+
+## Why this beats broader improvements
+
+I would not make the next improvement an LLM judge, broad “complexity smell” detector, or vague anti-vibe NLP rule. Those can be useful later, but they can also annoy serious adopters with false positives.
+
+This one is better because it is:
+
+**Deterministic:** duplicate keys are objectively ambiguous in canonical maps.
+
+**Agent-first:** agents rely on these maps to choose the right proof lane.
+
+**Security-relevant:** a shadowed key can silently remove a security, release, or owner route.
+
+**Low complexity:** a focused scanner and a few tests, not a new scoring subsystem.
+
+**Repair-oriented:** the fix is always concrete: merge or split the duplicate route.
+
+**Aligned with adoption:** Jankurai’s own mission says it should be useful before strict, starting with read-only/advisory reports, with ratchets and release gates opt-in and baseline-backed.  This rule can start advisory for non-core files and hard-fail only for trusted control-plane maps.
+
+My recommended PR title would be:
+
+```text
+Prevent silent proof-route shadowing in control-plane maps
+```
+
+And the one-line value statement:
+
+```text
+Jankurai should never let a duplicate key silently erase the proof lane that tells an agent what evidence is required.
+```
+

@@ -182,8 +182,13 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
     let mut seen = BTreeSet::new();
     let file_kind = line_kind(file);
     let text_lower = file.text.to_ascii_lowercase();
+    let is_github_workflow = file
+        .rel_path
+        .to_ascii_lowercase()
+        .starts_with(".github/workflows/");
 
-    if text_lower.contains("pull_request_target")
+    if is_github_workflow
+        && text_lower.contains("pull_request_target")
         && text_lower.contains("actions/checkout")
         && (text_lower.contains("github.event.pull_request.head.sha")
             || text_lower.contains("github.event.pull_request.head.ref")
@@ -215,7 +220,7 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
         );
     }
 
-    if !text_lower.contains("permissions:") {
+    if is_github_workflow && !text_lower.contains("permissions:") {
         push_once(
             &mut out,
             &mut seen,
@@ -231,7 +236,7 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
             ),
         );
     }
-    if !text_lower.contains("timeout-minutes:") {
+    if is_github_workflow && !text_lower.contains("timeout-minutes:") {
         push_once(
             &mut out,
             &mut seen,
@@ -247,7 +252,7 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
             ),
         );
     }
-    if !text_lower.contains("concurrency:") {
+    if is_github_workflow && !text_lower.contains("concurrency:") {
         push_once(
             &mut out,
             &mut seen,
@@ -263,7 +268,10 @@ fn findings_for_file(file: &FileInfo) -> Vec<LanguageFinding> {
             ),
         );
     }
-    if text_lower.contains("sarif") && !text_lower.contains("github/codeql-action/upload-sarif@") {
+    if is_github_workflow
+        && text_lower.contains("sarif")
+        && !text_lower.contains("github/codeql-action/upload-sarif@")
+    {
         push_once(
             &mut out,
             &mut seen,

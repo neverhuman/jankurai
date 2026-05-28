@@ -1,51 +1,175 @@
-# GitLab CI — mirrors .github/workflows/jankurai.yml quality and test gates.
-# Release (cross-platform builds, signing) stays GitHub-only.
-
 workflow:
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
     - when: never
 
 stages:
   - quality
-  - test
-
-variables:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  GIT_DEPTH: "1"
+  - coverage
+  - security
+  - audit
+  - release
+  - deploy
 
 default:
   image: rust:1.95.0
-  tags: [default]
-  interruptible: true
-  timeout: 90m
   before_script:
-    - unset RUSTC_WRAPPER
-    - pkill sccache 2>/dev/null || true
-    - rustup component add rustfmt clippy
-    - |
-      if ! command -v cargo-nextest >/dev/null 2>&1; then
-        curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin
-      fi
+    - rustup show
 
-fmt:
+quality:
   stage: quality
   script:
-    - cargo fmt --all -- --check
+    - bash ops/ci/quality-gates.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
 
-clippy:
-  stage: quality
+coverage:
+  stage: coverage
   script:
-    - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+    - cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION"
+    - bash ops/ci/coverage-llvm.sh
+  artifacts:
+    when: always
+    paths:
+      - target/coverage/lcov.info
+      - target/coverage/coverage.json
+      - target/coverage/summary.txt
+      - target/llvm-cov/lcov.info
+      - target/jankurai/coverage/rust-lcov.info
+      - target/jankurai/coverage/mutation.diff
+      - target/jankurai/coverage/mutants-list.json
+      - target/mutants/mutants.out/outcomes.json
+      - target/mutants/mutants.out/log
+      - target/mutants/mutants.out/diff
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
 
-check:
-  stage: quality
+security:
+  stage: security
   script:
-    - cargo check --workspace --all-targets
+    - bash ops/ci/security-tools.sh
+    - npm ci
+    - cargo run -p jankurai -- security run . --strict --profile ci --script tools/security-lane.sh --out target/jankurai/security/evidence.json
+  artifacts:
+    when: always
+    paths:
+      - target/jankurai/security/evidence.json
+      - target/jankurai/sbom.spdx.json
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
 
-test:
-  stage: test
+audit:
+  stage: audit
+  needs:
+    - quality
+    - coverage
+    - security
   script:
-    - cargo nextest run --workspace --no-fail-fast
+    - bash ops/ci/audit.sh
+  artifacts:
+    when: always
+    paths:
+      - target/jankurai/repo-score.json
+      - target/jankurai/repo-score.md
+      - target/jankurai/jankurai.sarif
+      - target/jankurai/summary.md
+      - target/jankurai/repair-queue.jsonl
+      - target/jankurai/proofbind/obligations.json
+      - target/jankurai/proofbind/surface-witness.json
+      - target/jankurai/proofmark/proofmark-receipt.json
+      - target/jankurai/proofmark/proof-receipt.json
+      - target/jankurai/rust/witness-graph.json
+      - target/jankurai/ux-qa.json
+      - target/jankurai/ux-qa-server.log
+      - target/jankurai/coverage/coverage-audit.json
+      - target/jankurai/coverage/coverage-audit.md
+      - target/jankurai/security/evidence.json
+      - target/jankurai/migration-prompt-verification.json
+      - target/jankurai/migration-prompt-verification.md
+      - target/jankurai/migration-slice-risk.json
+      - target/jankurai/migration-slice-risk.md
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+
+release_audit_gate:
+  stage: release
+  script:
+    - cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+    - cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION"
+    - bash ops/ci/release-audit-gate.sh
+  artifacts:
+    when: always
+    paths:
+      - target/jankurai/repo-score.json
+      - target/jankurai/repo-score.md
+      - target/jankurai/jankurai.sarif
+      - target/jankurai/security/evidence.json
+      - target/jankurai/coverage/rust-lcov.info
+      - target/jankurai/coverage/mutation.diff
+      - target/jankurai/coverage/mutants-list.json
+      - target/mutants/mutants.out/outcomes.json
+  rules:
+    - if: $CI_COMMIT_TAG
+
+release_build_linux:
+  stage: release
+  needs:
+    - release_audit_gate
+  script:
+    - bash ops/ci/release-build.sh
+  artifacts:
+    when: always
+    paths:
+      - dist/*.tar.gz
+      - dist/*.tar.gz.sha256
+      - dist/*.tar.gz.sigstore.bundle
+  rules:
+    - if: $CI_COMMIT_TAG
+
+release_build_macos:
+  stage: release
+  tags:
+    - macos
+  needs:
+    - release_audit_gate
+  script:
+    - bash ops/ci/release-build.sh
+  artifacts:
+    when: always
+    paths:
+      - dist/*.pkg
+      - dist/*.pkg.sha256
+      - dist/*.pkg.sigstore.bundle
+  rules:
+    - if: $CI_COMMIT_TAG
+
+release_publish:
+  stage: release
+  needs:
+    - release_audit_gate
+    - release_build_linux
+    - release_build_macos
+  script:
+    - bash ops/ci/release-publish.sh
+  rules:
+    - if: $CI_COMMIT_TAG
+
+post_main_shadow:
+  stage: deploy
+  allow_failure: true
+  script:
+    - bash ops/ci/post-main-shadow.sh
+  artifacts:
+    when: always
+    paths:
+      - target/jankurai/jeryu-shadow.json
+      - target/jankurai/jeryu-shadow.md
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"

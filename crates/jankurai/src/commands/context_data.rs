@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use crate::validation;
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OwnerMapFile {
     #[serde(default)]
@@ -86,10 +88,10 @@ pub struct RepoCatalog {
 impl RepoCatalog {
     pub fn load(repo: &Path) -> Result<Self> {
         Ok(Self {
-            owners: read_json::<OwnerMapFile>(&repo.join("agent/owner-map.json"))?
+            owners: read_json_strict::<OwnerMapFile>(&repo.join("agent/owner-map.json"))?
                 .map(|file| file.owners)
                 .unwrap_or_default(),
-            tests: read_json::<TestMapFile>(&repo.join("agent/test-map.json"))?
+            tests: read_json_strict::<TestMapFile>(&repo.join("agent/test-map.json"))?
                 .map(|file| file.tests)
                 .unwrap_or_default(),
             generated_zones: read_toml::<GeneratedZonesFile>(
@@ -210,13 +212,15 @@ impl RepoCatalog {
     }
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+fn read_json_strict<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if !path.exists() {
         return Ok(None);
     }
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let value = validation::parse_json_value_strict(&text)
+        .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
     Ok(Some(
-        serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
+        serde_json::from_value(value).with_context(|| format!("decode {}", path.display()))?,
     ))
 }
 

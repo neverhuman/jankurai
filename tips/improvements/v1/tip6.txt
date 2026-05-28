@@ -1,0 +1,328 @@
+My best improvement: **add a first-class “Evidence Contract Gate” to Jankurai.**
+
+Not another scanner. Not another heuristic rule. A deterministic verifier that proves Jankurai actually produced the proof/evidence artifacts it claims to rely on, that those artifacts are fresh for the current commit, schema-valid, non-empty, and tied to the right CI lane.
+
+This fits the project better than adding more lint/security checks because Jankurai’s mission is already “auditable AI-assisted merge”: local evidence, predictable receipts, proof lanes, baselines, ratchets, and repair queues. The README explicitly frames Jankurai as a local audit CLI that leaves JSON/Markdown reports, score history, proof artifacts, and command evidence under predictable paths, while starting read-only and only ratcheting after team adoption. ([GitHub][1])
+
+## Why this is the highest-value improvement
+
+The repo already has strong gates: format, clippy, workspace tests, UX QA, security, conformance, score, and paper generation in `just check`.  It also has a local/CI mirror philosophy: workflows are thin orchestration and the executable CI source of truth is under `ops/ci/*.sh`.  The audit lane already runs quality gates, proofbind, proofmark, security, UX, coverage, language fixtures, migration fixtures, and a final ratchet audit. 
+
+The gap is that the **evidence contract is distributed** across shell assertions, workflow upload lists, README promises, action outputs, and implicit knowledge. For example, `audit.sh` asserts several core artifacts such as security evidence, UX QA output, coverage audit JSON, repo score JSON/Markdown, and SARIF.   But the workflow uploads a much larger set of expected evidence files with `if-no-files-found: ignore`, including proofbind obligations, proofmark receipts, witness graph, coverage audit, security evidence, migration evidence, and repair queue. 
+
+That is not “bad”; it is a good pattern for preserving partial evidence on failures. But it means the strongest possible improvement is to make receipt completeness **explicit, versioned, local, and machine-checkable**.
+
+## The proposed feature
+
+Add:
+
+```bash
+jankurai evidence verify .
+```
+
+or, more specifically:
+
+```bash
+jankurai evidence verify . \
+  --lane audit \
+  --contract agent/evidence-contract.toml \
+  --out target/jankurai/evidence-contract.json \
+  --md target/jankurai/evidence-contract.md \
+  --strict
+```
+
+This command should not judge code quality. It should only verify declared evidence obligations.
+
+It should answer:
+
+```text
+For this lane, did Jankurai produce the exact receipts required for a trustworthy merge decision?
+Are they non-empty?
+Are they parseable?
+Are they current for this commit?
+Are they from the expected lane/mode?
+Are optional artifacts treated as optional rather than noisy failures?
+```
+
+## What the contract would look like
+
+Create one canonical file:
+
+```toml
+# agent/evidence-contract.toml
+
+[contract]
+version = 1
+
+[lanes.audit]
+description = "Full CI audit lane used before merge/release"
+requires_current_head = true
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/repo-score.json"
+kind = "repo_score"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/repo-score.md"
+kind = "human_report"
+required = true
+format = "markdown"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/jankurai.sarif"
+kind = "sarif"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/repair-queue.jsonl"
+kind = "repair_queue"
+required = true
+format = "jsonl"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/security/evidence.json"
+kind = "security_evidence"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/coverage/coverage-audit.json"
+kind = "coverage_audit"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/proofbind/obligations.json"
+kind = "proof_obligations"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/proofmark/proof-receipt.json"
+kind = "proof_receipt"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/rust/witness-graph.json"
+kind = "witness_graph"
+required = true
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/migration-prompt-verification.json"
+kind = "migration_evidence"
+required = false
+format = "json"
+
+[[lanes.audit.artifacts]]
+path = "target/jankurai/migration-slice-risk.json"
+kind = "migration_evidence"
+required = false
+format = "json"
+```
+
+The important part: **the contract is declarative**. CI should not infer obligations from vague heuristics. It should only fail when the repository itself says, “this lane requires this artifact,” and the artifact is missing, empty, malformed, stale, or outside the approved evidence root.
+
+## CI integration
+
+Add one step after `bash ops/ci/audit.sh` and before artifact upload:
+
+```yaml
+- name: Verify evidence contract
+  run: |
+    cargo run -p jankurai -- evidence verify . \
+      --lane audit \
+      --contract agent/evidence-contract.toml \
+      --out target/jankurai/evidence-contract.json \
+      --md target/jankurai/evidence-contract.md \
+      --strict
+```
+
+Then include the verifier’s own report in the uploaded evidence bundle:
+
+```yaml
+target/jankurai/evidence-contract.json
+target/jankurai/evidence-contract.md
+```
+
+Keep `if-no-files-found: ignore` on upload steps. That setting is useful because failed jobs should still publish whatever partial artifacts exist. The new gate should be the thing that decides whether missing evidence is acceptable, not the upload action.
+
+## Why this avoids false positives
+
+This should not be a “rule family” that guesses whether code is good or bad. It should be an **evidence integrity check**.
+
+It fails only on objective conditions:
+
+```text
+required artifact missing
+required artifact empty
+JSON artifact cannot be parsed
+JSONL artifact has malformed rows
+SARIF artifact is not valid JSON
+artifact claims a different repo root or commit, when freshness metadata exists
+artifact was written outside the allowed evidence directory
+contract references an unknown lane
+contract version is unsupported
+```
+
+It should explicitly not fail on:
+
+```text
+optional artifact absent
+coverage percentage lower than desired
+mutation score lower than desired
+number of findings higher than desired
+security scanner found advisory issues
+a proof lane was not required by the contract
+a tool omitted freshness metadata before that metadata is part of the stable schema
+```
+
+That is the key to low false-positive risk: **the gate validates receipts, not opinions**.
+
+## Why this also reduces complexity
+
+Right now, evidence expectations are spread across multiple places:
+
+```text
+README/action docs
+.github/workflows/jankurai.yml
+ops/ci/audit.sh
+ops/ci/lib.sh assert_nonempty calls
+Justfile recipes
+GitHub Action output assumptions
+release/audit scripts
+```
+
+A single `agent/evidence-contract.toml` becomes the source of truth. CI, local `just ci`, the Marketplace action, release gates, and documentation can all point to the same contract.
+
+This reduces cognitive load for agents too. Instead of asking an agent to remember which files count as proof, the repo says:
+
+```text
+For lane=audit, these are the receipts.
+Produce them or explain why the contract does not apply.
+```
+
+That is very aligned with the existing `kickoff` model, where Jankurai turns task intent into bounded plans, ownership boundaries, proof lanes, generated-zone constraints, and expected receipts before mutable commands run. ([GitHub][1])
+
+## Concrete implementation plan
+
+Add a new module:
+
+```text
+crates/jankurai/src/evidence/
+  mod.rs
+  contract.rs
+  verify.rs
+  report.rs
+```
+
+Add a CLI subcommand:
+
+```text
+jankurai evidence verify <repo>
+  --lane <name>
+  --contract <path>
+  --out <json>
+  --md <markdown>
+  --strict
+```
+
+Add report types roughly like:
+
+```rust
+pub struct EvidenceContractReport {
+    pub contract_version: u32,
+    pub lane: String,
+    pub repo_root: PathBuf,
+    pub head: Option<String>,
+    pub status: EvidenceStatus,
+    pub artifacts: Vec<EvidenceArtifactResult>,
+    pub findings: Vec<EvidenceFinding>,
+}
+
+pub enum EvidenceStatus {
+    Pass,
+    Advisory,
+    Fail,
+}
+
+pub struct EvidenceArtifactResult {
+    pub path: PathBuf,
+    pub kind: String,
+    pub required: bool,
+    pub present: bool,
+    pub non_empty: bool,
+    pub parse_status: ParseStatus,
+    pub freshness_status: FreshnessStatus,
+}
+
+pub struct EvidenceFinding {
+    pub code: String, // e.g. JK-EVIDENCE-MISSING
+    pub severity: EvidenceSeverity,
+    pub path: Option<PathBuf>,
+    pub message: String,
+    pub remediation: String,
+}
+```
+
+Add tests:
+
+```text
+evidence_contract_passes_when_required_artifacts_exist
+evidence_contract_fails_on_missing_required_artifact
+evidence_contract_allows_missing_optional_artifact
+evidence_contract_fails_on_empty_required_artifact
+evidence_contract_fails_on_malformed_json
+evidence_contract_rejects_paths_outside_artifact_root
+evidence_contract_reports_all_missing_artifacts_without_duplicate_noise
+evidence_contract_advisory_mode_never_blocks
+```
+
+Add a local recipe:
+
+```make
+evidence:
+    cargo run -p jankurai -- evidence verify . --lane audit --contract agent/evidence-contract.toml --out target/jankurai/evidence-contract.json --md target/jankurai/evidence-contract.md
+```
+
+Then wire it into `just ci-audit` and the audit workflow.
+
+## Suggested rollout
+
+Phase 1 should be advisory-only and verify only artifacts already asserted today:
+
+```text
+repo-score.json
+repo-score.md
+jankurai.sarif
+security/evidence.json
+coverage/coverage-audit.json
+ux-qa.json
+```
+
+Phase 2 can become strict for the audit lane and include proofbind/proofmark/witness artifacts.
+
+Phase 3 can add freshness checks once each receipt has stable metadata like:
+
+```json
+{
+  "schema_version": 1,
+  "repo_root": "...",
+  "head": "git sha",
+  "lane": "audit",
+  "generated_by": "jankurai 1.x"
+}
+```
+
+## The one-line value proposition
+
+**Jankurai should not only produce proof receipts; it should prove that the proof receipts are complete, fresh, and contractually sufficient for the merge decision.**
+
+That is the best improvement because it strengthens the project’s core promise, improves agent reliability, reduces duplicated CI knowledge, and avoids the false-positive trap of adding another heuristic scanner.
+
+[1]: https://github.com/neverhuman/jankurai/blob/main/README.md "jankurai/README.md at main · neverhuman/jankurai · GitHub"
+

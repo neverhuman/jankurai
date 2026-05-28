@@ -1,0 +1,193 @@
+## Best improvement: add a **Canonical Control-File Integrity Audit** for policy shadowing
+
+My strongest recommendation is to add a small, deterministic detector that rejects **duplicate keys and shadowed canonical policy entries in Jankurai’s own agent control files** before the normal JSON/TOML/schema validation path runs.
+
+Why this is the best next improvement: Jankurai’s mission is not just to run more checks; it is to make merge decisions reproducible through local evidence, owner maps, proof lanes, receipts, and merge witnesses. The README frames the loop as “find vibe artifacts, prove the merge, repair the repo,” and specifically says Jankurai turns ownership maps, proof lanes, generated zones, security boundaries, rolling scores, merge witnesses, and repair queues into files humans and agents can both read. ([GitHub][1]) The mission doc says a conformant repository should be able to answer, at the current commit, what changed, who owns it, which proof lanes apply, which receipts exist, what evidence is missing, and why the merge passed or failed. ([GitHub][2])
+
+The gap is that the most important “machine-readable truth” files are currently JSON objects keyed by route/pattern. That shape can silently hide duplicate policy entries.
+
+### The concrete issue I found
+
+`agent/test-map.json` currently contains two `"ops/"` entries with **different commands**: one maps `ops/` to `bash scripts/ci-local.sh quick`, and later another maps `ops/` to `just security`. In normal JSON object parsing, one of those entries wins and the other effectively disappears from the machine view, while a human scanning the file may think both policies exist. ([GitHub][3])
+
+`agent/owner-map.json` also contains a duplicate `"ops/"` key, though both visible values are `"ops"`, so that one is less dangerous but still violates canonical-policy hygiene. ([GitHub][4])
+
+This matters because RFC 8259 says JSON object names “SHOULD be unique,” and when they are not, receiving software behavior is unpredictable; many implementations report only the last name/value pair. ([RFC Editor][5]) For a project whose entire value proposition is trusted local evidence, this is exactly the kind of deterministic, low-noise defect worth catching.
+
+## Why this beats another heuristic rule
+
+I would **not** add another broad “bad code smell” detector as the next best improvement. Jankurai already covers a large catalog of HLT rule families, language bad-behavior catalogs, CI hardening, copy-code, release hazards, repo rot, web security, coverage evidence, proof routing, and guard enforcement. The README says it checks stable HLT rule families across release readiness, web security hazards, repo rot, bad CI/Git/tooling behavior, secret sprawl, generated drift, false-green tests, UX proof gaps, and missing evidence. ([GitHub][1])
+
+A duplicate-key/policy-shadow detector has a much better value-to-risk ratio:
+
+It is **objective**: either the same JSON object key appears twice or it does not.
+
+It is **mission-critical**: the affected files define ownership and proof routing.
+
+It is **low false-positive**: canonical control files should never depend on parser-specific duplicate-key behavior.
+
+It is **immediately actionable**: the repair is to split, merge, or delete the duplicate route.
+
+It **reduces complexity**: one route/pattern has one visible, machine-trusted meaning.
+
+## Proposed feature
+
+Add a new detector, tentatively:
+
+`HLT-044-CANONICAL-POLICY-SHADOW`
+
+Scope it narrowly at first to avoid noise:
+
+```text
+agent/owner-map.json
+agent/test-map.json
+agent/jankurai-badge.json
+agent/baselines/*.repo-score.json
+.jankurai/*.json when explicitly validated
+schemas/*.schema.json during rules verify
+```
+
+The first release should make it **blocking only for canonical source control files** such as `agent/owner-map.json` and `agent/test-map.json`. For generated reports, make it a validation error only when the user explicitly validates that artifact, because generated JSON might come from older tooling.
+
+## Detection rules
+
+### 1. Duplicate JSON object key
+
+Before `serde_json::from_str` converts the file into a `Value`, run a lightweight duplicate-key scanner that preserves JSON Pointer location.
+
+Example finding:
+
+```text
+rule_id: HLT-044-CANONICAL-POLICY-SHADOW
+severity: high
+path: agent/test-map.json
+pointer: $.tests["ops/"]
+problem: duplicate canonical route key has conflicting values
+evidence:
+  first command: bash scripts/ci-local.sh quick
+  later command: just security
+agent_fix: split into ops/ci/ and ops/, or merge into one explicit command/lane
+validation_lane: just score
+```
+
+Severity:
+
+```text
+high/block: duplicate key with different values in owner/test/proof routing maps
+medium: duplicate key with identical values in owner/test/proof routing maps
+low/advisory: duplicate key in non-routing generated artifacts
+```
+
+### 2. Optional non-blocking route-shadow report
+
+Do **not** block on prefix overlaps like `ops/` and `ops/git-hooks/`. Those can be valid if the resolver is “most specific wins.” Instead, emit an advisory section only when a broader and narrower route have conflicting lanes and the resolver policy is not explicitly documented.
+
+That keeps the first implementation safe: exact duplicate keys only.
+
+## Minimal first PR
+
+I would ship this as a very small PR with four changes.
+
+### 1. Fix the current maps
+
+In `agent/test-map.json`, replace the duplicate `ops/` entries with explicit non-overlapping routes:
+
+```json
+"ops/": {
+  "command": "just security",
+  "purpose": "verify ops routing remains visible to the audit"
+},
+"ops/ci/": {
+  "command": "bash scripts/ci-local.sh quick",
+  "purpose": "verify ops/ci/*.sh lanes still run the same gates CI executes"
+},
+"ops/git-hooks/": {
+  "command": "bash ops/git-hooks/pre-push",
+  "purpose": "verify the mandatory pre-push gate stays in sync with CI"
+}
+```
+
+In `agent/owner-map.json`, delete the repeated `"ops/"` entry and keep the single canonical owner route.
+
+### 2. Add `audit/control_integrity.rs`
+
+New module:
+
+```text
+crates/jankurai/src/audit/control_integrity.rs
+```
+
+Responsibilities:
+
+```text
+scan_json_control_file(path, text) -> Vec<ControlIntegrityFinding>
+detect_duplicate_object_keys(text)
+classify_duplicate_key(file, pointer, first_value_hash, second_value_hash)
+render_agent_fix(...)
+```
+
+No network. No external tools. No semantic inference.
+
+### 3. Wire it into audit/reporting
+
+Run it early in the audit path for known control files. The existing ownership analyzer currently gives credit for map presence and coverage: it checks for `agent/owner-map.json`, `agent/test-map.json`, and `agent/proof-lanes.toml`, then checks whether missing owner/test paths are empty.   The new detector should run before those “coverage” conclusions, because a map with hidden duplicate keys is not fully trustworthy.
+
+### 4. Add fixtures and false-positive tests
+
+Add fixtures:
+
+```text
+crates/jankurai/tests/fixtures/control_integrity/clean_test_map.json
+crates/jankurai/tests/fixtures/control_integrity/duplicate_test_map_conflicting.json
+crates/jankurai/tests/fixtures/control_integrity/duplicate_owner_map_identical.json
+crates/jankurai/tests/fixtures/control_integrity/nested_duplicate_schema_key.json
+```
+
+Add tests:
+
+```text
+duplicate_test_map_key_with_conflicting_command_is_high
+duplicate_owner_map_key_with_same_value_is_medium
+clean_control_files_have_no_findings
+prefix_specificity_is_not_blocking
+schema_validation_still_runs_after_duplicate_key_scan
+```
+
+## Why this adds real product value
+
+Jankurai’s standard says higher conformance levels depend on root instructions, owner maps, test maps, generated-zone manifests, version manifests, score artifacts, fast/full validation commands, and CI audit. ([GitHub][6]) The schemas for `test-map` and `owner-map` model these routing tables as JSON objects with arbitrary property names, which is convenient but cannot by itself preserve duplicate-key intent after normal parsing.  
+
+So this improvement protects the exact control-plane files that agents and CI are supposed to trust.
+
+It also improves security posture: a malicious or careless change could add a duplicate route later in a file and silently replace a strict lane with a weaker one. This detector turns that from “parser-dependent behavior” into an obvious, repairable finding.
+
+## Acceptance criteria
+
+A clean implementation is done when:
+
+```text
+cargo test -p jankurai control_integrity
+cargo test -p jankurai --test schema_contracts
+cargo run -p jankurai -- rules verify
+cargo run -p jankurai -- audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md
+```
+
+produces no duplicate-key findings after the current `agent/test-map.json` and `agent/owner-map.json` are fixed.
+
+The resulting user-facing behavior should be simple:
+
+```text
+Jankurai found a duplicate canonical route in agent/test-map.json.
+Machine parsers may only see one of these entries.
+Choose one route, split the route, or combine the proof lane.
+```
+
+That is the best improvement I see: small surface area, immediate real finding, aligned with the mission, and essentially no false-positive risk because canonical policy files should never rely on duplicate JSON object keys.
+
+[1]: https://github.com/neverhuman/jankurai/ "GitHub - neverhuman/jankurai: Slay repo jank with proof lanes, audit receipts, bounded agents, and no-proof-no-merge governance. · GitHub"
+[2]: https://raw.githubusercontent.com/neverhuman/jankurai/main/docs/mission.md "raw.githubusercontent.com"
+[3]: https://raw.githubusercontent.com/neverhuman/jankurai/main/agent/test-map.json "raw.githubusercontent.com"
+[4]: https://raw.githubusercontent.com/neverhuman/jankurai/main/agent/owner-map.json "raw.githubusercontent.com"
+[5]: https://www.rfc-editor.org/rfc/rfc8259 "RFC 8259: The JavaScript Object Notation (JSON) Data Interchange Format | RFC Editor"
+[6]: https://raw.githubusercontent.com/neverhuman/jankurai/main/docs/agent-native-standard.md "raw.githubusercontent.com"
+

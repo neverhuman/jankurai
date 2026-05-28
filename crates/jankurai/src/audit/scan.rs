@@ -4,6 +4,7 @@ use super::language_rules::common::{contains_unqualified_python_builtin_call, py
 use super::prose;
 use super::source_context;
 use crate::model::FileInfo;
+use crate::validation;
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -1962,14 +1963,24 @@ pub fn manifest_parse_findings(ctx: &AuditContext) -> Vec<FindingHit> {
     let mut out = Vec::new();
     let json_manifests: &[(&str, JsonManifestParser)] = &[
         ("agent/owner-map.json", |text| {
-            serde_json::from_str::<OwnerMapFile>(text)
-                .map(|_| ())
-                .map_err(|err| err.to_string())
+            validation::parse_json_value_strict(text)
+                .map_err(|err| anyhow::anyhow!("parse agent/owner-map.json: {err}"))
+                .and_then(|value| {
+                    serde_json::from_value::<OwnerMapFile>(value)
+                        .map(|_| ())
+                        .map_err(Into::into)
+                })
+                .map_err(|err: anyhow::Error| err.to_string())
         }),
         ("agent/test-map.json", |text| {
-            serde_json::from_str::<TestMapFile>(text)
-                .map(|_| ())
-                .map_err(|err| err.to_string())
+            validation::parse_json_value_strict(text)
+                .map_err(|err| anyhow::anyhow!("parse agent/test-map.json: {err}"))
+                .and_then(|value| {
+                    serde_json::from_value::<TestMapFile>(value)
+                        .map(|_| ())
+                        .map_err(Into::into)
+                })
+                .map_err(|err: anyhow::Error| err.to_string())
         }),
     ];
     for (path, parse) in json_manifests {

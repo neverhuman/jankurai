@@ -32,6 +32,21 @@ jankurai ci install . --github --mode observe --dry-run
 Apply only the reviewed control-plane files. Existing `AGENTS.md`, `Justfile`,
 docs, and workflows must be preserved or merge-marked.
 
+## Internal First
+
+Use this when the checkout should point only at the internal GitLab/Jeryu
+origin and GitHub should be treated as a post-merge mirror.
+
+```bash
+git remote -v
+git remote get-url origin
+bash scripts/ci-local.sh shadow
+```
+
+Completion: `origin` resolves to the local GitLab URL, `.jeryu/local/repos/jankurai.toml`
+describes the GitHub shadow remote, and the post-main shadow job is non-gating
+for the internal merge pipeline.
+
 ## Legacy Or Far Repo
 
 Use this when the detected stack is far from the target or proof lanes are weak.
