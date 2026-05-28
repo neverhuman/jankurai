@@ -121,7 +121,7 @@ run_advisory() {
 
 required_tool_names=(gitleaks)
 required_commands=(
-  "echo 'security-lane:gitleaks:start'; if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then scan_dir=\"\$(mktemp -d)\"; trap 'rm -rf \"\$scan_dir\"' EXIT; git archive --format=tar HEAD | tar -xf - -C \"\$scan_dir\"; (cd \"\$scan_dir\" && gitleaks detect --no-git --source . --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner); else gitleaks detect --no-git --source . --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner; fi; echo 'security-lane:gitleaks:done'"
+  "echo 'security-lane:gitleaks:start'; if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then scan_dir=\"\$(mktemp -d)\"; trap 'rm -rf \"\$scan_dir\"' EXIT; git archive --format=tar HEAD | tar -xf - -C \"\$scan_dir\"; (cd \"\$scan_dir\" && gitleaks detect --no-git --source . --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner); else gitleaks detect --no-git --source . --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner; fi; status=\$?; echo 'security-lane:gitleaks:done'; exit \$status"
 )
 
 advisory_tool_names=(cargo-audit npm syft zizmor)
