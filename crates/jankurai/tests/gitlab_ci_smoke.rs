@@ -151,6 +151,10 @@ fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
         Vec::<String>::new(),
         "security job should not inherit generated artifacts from earlier stages"
     );
+    assert!(
+        !text.contains("    - npm ci"),
+        "security job should not pre-populate node_modules before the gitleaks gate"
+    );
 
     assert!(text.contains("bash ops/ci/quality-gates.sh"));
     assert!(text.contains("bash ops/ci/coverage-llvm.sh"));
