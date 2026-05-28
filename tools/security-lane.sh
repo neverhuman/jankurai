@@ -103,7 +103,7 @@ run_advisory() {
 
 required_tool_names=(gitleaks)
 required_commands=(
-  "gitleaks detect --source . --redact --no-banner"
+  "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then scan_dir=\"\$(mktemp -d)\"; trap 'rm -rf \"\$scan_dir\"' EXIT; git archive --format=tar HEAD | tar -xf - -C \"\$scan_dir\"; (cd \"\$scan_dir\" && gitleaks detect --no-git --source . --redact --no-banner); else gitleaks detect --no-git --source . --redact --no-banner; fi"
 )
 
 advisory_tool_names=(cargo-audit npm syft zizmor)
