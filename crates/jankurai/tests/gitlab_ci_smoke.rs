@@ -156,6 +156,8 @@ fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
     assert!(text.contains("bash ops/ci/release-publish.sh"));
     assert!(text.contains("bash ops/ci/post-main-shadow.sh"));
     assert!(text.contains("JERYU_SCCACHE_ENABLED: \"0\""));
+    assert!(text.contains("CARGO_LLVM_COV_VERSION: \"0.6.16\""));
+    assert!(text.contains("CARGO_MUTANTS_VERSION: \"27.0.0\""));
     assert!(text.contains("TARGET: x86_64-unknown-linux-gnu"));
     assert!(text.contains("TARGET: aarch64-apple-darwin"));
 
