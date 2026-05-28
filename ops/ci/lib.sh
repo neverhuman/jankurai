@@ -60,6 +60,8 @@ ensure_fuse_dev() {
     return 0
   fi
   step "Install libfuse3-dev"
-  sudo apt-get update -qq
-  sudo apt-get install -y -qq libfuse3-dev pkg-config
+  local apt_cmd="apt-get"
+  command -v sudo >/dev/null 2>&1 && apt_cmd="sudo apt-get"
+  $apt_cmd update -qq
+  $apt_cmd install -y -qq libfuse3-dev pkg-config
 }
