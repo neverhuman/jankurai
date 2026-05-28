@@ -146,6 +146,12 @@ fn gitlab_ci_pipeline_mirrors_internal_first_release_flow() {
         );
     }
 
+    assert_eq!(
+        sequence_strings(top_level(top_level(&yaml, "security"), "dependencies")),
+        Vec::<String>::new(),
+        "security job should not inherit generated artifacts from earlier stages"
+    );
+
     assert!(text.contains("bash ops/ci/quality-gates.sh"));
     assert!(text.contains("bash ops/ci/coverage-llvm.sh"));
     assert!(text.contains("bash ops/ci/security-tools.sh"));
