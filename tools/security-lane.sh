@@ -50,21 +50,30 @@ run_required() {
     fi
     return 0
   fi
-  local err code
+  local out err code
+  out="$(mktemp)"
   err="$(mktemp)"
-  if bash -c "$cmd" 2>"$err"; then
+  if bash -c "$cmd" >"$out" 2>"$err"; then
     emit_step "$tool" "$tool" "$cmd" "ran" "0" "0"
+    if [ -s "$out" ]; then
+      cat "$out"
+    fi
     if [ -s "$err" ]; then
       cat "$err" >&2
     fi
+    rm -f "$out"
     rm -f "$err"
     return 0
   else
     code=$?
     emit_step "$tool" "$tool" "$cmd" "failed" "0" "$code"
+    if [ -s "$out" ]; then
+      cat "$out"
+    fi
     if [ -s "$err" ]; then
       cat "$err" >&2
     fi
+    rm -f "$out"
     rm -f "$err"
     exit "$code"
   fi
@@ -78,21 +87,30 @@ run_advisory() {
     emit_step "$tool" "$tool" "$cmd" "skipped" "1" ""
     return 0
   fi
-  local err code
+  local out err code
+  out="$(mktemp)"
   err="$(mktemp)"
-  if bash -c "$cmd" 2>"$err"; then
+  if bash -c "$cmd" >"$out" 2>"$err"; then
     emit_step "$tool" "$tool" "$cmd" "ran" "1" "0"
+    if [ -s "$out" ]; then
+      cat "$out"
+    fi
     if [ -s "$err" ]; then
       cat "$err" >&2
     fi
+    rm -f "$out"
     rm -f "$err"
     return 0
   else
     code=$?
     emit_step "$tool" "$tool" "$cmd" "failed" "1" "$code"
+    if [ -s "$out" ]; then
+      cat "$out"
+    fi
     if [ -s "$err" ]; then
       cat "$err" >&2
     fi
+    rm -f "$out"
     rm -f "$err"
     if [ "$strict" = "1" ]; then
       exit "$code"
