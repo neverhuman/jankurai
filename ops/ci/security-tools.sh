@@ -3,6 +3,12 @@
 # already on PATH at the required version.
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+cargo_bin_dir="${CARGO_HOME:-${HOME}/.cargo}/bin"
+case ":${PATH}:" in
+  *":${cargo_bin_dir}:"*) ;;
+  *) export PATH="${cargo_bin_dir}:${PATH}" ;;
+esac
+
 step "Node.js toolchain ${NODE_VERSION}"
 bash "$(dirname "${BASH_SOURCE[0]}")/node-tools.sh"
 
@@ -37,19 +43,20 @@ if ! want_version "gitleaks" "$GITLEAKS_VERSION"; then
   esac
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
+  local_bin="${HOME}/.local/bin"
+  mkdir -p "$local_bin"
   ( cd "$tmp"
     curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
     curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
     grep " ${asset}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
     tar -xzf "${asset}" gitleaks
-    local_bin="${HOME}/.local/bin"
-    mkdir -p "$local_bin"
     if install -m 0755 gitleaks "${local_bin}/gitleaks" 2>/dev/null; then
-      export PATH="${local_bin}:${PATH}"
+      :
     elif command -v sudo >/dev/null 2>&1; then
       sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
     else
       fail "could not install gitleaks without sudo or a writable ${local_bin}"
     fi
   )
+  export PATH="${local_bin}:${PATH}"
 fi

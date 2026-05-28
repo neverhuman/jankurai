@@ -104,6 +104,7 @@ fn security_tools_script_bootstraps_node_before_security_scans() {
 
     assert!(text.contains("node-tools.sh"));
     assert!(text.contains("Node.js toolchain"));
+    assert!(text.contains("cargo_bin_dir"));
     assert!(text.contains("cargo-audit"));
     assert!(text.contains("zizmor"));
     assert!(text.contains("gitleaks"));
