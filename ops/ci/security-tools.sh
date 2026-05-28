@@ -42,11 +42,14 @@ if ! want_version "gitleaks" "$GITLEAKS_VERSION"; then
     curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
     grep " ${asset}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
     tar -xzf "${asset}" gitleaks
-    if [[ "$uname_s" == "linux" ]]; then
+    local_bin="${HOME}/.local/bin"
+    mkdir -p "$local_bin"
+    if install -m 0755 gitleaks "${local_bin}/gitleaks" 2>/dev/null; then
+      export PATH="${local_bin}:${PATH}"
+    elif command -v sudo >/dev/null 2>&1; then
       sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
     else
-      install -m 0755 gitleaks "${HOME}/.local/bin/gitleaks" 2>/dev/null || \
-        sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+      fail "could not install gitleaks without sudo or a writable ${local_bin}"
     fi
   )
 fi

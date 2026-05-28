@@ -107,6 +107,8 @@ fn security_tools_script_bootstraps_node_before_security_scans() {
     assert!(text.contains("cargo-audit"));
     assert!(text.contains("zizmor"));
     assert!(text.contains("gitleaks"));
+    assert!(text.contains("local_bin"));
+    assert!(text.contains("could not install gitleaks without sudo or a writable"));
 }
 
 #[test]
