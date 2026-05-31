@@ -1199,10 +1199,21 @@ pub fn handwritten_api_hits(ctx: &AuditContext) -> bool {
 // --- Domain IO detection ---
 
 pub fn domain_io_hits(ctx: &AuditContext) -> Vec<String> {
+    use crate::audit::source_context;
     product_code_files(ctx)
         .into_iter()
         .filter(|f| f.rel_path.contains("/core/") || f.rel_path.contains("/domain/"))
         .filter(|f| {
+            // Only PRODUCTION code counts. Scanning the whole file text matched
+            // tokens inside comments and test code — e.g. a `#[test] fn
+            // terminal_status_blocks_reopen()` name contains the substring
+            // `open(`. Restrict to active (non-comment, non-test) source lines.
+            let prod: String = source_context::source_lines(f)
+                .iter()
+                .filter(|l| !l.comment_only && !l.test_scaffold)
+                .map(|l| l.active_code.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             // Real IO/syscall signals only. `read(`/`write(` were removed: they
             // are NOT IO-specific — `RwLock`/`Mutex` `.read()`/`.write()`,
             // `Cursor`/`BufReader`, channel sends, and `write!`-style buffers all
@@ -1219,7 +1230,7 @@ pub fn domain_io_hits(ctx: &AuditContext) -> Vec<String> {
                 "println!",
             ]
             .iter()
-            .any(|m| f.text.contains(m))
+            .any(|m| prod.contains(m))
         })
         .map(|f| f.rel_path)
         .collect()
