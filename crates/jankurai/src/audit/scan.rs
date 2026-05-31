@@ -1875,6 +1875,7 @@ pub fn duplicate_blocks(ctx: &AuditContext) -> Vec<FindingHit> {
 }
 
 pub fn future_hostile_hits(ctx: &AuditContext) -> Vec<FindingHit> {
+    let allow_terms = crate::audit::fs_policy::dead_language_allow_terms(&ctx.root);
     let mut out = vec![];
     for file in product_code_files(ctx) {
         if is_future_hostile_allowlisted(&file) {
@@ -1893,6 +1894,16 @@ pub fn future_hostile_hits(ctx: &AuditContext) -> Vec<FindingHit> {
                 .find(|(_, regex)| regex.is_match(active))
             {
                 if source_context::term_only_appears_in_local_binding(active, term) {
+                    continue;
+                }
+                // Opt-in domain / platform-API allowlist
+                // (`agent/audit-policy.toml` -> `[dead_language] allow_terms`):
+                // suppress ONLY the exact words a repository has declared
+                // load-bearing — e.g. the HTML `placeholder` attribute, the
+                // React `fallback` prop, or GitHub's `stale` CheckConclusion
+                // value. An empty/absent list keeps the default behaviour, so
+                // repositories that do not opt in are unaffected.
+                if allow_terms.iter().any(|allowed| allowed == term) {
                     continue;
                 }
                 out.push(FindingHit {

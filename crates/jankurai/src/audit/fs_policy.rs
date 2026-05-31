@@ -70,6 +70,52 @@ impl InventoryOptions {
     }
 }
 
+/// Opt-in dead-language term allowlist from `agent/audit-policy.toml`.
+///
+/// A repository may declare load-bearing API / protocol / domain words that the
+/// HLT-001 future-hostile heuristic would otherwise flag — e.g. the HTML
+/// `placeholder` attribute, the React `fallback` prop, or GitHub's `stale`
+/// CheckConclusion wire value. Listing a term here suppresses ONLY that exact
+/// word for the dead-marker check; every other dead-language, fallback-soup, and
+/// security check still runs on the same files. A missing/empty section means
+/// default behaviour, so repositories that do not opt in are unaffected.
+///
+/// ```toml
+/// [dead_language]
+/// allow_terms = ["placeholder", "fallback", "stale", "old"]
+/// ```
+pub fn dead_language_allow_terms(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("agent/audit-policy.toml"))
+        .ok()
+        .map(|text| parse_dead_language_allow_terms(&text))
+        .unwrap_or_default()
+}
+
+fn parse_dead_language_allow_terms(text: &str) -> Vec<String> {
+    #[derive(Debug, Deserialize, Default)]
+    struct PolicyFile {
+        #[serde(default)]
+        dead_language: DeadLanguagePolicy,
+    }
+    #[derive(Debug, Deserialize, Default)]
+    struct DeadLanguagePolicy {
+        #[serde(default)]
+        allow_terms: Vec<String>,
+    }
+    toml::from_str::<PolicyFile>(text)
+        .ok()
+        .map(|parsed| {
+            parsed
+                .dead_language
+                .allow_terms
+                .into_iter()
+                .map(|term| term.trim().to_ascii_lowercase())
+                .filter(|term| !term.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn normalize_excluded_paths<I, S>(paths: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -122,4 +168,30 @@ pub struct InventoryTimings {
     pub walk_ms: u128,
     pub metadata_ms: u128,
     pub text_capture_ms: u128,
+}
+
+#[cfg(test)]
+mod dead_language_allow_tests {
+    use super::parse_dead_language_allow_terms;
+
+    #[test]
+    fn absent_section_yields_empty_allowlist() {
+        // No opt-in -> default behaviour (other repos unaffected).
+        assert!(parse_dead_language_allow_terms("[scan]\nexcluded_paths = []\n").is_empty());
+        assert!(parse_dead_language_allow_terms("").is_empty());
+    }
+
+    #[test]
+    fn parses_and_normalizes_declared_terms() {
+        let terms = parse_dead_language_allow_terms(
+            "[dead_language]\nallow_terms = [\"Placeholder\", \" fallback \", \"STALE\", \"\"]\n",
+        );
+        assert_eq!(terms, vec!["placeholder", "fallback", "stale"]);
+    }
+
+    #[test]
+    fn malformed_policy_is_safe_default() {
+        // A broken policy must never panic or silently disable the rule globally.
+        assert!(parse_dead_language_allow_terms("not = valid = toml =").is_empty());
+    }
 }
