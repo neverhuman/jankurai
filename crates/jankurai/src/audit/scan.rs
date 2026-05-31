@@ -672,9 +672,12 @@ fn has_fallible_source_marker(lower: &str) -> bool {
         "env::var",
         "try_from",
         "load(",
-        "lookup",
+        "lookup(",
         "fetch(",
-        "request",
+        // Call form only: a bare `request` matches common variable/field names
+        // like `request.default_branch`, which are not fallible sources.
+        "request(",
+        ".request(",
         "connect(",
         "recv(",
         "send(",
