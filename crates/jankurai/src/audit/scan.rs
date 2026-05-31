@@ -137,6 +137,10 @@ pub fn is_test_or_example_path(path: &str) -> bool {
         || lower.contains("/examples/")
         || lower.contains("/example/")
         || lower.contains("/spec/")
+        // End-to-end test trees (Playwright/Cypress convention): e2e specs +
+        // their fixtures/page-objects are TEST code, not product code.
+        || lower.starts_with("e2e/")
+        || lower.contains("/e2e/")
         || lower.ends_with("_test.rs")
         || lower.ends_with(".test.rs")
         || lower.ends_with(".spec.rs")

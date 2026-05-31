@@ -57,7 +57,7 @@ pub fn analyze(ctx: &AuditContext) -> DimensionResult {
 
 pub fn status(ctx: &AuditContext) -> ToolAdoptionReadiness {
     let config = load_tool_adoption_config(&ctx.root);
-    let workflow_text = github_workflow_text(ctx);
+    let workflow_text = tool_adoption_ci_text(ctx);
     let mut items = Vec::new();
     let mut applicable_count = 0usize;
     let mut configured_count = 0usize;
@@ -207,7 +207,7 @@ pub fn status(ctx: &AuditContext) -> ToolAdoptionReadiness {
 
 pub fn missing_required_ci_tools(ctx: &AuditContext) -> Vec<String> {
     let config = load_tool_adoption_config(&ctx.root);
-    let workflow_text = github_workflow_text(ctx);
+    let workflow_text = tool_adoption_ci_text(ctx);
     let mut missing = Vec::new();
 
     for entry in TOOL_ADOPTION_CATALOG {

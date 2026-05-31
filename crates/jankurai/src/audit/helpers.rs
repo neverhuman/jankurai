@@ -436,6 +436,25 @@ pub fn tool_adoption_upload_text(ctx: &AuditContext) -> String {
     github_workflow_text(ctx)
 }
 
+/// Workflow text PLUS the `ops/ci/*.sh` lane scripts that workflows call.
+///
+/// A *thin* workflow (required by the CI-local-parity rule, HLT-042) delegates
+/// its real commands to `bash ops/ci/<lane>.sh`. The tool's adopted command
+/// then lives in the script, not the YAML — so crediting tool adoption must scan
+/// the called lane scripts too, otherwise the two rules contradict each other.
+pub fn tool_adoption_ci_text(ctx: &AuditContext) -> String {
+    let mut text = github_workflow_text(ctx);
+    for file in ctx
+        .all_files
+        .iter()
+        .filter(|f| f.rel_path.starts_with("ops/ci/") && f.rel_path.ends_with(".sh"))
+    {
+        text.push('\n');
+        text.push_str(&file.text.to_ascii_lowercase());
+    }
+    text
+}
+
 fn tool_audit_ci_applicable(ctx: &AuditContext) -> bool {
     is_high_risk_repo(ctx)
 }
