@@ -1203,15 +1203,19 @@ pub fn domain_io_hits(ctx: &AuditContext) -> Vec<String> {
         .into_iter()
         .filter(|f| f.rel_path.contains("/core/") || f.rel_path.contains("/domain/"))
         .filter(|f| {
+            // Real IO/syscall signals only. `read(`/`write(` were removed: they
+            // are NOT IO-specific — `RwLock`/`Mutex` `.read()`/`.write()`,
+            // `Cursor`/`BufReader`, channel sends, and `write!`-style buffers all
+            // match them, producing false positives in pure in-memory domain
+            // code. Genuine file/network/process IO is still caught by `std::fs`,
+            // `open(`, `socket`, `subprocess`, `fetch(`, and `requests.`.
             [
                 "fetch(",
                 "open(",
-                "read(",
                 "requests.",
                 "socket",
                 "std::fs",
                 "subprocess",
-                "write(",
                 "println!",
             ]
             .iter()
