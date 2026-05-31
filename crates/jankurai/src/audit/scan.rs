@@ -617,12 +617,14 @@ fn line_has_error_hiding_fallback(line: &str) -> bool {
         if lower.contains("unwrap_or(candidate)") {
             return false;
         }
-        return has_fallible_source_marker(&lower)
-            || line_trimmed.contains("default")
-            || line_trimmed.contains("empty")
-            || line_trimmed.contains("none")
-            || line_trimmed.contains("null")
-            || line_trimmed.contains("undefined");
+        // Only a genuinely FALLIBLE source (Result/parse/IO/decode/query/etc.)
+        // can hide an error here. A bare `unwrap_or_default()` /
+        // `unwrap_or_else(|| ...)` on an infallible `Option` — e.g.
+        // `map.get(k).cloned().unwrap_or_default()` (missing optional field ->
+        // type default) — is idiomatic Rust, not error swallowing. The method
+        // name merely containing "default"/"none" is not a signal, so require a
+        // real fallible-source marker before flagging.
+        return has_fallible_source_marker(&lower);
     }
 
     FALLBACK_PATTERNS

@@ -21,6 +21,11 @@ pub fn body_for_path(path: &str, level: &str, cargo_repo: bool) -> Option<&'stat
 
 const ADAPTER_POINTER: &str = "<!-- jankurai generated adapter -->\n<!-- jankurai agent request v1 sha256:REPLACE_WITH_HASH -->\nRead `AGENTS.md` first. Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\nWhen a user provides a paper, release, implementation, or handoff plan in the conversation, treat that plan as the controlling plan. Do not route such plans through the separate local phase workflow unless the user explicitly names MASTER_PLAN phase work.\nFor explicit MASTER_PLAN/phase work only, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file. Log explicit phase work in `tips/phases/logs/`.\nFor explicit MASTER_PLAN/phase planning only, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\nIf jankurai is installed, run `jankurai update --client-start --quiet` before work; do not apply updates unless the user asks.\n";
 const PROOF_ADAPTER_POINTER: &str = "---\nname: jankurai\ndescription: Jankurai workspace guidance for Codex. Read repo instructions and standard first; phase files are only for explicit phase work.\n---\n\n# jankurai\n\n<!-- jankurai generated adapter -->\n<!-- jankurai agent request v1 sha256:REPLACE_WITH_HASH -->\nRead `AGENTS.md` first. Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\nWhen a user provides a paper, release, implementation, or handoff plan in the conversation, treat that plan as the controlling plan. Do not route such plans through the separate local phase workflow unless the user explicitly names MASTER_PLAN phase work.\nFor explicit MASTER_PLAN/phase work only, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file. Log explicit phase work in `tips/phases/logs/`.\nFor explicit MASTER_PLAN/phase planning only, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.\nRun the proof lane in `agent/test-map.json` for changed paths.\nIf jankurai is installed, run `jankurai update --client-start --quiet` before work; do not apply updates unless the user asks.\n";
+macro_rules! workspace_boundary {
+    () => {
+        "## Workspace Boundary\n\n- Work only in the user-named active repo/worktree.\n- Never switch to sibling clones, archives, backups, resolved symlink targets, `/tmp` worktrees, or duplicate roots.\n- Never create repo copies or side folders outside the active repo; preserve work with git branches.\n- Before edits, report `pwd`, `git rev-parse --show-toplevel`, and `git status --short --branch`.\n- Use Jeryu APIs/CLI for local GitLab/MR work; no `glab`, credential scraping, or raw local GitLab API calls.\n\n"
+    };
+}
 macro_rules! workflow_adapter {
     ($title:literal, $usage:literal, $receipts:literal, $next:literal, $stop:literal) => {
         concat!(
@@ -56,6 +61,7 @@ macro_rules! cell_agents_template {
             "<!-- jankurai generated adapter -->\n",
             "<!-- jankurai agent request v1 sha256:REPLACE_WITH_HASH -->\n",
             "Read `AGENTS.md` first. Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.\n",
+            workspace_boundary!(),
             "When a user provides a paper, release, implementation, or handoff plan in the conversation, treat that plan as the controlling plan. Do not route such plans through the separate local phase workflow unless the user explicitly names MASTER_PLAN phase work.\n",
             "Owns `",
             $owner,
@@ -321,7 +327,11 @@ fi
 pub const TEMPLATES: &[Template] = &[
     Template {
         path: "AGENTS.md",
-        body: "# Agent Instructions\n\nRead `agent/JANKURAI_STANDARD.md` first. For explicit phase or MASTER_PLAN work only, read `agent/MASTER_PLAN.md` before `tips/phases/00-phase-index.md`. Keep generated artifacts under their declared source commands.\n",
+        body: concat!(
+            "# Agent Instructions\n\n",
+            "Read `agent/JANKURAI_STANDARD.md` first. For explicit phase or MASTER_PLAN work only, read `agent/MASTER_PLAN.md` before `tips/phases/00-phase-index.md`. Keep generated artifacts under their declared source commands.\n\n",
+            workspace_boundary!(),
+        ),
     },
     Template {
         path: "apps/web/AGENTS.md",
