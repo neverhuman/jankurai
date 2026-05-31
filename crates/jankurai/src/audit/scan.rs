@@ -606,6 +606,13 @@ fn line_has_error_hiding_fallback(line: &str) -> bool {
         return true;
     }
 
+    // `ok_or_else(|| Err)` converts `Option` -> `Result`, PRODUCING a typed
+    // error — the opposite of hiding one. Exclude it before the `or_else(`
+    // substring check below would otherwise match it.
+    if lower.contains("ok_or_else") || lower.contains("ok_or(") {
+        return false;
+    }
+
     if lower.contains(".ok().unwrap_or")
         || lower.contains("unwrap_or_default(")
         || lower.contains("unwrap_or_else(")
