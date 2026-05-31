@@ -232,6 +232,15 @@ fn ts_source_hard_hits(file: &FileInfo) -> Vec<LanguageFinding> {
             ));
         }
     }
+    // Honor inline reasoned allow annotations (`jankurai:allow <detector>
+    // reason=... expires=YYYY-MM-DD`), consistent with the web-security and
+    // input-boundary detectors: a reviewed, time-bounded exception at a
+    // provably-safe sink (e.g. DOMPurify-sanitized Markdown rendered via
+    // `dangerouslySetInnerHTML`) is suppressed. Empty/absent annotation =
+    // default behaviour, so repositories that do not annotate are unaffected.
+    out.retain(|f| {
+        !super::common::nearby_allow(&file.text, f.line.unwrap_or(0), f.matched_term)
+    });
     out
 }
 
