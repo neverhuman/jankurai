@@ -14,6 +14,40 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
   Homebrew formula metadata. The installer verifies release immutability,
   checksum, Sigstore bundle, and GitHub attestation before installing.
 
+## 1.6.10 - 2026-05-31
+
+Dead-language allowlist + false-positive precision suite. Each change removes a
+genuine false-positive class so a Rust + TypeScript/React + GitHub-compatible
+stack can reach an honest high score without gaming or mangling load-bearing API
+vocabulary. (Validated on the jeryu forge: caps 6→0, score 64→98.)
+
+### Added
+
+- Opt-in `[dead_language] allow_terms` policy allowlist for HLT-001: a repo may
+  declare load-bearing API/protocol/domain words (e.g. GitHub's `stale`
+  CheckConclusion value, the HTML `placeholder` attribute, the React `fallback`
+  prop) that the dead-marker scan must not flag. Empty/absent = prior behavior,
+  so repositories that do not opt in are unaffected.
+- TypeScript detector (HLT-031) now honors the inline `// jankurai:allow
+  <detector> reason=… expires=YYYY-MM-DD` annotation, consistent with the
+  web-security and input-boundary detectors.
+- Tool adoption now credits the `ops/ci/*.sh` lane scripts that a *thin* CI
+  workflow calls, resolving the contradiction between the CI-local-parity rule
+  (thin workflows) and the prior requirement that the command appear in the YAML.
+
+### Fixed
+
+- Fallback-soup precision: a bare `return null`/`return undefined` (idiomatic
+  TS/React), `Option::unwrap_or_default()`/`unwrap_or_else(|| …)` without a
+  fallible source, `panic!` closures, optional `env::var(…).unwrap_or_else(|_|
+  …)` config defaults, and `ok_or_else`/`ok_or` (which PRODUCE typed errors) are
+  no longer treated as error-hiding fallbacks.
+- `/e2e/` trees are recognized as test code (Playwright/Cypress), not product.
+- Code-shape `domain_io` detection: dropped the non-IO `read(`/`write(` tokens
+  (which matched RwLock/Mutex/Cursor/channel ops), `request`/`lookup` now require
+  a call form, and the scan is restricted to production (non-comment, non-test)
+  source lines — so a `#[test] fn …_reopen()` name no longer matches `open(`.
+
 ## 1.5.1 - 2026-05-19
 
 ### Fixed
