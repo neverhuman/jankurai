@@ -617,6 +617,17 @@ fn line_has_error_hiding_fallback(line: &str) -> bool {
         if lower.contains("unwrap_or(candidate)") {
             return false;
         }
+        // A closure that `panic!`s on the error SURFACES it loudly — that is the
+        // opposite of error-hiding, so it is not fallback-soup.
+        if lower.contains("panic!") {
+            return false;
+        }
+        // Reading an OPTIONAL environment override and falling back to a default
+        // (`env::var("X").unwrap_or_else(|_| default)`) is idiomatic config: the
+        // Err means "unset", which is the expected path, not a swallowed failure.
+        if lower.contains("env::var") {
+            return false;
+        }
         // Only a genuinely FALLIBLE source (Result/parse/IO/decode/query/etc.)
         // can hide an error here. A bare `unwrap_or_default()` /
         // `unwrap_or_else(|| ...)` on an infallible `Option` — e.g.
