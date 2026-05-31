@@ -586,11 +586,15 @@ fn line_has_error_hiding_fallback(line: &str) -> bool {
         || lower.contains("unbounded retry")
         || lower.contains("retry forever")
         || lower.contains("best effort")
-        || lower.contains("return null")
-        || lower.contains("return undefined")
     {
         return true;
     }
+    // NOTE: a bare `return null` / `return undefined` is NOT treated as
+    // error-hiding. Those literals only occur in TS/JS (Rust uses `None`), where
+    // they are idiomatic value returns — a React component rendering nothing
+    // (`if (!open) return null`) or a `useEffect` with no cleanup
+    // (`return undefined`). Genuine error swallowing is still caught by the
+    // explicit signals below (catch all / swallow|ignore|silence error / except:).
 
     if lower.contains("except:")
         || lower.contains("except exception")
