@@ -1927,6 +1927,12 @@ pub fn future_hostile_hits(ctx: &AuditContext) -> Vec<FindingHit> {
                 if source_context::term_only_appears_in_local_binding(active, term) {
                     continue;
                 }
+                // A public API identifier that is *named* with a future-hostile word
+                // (e.g. `pub deprecated: Option<T>`, `pub fn deprecated(&self)`) is a naming
+                // choice, not a dead-code marker. Skip only the exact declaration-site forms.
+                if term_is_declaration_identifier(active, term) {
+                    continue;
+                }
                 // Opt-in domain / platform-API allowlist
                 // (`agent/audit-policy.toml` -> `[dead_language] allow_terms`):
                 // suppress ONLY the exact words a repository has declared
@@ -1949,6 +1955,40 @@ pub fn future_hostile_hits(ctx: &AuditContext) -> Vec<FindingHit> {
         }
     }
     out
+}
+
+/// True when `term` is the exact identifier being *declared* on `active` — a field/binding
+/// (`<term>:` after stripping visibility) or a fn/method (`fn <term>(`). Naming an API element
+/// `deprecated`/`stale`/`old`/`legacy` is a naming choice, not a dead-code marker. Status-marker
+/// uses (comments, `deprecated = true`, `todo!()`, `stale_flag`) do not take these forms and stay
+/// flagged. Conservative: only the declaration-site shapes are exempted.
+fn term_is_declaration_identifier(active: &str, term: &str) -> bool {
+    // fn/method whose name is exactly the term (covers `pub fn`, `pub(crate) async fn`, …).
+    if active.contains(&format!("fn {term}(")) || active.contains(&format!("fn {term} (")) {
+        return true;
+    }
+    // field / typed binding whose name is exactly the term: the visibility-stripped line begins
+    // with `<term>:` and a (non-`::`) type follows — e.g. `pub deprecated: Option<VersionRange>`.
+    let mut head = active.trim_start();
+    for vis in [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(self) ",
+        "pub ",
+        "const ",
+        "static ",
+        "let ",
+    ] {
+        if let Some(rest) = head.strip_prefix(vis) {
+            head = rest.trim_start();
+        }
+    }
+    if let Some(after) = head.strip_prefix(term) {
+        if let Some(ty) = after.trim_start().strip_prefix(':') {
+            return !ty.starts_with(':') && !ty.trim().is_empty();
+        }
+    }
+    false
 }
 
 fn future_hostile_term_regexes() -> &'static [(String, Regex)] {
@@ -2344,6 +2384,42 @@ fn governed_generated_zone_paths(ctx: &AuditContext) -> Vec<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn dead_marker_exempts_declaration_site_identifiers_only() {
+        // API elements NAMED with a future-hostile word are declarations, not markers — exempt.
+        assert!(term_is_declaration_identifier(
+            "pub deprecated: Option<VersionRange>,",
+            "deprecated"
+        ));
+        assert!(term_is_declaration_identifier(
+            "deprecated: VersionRange,",
+            "deprecated"
+        ));
+        assert!(term_is_declaration_identifier(
+            "pub fn deprecated(&self) -> Option<T> {",
+            "deprecated"
+        ));
+        assert!(term_is_declaration_identifier("    stale: bool,", "stale"));
+        // Real dead-code markers are NOT declaration sites — they stay flagged.
+        assert!(!term_is_declaration_identifier(
+            "let v = deprecated_value();",
+            "deprecated"
+        ));
+        assert!(!term_is_declaration_identifier(
+            "deprecated = true;",
+            "deprecated"
+        ));
+        assert!(!term_is_declaration_identifier(
+            "Old => legacy_path(),",
+            "old"
+        ));
+        // A longer identifier that merely contains the term is not exempted.
+        assert!(!term_is_declaration_identifier(
+            "pub deprecated_at: i64,",
+            "deprecated"
+        ));
+    }
 
     #[test]
     fn generated_path_dir_prefixes_remain_recognized() {

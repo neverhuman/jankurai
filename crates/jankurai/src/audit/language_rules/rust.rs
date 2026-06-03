@@ -540,7 +540,10 @@ fn hard_hit_for_line(
             "NearbySafetyComment",
         ));
     }
-    if lower.contains("zeroed(") {
+    // Match `mem::zeroed(` specifically (the unsafe fabricate-invalid-value hazard the finding
+    // text names), not the bare `zeroed(` substring, which also hit safe wrappers like
+    // `BytesMut::zeroed(` / `MaybeUninit::zeroed(`. `mem::zeroed(` covers std::/core:: forms.
+    if lower.contains("mem::zeroed(") {
         return Some(finding(
             "rust.unsafe.zeroed",
             "zeroed",

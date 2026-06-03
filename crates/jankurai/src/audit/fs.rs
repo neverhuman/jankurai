@@ -318,6 +318,9 @@ pub fn is_generated_zone_protected_path(path: &str) -> bool {
         || rel == "agent/repo-score.json"
         || rel == "agent/repo-score.md"
         || rel.starts_with("agent/baselines/")
+        // jankurai's own badge output (declared in generated-zones.toml), same class as repo-score.*
+        || (rel.starts_with("agent/jankurai-badge")
+            && (rel.ends_with(".svg") || rel.ends_with(".json") || rel.ends_with(".md")))
         || rel == "Cargo.lock"
         || rel == "package-lock.json"
         || rel == "pnpm-lock.yaml"
