@@ -15,6 +15,7 @@ pub mod coverage;
 pub mod diff_audit;
 pub mod doctor;
 pub mod exceptions;
+pub mod fleet;
 pub mod govern;
 pub mod history;
 pub mod hooks;
