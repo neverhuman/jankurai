@@ -168,6 +168,25 @@ fn language_bad_behavior_rules_are_registered() {
 }
 
 #[test]
+fn jankurai_pillar_rules_are_registered() {
+    for (rule_id, category, lane) in [
+        ("HLT-046-UNNECESSARY-VARIETY", "copy-code", "copy-code"),
+        ("HLT-047-CANONICAL-README", "context", "fast"),
+        ("HLT-048-CANONICAL-CI-GAP", "context", "audit"),
+    ] {
+        let rule = rules::lookup(rule_id).unwrap_or_else(|| panic!("{rule_id} must exist"));
+        assert_eq!(rule.id, rule_id);
+        assert_eq!(rule.category, category);
+        assert_eq!(rule.lane, lane);
+        // Advisory Jankurai-pillar guards: experimental, no hard cap.
+        assert_eq!(rule.status, rules::RuleStatus::Experimental);
+        assert_eq!(rule.severity, "medium");
+        assert_eq!(rule.cap_key, None);
+        assert!(!rule.docs_url.trim().is_empty());
+    }
+}
+
+#[test]
 fn every_rule_has_repair_policy_metadata() {
     for rule in rules::all() {
         assert!(

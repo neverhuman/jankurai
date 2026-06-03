@@ -86,11 +86,16 @@ fn every_rule_lane_is_valid() {
 }
 
 /// Rules that are intentionally still Experimental. HLT-044 and HLT-045 are the
-/// advisory governance guards (worktree sprawl, generated-zone hand-edits) that
-/// stay Experimental until each is promoted with its own cap.
+/// advisory governance guards (worktree sprawl, generated-zone hand-edits), and
+/// HLT-046/047/048 are the advisory Jankurai-pillar guards (unnecessary variety,
+/// canonical README, canonical CI) that stay Experimental until each is promoted
+/// with its own cap.
 const EXPERIMENTAL_RULES: &[&str] = &[
     "HLT-044-WORKTREE-SPRAWL",
     "HLT-045-GENERATED-ZONE-GOVERNANCE",
+    "HLT-046-UNNECESSARY-VARIETY",
+    "HLT-047-CANONICAL-README",
+    "HLT-048-CANONICAL-CI-GAP",
 ];
 
 #[test]
@@ -231,8 +236,8 @@ fn rule_count_matches_expected() {
     assert_eq!(stable, 43, "Expected exactly 43 stable rules");
     assert_eq!(
         rules::all().len(),
-        45,
-        "Expected exactly 45 rules (43 stable + 2 experimental governance guards)"
+        48,
+        "Expected exactly 48 rules (43 stable + 5 experimental: 2 governance guards + 3 Jankurai-pillar guards)"
     );
 }
 
