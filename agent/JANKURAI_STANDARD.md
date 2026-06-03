@@ -209,8 +209,10 @@ Stop or fix first when any condition is true:
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
 | `HLT-042-CI-LOCAL-PARITY` | CI workflows inline commands rather than delegating to `ops/ci/*.sh`, leaving local runners without a way to reproduce the gate before push |
 | `HLT-043-COPY-PASTE-BAD-BEHAVIOR` | Exact active-source duplicate files and same-name semantic units are copied across owner boundaries |
+| `HLT-044-WORKTREE-SPRAWL` | Same-origin sibling worktrees or clones create parallel checkouts that fork working state outside one owned root (advisory, experimental) |
+| `HLT-045-GENERATED-ZONE-GOVERNANCE` | Hand-edits land inside a declared generated zone instead of being re-derived from the source generator (advisory, experimental) |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family. `HLT-044-WORKTREE-SPRAWL` (see [Ownership Boundaries](#ownership-boundaries)) and `HLT-045-GENERATED-ZONE-GOVERNANCE` (see [Generated Zones](#generated-zones)) are advisory experimental governance guards that stay off the hard-cap path until each is promoted with its own cap.
 
 ## Ownership Boundaries
 

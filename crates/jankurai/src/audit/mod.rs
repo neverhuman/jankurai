@@ -29,6 +29,7 @@ pub mod smart_scan;
 pub mod source_context;
 pub mod ux_artifact;
 pub mod web_security;
+pub mod worktree_sprawl;
 pub mod zyal;
 
 use crate::model::*;
@@ -1390,6 +1391,36 @@ fn build_findings(
             &hit.agent_fix,
             vec![hit.text],
             Some("HLT-007-HANDWRITTEN-CONTRACT"),
+            hit.line,
+        );
+    }
+    // Feature B guard 1 (HLT-044): same-origin worktree/clone sprawl. Advisory:
+    // emitted at medium severity so a green repo with no parallel checkout of
+    // itself (such as jankurai) stays green and never auto-fails.
+    for hit in worktree_sprawl::detect_sprawl(ctx) {
+        b.add(
+            "medium",
+            "governance",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            Some("HLT-044-WORKTREE-SPRAWL"),
+            hit.line,
+        );
+    }
+    // Feature B guard 2 (HLT-045): hand-edits inside declared generated zones,
+    // skipping auditor_output/lockfile zones. Advisory: emitted at medium
+    // severity (soft) so a clean generated zone yields no hard finding.
+    for hit in scan::generated_zone_edit_hits(ctx) {
+        b.add(
+            "medium",
+            "governance",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            Some("HLT-045-GENERATED-ZONE-GOVERNANCE"),
             hit.line,
         );
     }

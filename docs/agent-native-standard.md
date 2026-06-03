@@ -111,8 +111,10 @@ Stable rule IDs:
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
 | `HLT-042-CI-LOCAL-PARITY` | CI workflows do not delegate to versioned `ops/ci/*.sh` scripts, so failures cannot be reproduced locally before push |
 | `HLT-043-COPY-PASTE-BAD-BEHAVIOR` | Exact active-source duplicate files and same-name semantic units are copied across owner boundaries |
+| `HLT-044-WORKTREE-SPRAWL` | Same-origin sibling worktrees or clones create parallel checkouts that fork working state outside one owned root (advisory, experimental) |
+| `HLT-045-GENERATED-ZONE-GOVERNANCE` | Hand-edits land inside a declared generated zone instead of being re-derived from the source generator (advisory, experimental) |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed in this release. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed in this release. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family. `HLT-044-WORKTREE-SPRAWL` and `HLT-045-GENERATED-ZONE-GOVERNANCE` are advisory experimental governance guards that stay off the hard-cap path until each is promoted with its own cap.
 
 Centerline drift is the delta between claimed conformance and observed repository behavior. Hard caps are versioned policy, not final empirical truth.
 
