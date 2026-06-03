@@ -10,7 +10,6 @@
 
 Read `agent/JANKURAI_STANDARD.md` first. The full standard is in
 `docs/agent-native-standard.md`; the paper mission is in `docs/mission.md`.
-Generated-zone review guidance lives in `docs/generated-zones.md`.
 When a user provides a paper, release, implementation, or handoff plan in the
 conversation, treat that plan as the controlling plan. Do not route such plans
 through the separate local phase workflow unless the user explicitly names it.
