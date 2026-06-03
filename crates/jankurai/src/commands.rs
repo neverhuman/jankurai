@@ -37,6 +37,7 @@ pub mod repair_git;
 pub mod repair_plan;
 pub mod repair_pr;
 pub mod repair_real;
+pub mod repair_tasks;
 pub mod rules;
 pub mod rust;
 pub mod score;

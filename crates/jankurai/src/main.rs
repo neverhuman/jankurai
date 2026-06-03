@@ -6,7 +6,7 @@ use jankurai::commands::{
     adopt, agent, audit_file, badge, bench, cell, certify, conformance, context_pack, copy_code,
     coverage, diff_audit, doctor, exceptions, fleet, govern, history, hooks, init, kickoff,
     migrate, optimize, paper, postmortem, proof, proofbind, proofmark, publish, registry, repair,
-    repair_plan, rules, rust, score, security, update, vibe, witness,
+    repair_plan, repair_tasks, rules, rust, score, security, update, vibe, witness,
 };
 use jankurai::render::{render_markdown, write_json, write_markdown};
 use jankurai::report::issues::IssueFormat;
@@ -92,6 +92,7 @@ enum Commands {
         command: PaperCommand,
     },
     Fleet(FleetArgs),
+    RepairTasks(RepairTasksArgs),
     Repair(RepairArgs),
     Optimize(OptimizeArgs),
     Version(VersionArgs),
@@ -1001,6 +1002,17 @@ struct FleetArgs {
     format: String,
     #[arg(long, value_name = "SCORE")]
     fail_under: Option<i32>,
+}
+
+#[derive(Args, Debug)]
+struct RepairTasksArgs {
+    /// Repo to audit and convert into a deduplicated repair-task feed.
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    out: Option<String>,
+    #[arg(long, default_value = "json", value_parser = ["json", "md"])]
+    format: String,
 }
 
 #[derive(Args, Debug)]
@@ -1980,6 +1992,13 @@ fn main() -> anyhow::Result<()> {
                 out: args.out,
                 format: args.format,
                 fail_under: args.fail_under,
+            })?;
+        }
+        Some(Commands::RepairTasks(args)) => {
+            repair_tasks::run(repair_tasks::RepairTasksArgs {
+                repo: args.repo,
+                out: args.out,
+                format: args.format,
             })?;
         }
         Some(Commands::Repair(args)) => {
