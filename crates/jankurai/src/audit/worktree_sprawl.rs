@@ -57,6 +57,13 @@ pub fn detect_sprawl(ctx: &AuditContext) -> Vec<FindingHit> {
         if !origins_match(&root_origin, &sibling_origin) {
             continue;
         }
+        // Only flag genuine separate checkouts/worktrees, not subdirectories of
+        // the same repo: workspace member crates (e.g. `crates/jankurai-guard`)
+        // inherit the repo's `origin` url, so without this guard every sibling
+        // crate would be a false-positive "clone".
+        if !is_own_checkout_root(&sibling) {
+            continue;
+        }
         let name = sibling
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -97,6 +104,31 @@ fn origin_url(dir: &Path) -> Option<String> {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+/// True when `dir` is itself the root of a git checkout or worktree — i.e.
+/// `git -C <dir> rev-parse --show-toplevel` resolves back to `dir`. A workspace
+/// member crate (a subdirectory of a larger repo) resolves to the repo root
+/// instead, so it is correctly NOT treated as a separate same-origin checkout.
+fn is_own_checkout_root(dir: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .args(["-C"])
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(top) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(top.trim())) {
+        (Ok(d), Ok(t)) => d == t,
+        _ => false,
     }
 }
 
