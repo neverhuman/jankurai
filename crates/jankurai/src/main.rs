@@ -4,7 +4,7 @@ use jankurai::audit::{run_audit, run_audit_timed_with_options, AuditOptions};
 use jankurai::commands::copy_code::CopyCodeArgs;
 use jankurai::commands::{
     adopt, agent, audit_file, badge, bench, cell, certify, conformance, context_pack, copy_code,
-    coverage, diff_audit, doctor, exceptions, fleet, govern, history, hooks, init, kickoff,
+    coverage, diff_audit, doctor, exceptions, fleet, gate, govern, history, hooks, init, kickoff,
     migrate, optimize, paper, postmortem, proof, proofbind, proofmark, publish, registry, repair,
     repair_plan, repair_tasks, rules, rust, score, security, update, vibe, witness,
 };
@@ -92,6 +92,11 @@ enum Commands {
         command: PaperCommand,
     },
     Fleet(FleetArgs),
+    /// Blocking pre-commit gate: audits staged/changed files and BLOCKs (exit 1)
+    /// on hard findings, all-caps/issue markers, or a score regression vs the
+    /// ratchet baseline. Advisory by default (`[precommit_gate] blocking` in
+    /// agent/audit-policy.toml); honours `JANKURAI_SKIP_HOOKS=1`.
+    Gate(GateCliArgs),
     RepairTasks(RepairTasksArgs),
     Repair(RepairArgs),
     Optimize(OptimizeArgs),
@@ -1013,6 +1018,22 @@ struct RepairTasksArgs {
     out: Option<String>,
     #[arg(long, default_value = "json", value_parser = ["json", "md"])]
     format: String,
+}
+
+#[derive(Args, Debug)]
+struct GateCliArgs {
+    /// Repo to gate.
+    #[arg(default_value = ".", value_parser = parse_repo_arg)]
+    repo: PathBuf,
+    /// Force blocking on for this run, regardless of the repo's config.
+    #[arg(long)]
+    blocking: bool,
+    /// Restrict the audit scope to staged files only (ignore unstaged changes).
+    #[arg(long)]
+    staged_only: bool,
+    /// Ratchet baseline JSON; defaults to agent/baselines/main.repo-score.json.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1993,6 +2014,18 @@ fn main() -> anyhow::Result<()> {
                 format: args.format,
                 fail_under: args.fail_under,
             })?;
+        }
+        Some(Commands::Gate(args)) => {
+            let code = gate::run(gate::GateArgs {
+                repo: args.repo,
+                blocking: args.blocking,
+                staged_only: args.staged_only,
+                baseline: args.baseline,
+            })?;
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            std::io::stderr().flush().ok();
+            std::process::exit(code);
         }
         Some(Commands::RepairTasks(args)) => {
             repair_tasks::run(repair_tasks::RepairTasksArgs {

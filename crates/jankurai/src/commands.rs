@@ -16,6 +16,7 @@ pub mod diff_audit;
 pub mod doctor;
 pub mod exceptions;
 pub mod fleet;
+pub mod gate;
 pub mod govern;
 pub mod history;
 pub mod hooks;
