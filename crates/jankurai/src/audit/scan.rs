@@ -389,7 +389,7 @@ pub const FUTURE_HOSTILE_PRODUCT_COPY_PARTS: &[&str] = &[
     "translations",
 ];
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FindingHit {
     pub path: String,
     pub line: Option<usize>,
@@ -2259,6 +2259,87 @@ pub fn event_contract_path_hits(ctx: &AuditContext) -> Vec<FindingHit> {
     hits
 }
 
+/// Write policies whose declared generated zone is EXPECTED to mutate during
+/// normal operation, so a working-tree change is not a hand-edit. `auditor_output`
+/// zones are refreshed by the auditor itself; `lockfile` zones are refreshed by
+/// the package manager. Both are skipped by the generated-zone governance guard.
+const GENERATED_ZONE_EXPECTED_MUTATION_POLICIES: &[&str] = &["auditor_output", "lockfile"];
+
+/// HLT-045-GENERATED-ZONE-GOVERNANCE: flags hand-edits inside declared generated
+/// zones. A "hand-edit" is a working-tree modification of a file that lives in a
+/// generated zone whose `write_policy` is generator-managed (anything other than
+/// `auditor_output` or `lockfile`, which are expected to mutate).
+///
+/// Zones are read from `agent/generated-zones.toml` via [`generated_zone_paths`]
+/// (paired here with their write policy). Modified files are read from
+/// `git status --porcelain`, so a clean generated zone — like jankurai's own —
+/// yields zero findings. The guard is advisory and never recurses into siblings.
+pub fn generated_zone_edit_hits(ctx: &AuditContext) -> Vec<FindingHit> {
+    let zones = governed_generated_zone_paths(ctx);
+    if zones.is_empty() {
+        return vec![];
+    }
+    let modified = match crate::audit::smart_scan::git_status_changed_files(&ctx.root) {
+        Ok(paths) => paths,
+        Err(_) => return vec![],
+    };
+    let mut hits = vec![];
+    for path in modified {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let Some(zone) = zones
+            .iter()
+            .find(|zone| path_matches_prefix(&rel, zone))
+            .cloned()
+        else {
+            continue;
+        };
+        hits.push(FindingHit {
+            path: rel.clone(),
+            line: None,
+            text: format!(
+                "`{rel}` was hand-edited inside declared generated zone `{zone}`"
+            ),
+            matched_term: Some("generated-zone-hand-edit".into()),
+            agent_fix: format!(
+                "revert the in-place edit to `{rel}` and regenerate it from the declared source/command in `agent/generated-zones.toml`; do not patch generated output by hand"
+            ),
+            problem: format!(
+                "generated zone `{zone}` has an uncommitted hand-edit at `{rel}` instead of a regeneration"
+            ),
+        });
+        if hits.len() >= 20 {
+            break;
+        }
+    }
+    hits
+}
+
+/// Returns the declared generated-zone paths whose `write_policy` is
+/// generator-managed (i.e. NOT `auditor_output` or `lockfile`). Reuses the same
+/// manifest read path as [`generated_zone_paths`] but keeps only the zones that
+/// the governance guard should police.
+fn governed_generated_zone_paths(ctx: &AuditContext) -> Vec<String> {
+    let path = ctx.root.join(GENERATED_ZONES_MANIFEST);
+    if !path.exists() {
+        return vec![];
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let Ok(file) = toml::from_str::<crate::commands::context_data::GeneratedZonesFile>(&text)
+    else {
+        return vec![];
+    };
+    file.zone
+        .into_iter()
+        .filter(|zone| {
+            !GENERATED_ZONE_EXPECTED_MUTATION_POLICIES.contains(&zone.write_policy.trim())
+        })
+        .map(|zone| zone.path.trim().to_string())
+        .filter(|zone_path| !zone_path.is_empty())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2819,5 +2900,190 @@ fn finding_count(row: &Value) -> Result<u64> {
         let literal_ctx = make_ctx(vec![literal]);
         assert!(secret_hits(&example_ctx).is_empty());
         assert!(!secret_hits(&literal_ctx).is_empty());
+    }
+
+    // --- HLT-045 generated-zone governance (hand-edit) guard ---------------
+
+    fn git_run(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git available");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_git_repo(dir: &std::path::Path) {
+        git_run(dir, &["init", "-q"]);
+        git_run(dir, &["config", "user.email", "t@example.com"]);
+        git_run(dir, &["config", "user.name", "Test"]);
+    }
+
+    fn zone_edit_ctx(root: std::path::PathBuf) -> AuditContext {
+        AuditContext {
+            root,
+            all_files: vec![],
+            scope_files: vec![],
+            scope_paths: vec![],
+            self_audit: true,
+            boundary_reclassifications: vec![],
+            copy_code: None,
+        }
+    }
+
+    #[test]
+    fn generated_zone_edit_flags_hand_edit_in_governed_zone() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(
+            root.join("agent/generated-zones.toml"),
+            r#"[[zone]]
+path = "generated/api.ts"
+source = "contracts/openapi.yaml"
+command = "cargo run -p jankurai -- generate"
+read_only = true
+write_policy = "generator_only"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("generated/api.ts"),
+            "// Generated\nexport const x = 1;\n",
+        )
+        .unwrap();
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "init"]);
+        // Hand-edit the generated file (now dirty in the worktree).
+        std::fs::write(
+            root.join("generated/api.ts"),
+            "// Generated\nexport const x = 2;\n",
+        )
+        .unwrap();
+
+        let hits = generated_zone_edit_hits(&zone_edit_ctx(root.to_path_buf()));
+        assert_eq!(
+            hits.len(),
+            1,
+            "hand-edit in governed zone expected: {hits:?}"
+        );
+        assert_eq!(hits[0].path, "generated/api.ts");
+        assert_eq!(
+            hits[0].matched_term.as_deref(),
+            Some("generated-zone-hand-edit")
+        );
+    }
+
+    #[test]
+    fn generated_zone_edit_skips_auditor_output_and_lockfile() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        std::fs::create_dir_all(root.join("agent/baselines")).unwrap();
+        std::fs::write(
+            root.join("agent/generated-zones.toml"),
+            r#"[[zone]]
+path = "agent/baselines/main.repo-score.json"
+source = "audit output"
+command = "cargo run -p jankurai -- audit"
+read_only = true
+write_policy = "auditor_output"
+
+[[zone]]
+path = "package-lock.json"
+source = "package.json"
+command = "npm install"
+read_only = true
+write_policy = "lockfile"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("agent/baselines/main.repo-score.json"), "{}\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "init"]);
+        // Mutate both expected-mutation zones; neither should be flagged.
+        std::fs::write(
+            root.join("agent/baselines/main.repo-score.json"),
+            "{\"x\":1}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("package-lock.json"), "{\"x\":1}\n").unwrap();
+
+        let hits = generated_zone_edit_hits(&zone_edit_ctx(root.to_path_buf()));
+        assert!(
+            hits.is_empty(),
+            "auditor_output and lockfile zones are expected to mutate: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn generated_zone_edit_clean_zone_is_advisory_no_finding() {
+        // Ratchet-readiness: a clean governed zone (no working-tree edit) yields
+        // zero findings, so the guard cannot auto-fail a currently-green repo.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::create_dir_all(root.join("generated")).unwrap();
+        std::fs::write(
+            root.join("agent/generated-zones.toml"),
+            r#"[[zone]]
+path = "generated/api.ts"
+source = "contracts/openapi.yaml"
+command = "cargo run -p jankurai -- generate"
+read_only = true
+write_policy = "generator_only"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("generated/api.ts"),
+            "// Generated\nexport const x = 1;\n",
+        )
+        .unwrap();
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "init"]);
+
+        let hits = generated_zone_edit_hits(&zone_edit_ctx(root.to_path_buf()));
+        assert!(
+            hits.is_empty(),
+            "clean governed zone must be silent: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn generated_zone_edit_ignores_edits_outside_zones() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        init_git_repo(root);
+        std::fs::create_dir_all(root.join("agent")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("agent/generated-zones.toml"),
+            r#"[[zone]]
+path = "generated/api.ts"
+source = "contracts/openapi.yaml"
+command = "cargo run -p jankurai -- generate"
+read_only = true
+write_policy = "generator_only"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git_run(root, &["add", "-A"]);
+        git_run(root, &["commit", "-q", "-m", "init"]);
+        // Edit a NON-zone file; must not be flagged.
+        std::fs::write(root.join("src/lib.rs"), "pub fn a() {}\npub fn b() {}\n").unwrap();
+
+        let hits = generated_zone_edit_hits(&zone_edit_ctx(root.to_path_buf()));
+        assert!(hits.is_empty(), "non-zone edits must be ignored: {hits:?}");
     }
 }
