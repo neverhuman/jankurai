@@ -4,8 +4,8 @@ use jankurai::audit::{run_audit, run_audit_timed_with_options, AuditOptions};
 use jankurai::commands::copy_code::CopyCodeArgs;
 use jankurai::commands::{
     adopt, agent, audit_file, badge, bench, cell, certify, conformance, context_pack, copy_code,
-    coverage, diff_audit, doctor, exceptions, govern, history, hooks, init, kickoff, migrate,
-    optimize, paper, postmortem, proof, proofbind, proofmark, publish, registry, repair,
+    coverage, diff_audit, doctor, exceptions, fleet, govern, history, hooks, init, kickoff,
+    migrate, optimize, paper, postmortem, proof, proofbind, proofmark, publish, registry, repair,
     repair_plan, rules, rust, score, security, update, vibe, witness,
 };
 use jankurai::render::{render_markdown, write_json, write_markdown};
@@ -91,6 +91,7 @@ enum Commands {
         #[command(subcommand)]
         command: PaperCommand,
     },
+    Fleet(FleetArgs),
     Repair(RepairArgs),
     Optimize(OptimizeArgs),
     Version(VersionArgs),
@@ -987,6 +988,19 @@ struct BenchArgs {
     out: Option<String>,
     #[arg(long, value_name = "PATH")]
     md: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct FleetArgs {
+    /// Repo paths to audit; when omitted, the list is read from ~/.jankurai/fleet.toml.
+    #[arg(value_name = "PATH")]
+    repos: Vec<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    out: Option<String>,
+    #[arg(long, default_value = "json", value_parser = ["json", "md"])]
+    format: String,
+    #[arg(long, value_name = "SCORE")]
+    fail_under: Option<i32>,
 }
 
 #[derive(Args, Debug)]
@@ -1960,6 +1974,14 @@ fn main() -> anyhow::Result<()> {
                 })?;
             }
         },
+        Some(Commands::Fleet(args)) => {
+            fleet::run(fleet::FleetArgs {
+                repos: args.repos,
+                out: args.out,
+                format: args.format,
+                fail_under: args.fail_under,
+            })?;
+        }
         Some(Commands::Repair(args)) => {
             repair::run(repair::RepairArgs {
                 repo: args.repo,

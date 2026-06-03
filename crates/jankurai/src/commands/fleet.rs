@@ -145,15 +145,13 @@ fn fleet_config_path() -> Option<PathBuf> {
 
 /// Read the `repos` array from `~/.jankurai/fleet.toml`.
 fn read_fleet_config(path: &Path) -> Result<Vec<PathBuf>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     parse_fleet_config(&text)
 }
 
 /// Parse a fleet config body. Expected shape: `repos = ["/a", "/b"]`.
 fn parse_fleet_config(text: &str) -> Result<Vec<PathBuf>> {
-    let value: toml::Value =
-        toml::from_str(text).with_context(|| "parse fleet config as TOML")?;
+    let value: toml::Value = toml::from_str(text).with_context(|| "parse fleet config as TOML")?;
     let repos = value
         .get("repos")
         .and_then(|v| v.as_array())
@@ -246,7 +244,11 @@ fn top_tool_opportunities(report: &Report) -> Vec<String> {
 }
 
 /// Build the matrix with aggregate totals from the projected rows.
-fn build_matrix(rows: Vec<FleetRow>, errors: Vec<FleetError>, fail_under: Option<i32>) -> FleetMatrix {
+fn build_matrix(
+    rows: Vec<FleetRow>,
+    errors: Vec<FleetError>,
+    fail_under: Option<i32>,
+) -> FleetMatrix {
     let totals = aggregate_totals(&rows, &errors, fail_under);
     FleetMatrix {
         generated_at_note: GENERATED_AT_NOTE.to_string(),
@@ -257,7 +259,11 @@ fn build_matrix(rows: Vec<FleetRow>, errors: Vec<FleetError>, fail_under: Option
 }
 
 /// Compute min/max/average score, hard-finding totals, and below-threshold count.
-fn aggregate_totals(rows: &[FleetRow], errors: &[FleetError], fail_under: Option<i32>) -> FleetTotals {
+fn aggregate_totals(
+    rows: &[FleetRow],
+    errors: &[FleetError],
+    fail_under: Option<i32>,
+) -> FleetTotals {
     let audited = rows.len();
     let min_score = rows.iter().map(|r| r.score).min();
     let max_score = rows.iter().map(|r| r.score).max();
@@ -348,11 +354,7 @@ fn render_markdown(matrix: &FleetMatrix) -> String {
         "- Hard findings: {}",
         matrix.totals.total_hard_findings
     );
-    let _ = writeln!(
-        out,
-        "- Below threshold: {}",
-        matrix.totals.below_threshold
-    );
+    let _ = writeln!(out, "- Below threshold: {}", matrix.totals.below_threshold);
     if !matrix.errors.is_empty() {
         let _ = writeln!(out);
         let _ = writeln!(out, "## Errors");
@@ -504,7 +506,10 @@ mod tests {
     #[test]
     fn fleet_config_parses_repos_array() {
         let repos = parse_fleet_config("repos = [\"/a/one\", \"/b/two\"]").unwrap();
-        assert_eq!(repos, vec![PathBuf::from("/a/one"), PathBuf::from("/b/two")]);
+        assert_eq!(
+            repos,
+            vec![PathBuf::from("/a/one"), PathBuf::from("/b/two")]
+        );
     }
 
     #[test]
