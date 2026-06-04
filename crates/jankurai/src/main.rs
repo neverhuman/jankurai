@@ -1007,6 +1007,17 @@ struct FleetArgs {
     format: String,
     #[arg(long, value_name = "SCORE")]
     fail_under: Option<i32>,
+    /// `full` (live audit per repo) or `cached` (reuse each repo's last `.jankurai/repo-score.json`
+    /// in seconds, flagged fresh/cached/stale).
+    #[arg(long, default_value = "full", value_parser = ["full", "cached"])]
+    mode: String,
+    /// Alias for `--mode cached`.
+    #[arg(long)]
+    quick: bool,
+    /// In full mode, write each repo's score to `.jankurai/repo-score.json` so a later
+    /// `--mode cached` run has inputs (default off to keep fleet read-only across the fleet).
+    #[arg(long)]
+    write_cache: bool,
 }
 
 #[derive(Args, Debug)]
@@ -2008,11 +2019,18 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Some(Commands::Fleet(args)) => {
+            let mode = if args.quick {
+                "cached".to_string()
+            } else {
+                args.mode
+            };
             fleet::run(fleet::FleetArgs {
                 repos: args.repos,
                 out: args.out,
                 format: args.format,
                 fail_under: args.fail_under,
+                mode,
+                write_cache: args.write_cache,
             })?;
         }
         Some(Commands::Gate(args)) => {

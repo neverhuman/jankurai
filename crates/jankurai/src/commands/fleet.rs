@@ -7,10 +7,12 @@
 //! relevant report fields are projected into a stable matrix row.
 
 use crate::audit::{run_audit_with_options, AuditOptions};
-use crate::model::{Finding, Report};
+use crate::model::{Finding, Report, AUDITOR_VERSION};
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::UNIX_EPOCH;
 
 /// Stable note emitted in place of a wall-clock timestamp so the matrix is
 /// reproducible for dashboard diffing and golden tests.
@@ -35,6 +37,12 @@ pub struct FleetArgs {
     pub format: String,
     /// When set, exit nonzero if any repo scores below this threshold.
     pub fail_under: Option<i32>,
+    /// `full` (default; live audit per repo) or `cached` (read each repo's last
+    /// `.jankurai/repo-score.json` — seconds, not minutes — flagged fresh/cached/stale).
+    pub mode: String,
+    /// In `full` mode, persist each repo's score to `.jankurai/repo-score.json` so a later
+    /// `--mode cached` run has inputs. Default off to keep fleet read-only across the fleet.
+    pub write_cache: bool,
 }
 
 /// One row of the consolidated fleet matrix, one per audited repo.
@@ -49,6 +57,74 @@ pub struct FleetRow {
     pub hl_level: String,
     pub top_findings: Vec<String>,
     pub top_tool_opportunities: Vec<String>,
+    // ── v2 deterministic repo-state additions (the JMCP universe-dashboard data) ──
+    // Appended (never inserted) so existing JSON key order stays stable. All
+    // wall-clock fields are raw epoch seconds, never relative/formatted strings,
+    // so the matrix stays reproducible for golden tests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    pub dirty_files: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_commit_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_binary_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tests_epoch: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    pub ci_configured: bool,
+    /// `fresh` (live audit this run) | `cached` (reused, HEAD/ruleset unchanged) |
+    /// `stale` (cached score, but HEAD moved / worktree dirty / auditor bumped). Always
+    /// emitted so the dashboard never renders a stale score as current.
+    pub score_freshness: String,
+}
+
+/// Deterministic repo identity/state shared by full and cached rows.
+struct RepoMeta {
+    version: Option<String>,
+    branch: Option<String>,
+    head_sha: Option<String>,
+    dirty_files: usize,
+    last_commit_epoch: Option<i64>,
+    last_binary_epoch: Option<i64>,
+    last_tests_epoch: Option<i64>,
+    host: Option<String>,
+    ci_configured: bool,
+}
+
+/// The subset of a persisted `.jankurai/repo-score.json` the fleet reuses in cached mode.
+/// `Report` is serialize-only, so this is a tolerant deserialize shim (unknown fields ignored).
+#[derive(Deserialize)]
+struct CachedScore {
+    score: i32,
+    #[serde(default)]
+    raw_score: i32,
+    #[serde(default)]
+    caps_applied: Vec<String>,
+    #[serde(default)]
+    observed_conformance_level: String,
+    #[serde(default)]
+    auditor_version: String,
+    #[serde(default)]
+    decision: Option<CachedDecision>,
+    #[serde(default)]
+    git: Option<CachedGit>,
+}
+
+#[derive(Deserialize)]
+struct CachedDecision {
+    #[serde(default)]
+    hard_findings: usize,
+}
+
+#[derive(Deserialize)]
+struct CachedGit {
+    #[serde(default)]
+    head: Option<String>,
 }
 
 /// Aggregate totals across the fleet, mirroring the census summary style used
@@ -88,6 +164,11 @@ pub fn run(args: FleetArgs) -> Result<()> {
     if repos.is_empty() {
         bail!("no repos to audit; pass repo paths or populate ~/.jankurai/fleet.toml");
     }
+    let cached_mode = match args.mode.as_str() {
+        "cached" => true,
+        "full" | "" => false,
+        other => bail!("unknown mode '{other}'; expected 'full' or 'cached'"),
+    };
 
     let mut rows = Vec::new();
     let mut errors = Vec::new();
@@ -96,12 +177,29 @@ pub fn run(args: FleetArgs) -> Result<()> {
             // A missing path is a fatal configuration error: surface it directly.
             bail!("repo path does not exist: {}", repo.display());
         }
-        match audit_repo(repo) {
-            Ok(report) => rows.push(build_row(repo, &report)),
-            Err(err) => errors.push(FleetError {
-                path: display_path(repo),
-                error: err.to_string(),
-            }),
+        if cached_mode {
+            match cached_row(repo) {
+                Some(row) => rows.push(row),
+                None => errors.push(FleetError {
+                    path: display_path(repo),
+                    error: "no cached score (.jankurai/repo-score.json); run a full audit first"
+                        .to_string(),
+                }),
+            }
+        } else {
+            match audit_repo(repo) {
+                Ok(report) => {
+                    if args.write_cache {
+                        // Best-effort: a cache-write failure must not fail the fleet run.
+                        let _ = write_score_cache(repo, &report);
+                    }
+                    rows.push(build_row(repo, &report));
+                }
+                Err(err) => errors.push(FleetError {
+                    path: display_path(repo),
+                    error: err.to_string(),
+                }),
+            }
         }
     }
 
@@ -187,6 +285,7 @@ fn build_row(repo: &Path, report: &Report) -> FleetRow {
                 .count()
         });
 
+    let meta = repo_metadata(repo);
     FleetRow {
         name: repo_name(repo),
         path: display_path(repo),
@@ -197,6 +296,73 @@ fn build_row(repo: &Path, report: &Report) -> FleetRow {
         hl_level: report.observed_conformance_level.clone(),
         top_findings: top_findings(&report.findings),
         top_tool_opportunities: top_tool_opportunities(report),
+        version: meta.version,
+        branch: meta.branch,
+        head_sha: meta.head_sha,
+        dirty_files: meta.dirty_files,
+        last_commit_epoch: meta.last_commit_epoch,
+        last_binary_epoch: meta.last_binary_epoch,
+        last_tests_epoch: meta.last_tests_epoch,
+        host: meta.host,
+        ci_configured: meta.ci_configured,
+        score_freshness: "fresh".to_string(),
+    }
+}
+
+/// Project a repo's last persisted score into a cached/stale row (cached mode).
+/// Returns `None` only when no cached score file exists at all.
+fn cached_row(repo: &Path) -> Option<FleetRow> {
+    let path = crate::local_state::preferred_repo_path(
+        repo,
+        crate::local_state::SCORE_JSON,
+        Some(crate::local_state::LEGACY_SCORE_JSON),
+    );
+    let text = std::fs::read_to_string(&path).ok()?;
+    let cached: CachedScore = serde_json::from_str(&text).ok()?;
+    let meta = repo_metadata(repo);
+    let score_freshness = cached_freshness(&cached, &meta);
+    let hard_findings = cached
+        .decision
+        .as_ref()
+        .map(|d| d.hard_findings)
+        .unwrap_or(0);
+    Some(FleetRow {
+        name: repo_name(repo),
+        path: display_path(repo),
+        score: cached.score,
+        raw: cached.raw_score,
+        caps: cached.caps_applied,
+        hard_findings,
+        hl_level: cached.observed_conformance_level,
+        // Cached mode is the fast, lightweight view; per-finding detail comes from a full run.
+        top_findings: Vec::new(),
+        top_tool_opportunities: Vec::new(),
+        version: meta.version,
+        branch: meta.branch,
+        head_sha: meta.head_sha,
+        dirty_files: meta.dirty_files,
+        last_commit_epoch: meta.last_commit_epoch,
+        last_binary_epoch: meta.last_binary_epoch,
+        last_tests_epoch: meta.last_tests_epoch,
+        host: meta.host,
+        ci_configured: meta.ci_configured,
+        score_freshness,
+    })
+}
+
+/// A cached score is `cached` (safe to show as current) only when it reflects the current
+/// committed state AND the current ruleset: HEAD unchanged, worktree clean, auditor version
+/// matched. Conservative — any doubt yields `stale`, never a silently-current stale score.
+fn cached_freshness(cached: &CachedScore, meta: &RepoMeta) -> String {
+    let cached_head = cached.git.as_ref().and_then(|g| g.head.as_deref());
+    let head_match =
+        matches!((cached_head, meta.head_sha.as_deref()), (Some(c), Some(n)) if c == n);
+    let clean = meta.dirty_files == 0;
+    let auditor_match = cached.auditor_version == AUDITOR_VERSION;
+    if head_match && clean && auditor_match {
+        "cached".to_string()
+    } else {
+        "stale".to_string()
     }
 }
 
@@ -300,9 +466,12 @@ fn render_markdown(matrix: &FleetMatrix) -> String {
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "| Name | Path | Score | Raw | Caps | Hard | Conformance level | Top findings |"
+        "| Name | Path | Score | Raw | Caps | Hard | Conformance level | Host | Branch | Dirty | Version | Fresh | Top findings |"
     );
-    let _ = writeln!(out, "| --- | --- | ---: | ---: | ---: | ---: | --- | --- |");
+    let _ = writeln!(
+        out,
+        "| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | --- | --- | --- |"
+    );
     for row in &matrix.repos {
         let findings = if row.top_findings.is_empty() {
             "none".to_string()
@@ -315,7 +484,7 @@ fn render_markdown(matrix: &FleetMatrix) -> String {
         };
         let _ = writeln!(
             out,
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             row.name,
             row.path,
             row.score,
@@ -323,6 +492,11 @@ fn render_markdown(matrix: &FleetMatrix) -> String {
             row.caps.len(),
             row.hard_findings,
             row.hl_level,
+            row.host.as_deref().unwrap_or("—"),
+            row.branch.as_deref().unwrap_or("—"),
+            row.dirty_files,
+            row.version.as_deref().unwrap_or("—"),
+            row.score_freshness,
             findings
         );
     }
@@ -388,6 +562,160 @@ fn display_path(repo: &Path) -> String {
     repo.to_string_lossy().into_owned()
 }
 
+/// Gather the deterministic repo identity/state fields (git + filesystem + manifest).
+/// All cheap, repo-local, network-free — runtime signals (live CI, active runners) are
+/// intentionally NOT here; they belong to the JMCP collector, not the quality auditor.
+fn repo_metadata(repo: &Path) -> RepoMeta {
+    RepoMeta {
+        version: repo_version(repo),
+        branch: git_branch(repo),
+        head_sha: git_str(repo, &["rev-parse", "--short", "HEAD"]),
+        dirty_files: dirty_file_count(repo),
+        last_commit_epoch: git_commit_epoch(repo),
+        last_binary_epoch: newest_mtime(&repo.join("target/release")),
+        last_tests_epoch: [
+            newest_mtime(&repo.join(".jankurai")),
+            newest_mtime(&repo.join("test-results")),
+        ]
+        .into_iter()
+        .flatten()
+        .max(),
+        host: git_host(repo),
+        ci_configured: repo.join(".github/workflows").is_dir(),
+    }
+}
+
+/// Run a repo-relative git command, returning trimmed stdout on success.
+fn git_str(repo: &Path, args: &[&str]) -> Option<String> {
+    Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Current branch, or `(detached <sha>)` when HEAD is not on a branch.
+fn git_branch(repo: &Path) -> Option<String> {
+    match git_str(repo, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Some(branch) if branch != "HEAD" => Some(branch),
+        _ => {
+            git_str(repo, &["rev-parse", "--short", "HEAD"]).map(|sha| format!("(detached {sha})"))
+        }
+    }
+}
+
+/// Classify the canonical host from origin's URL (forge = local Jeryu, else github/other).
+fn git_host(repo: &Path) -> Option<String> {
+    let url = git_str(repo, &["remote", "get-url", "origin"])?;
+    let host = if url.contains("127.0.0.1:8787") {
+        "forge"
+    } else if url.contains("github") {
+        "github"
+    } else {
+        "other"
+    };
+    Some(host.to_string())
+}
+
+/// HEAD commit time as raw epoch seconds (deterministic; the dashboard computes age).
+fn git_commit_epoch(repo: &Path) -> Option<i64> {
+    git_str(repo, &["log", "-1", "--format=%ct"]).and_then(|s| s.parse().ok())
+}
+
+/// Count of uncommitted entries (tracked + untracked).
+fn dirty_file_count(repo: &Path) -> usize {
+    git_str(repo, &["status", "--porcelain"])
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+/// Newest direct-child mtime under `dir` as epoch seconds, or `None` if absent/empty.
+fn newest_mtime(dir: &Path) -> Option<i64> {
+    if !dir.is_dir() {
+        return None;
+    }
+    let mut newest: Option<i64> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        if let Some(secs) = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+        {
+            newest = Some(newest.map_or(secs, |n| n.max(secs)));
+        }
+    }
+    newest
+}
+
+/// Per-repo version: workspace.package.version → first member crate's package.version
+/// (skipping `version.workspace = true`) → package.json.version → `None`.
+fn repo_version(repo: &Path) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(repo.join("Cargo.toml")) {
+        if let Ok(value) = toml::from_str::<toml::Value>(&text) {
+            if let Some(v) = value
+                .get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|p| p.get("version"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(v.to_string());
+            }
+            if let Some(v) = value
+                .get("package")
+                .and_then(|p| p.get("version"))
+                .and_then(|v| v.as_str())
+            {
+                return Some(v.to_string());
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(repo.join("crates")) {
+        let mut members: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        members.sort();
+        for member in members {
+            if let Ok(text) = std::fs::read_to_string(member.join("Cargo.toml")) {
+                if let Some(v) = toml::from_str::<toml::Value>(&text)
+                    .ok()
+                    .as_ref()
+                    .and_then(|val| val.get("package"))
+                    .and_then(|p| p.get("version"))
+                    .and_then(|v| v.as_str())
+                {
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(repo.join("package.json")) {
+        if let Some(v) = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .as_ref()
+            .and_then(|val| val.get("version"))
+            .and_then(|v| v.as_str())
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Persist a repo's audit report to `.jankurai/repo-score.json` so a later `--mode cached`
+/// run has inputs. Writes only under the repo's gitignored `.jankurai/`.
+fn write_score_cache(repo: &Path, report: &Report) -> Result<()> {
+    let dir = repo.join(crate::local_state::LOCAL_ROOT);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = repo.join(crate::local_state::SCORE_JSON);
+    let json = serde_json::to_string_pretty(report)?;
+    std::fs::write(&path, json).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +756,45 @@ mod tests {
             hl_level: "HL3".to_string(),
             top_findings: vec!["high test src/lib.rs: example".to_string()],
             top_tool_opportunities: vec!["clippy (missing)".to_string()],
+            // Fixed, non-time values so golden assertions stay reproducible.
+            version: Some("1.0.0".to_string()),
+            branch: Some("main".to_string()),
+            head_sha: Some("abc1234".to_string()),
+            dirty_files: 0,
+            last_commit_epoch: None,
+            last_binary_epoch: None,
+            last_tests_epoch: None,
+            host: Some("github".to_string()),
+            ci_configured: true,
+            score_freshness: "fresh".to_string(),
+        }
+    }
+
+    fn meta(head: Option<&str>, dirty: usize) -> RepoMeta {
+        RepoMeta {
+            version: None,
+            branch: None,
+            head_sha: head.map(String::from),
+            dirty_files: dirty,
+            last_commit_epoch: None,
+            last_binary_epoch: None,
+            last_tests_epoch: None,
+            host: None,
+            ci_configured: false,
+        }
+    }
+
+    fn cached(head: Option<&str>, auditor: &str) -> CachedScore {
+        CachedScore {
+            score: 96,
+            raw_score: 96,
+            caps_applied: vec![],
+            observed_conformance_level: "HL3".to_string(),
+            auditor_version: auditor.to_string(),
+            decision: None,
+            git: head.map(|h| CachedGit {
+                head: Some(h.to_string()),
+            }),
         }
     }
 
@@ -454,9 +821,21 @@ mod tests {
             "hl_level",
             "top_findings",
             "top_tool_opportunities",
+            // v2 additions (mock_row sets version/branch/host; dirty_files/ci_configured/freshness always present)
+            "version",
+            "branch",
+            "dirty_files",
+            "host",
+            "ci_configured",
+            "score_freshness",
         ] {
             assert!(first.get(key).is_some(), "row missing key {key}");
         }
+        // Optional epoch fields are skipped when None; the freshness signal is always one of three states.
+        assert!(
+            ["fresh", "cached", "stale"].contains(&first["score_freshness"].as_str().unwrap()),
+            "score_freshness must be a known state"
+        );
         let totals = &json["totals"];
         assert_eq!(totals["repo_count"], 2);
         assert_eq!(totals["audited"], 2);
@@ -525,7 +904,78 @@ mod tests {
         assert!(md.contains("# jankurai fleet matrix"));
         assert!(md.contains("| Name | Path | Score |"));
         assert!(md.contains("alpha"));
+        // v2 columns render with sentence-case headings.
+        assert!(md.contains("| Host | Branch | Dirty | Version | Fresh |"));
         // No screaming all-caps section markers in user-visible output.
         assert!(!md.contains("FLEET MATRIX"));
+    }
+
+    #[test]
+    fn cached_freshness_is_cached_only_when_head_clean_and_auditor_match() {
+        // Matching HEAD + clean worktree + current auditor → safe to reuse.
+        assert_eq!(
+            cached_freshness(
+                &cached(Some("abc1234"), AUDITOR_VERSION),
+                &meta(Some("abc1234"), 0)
+            ),
+            "cached"
+        );
+        // HEAD moved → stale.
+        assert_eq!(
+            cached_freshness(
+                &cached(Some("abc1234"), AUDITOR_VERSION),
+                &meta(Some("def5678"), 0)
+            ),
+            "stale"
+        );
+        // Dirty worktree → stale (score predates uncommitted churn).
+        assert_eq!(
+            cached_freshness(
+                &cached(Some("abc1234"), AUDITOR_VERSION),
+                &meta(Some("abc1234"), 3)
+            ),
+            "stale"
+        );
+        // Auditor bumped → stale (ruleset changed; score not comparable).
+        assert_eq!(
+            cached_freshness(&cached(Some("abc1234"), "0.0.0"), &meta(Some("abc1234"), 0)),
+            "stale"
+        );
+        // Missing cached HEAD → stale (can't prove currency).
+        assert_eq!(
+            cached_freshness(&cached(None, AUDITOR_VERSION), &meta(Some("abc1234"), 0)),
+            "stale"
+        );
+    }
+
+    #[test]
+    fn newest_mtime_returns_none_for_missing_and_some_for_present() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(newest_mtime(&dir.path().join("absent")), None);
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        let got = newest_mtime(dir.path());
+        assert!(got.is_some() && got.unwrap() > 0);
+    }
+
+    #[test]
+    fn repo_version_prefers_workspace_then_package_then_none() {
+        let none_dir = tempfile::tempdir().unwrap();
+        assert_eq!(repo_version(none_dir.path()), None);
+
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"4.2.0\"\n",
+        )
+        .unwrap();
+        assert_eq!(repo_version(ws.path()), Some("4.2.0".to_string()));
+
+        let pkg = tempfile::tempdir().unwrap();
+        std::fs::write(
+            pkg.path().join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+        assert_eq!(repo_version(pkg.path()), Some("1.2.3".to_string()));
     }
 }
