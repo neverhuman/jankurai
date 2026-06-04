@@ -552,6 +552,8 @@ Known open-source gaps:
 - [Running CI locally](docs/ci-local.md)
 - [Agent-native standard](docs/agent-native-standard.md)
 - [Architecture](docs/architecture.md)
+- [Boundaries](docs/boundaries.md)
+- [Generated zones](docs/generated-zones.md)
 - [Testing and proof lanes](docs/testing.md)
 - [Jankurai Guard — realtime agent write enforcement](docs/guard.md)
 - [Tuiwright TUI testing](docs/tuiwright.md)

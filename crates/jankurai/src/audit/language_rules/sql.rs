@@ -161,7 +161,10 @@ fn hard_hit_for_line(
         return None;
     }
 
-    if detect_full_table_write && is_full_table_write_line(&lower) {
+    if detect_full_table_write
+        && is_full_table_write_line(&lower)
+        && statement_lacks_where(file, line_no, line)
+    {
         return Some(super::common::sql_finding(
             HLT_RULE_ID,
             DETECTOR_FULL_TABLE_WRITE,
@@ -238,6 +241,29 @@ fn normalize_sql_line(line: &str) -> Option<String> {
 fn is_full_table_write_line(lower: &str) -> bool {
     (lower.contains("delete from") && !lower.contains(" where "))
         || (lower.contains("update ") && lower.contains(" set ") && !lower.contains(" where "))
+}
+
+/// True when the UPDATE/DELETE statement starting at `line_no` (1-indexed) genuinely has no
+/// WHERE clause up to its terminating `;`. `is_full_table_write_line` only inspects the current
+/// line, so an idiomatic multi-line statement whose WHERE sits on a following line was falsely
+/// flagged; this honors that WHERE before reporting a whole-table write.
+fn statement_lacks_where(file: &FileInfo, line_no: usize, current_line: &str) -> bool {
+    // The statement terminates on the current line (`;`) with no WHERE → genuine full-table write.
+    if current_line.contains(';') {
+        return true;
+    }
+    const LOOKAHEAD: usize = 40;
+    // line_no is 1-indexed; skip(line_no) begins at the line *after* the current one.
+    for raw in file.text.lines().skip(line_no).take(LOOKAHEAD) {
+        // Pad so a line-leading `where ...` matches and `somewhere` does not.
+        if format!(" {} ", raw.to_ascii_lowercase()).contains(" where ") {
+            return false;
+        }
+        if raw.contains(';') {
+            return true; // statement ended without a WHERE
+        }
+    }
+    true
 }
 
 fn is_dynamic_sql_line(lower: &str) -> bool {

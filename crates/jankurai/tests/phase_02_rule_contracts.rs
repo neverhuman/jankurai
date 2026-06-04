@@ -85,9 +85,31 @@ fn every_rule_lane_is_valid() {
     }
 }
 
+/// Rules that are intentionally still Experimental. HLT-044 and HLT-045 are the
+/// advisory governance guards (worktree sprawl, generated-zone hand-edits), and
+/// HLT-046/047/048 are the advisory Jankurai-pillar guards (unnecessary variety,
+/// canonical README, canonical CI) that stay Experimental until each is promoted
+/// with its own cap.
+const EXPERIMENTAL_RULES: &[&str] = &[
+    "HLT-044-WORKTREE-SPRAWL",
+    "HLT-045-GENERATED-ZONE-GOVERNANCE",
+    "HLT-046-UNNECESSARY-VARIETY",
+    "HLT-047-CANONICAL-README",
+    "HLT-048-CANONICAL-CI-GAP",
+];
+
 #[test]
 fn every_rule_status_is_stable() {
     for rule in rules::all() {
+        if EXPERIMENTAL_RULES.contains(&rule.id) {
+            assert_eq!(
+                rule.status,
+                rules::RuleStatus::Experimental,
+                "Rule {} is allow-listed as Experimental",
+                rule.id
+            );
+            continue;
+        }
         assert_eq!(
             rule.status,
             rules::RuleStatus::Stable,
@@ -133,11 +155,13 @@ fn every_high_or_critical_rule_has_cap_key() {
             // HLT-003-OWNERLESS-PATH is dimension-driven, not cap-driven.
             // HLT-004-UNMAPPED-PROOF is dimension-driven (and soft capped).
             // HLT-017-OPAQUE-OBSERVABILITY is dimension-driven.
+            // HLT-044-WORKTREE-SPRAWL is an advisory Experimental governance guard with no cap yet.
             if ![
                 "HLT-014-A11Y-GAP",
                 "HLT-003-OWNERLESS-PATH",
                 "HLT-004-UNMAPPED-PROOF",
                 "HLT-017-OPAQUE-OBSERVABILITY",
+                "HLT-044-WORKTREE-SPRAWL",
             ]
             .contains(&rule.id)
             {
@@ -205,7 +229,16 @@ fn confidence_policy_is_consistent_with_severity() {
 
 #[test]
 fn rule_count_matches_expected() {
-    assert_eq!(rules::all().len(), 43, "Expected exactly 43 stable rules");
+    let stable = rules::all()
+        .iter()
+        .filter(|r| r.status == rules::RuleStatus::Stable)
+        .count();
+    assert_eq!(stable, 43, "Expected exactly 43 stable rules");
+    assert_eq!(
+        rules::all().len(),
+        48,
+        "Expected exactly 48 rules (43 stable + 5 experimental: 2 governance guards + 3 Jankurai-pillar guards)"
+    );
 }
 
 #[test]

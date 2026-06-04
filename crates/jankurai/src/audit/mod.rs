@@ -2,6 +2,7 @@ pub mod analyzers;
 pub mod baseline;
 pub mod boundaries_artifact;
 pub mod boundary_reclassification;
+pub mod canonical_standard;
 pub mod caps;
 pub mod ci_local_parity;
 pub mod copy_code;
@@ -27,8 +28,10 @@ pub mod scan;
 pub mod security_artifact;
 pub mod smart_scan;
 pub mod source_context;
+pub mod unnecessary_variety;
 pub mod ux_artifact;
 pub mod web_security;
+pub mod worktree_sprawl;
 pub mod zyal;
 
 use crate::model::*;
@@ -1391,6 +1394,81 @@ fn build_findings(
             vec![hit.text],
             Some("HLT-007-HANDWRITTEN-CONTRACT"),
             hit.line,
+        );
+    }
+    // Feature B guard 1 (HLT-044): same-origin worktree/clone sprawl. Advisory:
+    // emitted at medium severity so a green repo with no parallel checkout of
+    // itself (such as jankurai) stays green and never auto-fails.
+    for hit in worktree_sprawl::detect_sprawl(ctx) {
+        b.add(
+            "medium",
+            "governance",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            Some("HLT-044-WORKTREE-SPRAWL"),
+            hit.line,
+        );
+    }
+    // Feature B guard 2 (HLT-045): hand-edits inside declared generated zones,
+    // skipping auditor_output/lockfile zones. Advisory: emitted at medium
+    // severity (soft) so a clean generated zone yields no hard finding.
+    for hit in scan::generated_zone_edit_hits(ctx) {
+        b.add(
+            "medium",
+            "governance",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            Some("HLT-045-GENERATED-ZONE-GOVERNANCE"),
+            hit.line,
+        );
+    }
+    // Jankurai pillar guard 1 (HLT-046): redundant variety where consistency is
+    // expected (same-name enum/const/static defined with diverging shapes across
+    // modules). Advisory: emitted via the rule's own medium severity so a tree
+    // that defines each shape once (such as jankurai) stays green.
+    for hit in unnecessary_variety::detect_variety(ctx) {
+        b.add_with_rule(
+            "HLT-046-UNNECESSARY-VARIETY",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            hit.line,
+            hit.matched_term,
+            None,
+        );
+    }
+    // Jankurai pillar guard 2 (HLT-047/048): canonical README and CI shape. The
+    // README check (HLT-047) and CI check (HLT-048) are advisory; a repo whose
+    // README links AGENTS.md, names its stack, carries a badge + quick-start, and
+    // whose CI delegates to ops/ci/*.sh with pinned SHAs and a jankurai audit lane
+    // yields no findings.
+    for hit in canonical_standard::detect_readme_gaps(ctx) {
+        b.add_with_rule(
+            "HLT-047-CANONICAL-README",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            hit.line,
+            hit.matched_term,
+            None,
+        );
+    }
+    for hit in canonical_standard::detect_ci_gaps(ctx) {
+        b.add_with_rule(
+            "HLT-048-CANONICAL-CI-GAP",
+            &hit.path,
+            &hit.problem,
+            &hit.agent_fix,
+            vec![hit.text],
+            hit.line,
+            hit.matched_term,
+            None,
         );
     }
 

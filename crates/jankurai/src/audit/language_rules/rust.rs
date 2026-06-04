@@ -4,8 +4,17 @@ use super::catalog::{
 use crate::audit::helpers::{product_code_files, AuditContext};
 use crate::audit::scan;
 use once_cell::sync::Lazy;
+use regex::Regex;
 
 const HLT_RULE_ID: &str = "HLT-029-RUST-BAD-BEHAVIOR";
+
+/// Matches the `static mut` *keyword* (a mutable global — the real HLT-029 hazard)
+/// while excluding the `'static` lifetime: `&'static Mutex<…>` and `&'static mut T`
+/// (a borrow, not a global) lowercase to `'static mut…`, which a plain substring
+/// `contains("static mut")` flags as a false positive. The leading `[^'\w]` rejects a
+/// preceding `'` (lifetime) or word char (identifier); the trailing `\b` rejects `mutex`.
+static STATIC_MUT_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?:^|[^'\w])static\s+mut\b").expect("static-mut regex"));
 
 const HARD_RULES: &[LanguageRule] = &[
     LanguageRule {
@@ -531,7 +540,10 @@ fn hard_hit_for_line(
             "NearbySafetyComment",
         ));
     }
-    if lower.contains("zeroed(") {
+    // Match `mem::zeroed(` specifically (the unsafe fabricate-invalid-value hazard the finding
+    // text names), not the bare `zeroed(` substring, which also hit safe wrappers like
+    // `BytesMut::zeroed(` / `MaybeUninit::zeroed(`. `mem::zeroed(` covers std::/core:: forms.
+    if lower.contains("mem::zeroed(") {
         return Some(finding(
             "rust.unsafe.zeroed",
             "zeroed",
@@ -648,7 +660,7 @@ fn hard_hit_for_line(
             "NearbySafetyComment",
         ));
     }
-    if lower.contains("static mut") {
+    if STATIC_MUT_RE.is_match(&lower) {
         return Some(finding(
             "rust.unsafe.static-mut",
             "static mut",
@@ -928,4 +940,31 @@ fn finding(
             format!("snippet={snippet}"),
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::STATIC_MUT_RE;
+
+    // Inputs are pre-lowercased, mirroring `hard_hit_for_line`'s `line.to_ascii_lowercase()`.
+    fn flags(line: &str) -> bool {
+        STATIC_MUT_RE.is_match(&line.to_ascii_lowercase())
+    }
+
+    #[test]
+    fn static_mut_keyword_is_flagged() {
+        assert!(flags("static mut GLOBAL: usize = 0;"));
+        assert!(flags("    pub static mut COUNTER: u32 = 1;"));
+        assert!(flags("pub(crate) static mut STATE: State = State::new();"));
+    }
+
+    #[test]
+    fn static_lifetime_is_not_flagged() {
+        // The HLT-029 false positive that forced workarounds (e.g. jekko's BalancerLock alias):
+        // `'static mutex` / `'static mut <type>` borrows are not mutable global statics.
+        assert!(!flags("    lock: &'static Mutex<Option<KeyBalancer>>,"));
+        assert!(!flags("fn get() -> &'static Mutex<State> { &LOCK }"));
+        assert!(!flags("let r: &'static mut T = leak(value);")); // a borrow, not a global
+        assert!(!flags("type BalancerLock = Mutex<Option<KeyBalancer>>;"));
+    }
 }

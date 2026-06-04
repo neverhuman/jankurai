@@ -209,8 +209,34 @@ Stop or fix first when any condition is true:
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
 | `HLT-042-CI-LOCAL-PARITY` | CI workflows inline commands rather than delegating to `ops/ci/*.sh`, leaving local runners without a way to reproduce the gate before push |
 | `HLT-043-COPY-PASTE-BAD-BEHAVIOR` | Exact active-source duplicate files and same-name semantic units are copied across owner boundaries |
+| `HLT-044-WORKTREE-SPRAWL` | Same-origin sibling worktrees or clones create parallel checkouts that fork working state outside one owned root (advisory, experimental) |
+| `HLT-045-GENERATED-ZONE-GOVERNANCE` | Hand-edits land inside a declared generated zone instead of being re-derived from the source generator (advisory, experimental) |
+| `HLT-046-UNNECESSARY-VARIETY` | Same-name enum/const/static definitions diverge across modules where one consistent definition is expected (advisory, experimental) |
+| `HLT-047-CANONICAL-README` | README drifts from the canonical agent-native shape (AGENTS.md link, target stack, badge, quick-start) (advisory, experimental) |
+| `HLT-048-CANONICAL-CI-GAP` | CI drifts from the canonical local-parity shape (`ops/ci/*.sh` delegation, pinned action SHAs, jankurai audit lane) (advisory, experimental) |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed now. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family. `HLT-044-WORKTREE-SPRAWL` (see [Ownership Boundaries](#ownership-boundaries)) and `HLT-045-GENERATED-ZONE-GOVERNANCE` (see [Generated Zones](#generated-zones)) are advisory experimental governance guards that stay off the hard-cap path until each is promoted with its own cap. `HLT-046-UNNECESSARY-VARIETY`, `HLT-047-CANONICAL-README`, and `HLT-048-CANONICAL-CI-GAP` (see [Jankurai Pillar: Variety and Canonical Shape](#jankurai-pillar-variety-and-canonical-shape)) are the advisory experimental Jankurai-pillar guards and also stay off the hard-cap path until promoted.
+
+## Jankurai Pillar: Variety and Canonical Shape
+
+The Jankurai pillar adds three advisory guards that reward consistency and a
+canonical agent-native shape. All three are medium-severity, experimental, and
+carry no hard cap, so they never block or lower a green repository's score.
+
+- `HLT-046-UNNECESSARY-VARIETY` flags redundant *variety* where consistency is
+  expected: the same `enum`/`const`/`static` defined in two or more active-source
+  modules with diverging shapes. It reuses the copy-code token normalization,
+  defers byte-identical copies to the copy-code lane, and is gated by
+  `[variety] min_instance` (default 2) so a single occurrence never fires.
+- `HLT-047-CANONICAL-README` checks that the root README links `AGENTS.md`,
+  states the target stack, carries a status/score badge, and offers a quick-start
+  section. No README means no finding.
+- `HLT-048-CANONICAL-CI-GAP` checks that CI delegates to versioned `ops/ci/*.sh`
+  scripts, pins every `uses:` action to a full 40-character commit SHA, and runs a
+  jankurai audit lane. No workflows means no finding.
+
+Thresholds and toggles live under `[variety]` and `[canonical]` in
+`agent/audit-policy.toml`.
 
 ## Ownership Boundaries
 

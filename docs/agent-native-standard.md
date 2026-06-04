@@ -111,8 +111,38 @@ Stable rule IDs:
 | `HLT-041-COMMENT-HYGIENE` | Source code contains dangerous comments admitting unsafe behavior, temporary hacks, or AI scaffolding |
 | `HLT-042-CI-LOCAL-PARITY` | CI workflows do not delegate to versioned `ops/ci/*.sh` scripts, so failures cannot be reproduced locally before push |
 | `HLT-043-COPY-PASTE-BAD-BEHAVIOR` | Exact active-source duplicate files and same-name semantic units are copied across owner boundaries |
+| `HLT-044-WORKTREE-SPRAWL` | Same-origin sibling worktrees or clones create parallel checkouts that fork working state outside one owned root (advisory, experimental) |
+| `HLT-045-GENERATED-ZONE-GOVERNANCE` | Hand-edits land inside a declared generated zone instead of being re-derived from the source generator (advisory, experimental) |
+| `HLT-046-UNNECESSARY-VARIETY` | Same-name enum/const/static definitions diverge across modules where one consistent definition is expected, so the redundant copies drift apart (advisory, experimental) |
+| `HLT-047-CANONICAL-README` | README drifts from the canonical agent-native shape: missing AGENTS.md link, target-stack statement, status badge, or quick-start (advisory, experimental) |
+| `HLT-048-CANONICAL-CI-GAP` | CI drifts from the canonical local-parity shape: no `ops/ci/*.sh` delegation, unpinned action tags, or no jankurai audit lane (advisory, experimental) |
 
-`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed in this release. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family.
+`HLT-029-RUST-BAD-BEHAVIOR` is detector-backed in this release. `HLT-030` through `HLT-043` are detector-backed catalog IDs in the bad-behavior family. `HLT-044-WORKTREE-SPRAWL` and `HLT-045-GENERATED-ZONE-GOVERNANCE` are advisory experimental governance guards that stay off the hard-cap path until each is promoted with its own cap. `HLT-046-UNNECESSARY-VARIETY`, `HLT-047-CANONICAL-README`, and `HLT-048-CANONICAL-CI-GAP` are the advisory experimental Jankurai-pillar guards for redundant variety and canonical README/CI shape; they also stay off the hard-cap path until promoted.
+
+### Jankurai Pillar: Variety and Canonical Shape
+
+The Jankurai pillar adds three advisory guards that reward consistency and a
+canonical agent-native shape without ever capping a green repository.
+
+- **`HLT-046-UNNECESSARY-VARIETY`** flags redundant *variety* where consistency
+  is expected: the same `enum`/`const`/`static` is defined independently in two
+  or more active-source modules with diverging shapes, so the copies drift apart.
+  It reuses the copy-code token normalization (`audit::copy_code::normalize_token_line`)
+  to judge structure, preserves literal values so divergent constants are caught,
+  defers byte-identical copies to the copy-code lane, and is gated behind a
+  configurable `[variety] min_instance` threshold (default 2) so a single
+  occurrence never fires.
+- **`HLT-047-CANONICAL-README`** validates the root README against the canonical
+  shape: it must link `AGENTS.md`, state the target stack, carry a status/score
+  badge, and offer a quick-start (install / getting-started) section. No README
+  means no finding.
+- **`HLT-048-CANONICAL-CI-GAP`** validates CI against the canonical CI Local
+  Parity shape: workflows must delegate to versioned `ops/ci/*.sh` scripts, pin
+  every `uses:` action to a full 40-character commit SHA, and run a jankurai
+  audit lane. No workflows means no finding.
+
+Both checks are configured under `[variety]` and `[canonical]` in
+`agent/audit-policy.toml` and stay advisory (medium severity, no cap).
 
 Centerline drift is the delta between claimed conformance and observed repository behavior. Hard caps are versioned policy, not final empirical truth.
 

@@ -702,18 +702,32 @@ pub fn has_web_surface(ctx: &AuditContext) -> bool {
             && (f.text.contains("from \"react\"")
                 || f.text.contains("from 'react'")
                 || f.text.contains("React."));
+        // A web-shaped dir counts only when it holds actual web SOURCE, not a stub
+        // (e.g. apps/web/AGENTS.md), so backend/library repos with a placeholder web dir
+        // aren't falsely flagged — while non-React web apps (Vue/Svelte/vanilla) still match.
+        let web_dir_source = matches!(
+            f.suffix.as_str(),
+            ".tsx"
+                | ".jsx"
+                | ".ts"
+                | ".js"
+                | ".mjs"
+                | ".vue"
+                | ".svelte"
+                | ".css"
+                | ".scss"
+                | ".html"
+        ) && (f.rel_path.starts_with("apps/web")
+            || f.rel_path.starts_with("frontend")
+            || f.rel_path.starts_with("ui")
+            || f.rel_path.starts_with("packages/web")
+            || f.rel_path.starts_with("packages/ui"));
         !f.rel_path.starts_with("docs/")
             && !f.rel_path.starts_with("paper/")
             && !f.rel_path.starts_with("reference/")
             && !f.rel_path.starts_with("tips/")
             && !f.rel_path.starts_with("agent/")
-            && (f.rel_path.starts_with("apps/web")
-                || f.rel_path.starts_with("frontend")
-                || f.rel_path.starts_with("ui")
-                || f.rel_path.starts_with("packages/web")
-                || f.rel_path.starts_with("packages/ui")
-                || manifest_web_hint
-                || react_source_hint)
+            && (web_dir_source || manifest_web_hint || react_source_hint)
     })
 }
 
@@ -1274,6 +1288,10 @@ fn load_test_map(ctx: &AuditContext) -> Option<crate::commands::context_data::Te
 }
 
 fn auditable_manifest_paths(ctx: &AuditContext) -> Vec<String> {
+    // Ephemeral/gitignored runtime dirs (.jekko/, .venv, build output) and generated files
+    // are not source that needs an owner-map/proof route; excluding them mirrors the
+    // is_high_risk_repo gating above and clears HLT-003/HLT-004 false positives.
+    let ignored = build_repo_gitignore(&ctx.root);
     ctx.scope_files
         .iter()
         .filter(|file| {
@@ -1282,6 +1300,8 @@ fn auditable_manifest_paths(ctx: &AuditContext) -> Vec<String> {
                 && !file.rel_path.starts_with("node_modules/")
                 && !file.rel_path.starts_with("paper/jankurai.")
                 && !file.rel_path.starts_with("reference/")
+                && !file.is_generated
+                && !path_is_gitignored(&ignored, &file.rel_path)
         })
         .map(|file| file.rel_path.clone())
         .collect()

@@ -345,8 +345,14 @@ fn write_empty_diff_score(json_path: &str, md_path: &str, base: Option<&str>) ->
 mod tests {
     use super::*;
 
+    // These tests mutate process-global env vars; cargo runs tests in parallel, so they must be
+    // serialized against each other or they race (poison-tolerant: a panic in one must not wedge
+    // the other). No other module touches these vars, so a local guard is sufficient.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_base_ref_explicit_wins() {
+        let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("JANKURAI_DIFF_BASE", "should-not-win");
         let got = resolve_base_ref(Some("origin/feature"));
         assert_eq!(got, "origin/feature");
@@ -355,6 +361,7 @@ mod tests {
 
     #[test]
     fn resolve_base_ref_env_precedence() {
+        let _env = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         // env-var slot order: JANKURAI_DIFF_BASE > GITHUB_BASE_REF > CI_MERGE_REQUEST_DIFF_BASE_SHA > default
         std::env::remove_var("JANKURAI_DIFF_BASE");
         std::env::remove_var("GITHUB_BASE_REF");

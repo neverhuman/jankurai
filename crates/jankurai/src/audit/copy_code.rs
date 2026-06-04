@@ -1201,7 +1201,13 @@ fn normalize_exact_text(text: &str) -> String {
     out.join("\n")
 }
 
-fn normalize_token_line(line: &str) -> String {
+/// Normalizes a single source line into a token-shape signature by replacing
+/// string literals (`STR`), numbers (`NUM`), and identifiers (`ID`) with stable
+/// placeholders and collapsing whitespace. Two lines that differ only in names
+/// or literals normalize to the same string, which lets callers compare the
+/// *structure* of code while ignoring renames. Shared with the variety detector
+/// (`audit::unnecessary_variety`) so both lanes use one normalization idiom.
+pub(crate) fn normalize_token_line(line: &str) -> String {
     static STRING_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r#""([^"\\]|\\.)*"|'([^'\\]|\\.)*'|`([^`\\]|\\.)*`"#).expect("regex")
     });
@@ -1241,7 +1247,10 @@ fn is_boilerplate_line(line: &str) -> bool {
         || trimmed.len() < 12
 }
 
-fn rust_unit_name(line: &str) -> Option<String> {
+/// Extracts the name of a Rust function declared on `line`, if any. Shared with
+/// the variety detector (`audit::unnecessary_variety`) so both lanes identify the
+/// same logical units with one regex idiom.
+pub(crate) fn rust_unit_name(line: &str) -> Option<String> {
     static RUST_UNIT_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b")
             .expect("regex")
