@@ -72,7 +72,7 @@ checkout_repo() {
     git clone "$url" "$dest"
   else
     git -C "$dest" remote set-url origin "$url" || true
-    git -C "$dest" fetch --tags origin
+    git -C "$dest" fetch --force --tags origin
   fi
 
   if [[ -n "$(git -C "$dest" status --porcelain)" ]]; then
@@ -83,7 +83,7 @@ checkout_repo() {
     fi
   fi
 
-  git -C "$dest" fetch --tags origin || true
+  git -C "$dest" fetch --force --tags origin || true
   if [[ -n "$commit" && "$commit" != "pending" ]]; then
     git -C "$dest" checkout --detach "$commit"
   else
