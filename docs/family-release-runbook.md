@@ -28,27 +28,25 @@ plus `-guard`, `-proof`, `-tui`, `-ux`, and the data/doc repos
   `validate-family.sh`. Local path patches live only in the uncommitted
   `.fusion/` workspace or an uncommitted dev `[patch]`.
 
-## BEFORE the first release — decide the version (BLOCKER)
-`ops/ci/release-build.sh` asserts `RELEASE_TAG (minus v) == VERSION`. Today the
-`VERSION` files disagree with the release tag:
-- hub/core/deploy `VERSION` = `1.6.10`, kernel `VERSION` = `1.7.0`,
-  core crate version = `1.6.11`, manifest `release` / tag = `1.7.0-split.0`.
-**Action:** pick the canonical version (recommended `1.7.0-split.0` to match the
-tag), set every repo's `VERSION` to it, commit, move tags, regenerate
-`family.lock`. (The cargo crate `version =` is independent and may stay semver.)
+## Version — DONE
+Every repo's `VERSION` is reconciled to `1.7.0-split.0` (matches the release tag +
+manifest `release`); `ops/ci/release-build.sh`'s `RELEASE_TAG == VERSION` gate
+passes. Tags moved + `family.lock` re-pinned; 15/15 still audit-green, oracle 10/10.
+(The cargo crate `version =` fields are independent semver and were left as-is.)
 
-## Release pipeline (consolidate onto the hub)
-The installer + `action.yml` verify the cosign identity at
-`github.com/neverhuman/jankurai/.github/workflows/release.yml@<tag>`, so the
-release MUST run on the **hub**. The proven build/sign/publish scripts live in
-`jankurai-deploy/ops/ci/release-{audit-gate,build,macos-sign,publish,sign-blob}.sh`.
-Port them to the hub and have `release.yml`:
-1. `bash scripts/fuse.sh --source github --all` (assemble the workspace from tags)
-2. build+sign in the fused workspace (`CI_ROOT=.fusion`, Linux tar.gz + macOS pkg,
-   cosign + attestation)
-3. `gh release create` on `neverhuman/jankurai`, attaching `jankurai-installer.sh`.
-NOTE: signing/notarization/publish is only testable on GitHub with the Apple +
-Sigstore secrets configured.
+## Release pipeline — DONE (lives on the hub)
+`jankurai/.github/workflows/release.yml` (+ `ops/ci/release-*.sh`) now owns the
+signed release, on the hub so the installer's cosign identity
+(`github.com/neverhuman/jankurai/.github/workflows/release.yml@<tag>`) verifies.
+On a `v*.*.*` tag it runs: family-gate (`validate-family.sh`) -> build
+(`scripts/fuse.sh --source github --all` then `BUILD_DIR=.fusion bash
+ops/ci/release-build.sh`, Linux tar.gz + macOS pkg, cosign + attestation) ->
+publish (`gh release create` on `neverhuman/jankurai` with `jankurai-installer.sh`).
+Verified locally: yaml/bash valid, VERSION==tag gate passes, hub stays audit-green,
+the fuse build produces the binary. NOT testable offline: signing/notarization/
+publish need the Apple + Sigstore secrets on GitHub.
+(`jankurai-deploy/.github/workflows/release.yml` is superseded/inert — it triggers
+on `v*.*.*`, which only the hub ever receives; safe to delete.)
 
 ## Provision GitHub + Jeryu (you run this)
 With `gh` authenticated to `neverhuman` and the Jeryu remote reachable:
