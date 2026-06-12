@@ -100,6 +100,10 @@ cat > "${fusion}/Cargo.toml" <<'EOF_CARGO'
 [workspace]
 members = [
   "repos/jankurai-core/crates/jankurai",
+  "repos/jankurai-tools-kernel/crates/jankurai-audit-kernel",
+  "repos/jankurai-tools-dedup/crates/jankurai-audit-dedup",
+  "repos/jankurai-tools-fleet/crates/jankurai-fleet",
+  "repos/jankurai-tools-analyzers/crates/jankurai-audit-analyzers",
   "repos/jankurai-tools-guard/crates/jankurai-guard",
   "repos/jankurai-tools-proof/crates/jankurai-proofbind",
   "repos/jankurai-tools-proof/crates/jankurai-proofmark",
@@ -108,6 +112,18 @@ members = [
   "repos/jankurai-tools-tui/examples/tuiwright-demo",
 ]
 resolver = "2"
+
+[patch."https://github.com/neverhuman/jankurai-tools-kernel.git"]
+jankurai-audit-kernel = { path = "repos/jankurai-tools-kernel/crates/jankurai-audit-kernel" }
+
+[patch."https://github.com/neverhuman/jankurai-tools-dedup.git"]
+jankurai-audit-dedup = { path = "repos/jankurai-tools-dedup/crates/jankurai-audit-dedup" }
+
+[patch."https://github.com/neverhuman/jankurai-tools-fleet.git"]
+jankurai-fleet = { path = "repos/jankurai-tools-fleet/crates/jankurai-fleet" }
+
+[patch."https://github.com/neverhuman/jankurai-tools-analyzers.git"]
+jankurai-audit-analyzers = { path = "repos/jankurai-tools-analyzers/crates/jankurai-audit-analyzers" }
 
 [patch."https://github.com/neverhuman/jankurai-tools-guard.git"]
 jankurai-guard = { path = "repos/jankurai-tools-guard/crates/jankurai-guard" }
