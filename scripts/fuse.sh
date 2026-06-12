@@ -133,9 +133,10 @@ jankurai-proofbind = { path = "repos/jankurai-tools-proof/crates/jankurai-proofb
 jankurai-proofmark = { path = "repos/jankurai-tools-proof/crates/jankurai-proofmark" }
 EOF_CARGO
 
-if [[ -f "${repos_dir}/jankurai-core/Cargo.lock" ]]; then
-  cp "${repos_dir}/jankurai-core/Cargo.lock" "${fusion}/Cargo.lock"
-fi
+# The fused workspace has more members than any single repo (kernel/dedup/fleet/
+# analyzers are path members here, git-deps in the real manifests), so a single
+# repo's Cargo.lock does not match. Generate a fresh lock for the fused graph.
+( cd "${fusion}" && cargo generate-lockfile >/dev/null 2>&1 ) || true
 
 cat > "${fusion}/package.json" <<'EOF_PACKAGE'
 {
@@ -159,11 +160,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 case "${1:-build}" in
   build)
-    cargo build -p jankurai --locked
+    cargo build -p jankurai
     (cd repos/jankurai-tools-ux && npm ci && npm run build)
     ;;
   test)
-    cargo test --workspace --locked
+    cargo test --workspace
     (cd repos/jankurai-tools-ux && npm ci && npm run build && npm test)
     ;;
   version)
