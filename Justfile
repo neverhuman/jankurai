@@ -1,0 +1,57 @@
+# jankurai hub root command surface.
+# One-command setup and validation lanes for agents and CI.
+# This repo is the thin public hub: it carries the installer, GitHub Action,
+# family manifest, lockfile, and the local fusion script. Every lane below is
+# deterministic, hermetic, and runnable from the repo root. The same commands
+# run in CI via ops/ci/<lane>.sh so local and CI execution match exactly.
+
+# Default: list available lanes.
+default:
+    @just --list
+
+# One-command bootstrap: make the local CI scripts executable and resolve the
+# family manifest against the lockfile so the hub is ready to validate.
+setup:
+    chmod +x scripts/*.sh ops/ci/*.sh
+    bash scripts/validate-family.sh
+
+# Aliases so `just install` and `just bootstrap` also resolve to setup.
+install: setup
+
+bootstrap: setup
+
+# Deterministic fast lane: the narrowest proof loop for agent iteration.
+# Validates required split metadata, Jeryu mirror config, lockfile pins, branch
+# dependencies, committed cross-repo path dependencies, and action pinning.
+fast:
+    bash scripts/validate-family.sh
+
+# Run the full local check: fast lane, security scan, and self-audit.
+check: fast security audit
+
+# Verify is an alias of check for agents that look for a `verify` lane.
+verify: check
+
+# Run the hub validation suite (alias of the fast lane).
+test:
+    bash scripts/validate-family.sh
+
+# Security lane: secret scanning, supply-chain SBOM, and workflow linting.
+# gitleaks scans the tracked tree for committed secrets; syft generates a
+# CycloneDX SBOM from the family manifest/lock supply-chain surface; actionlint
+# lints the pinned GitHub Actions workflows; and the manifest scan verifies every
+# family lock pin resolves to an immutable tag and commit (this hub's
+# dependency-audit surface, since no Cargo.toml/package.json is shipped).
+security:
+    gitleaks detect --source . --no-banner --redact
+    syft scan dir:. -o cyclonedx-json=target/jankurai/security/sbom.json
+    actionlint .github/workflows/ci.yml
+    bash scripts/validate-family.sh
+
+# Jankurai self-audit lane: writes the repo-score artifacts that CI uploads.
+audit:
+    /home/ubuntu/jankurai-split/jankurai/.fusion/target/debug/jankurai audit . --no-score-history --json .jankurai/repo-score.json --md .jankurai/repo-score.md
+
+# Print the declared hub version.
+versions:
+    cat VERSION
