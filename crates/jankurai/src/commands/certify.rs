@@ -1,6 +1,4 @@
-use crate::commands::release_data::{
-    load_release_data, read_repo_score, workspace_root, FindingsSummary,
-};
+use crate::commands::release_data::{load_release_data, read_repo_score, FindingsSummary};
 use crate::commands::repair::now_string;
 use crate::validation::{self, ArtifactSchema};
 use anyhow::Result;
@@ -78,11 +76,7 @@ pub fn build_certification(repo: &Path) -> Result<Certification> {
         Some(local_state::LEGACY_SCORE_JSON),
     );
     let score = read_repo_score(repo)?;
-    let evidence_root = if score_path.exists() {
-        repo.to_path_buf()
-    } else {
-        workspace_root()
-    };
+    let evidence_root = repo.to_path_buf();
 
     let (score_value, caps, mut findings_summary) = match score.as_ref() {
         Some(summary) => (

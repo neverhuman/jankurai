@@ -39,8 +39,17 @@ echo "[pr-ci] source coverage and mutation evidence" >&2
 GITHUB_BASE_REF=main bash ops/ci/coverage-llvm.sh
 
 echo "[pr-ci] exact candidate binary" >&2
-cargo build -p jankurai --release --locked
-candidate_bin="${CARGO_TARGET_DIR:-$repo_root/target}/release/jankurai"
+candidate_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+candidate_target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+if [[ -n "${RUSTFLAGS:-}" || -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+  echo "[pr-ci] inherited Rust flags would make the release binary non-reproducible" >&2
+  exit 1
+fi
+candidate_rustflags="--remap-path-prefix=$repo_root=/jankurai-build/source"
+candidate_rustflags+=" --remap-path-prefix=$candidate_cargo_home=/jankurai-build/cargo"
+candidate_rustflags+=" --remap-path-prefix=$candidate_target_dir=/jankurai-build/target"
+RUSTFLAGS="$candidate_rustflags" cargo build -p jankurai --release --locked
+candidate_bin="${candidate_target_dir}/release/jankurai"
 [[ -x "$candidate_bin" ]] || { echo "missing candidate binary: $candidate_bin" >&2; exit 1; }
 expected_version="jankurai $(tr -d '[:space:]' < VERSION)"
 actual_version="$($candidate_bin --version)"

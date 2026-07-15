@@ -33,9 +33,22 @@ GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
 printf '# release notes\n\n- relocated\n' >"${fixture}/CHANGELOG.md"
 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "${fixture}" add CHANGELOG.md
 
+expected_semver="$(read_version)"
 version="$(${run_dir}/bin/jankurai --version)"
-[[ "${version}" == "jankurai $(read_version)" ]] \
+[[ "${version}" == "jankurai ${expected_semver}" ]] \
   || fail "relocated binary version mismatch: ${version}"
+
+(cd "${fixture}" && "${run_dir}/bin/jankurai" version) \
+  | grep -q "CLI version: \`${expected_semver}\`" \
+  || fail "relocated binary could not report installed release identity"
+
+JANKURAI_NO_UPDATE_CHECK=1 \
+  "${run_dir}/bin/jankurai" bench "${fixture}" \
+    --out "${fixture}/target/jankurai/relocated-benchmark.json"
+
+JANKURAI_NO_UPDATE_CHECK=1 \
+  "${run_dir}/bin/jankurai" certify "${fixture}" \
+    --out "${fixture}/target/jankurai/relocated-certification.json"
 
 JANKURAI_NO_UPDATE_CHECK=1 \
 GIT_CONFIG_GLOBAL=/dev/null \
@@ -54,4 +67,12 @@ GIT_TERMINAL_PROMPT=0 \
   "${run_dir}/bin/jankurai" gate "${fixture}" --staged-only
 
 assert_nonempty "${fixture}/target/jankurai/diff/diff-score.json"
-note "relocated schema-dependent commands passed after source removal"
+assert_nonempty "${fixture}/target/jankurai/relocated-benchmark.json"
+assert_nonempty "${fixture}/target/jankurai/relocated-certification.json"
+jq -e --arg version "${expected_semver}" '.runner_version == $version' \
+  "${fixture}/target/jankurai/relocated-benchmark.json" >/dev/null \
+  || fail "relocated benchmark did not use embedded release identity"
+jq -e --arg version "${expected_semver}" '.auditor_version == $version' \
+  "${fixture}/target/jankurai/relocated-certification.json" >/dev/null \
+  || fail "relocated certification did not use embedded release identity"
+note "relocated schema and release-data commands passed after source removal"

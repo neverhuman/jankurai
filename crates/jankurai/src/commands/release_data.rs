@@ -2,9 +2,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::local_state;
+
+const BUNDLED_STANDARD_VERSION_MANIFEST: &str =
+    include_str!("../../../../agent/standard-version.toml");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StandardVersionManifest {
@@ -46,19 +49,23 @@ pub struct RepoScoreSummary {
     pub findings: FindingsSummary,
 }
 
-pub fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-}
-
 pub fn load_release_data(repo: &Path) -> Result<ReleaseData> {
-    let manifest_path = release_manifest_path(repo);
-    let text = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("read {}", manifest_path.display()))?;
+    let manifest_path = repo.join("agent/standard-version.toml");
+    let (text, source) = if manifest_path.exists() {
+        (
+            fs::read_to_string(&manifest_path)
+                .with_context(|| format!("read {}", manifest_path.display()))?,
+            manifest_path.display().to_string(),
+        )
+    } else {
+        (
+            BUNDLED_STANDARD_VERSION_MANIFEST.to_string(),
+            "embedded agent/standard-version.toml".to_string(),
+        )
+    };
     let manifest: StandardVersionManifest =
-        toml::from_str(&text).with_context(|| format!("parse {}", manifest_path.display()))?;
-    let standard_version = if repo.join("agent/standard-version.toml").exists() {
+        toml::from_str(&text).with_context(|| format!("parse {source}"))?;
+    let standard_version = if manifest_path.exists() {
         manifest.standard_version
     } else {
         standard_doc_version(repo).unwrap_or(manifest.standard_version)
@@ -92,15 +99,6 @@ pub fn read_repo_score(repo: &Path) -> Result<Option<RepoScoreSummary>> {
         caps: read_string_array(&value, &["hard_caps", "caps", "caps_applied"]),
         findings: read_findings_summary(&value),
     }))
-}
-
-fn release_manifest_path(repo: &Path) -> PathBuf {
-    let candidate = repo.join("agent/standard-version.toml");
-    if candidate.exists() {
-        candidate
-    } else {
-        workspace_root().join("agent/standard-version.toml")
-    }
 }
 
 fn standard_doc_version(root: &Path) -> Option<String> {
