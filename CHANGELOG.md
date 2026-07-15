@@ -14,6 +14,19 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
   Homebrew formula metadata. The installer verifies release immutability,
   checksum, Sigstore bundle, and GitHub attestation before installing.
 
+## 1.6.11 - 2026-07-15
+
+Internal governed Jain/Jeryu CI maintenance release. The public Jankurai split
+hub remains on its independent 1.7.0 release line.
+
+### Fixed
+
+- Embed the JSON schema set into the auditor at build time so installed
+  `diff-audit` and pre-commit validation no longer depend on the source checkout
+  or its build-time `schemas/` path.
+- Reconcile the CLI package, compiled auditor, standard manifest, UX package,
+  lockfiles, and immutable internal tag identity at 1.6.11.
+
 ## 1.6.10 - 2026-05-31
 
 Dead-language allowlist + false-positive precision suite. Each change removes a

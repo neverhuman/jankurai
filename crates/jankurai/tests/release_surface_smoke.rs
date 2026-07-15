@@ -48,6 +48,21 @@ fn release_build_script_switches_between_tar_and_pkg_outputs() {
 }
 
 #[test]
+fn release_audit_gate_binds_tag_identity_and_relocation_proof() {
+    let text = read("ops/ci/release-audit-gate.sh");
+
+    assert!(text.contains("agent/standard-version.toml"));
+    assert!(text.contains("RELEASE_TAG (${RELEASE_TAG}) does not match release_tag"));
+    assert!(text.contains("relocation-test.sh"));
+
+    let relocation = read("ops/ci/relocation-test.sh");
+    assert!(relocation.contains("CARGO_NET_OFFLINE=true"));
+    assert!(relocation.contains("rm -rf \"${source_dir}\" \"${target_dir}\""));
+    assert!(relocation.contains("diff-audit"));
+    assert!(relocation.contains("gate \"${fixture}\" --staged-only"));
+}
+
+#[test]
 fn release_publish_script_stages_installer_and_formula_metadata() {
     let text = read("ops/ci/release-publish.sh");
 

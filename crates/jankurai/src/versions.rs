@@ -41,11 +41,13 @@ pub fn check_versions(repo: &Path) -> Result<()> {
 
     let standard_version = scalar(&manifest, "standard_version")?;
     let auditor_version = scalar(&manifest, "auditor_version")?;
+    let release_tag = scalar(&manifest, "release_tag")?;
     let schema_version = scalar(&manifest, "schema_version")?;
     let paper_edition = scalar(&manifest, "paper_edition")?;
     let target_stack = scalar(&manifest, "target_stack")?;
 
     assert_contains(root.join("VERSION"), auditor_version.as_str(), "VERSION")?;
+    assert_release_tag(&release_tag, AUDITOR_VERSION)?;
     assert_contains(
         root.join("docs/agent-native-standard.md"),
         &format!("Standard version: `{}`", STANDARD_VERSION),
@@ -135,6 +137,20 @@ fn assert_contains(path: PathBuf, expected: &str, label: &str) -> Result<()> {
     if !actual.contains(expected) {
         return Err(anyhow!(
             "{label}: expected to contain {expected}, got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn assert_release_tag(tag: &str, expected_version: &str) -> Result<()> {
+    let actual_version = tag
+        .strip_prefix('v')
+        .and_then(|value| value.split('-').next())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("release_tag must start with v<semver>: {tag}"))?;
+    if actual_version != expected_version {
+        return Err(anyhow!(
+            "release_tag version: expected {expected_version}, got {actual_version}"
         ));
     }
     Ok(())
