@@ -116,7 +116,7 @@ required_commands=(
 
 required_tool_names_ci=(cargo-audit npm zizmor)
 required_commands_ci=(
-  "db=\"\${JANKURAI_CARGO_AUDIT_DB:-target/jankurai/security/advisory-db}\"; if [ -d \"\$db/.git\" ]; then git -C \"\$db\" pull --ff-only --depth 1; else git clone --depth 1 https://github.com/RustSec/advisory-db.git \"\$db\"; fi; cargo audit --db \"\$db\" --no-fetch --stale"
+  "db=\"\${JANKURAI_CARGO_AUDIT_DB:-target/jankurai/security/advisory-db}\"; offline=\"\${JANKURAI_SECURITY_OFFLINE:-\${CARGO_NET_OFFLINE:-false}}\"; case \"\$offline\" in 1|true|TRUE) [ -d \"\$db\" ] || { echo \"offline advisory database missing: \$db\" >&2; exit 1; } ;; *) if [ -d \"\$db/.git\" ]; then git -C \"\$db\" pull --ff-only --depth 1; else git clone --depth 1 https://github.com/RustSec/advisory-db.git \"\$db\"; fi ;; esac; cargo audit --db \"\$db\" --no-fetch --stale"
   "npm audit --audit-level=high"
   "zizmor .github/workflows"
 )
