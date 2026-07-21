@@ -8,12 +8,17 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 ### Fixed
 
-- `HLT-006-DIRECT-DB-WRONG-LAYER` no longer treats bare English or shell verbs
-  (`apt-get update`, "delete session", "insert a coin") as direct DB access:
-  the detector now requires statement-shaped SQL (`SELECT ... FROM`,
-  `INSERT INTO`, `UPDATE ... SET`, `DELETE FROM`) or a word-bounded driver
-  crate name (`sqlx`, `diesel`, `psycopg`, `rusqlite`, `sqlite3`). Real SQL in
-  non-adapter layers still caps exactly as before.
+- `HLT-006-DIRECT-DB-WRONG-LAYER` no longer treats bare verbs (`apt-get
+  update`, "delete session", "insert a coin") as direct DB access: a match now
+  requires statement-shaped SQL (`SELECT ... FROM`, `INSERT INTO`,
+  `UPDATE ... SET`, `DELETE FROM` — the paired-keyword gap spans newlines and
+  `${...}` interpolation, bounded at 240 chars and the first `;`) or a driver
+  token (`sqlx*`, `diesel*`, `psycopg*`, `rusqlite`, `sqlite3`, `knex`,
+  `prisma`, `mysql`/`mysql2`, and `pg` import/require forms). Documented
+  trade-offs, pinned by tests: statement-shaped English inside one 240-char
+  unpunctuated span (e.g. "Select a dataset from the sidebar") still caps, and
+  statements with more than 240 chars between the paired keywords do not.
+  README test-surface block regenerated for the new tests.
 
 ### Added
 

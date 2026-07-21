@@ -1705,3 +1705,76 @@ fn statement_shaped_sql_still_trips_hlt006() {
         fs::remove_file(dir.path().join("apps/web/src").join(name)).unwrap();
     }
 }
+
+#[test]
+fn multiline_and_interpolated_sql_still_trips_hlt006() {
+    let dir = tempdir().unwrap();
+    write_audit_notice_fixture(dir.path());
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+    for (name, body) in [
+        (
+            "report_repo.ts",
+            "import { Pool } from 'pg';\nconst q = `SELECT r.id, r.name\n  FROM reports r`;\n",
+        ),
+        (
+            "interpolated.ts",
+            "const q = `SELECT ${cols} FROM ${table}`;\n",
+        ),
+        (
+            "update_multiline.ts",
+            "const q = `UPDATE runs\n  SET state = 'done'`;\n",
+        ),
+        ("sqlx_core.rs", "use sqlx_core::query::Query;\n"),
+    ] {
+        fs::write(dir.path().join("apps/web/src").join(name), body).unwrap();
+        let report = run_audit(dir.path(), &[]).unwrap();
+        let hit = report.findings.iter().any(|finding| {
+            finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER")
+                && finding.path.starts_with("apps/web/")
+        });
+        assert!(
+            hit,
+            "multi-line/interpolated SQL in {name} must stay visible"
+        );
+        fs::remove_file(dir.path().join("apps/web/src").join(name)).unwrap();
+    }
+}
+
+#[test]
+fn hlt006_accepted_trade_offs_are_pinned() {
+    // Documented limitation 1: statement-shaped ENGLISH inside one unpunctuated
+    // 240-char span still caps ("select ... from ...").  Documented limitation
+    // 2: single statements with >240 chars between the paired keywords do not.
+    let dir = tempdir().unwrap();
+    write_audit_notice_fixture(dir.path());
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+
+    fs::write(
+        dir.path().join("apps/web/src/copy.ts"),
+        "export const hint = 'Select a dataset from the sidebar';\n",
+    )
+    .unwrap();
+    let report = run_audit(dir.path(), &[]).unwrap();
+    assert!(
+        report.findings.iter().any(|finding| {
+            finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER")
+                && finding.path.starts_with("apps/web/")
+        }),
+        "known false positive: statement-shaped prose within one span still caps"
+    );
+    fs::remove_file(dir.path().join("apps/web/src/copy.ts")).unwrap();
+
+    let wide_gap = format!(
+        "const q = \"SELECT {} FROM t\";\n",
+        "col_aaaaaaaaaa, ".repeat(20)
+    );
+    fs::write(dir.path().join("apps/web/src/wide.ts"), wide_gap).unwrap();
+    let report = run_audit(dir.path(), &[]).unwrap();
+    assert!(
+        !report.findings.iter().any(|finding| {
+            finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER")
+                && finding.path.starts_with("apps/web/")
+        }),
+        "known miss: >240 chars between SELECT and FROM is accepted and pinned"
+    );
+}

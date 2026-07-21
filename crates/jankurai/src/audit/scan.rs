@@ -1767,13 +1767,22 @@ pub fn generated_zone_issues(ctx: &AuditContext) -> Vec<FindingHit> {
 /// HLT-006 DB-access shapes. The former bare-substring verbs ("update ",
 /// "delete ", ...) capped repos whose UI copy or shell installers merely said
 /// "apt-get update" or "delete session"; a statement now needs its structural
-/// second keyword (or a real driver-crate name) to count as direct DB access.
+/// second keyword (or a driver token) to count as direct DB access. The
+/// paired-keyword gap admits newlines and `${...}` interpolation (multi-line
+/// template literals are the dominant embedded-SQL style) but stops at the
+/// first `;` and 240 chars, so statements match while most running prose does
+/// not. Known accepted trade-offs: English of the exact shape
+/// "select ... from ..." / "update ... set ..." inside one 240-char
+/// unpunctuated span still caps, and single statements with >240 chars
+/// between the paired keywords do not.
 static DB_ACCESS_SHAPES: Lazy<Regex> = Lazy::new(|| {
     Regex::new(concat!(
-        r"(?i)\bsqlx\b|\bdiesel\b|\bpsycopg2?\b|\brusqlite\b|\bsqlite3\b",
-        r"|\bselect\b[^;{}\n]{0,200}\bfrom\b",
+        r"(?i)\bsqlx\w*|\bdiesel\w*|\bpsycopg\w*|\brusqlite\b|\bsqlite3\b",
+        r"|\bknex\b|\bprisma\b|\bmysql2?\b",
+        r#"|from\s+['"]pg['"]|require\(\s*['"]pg['"]"#,
+        r"|\bselect\b[^;]{0,240}\bfrom\b",
         r"|\binsert\s+into\b",
-        r"|\bupdate\b[^;{}\n]{0,200}\bset\b",
+        r"|\bupdate\b[^;]{0,240}\bset\b",
         r"|\bdelete\s+from\b",
     ))
     .expect("HLT-006 shapes regex is valid")
