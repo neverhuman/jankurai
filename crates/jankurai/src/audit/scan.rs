@@ -1764,6 +1764,21 @@ pub fn generated_zone_issues(ctx: &AuditContext) -> Vec<FindingHit> {
     issues
 }
 
+/// HLT-006 DB-access shapes. The former bare-substring verbs ("update ",
+/// "delete ", ...) capped repos whose UI copy or shell installers merely said
+/// "apt-get update" or "delete session"; a statement now needs its structural
+/// second keyword (or a real driver-crate name) to count as direct DB access.
+static DB_ACCESS_SHAPES: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(concat!(
+        r"(?i)\bsqlx\b|\bdiesel\b|\bpsycopg2?\b|\brusqlite\b|\bsqlite3\b",
+        r"|\bselect\b[^;{}\n]{0,200}\bfrom\b",
+        r"|\binsert\s+into\b",
+        r"|\bupdate\b[^;{}\n]{0,200}\bset\b",
+        r"|\bdelete\s+from\b",
+    ))
+    .expect("HLT-006 shapes regex is valid")
+});
+
 pub fn wrong_layer_db_hits(ctx: &AuditContext) -> Vec<FindingHit> {
     let mut hits = vec![];
     for file in product_files(ctx) {
@@ -1779,11 +1794,7 @@ pub fn wrong_layer_db_hits(ctx: &AuditContext) -> Vec<FindingHit> {
         if ["apps/web/", "crates/domain/", "frontend/", "ui/", "src/"]
             .iter()
             .any(|p| file.rel_path.starts_with(p))
-            && [
-                "select ", "insert ", "update ", "delete ", "sqlx", "diesel", "psycopg", "sqlite3",
-            ]
-            .iter()
-            .any(|m| file.text.to_ascii_lowercase().contains(m))
+            && DB_ACCESS_SHAPES.is_match(&file.text)
         {
             hits.push(FindingHit::new(
                 &file.rel_path,

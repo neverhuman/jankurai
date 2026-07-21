@@ -6,6 +6,15 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 ## Unreleased
 
+### Fixed
+
+- `HLT-006-DIRECT-DB-WRONG-LAYER` no longer treats bare English or shell verbs
+  (`apt-get update`, "delete session", "insert a coin") as direct DB access:
+  the detector now requires statement-shaped SQL (`SELECT ... FROM`,
+  `INSERT INTO`, `UPDATE ... SET`, `DELETE FROM`) or a word-bounded driver
+  crate name (`sqlx`, `diesel`, `psycopg`, `rusqlite`, `sqlite3`). Real SQL in
+  non-adapter layers still caps exactly as before.
+
 ### Added
 
 - Installer-first release packaging: release builds now produce signed Linux

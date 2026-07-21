@@ -1633,3 +1633,75 @@ fn audit_ast_pilot_detects_typescript_web_impurity() {
         .problem
         .contains("UI layer directly imports backend module")));
 }
+
+#[test]
+fn prose_and_shell_verbs_do_not_trip_hlt006() {
+    let dir = tempdir().unwrap();
+    write_audit_notice_fixture(dir.path());
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/App.tsx"),
+        [
+            "export const hints = [",
+            "  'refresh/update the cockpit',",
+            "  'Delete session',",
+            "  'insert a coin to continue',",
+            "  'select a dataset in the sidebar',",
+            "];",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("apps/web/installer")).unwrap();
+    fs::write(
+        dir.path().join("apps/web/installer/install.sh"),
+        "sudo apt-get update && sudo apt-get install -y docker-ce\n",
+    )
+    .unwrap();
+
+    let report = run_audit(dir.path(), &[]).unwrap();
+    let hlt006 = report
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER")
+                && finding.path.starts_with("apps/web/")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        hlt006.is_empty(),
+        "bare English/shell verbs must not read as direct DB access: {hlt006:?}"
+    );
+}
+
+#[test]
+fn statement_shaped_sql_still_trips_hlt006() {
+    let dir = tempdir().unwrap();
+    write_audit_notice_fixture(dir.path());
+    fs::create_dir_all(dir.path().join("apps/web/src")).unwrap();
+    for (name, body) in [
+        (
+            "select.ts",
+            "const q = \"SELECT id FROM users WHERE id = ?\";\n",
+        ),
+        ("insert.ts", "const q = \"INSERT INTO runs VALUES (1)\";\n"),
+        (
+            "update.ts",
+            "const q = \"UPDATE runs SET state = 'done'\";\n",
+        ),
+        (
+            "delete.ts",
+            "const q = \"DELETE FROM runs WHERE id = 1\";\n",
+        ),
+        ("driver.rs", "use rusqlite::Connection;\n"),
+    ] {
+        fs::write(dir.path().join("apps/web/src").join(name), body).unwrap();
+        let report = run_audit(dir.path(), &[]).unwrap();
+        let hit = report.findings.iter().any(|finding| {
+            finding.rule_id.as_deref() == Some("HLT-006-DIRECT-DB-WRONG-LAYER")
+                && finding.path.starts_with("apps/web/")
+        });
+        assert!(hit, "statement-shaped SQL in {name} must stay visible");
+        fs::remove_file(dir.path().join("apps/web/src").join(name)).unwrap();
+    }
+}
