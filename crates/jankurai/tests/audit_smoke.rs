@@ -611,6 +611,122 @@ fn changed_fast_scope_is_advisory_and_partial() {
 }
 
 #[test]
+fn changed_fast_inventories_unchanged_readme_and_release_evidence() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("AGENTS.md"), "Read agent standard\n").unwrap();
+    fs::write(
+        dir.path().join("README.md"),
+        "# Repo\n\n[![CI](https://img.shields.io/badge/ci-green.svg)](ci)\n\nBuilt on a Rust core. See [AGENTS.md](AGENTS.md).\n\n## Quick start\n\n```sh\ncargo test\n```\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"1.0.0\"\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("CHANGELOG.md"), "# Changelog\n").unwrap();
+    fs::write(
+        dir.path().join("Justfile"),
+        "check:\n    cargo test\nrelease:\n    cargo test\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("docs")).unwrap();
+    fs::write(
+        dir.path().join("docs/architecture.md"),
+        "# Architecture\n\nRust workspace boundaries.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("docs/testing.md"),
+        "# Testing\n\nRun cargo test.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("docs/release.md"),
+        "# Release process\n\nThe release gate requires security review, backup rehearsal, monitoring, rollback, and rate limit abuse controls. Verify SHA256 checksums, provenance, and the SBOM before publication.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(
+        dir.path().join("src/unrelated.rs"),
+        "pub fn unrelated() -> bool { true }\n",
+    )
+    .unwrap();
+
+    let report = run_audit_with_options(
+        dir.path(),
+        &[dir.path().join("src/unrelated.rs")],
+        AuditOptions {
+            self_audit: false,
+            proof_receipts: None,
+            changed_fast: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.scope.mode, "changed-fast");
+    assert_eq!(report.scope.paths, vec!["src/unrelated.rs".to_string()]);
+    assert!(!report
+        .caps_applied
+        .iter()
+        .any(|cap| cap == "missing-agent-readable-docs"));
+    assert!(!report
+        .caps_applied
+        .iter()
+        .any(|cap| cap == "release-readiness-gap"));
+    assert!(!report
+        .findings
+        .iter()
+        .any(|finding| { finding.path == "README.md" || finding.path == "docs/release.md" }));
+}
+
+#[test]
+fn changed_fast_inventories_unchanged_rendered_ux_evidence() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("AGENTS.md"), "Read agent standard\n").unwrap();
+    fs::create_dir_all(dir.path().join("apps/web/src/storybook")).unwrap();
+    fs::create_dir_all(dir.path().join("apps/web/e2e")).unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/App.tsx"),
+        "export const App = () => <main />;\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/storybook/states.ts"),
+        "// Component Story Format state consumed by an MSW adapter.\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("apps/web/src/styles.css"),
+        "/* semantic design tokens */\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("apps/web/e2e/rendered.spec.ts"),
+        "// Visual review uses @axe-core/playwright, toHaveScreenshot, cumulative layout shift, and artifactPath receipts.\n",
+    )
+    .unwrap();
+
+    let report = run_audit_with_options(
+        dir.path(),
+        &[dir.path().join("apps/web/src/App.tsx")],
+        AuditOptions {
+            self_audit: false,
+            proof_receipts: None,
+            changed_fast: true,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(report.scope.mode, "changed-fast");
+    assert_eq!(report.scope.paths, vec!["apps/web/src/App.tsx".to_string()]);
+    assert!(!report
+        .caps_applied
+        .iter()
+        .any(|cap| cap == "missing-rendered-ux-qa-lane"));
+}
+
+#[test]
 fn changed_fast_cli_requires_changed_scope_and_skips_score_history() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("AGENTS.md"), "Read agent standard\n").unwrap();
