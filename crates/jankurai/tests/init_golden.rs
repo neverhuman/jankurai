@@ -478,6 +478,33 @@ fn hooks_install_yes_installs_local_hooks() {
 }
 
 #[test]
+fn hooks_explicit_binary_overrides_managed_default() {
+    let dir = tempdir().unwrap();
+    init_git_repo(dir.path());
+
+    assert_command_success(
+        Command::new(binary_path())
+            .arg("hooks")
+            .arg("install")
+            .arg(dir.path())
+            .arg("--yes"),
+    );
+
+    fs::write(
+        dir.path().join(".git/jankurai/env"),
+        "JANKURAI_BIN='/bin/false'\nJANKURAI_FALLBACK_BIN='/bin/false'\n",
+    )
+    .unwrap();
+
+    assert_command_success(
+        Command::new(dir.path().join(".git/hooks/pre-commit"))
+            .current_dir(dir.path())
+            .env("JANKURAI_BIN", binary_path()),
+    );
+    assert!(dir.path().join(".git/jankurai/last-score.env").is_file());
+}
+
+#[test]
 fn hooks_install_backs_up_and_chains_existing_hooks() {
     let dir = tempdir().unwrap();
     init_git_repo(dir.path());

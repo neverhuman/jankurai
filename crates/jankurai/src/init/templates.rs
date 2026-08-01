@@ -190,10 +190,14 @@ esac
 jankurai_dir="$git_dir/jankurai"
 mkdir -p "$jankurai_dir"
 
+explicit_jankurai_bin="${JANKURAI_BIN:-}"
 env_file="$jankurai_dir/env"
 if [ -f "$env_file" ]; then
   # shellcheck disable=SC1090
   . "$env_file"
+fi
+if [ -n "$explicit_jankurai_bin" ]; then
+  JANKURAI_BIN="$explicit_jankurai_bin"
 fi
 
 if [ -n "${JANKURAI_PRE_COMMIT_CHAIN:-}" ] && [ -x "$JANKURAI_PRE_COMMIT_CHAIN" ] && [ -z "${JANKURAI_CHAINED_HOOK:-}" ]; then
