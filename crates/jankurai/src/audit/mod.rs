@@ -1569,6 +1569,9 @@ fn changed_fast_inventory_paths(scope_paths: &[String]) -> Vec<String> {
         "go.sum",
         "agent",
         ".github/workflows",
+        "contracts",
+        "db",
+        "schemas",
         "apps/marketing/e2e",
         "apps/web/e2e",
         "apps/web/src/storybook",
@@ -1584,6 +1587,7 @@ fn changed_fast_inventory_paths(scope_paths: &[String]) -> Vec<String> {
         "ops/AGENTS.md",
         "ops/ci",
         "ops/git-hooks",
+        "tools/security-lane.sh",
     ] {
         paths.insert(path.to_string());
     }
