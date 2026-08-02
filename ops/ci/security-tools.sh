@@ -16,6 +16,11 @@ case "${JAIN_HOST_CI_NETWORK_ISOLATED:-0}" in
     ;;
   1)
     note "network-isolated release uses the offline release security profile"
+    for projected_tool in cargo-audit zizmor gitleaks syft grype; do
+      command -v "$projected_tool" >/dev/null 2>&1 \
+        || fail "network-isolated release requires projected security tool: $projected_tool"
+    done
+    exit 0
     ;;
   *)
     fail "JAIN_HOST_CI_NETWORK_ISOLATED must be exactly 0 or 1"

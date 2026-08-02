@@ -104,7 +104,9 @@ selects the strict `release` security profile. That profile uses the pinned
 RustSec inputs plus gitleaks, Zizmor, Syft, and a JavaScript-lock
 SBOM scanned by Grype's sealed database; it neither provisions Node nor treats
 an empty offline `npm audit` response as evidence. Ordinary connected CI keeps
-the existing strict `ci` profile and npm audit path.
+the existing strict `ci` profile and npm audit path. The root boundary owns the
+projected scanner versions and digests, so isolated setup requires those five
+commands on its sealed `PATH` and never self-installs or substitutes them.
 
 ### `just ci-release-build`
 The release.yml build matrix. It expects `LOCAL_RELEASE_TAG=vX.Y.Z` and will

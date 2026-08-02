@@ -1,7 +1,9 @@
 use serde_yaml::Value as YamlValue;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use tempfile::tempdir;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,6 +13,13 @@ fn repo_root() -> PathBuf {
 
 fn read(path: &str) -> String {
     fs::read_to_string(repo_root().join(path)).expect(path)
+}
+
+fn write_executable(path: &std::path::Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
 }
 
 #[test]
@@ -145,6 +154,63 @@ fn security_tools_rejects_malformed_host_isolation_mode_before_setup() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("JAIN_HOST_CI_NETWORK_ISOLATED must be exactly 0 or 1"));
+}
+
+#[test]
+fn network_isolated_security_tools_consumes_projection_without_installers() {
+    let bin_dir = tempdir().unwrap();
+    for tool in ["cargo-audit", "zizmor", "gitleaks", "syft", "grype"] {
+        write_executable(&bin_dir.path().join(tool), "#!/usr/bin/env bash\nexit 93\n");
+    }
+    let tripwire = bin_dir.path().join("installer-invoked");
+    for tool in ["cargo", "curl", "sudo", "npm", "node"] {
+        write_executable(
+            &bin_dir.path().join(tool),
+            "#!/usr/bin/env bash\n: >\"${TRIPWIRE_MARKER:?}\"\nexit 97\n",
+        );
+    }
+
+    let output = Command::new("/bin/bash")
+        .arg(repo_root().join("ops/ci/security-tools.sh"))
+        .current_dir(repo_root())
+        .env("JAIN_HOST_CI_NETWORK_ISOLATED", "1")
+        .env("TRIPWIRE_MARKER", &tripwire)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin_dir.path().display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "projected setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!tripwire.exists(), "release setup invoked an installer");
+}
+
+#[test]
+fn network_isolated_security_tools_requires_every_projected_command() {
+    let bin_dir = tempdir().unwrap();
+    for tool in ["cargo-audit", "zizmor", "gitleaks", "syft"] {
+        write_executable(&bin_dir.path().join(tool), "#!/usr/bin/env bash\nexit 0\n");
+    }
+
+    let output = Command::new("/bin/bash")
+        .arg(repo_root().join("ops/ci/security-tools.sh"))
+        .current_dir(repo_root())
+        .env("JAIN_HOST_CI_NETWORK_ISOLATED", "1")
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", bin_dir.path().display()),
+        )
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("network-isolated release requires projected security tool: grype"));
 }
 
 #[test]
