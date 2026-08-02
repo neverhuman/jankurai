@@ -158,6 +158,7 @@ pub fn run(args: SecurityRunArgs) -> Result<()> {
 
     let mut cmd = Command::new("bash");
     cmd.arg(&script_rel).current_dir(&repo);
+    cmd.env("JANKURAI_SECURITY_PROFILE", &args.profile);
     if args.strict {
         cmd.env("JANKURAI_SECURITY_STRICT", "1");
     } else {

@@ -74,6 +74,67 @@ fn security_run_writes_valid_evidence_and_log() {
 }
 
 #[test]
+fn security_run_passes_the_validated_profile_to_the_wrapper() {
+    let repo = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("agent")).unwrap();
+    fs::create_dir_all(repo.path().join("tools")).unwrap();
+    fs::write(
+        repo.path().join("agent/security-policy.toml"),
+        r#"
+schema_version = "1.0.0"
+
+[profiles.release]
+enabled_tools = ["gitleaks"]
+required_tools = ["gitleaks"]
+advisory_tools = []
+
+[severity_thresholds]
+fail_lane_on = "high"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("tools/security-lane.sh"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+[[ "${JANKURAI_SECURITY_PROFILE:?}" == release ]]
+printf '%s\n' 'jankurai-security-step={"label":"gitleaks","tool":"gitleaks","shell_command":"true","status":"ran","advisory":false,"exit_code":0}'
+"#,
+    )
+    .unwrap();
+
+    let evidence_path = repo.path().join("out/evidence.json");
+    let output = Command::new(binary_path())
+        .env("JANKURAI_SECURITY_PROFILE", "ci")
+        .args([
+            "security",
+            "run",
+            repo.path().to_str().unwrap(),
+            "--profile",
+            "release",
+            "--strict",
+            "--script",
+            "tools/security-lane.sh",
+            "--out",
+            evidence_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "security run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&evidence_path).unwrap()).unwrap();
+    validation::validate_value(repo.path(), ArtifactSchema::SecurityEvidence, &value).unwrap();
+    assert_eq!(value["policy"]["profile"], "release");
+    assert_eq!(value["commands"][0]["tool"], "gitleaks");
+    assert_eq!(value["commands"][0]["blocking"], false);
+}
+
+#[test]
 fn security_run_records_non_zero_exit_in_evidence() {
     let repo = tempdir().unwrap();
     fs::create_dir_all(repo.path().join("tools")).unwrap();

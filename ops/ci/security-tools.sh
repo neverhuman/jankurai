@@ -9,8 +9,18 @@ case ":${PATH}:" in
   *) export PATH="${cargo_bin_dir}:${PATH}" ;;
 esac
 
-step "Node.js toolchain ${NODE_VERSION}"
-bash "$(dirname "${BASH_SOURCE[0]}")/node-tools.sh"
+case "${JAIN_HOST_CI_NETWORK_ISOLATED:-0}" in
+  0)
+    step "Node.js toolchain ${NODE_VERSION}"
+    bash "$(dirname "${BASH_SOURCE[0]}")/node-tools.sh"
+    ;;
+  1)
+    note "network-isolated release uses the offline release security profile"
+    ;;
+  *)
+    fail "JAIN_HOST_CI_NETWORK_ISOLATED must be exactly 0 or 1"
+    ;;
+esac
 
 want_version() {
   local cmd="$1" want="$2"

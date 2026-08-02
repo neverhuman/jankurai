@@ -1,6 +1,7 @@
 use serde_yaml::Value as YamlValue;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -54,6 +55,9 @@ fn release_audit_gate_binds_tag_identity_and_relocation_proof() {
     assert!(text.contains("agent/standard-version.toml"));
     assert!(text.contains("RELEASE_TAG (${RELEASE_TAG}) does not match release_tag"));
     assert!(text.contains("relocation-test.sh"));
+    assert!(text.contains("JAIN_HOST_CI_NETWORK_ISOLATED"));
+    assert!(text.contains("security_profile=release"));
+    assert!(text.contains("--profile \"$security_profile\""));
 
     let relocation = read("ops/ci/relocation-test.sh");
     assert!(relocation.contains("CARGO_NET_OFFLINE=true"));
@@ -119,12 +123,44 @@ fn security_tools_script_bootstraps_node_before_security_scans() {
 
     assert!(text.contains("node-tools.sh"));
     assert!(text.contains("Node.js toolchain"));
+    assert!(text.contains("JAIN_HOST_CI_NETWORK_ISOLATED"));
+    assert!(text.contains("network-isolated release uses the offline release security profile"));
     assert!(text.contains("cargo_bin_dir"));
     assert!(text.contains("cargo-audit"));
     assert!(text.contains("zizmor"));
     assert!(text.contains("gitleaks"));
     assert!(text.contains("local_bin"));
     assert!(text.contains("could not install gitleaks without sudo or a writable"));
+}
+
+#[test]
+fn security_tools_rejects_malformed_host_isolation_mode_before_setup() {
+    let output = Command::new("bash")
+        .arg(repo_root().join("ops/ci/security-tools.sh"))
+        .current_dir(repo_root())
+        .env("JAIN_HOST_CI_NETWORK_ISOLATED", "invalid")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("JAIN_HOST_CI_NETWORK_ISOLATED must be exactly 0 or 1"));
+}
+
+#[test]
+fn release_security_profile_uses_the_offline_javascript_advisory_path() {
+    let policy = read("agent/security-policy.toml");
+    let lane = read("tools/security-lane.sh");
+
+    assert!(policy.contains("[profiles.release]"));
+    assert!(policy.contains(
+        "required_tools = [\"gitleaks\", \"cargo-audit\", \"zizmor\", \"syft\", \"grype\"]"
+    ));
+    assert!(lane.contains("JANKURAI_SECURITY_PROFILE"));
+    assert!(lane.contains("javascript-lock-cataloger"));
+    assert!(lane.contains("GRYPE_DB_AUTO_UPDATE=false"));
+    assert!(lane.contains("grype sbom:"));
+    assert!(lane.contains("npm audit --audit-level=high"));
 }
 
 #[test]

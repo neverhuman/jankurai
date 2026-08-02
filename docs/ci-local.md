@@ -99,6 +99,13 @@ evidence before the ratchet audit, so tag releases do not depend on stale local
 `target/` files or PR artifacts. Optionally set `LOCAL_RELEASE_TAG=v1.0.0` to
 also assert `VERSION` matches the tag.
 
+Inside the root-sealed, network-isolated Jeryu host-CI boundary, the same gate
+selects the strict `release` security profile. That profile uses the pinned
+RustSec inputs plus gitleaks, Zizmor, Syft, and a JavaScript-lock
+SBOM scanned by Grype's sealed database; it neither provisions Node nor treats
+an empty offline `npm audit` response as evidence. Ordinary connected CI keeps
+the existing strict `ci` profile and npm audit path.
+
 ### `just ci-release-build`
 The release.yml build matrix. It expects `LOCAL_RELEASE_TAG=vX.Y.Z` and will
 produce either a signed Linux tarball or a notarized macOS `.pkg` for the

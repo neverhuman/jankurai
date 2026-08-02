@@ -2,6 +2,14 @@
 set -euo pipefail
 
 strict="${JANKURAI_SECURITY_STRICT:-0}"
+security_profile="${JANKURAI_SECURITY_PROFILE:-local}"
+case "$security_profile" in
+  local|ci|release) ;;
+  *)
+    echo "unsupported JANKURAI_SECURITY_PROFILE: $security_profile" >&2
+    exit 2
+    ;;
+esac
 
 # One JSON object per line after the prefix; parsed by `jankurai security run`.
 emit_step() {
@@ -114,12 +122,24 @@ required_commands=(
   "echo 'security-lane:gitleaks:start' >&2; if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then scan_dir=\"\$(mktemp -d)\"; trap 'rm -rf \"\$scan_dir\"' EXIT; git archive --format=tar HEAD | tar -xf - -C \"\$scan_dir\"; (cd \"\$scan_dir\" && gitleaks detect --no-git --source . --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner); else gitleaks detect --no-git --source . --config .gitleaks.toml --gitleaks-ignore-path .gitleaksignore --redact --no-banner; fi; status=\$?; echo 'security-lane:gitleaks:done' >&2; exit \$status"
 )
 
+cargo_audit_command='db="${JANKURAI_CARGO_AUDIT_DB:-${JAIN_PINNED_ADVISORY_DB:-target/jankurai/security/advisory-db}}"; offline="${JANKURAI_SECURITY_OFFLINE:-${CARGO_NET_OFFLINE:-false}}"; case "$offline" in 1|true|TRUE) [ -d "$db" ] || { echo "offline advisory database missing: $db" >&2; exit 1; } ;; *) if [ -d "$db/.git" ]; then git -C "$db" pull --ff-only --depth 1; else git clone --depth 1 https://github.com/RustSec/advisory-db.git "$db"; fi ;; esac; cargo audit --db "$db" --no-fetch --stale'
+
 required_tool_names_ci=(cargo-audit npm zizmor)
 required_commands_ci=(
-  "db=\"\${JANKURAI_CARGO_AUDIT_DB:-target/jankurai/security/advisory-db}\"; offline=\"\${JANKURAI_SECURITY_OFFLINE:-\${CARGO_NET_OFFLINE:-false}}\"; case \"\$offline\" in 1|true|TRUE) [ -d \"\$db\" ] || { echo \"offline advisory database missing: \$db\" >&2; exit 1; } ;; *) if [ -d \"\$db/.git\" ]; then git -C \"\$db\" pull --ff-only --depth 1; else git clone --depth 1 https://github.com/RustSec/advisory-db.git \"\$db\"; fi ;; esac; cargo audit --db \"\$db\" --no-fetch --stale"
+  "$cargo_audit_command"
   "npm audit --audit-level=high"
   "zizmor .github/workflows"
 )
+
+if [ "$security_profile" = "release" ]; then
+  required_tool_names_ci=(cargo-audit zizmor syft grype)
+  required_commands_ci=(
+    "$cargo_audit_command"
+    "zizmor .github/workflows"
+    "syft dir:. -o spdx-json=target/jankurai/sbom.spdx.json"
+    "syft dir:. --override-default-catalogers javascript-lock-cataloger -o syft-json=target/jankurai/security/javascript-packages.syft.json && GRYPE_DB_AUTO_UPDATE=false GRYPE_CHECK_FOR_APP_UPDATE=false grype sbom:target/jankurai/security/javascript-packages.syft.json --fail-on high"
+  )
+fi
 
 for i in "${!required_tool_names[@]}"; do
   run_required "${required_tool_names[$i]}" "${required_commands[$i]}"
@@ -134,4 +154,6 @@ for i in "${!required_tool_names_ci[@]}"; do
   run_tool "${required_tool_names_ci[$i]}" "${required_tool_names_ci[$i]}" "${required_commands_ci[$i]}" "$advisory_flag"
 done
 
-run_tool "syft" "syft" "syft . -o spdx-json=target/jankurai/sbom.spdx.json" "1"
+if [ "$security_profile" != "release" ]; then
+  run_tool "syft" "syft" "syft . -o spdx-json=target/jankurai/sbom.spdx.json" "1"
+fi

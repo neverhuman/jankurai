@@ -34,6 +34,13 @@ fail_lane_on = "high"
     .unwrap();
 }
 
+fn write_executable(path: &std::path::Path, body: &str) {
+    fs::write(path, body).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
 #[test]
 fn required_tool_failure_exits_nonzero_and_records_real_exit_code() {
     let repo = tempdir().unwrap();
@@ -192,4 +199,93 @@ fn ci_security_lane_scans_a_source_snapshot_without_mutating_workspace() {
         repo.path().join("junk.txt").exists(),
         "source snapshot scanning should not delete the live workspace"
     );
+}
+
+#[test]
+fn release_profile_uses_offline_scanners_and_never_invokes_npm() {
+    let repo = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("agent")).unwrap();
+    fs::create_dir_all(repo.path().join("tools")).unwrap();
+    fs::create_dir_all(repo.path().join("advisory-db")).unwrap();
+    fs::write(
+        repo.path().join("agent/security-policy.toml"),
+        fs::read_to_string(repo_root().join("agent/security-policy.toml")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("tools/security-lane.sh"),
+        fs::read_to_string(repo_root().join("tools/security-lane.sh")).unwrap(),
+    )
+    .unwrap();
+
+    let bin_dir = tempdir().unwrap();
+    for tool in ["gitleaks", "cargo-audit", "zizmor", "syft", "grype"] {
+        write_executable(&bin_dir.path().join(tool), "#!/usr/bin/env bash\nexit 0\n");
+    }
+    write_executable(
+        &bin_dir.path().join("cargo"),
+        "#!/usr/bin/env bash\ncase \"${1-}\" in audit|deny) exit 0 ;; *) exit 98 ;; esac\n",
+    );
+    let npm_marker = repo.path().join("npm-was-invoked");
+    write_executable(
+        &bin_dir.path().join("npm"),
+        "#!/usr/bin/env bash\n: >\"${NPM_MARKER:?}\"\nexit 97\n",
+    );
+
+    let evidence_path = repo.path().join("out/evidence.json");
+    let output = Command::new(binary_path())
+        .current_dir(repo.path())
+        .env("JANKURAI_SECURITY_PROFILE", "ci")
+        .env("JANKURAI_CARGO_AUDIT_DB", repo.path().join("advisory-db"))
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("NPM_MARKER", &npm_marker)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.path().display(),
+                env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .args([
+            "security",
+            "run",
+            ".",
+            "--profile",
+            "release",
+            "--strict",
+            "--script",
+            "tools/security-lane.sh",
+            "--out",
+            evidence_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "release security failed: stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!npm_marker.exists(), "release profile invoked npm");
+
+    let value: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&evidence_path).unwrap()).unwrap();
+    validation::validate_value(repo.path(), ArtifactSchema::SecurityEvidence, &value).unwrap();
+    assert_eq!(value["policy"]["profile"], "release");
+    let tools: Vec<_> = value["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|command| command["tool"].as_str())
+        .collect();
+    assert_eq!(
+        tools,
+        ["gitleaks", "cargo-audit", "zizmor", "syft", "grype"]
+    );
+    assert!(value["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|command| command["status"] == "ran" && command["blocking"] == false));
 }

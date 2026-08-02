@@ -36,8 +36,16 @@ bash "$(dirname "${BASH_SOURCE[0]}")/coverage-llvm.sh"
 step "Install local jankurai"
 cargo install --path crates/jankurai --locked --force
 
-step "Security lane (strict, ci profile)"
-jankurai security run . --strict --profile ci --out "${ARTIFACT_ROOT}/security/evidence.json"
+security_profile=ci
+case "${JAIN_HOST_CI_NETWORK_ISOLATED:-0}" in
+  0) ;;
+  1) security_profile=release ;;
+  *) fail "JAIN_HOST_CI_NETWORK_ISOLATED must be exactly 0 or 1" ;;
+esac
+
+step "Security lane (strict, ${security_profile} profile)"
+jankurai security run . --strict --profile "$security_profile" \
+  --out "${ARTIFACT_ROOT}/security/evidence.json"
 
 step "Ratchet audit"
 jankurai audit . \
