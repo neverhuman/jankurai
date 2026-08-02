@@ -625,7 +625,15 @@ fn candidate_source_files(repo: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in WalkDir::new(repo)
         .into_iter()
-        .filter_entry(|entry| !entry.file_type().is_dir() || !is_skipped_dir(entry.path()))
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(repo) else {
+                return false;
+            };
+            !is_skipped_dir(relative)
+        })
         .filter_map(Result::ok)
     {
         let path = entry.path();

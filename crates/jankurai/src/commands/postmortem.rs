@@ -337,7 +337,15 @@ fn collect_entries(repo: &Path, root: &Path) -> Result<Vec<PostmortemEntry>> {
     }
     for entry in WalkDir::new(root)
         .into_iter()
-        .filter_entry(|entry| !entry.file_type().is_dir() || !is_skipped_dir(entry.path()))
+        .filter_entry(|entry| {
+            if !entry.file_type().is_dir() {
+                return true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(root) else {
+                return false;
+            };
+            !is_skipped_dir(relative)
+        })
         .filter_map(Result::ok)
     {
         let path = entry.path();

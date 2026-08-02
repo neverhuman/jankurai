@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use tempfile::tempdir;
+use tempfile::{tempdir, tempdir_in};
 
 use jankurai::validation::{self, ArtifactSchema};
 
@@ -275,6 +275,60 @@ fn slice_risk_prunes_skipped_directories_during_whole_repo_scan() {
         serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
     assert_eq!(report["decision"], "pass");
     assert_eq!(report["signals_total"], 0);
+}
+
+#[test]
+fn slice_risk_scans_repos_nested_beneath_target_ancestors() {
+    let outer = tempdir().unwrap();
+    let target_ancestor = outer.path().join("target");
+    fs::create_dir(&target_ancestor).unwrap();
+    let repo_dir = tempdir_in(&target_ancestor).unwrap();
+    fs::create_dir_all(repo_dir.path().join("docs")).unwrap();
+    fs::create_dir_all(repo_dir.path().join("src")).unwrap();
+    fs::write(
+        repo_dir.path().join("docs/notes.md"),
+        "documentation only\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("src/model.py"),
+        "import torch\n\n\ndef load(path):\n    return torch.load(path)\n",
+    )
+    .unwrap();
+
+    fs::write(
+        repo_dir.path().join("plan.json"),
+        plan_json("clean-target", r#"["docs/"]"#, "\"notes\""),
+    )
+    .unwrap();
+    let (clean_output, _dir, clean_json, _) =
+        run_slice_risk(&repo_dir.path().to_path_buf(), "clean-target", false);
+    assert!(
+        clean_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+    let clean: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&clean_json).unwrap()).unwrap();
+    assert_eq!(clean["decision"], "pass");
+    assert_eq!(clean["signals_total"], 0);
+
+    fs::write(
+        repo_dir.path().join("plan.json"),
+        plan_json("risky-target", r#"["src/"]"#, "\"notes\""),
+    )
+    .unwrap();
+    let (risky_output, _dir, risky_json, _) =
+        run_slice_risk(&repo_dir.path().to_path_buf(), "risky-target", false);
+    assert!(
+        risky_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&risky_output.stderr)
+    );
+    let risky: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&risky_json).unwrap()).unwrap();
+    assert_eq!(risky["decision"], "block");
+    assert!(risky["critical_signals"].as_u64().unwrap() >= 1);
 }
 
 fn plan_json(slice_id: &str, allowed_paths: &str, notes: &str) -> String {

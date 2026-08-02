@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use tempfile::tempdir;
+use tempfile::{tempdir, tempdir_in};
 
 use jankurai::validation::{self, ArtifactSchema};
 
@@ -129,4 +129,35 @@ fn postmortem_list_show_and_read_are_read_only() {
         .unwrap()
         .count();
     assert_eq!(before, after);
+}
+
+#[test]
+fn postmortem_lists_repos_nested_beneath_target_ancestors() {
+    let outer = tempdir().unwrap();
+    let target_ancestor = outer.path().join("target");
+    fs::create_dir(&target_ancestor).unwrap();
+    let repo = tempdir_in(&target_ancestor).unwrap();
+    fs::create_dir_all(repo.path().join(".jankurai/postmortems")).unwrap();
+    fs::write(
+        repo.path().join(".jankurai/postmortems/alpha.toml"),
+        fs::read_to_string(fixture("alpha.toml")).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".jankurai/postmortems/beta.toml"),
+        fs::read_to_string(fixture("beta.toml")).unwrap(),
+    )
+    .unwrap();
+
+    let (output, _dir, json_path, _) = run_postmortem_report(&repo.path().to_path_buf(), &["list"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(report["records_total"], 2);
+    assert_eq!(report["records"][0]["postmortem_id"], "alpha");
+    assert_eq!(report["records"][1]["postmortem_id"], "beta");
 }
