@@ -34,7 +34,7 @@ step "Coverage and mutation evidence"
 bash "$(dirname "${BASH_SOURCE[0]}")/coverage-llvm.sh"
 
 step "Install local jankurai"
-cargo install --path crates/jankurai --locked --force
+install_local_jankurai "${ARTIFACT_ROOT}/candidate-install"
 
 security_profile=ci
 case "${JAIN_HOST_CI_NETWORK_ISOLATED:-0}" in
@@ -44,11 +44,11 @@ case "${JAIN_HOST_CI_NETWORK_ISOLATED:-0}" in
 esac
 
 step "Security lane (strict, ${security_profile} profile)"
-jankurai security run . --strict --profile "$security_profile" \
+"${JANKURAI_CANDIDATE_BIN}" security run . --strict --profile "$security_profile" \
   --out "${ARTIFACT_ROOT}/security/evidence.json"
 
 step "Ratchet audit"
-jankurai audit . \
+"${JANKURAI_CANDIDATE_BIN}" audit . \
   --full \
   --mode ratchet \
   --baseline "${CI_ROOT}/agent/baselines/main.repo-score.json" \

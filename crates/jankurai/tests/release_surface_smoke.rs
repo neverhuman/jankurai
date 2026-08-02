@@ -60,6 +60,8 @@ fn release_build_script_switches_between_tar_and_pkg_outputs() {
 #[test]
 fn release_audit_gate_binds_tag_identity_and_relocation_proof() {
     let text = read("ops/ci/release-audit-gate.sh");
+    let audit = read("ops/ci/audit.sh");
+    let lib = read("ops/ci/lib.sh");
 
     assert!(text.contains("agent/standard-version.toml"));
     assert!(text.contains("RELEASE_TAG (${RELEASE_TAG}) does not match release_tag"));
@@ -67,12 +69,88 @@ fn release_audit_gate_binds_tag_identity_and_relocation_proof() {
     assert!(text.contains("JAIN_HOST_CI_NETWORK_ISOLATED"));
     assert!(text.contains("security_profile=release"));
     assert!(text.contains("--profile \"$security_profile\""));
+    assert!(lib.contains("install_local_jankurai()"));
+    assert!(lib.contains("--root \"$install_root\""));
+    assert!(lib.contains("JANKURAI_CANDIDATE_BIN=\"${install_root}/bin/jankurai\""));
+    for lane in [&text, &audit] {
+        assert!(lane.contains("install_local_jankurai \"${ARTIFACT_ROOT}/candidate-install\""));
+        assert!(lane.contains("\"${JANKURAI_CANDIDATE_BIN}\" security run"));
+        assert!(lane.contains("\"${JANKURAI_CANDIDATE_BIN}\" audit"));
+        assert!(!lane
+            .lines()
+            .any(|line| line.trim_start().starts_with("jankurai ")));
+    }
 
     let relocation = read("ops/ci/relocation-test.sh");
     assert!(relocation.contains("CARGO_NET_OFFLINE=true"));
     assert!(relocation.contains("rm -rf \"${source_dir}\" \"${target_dir}\""));
     assert!(relocation.contains("diff-audit"));
     assert!(relocation.contains("gate \"${fixture}\" --staged-only"));
+}
+
+#[test]
+fn local_candidate_install_ignores_a_hostile_path_jankurai() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let stale_marker = dir.path().join("stale-selected");
+    let candidate_marker = dir.path().join("candidate-selected");
+    let install_root = dir.path().join("candidate-install");
+
+    write_executable(
+        &bin_dir.join("jankurai"),
+        "#!/usr/bin/env bash\n: >\"${STALE_MARKER:?}\"\n",
+    );
+    write_executable(
+        &bin_dir.join("cargo"),
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+install_root=""
+while [[ $# -gt 0 ]]; do
+  if [[ "$1" == "--root" ]]; then
+    install_root="$2"
+    shift 2
+  else
+    shift
+  fi
+done
+[[ -n "$install_root" ]]
+mkdir -p "$install_root/bin"
+cat >"$install_root/bin/jankurai" <<'EOF'
+#!/usr/bin/env bash
+: >"${CANDIDATE_MARKER:?}"
+EOF
+chmod +x "$install_root/bin/jankurai"
+"#,
+    );
+
+    let command = format!(
+        "source '{}'; install_local_jankurai \"$INSTALL_ROOT\"; \"$JANKURAI_CANDIDATE_BIN\"",
+        repo_root().join("ops/ci/lib.sh").display()
+    );
+    let output = Command::new("/bin/bash")
+        .arg("-c")
+        .arg(command)
+        .env("CI_ROOT", repo_root())
+        .env("ARTIFACT_ROOT", dir.path().join("artifacts"))
+        .env("INSTALL_ROOT", &install_root)
+        .env("STALE_MARKER", &stale_marker)
+        .env("CANDIDATE_MARKER", &candidate_marker)
+        .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "candidate binding failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        candidate_marker.exists(),
+        "candidate executable was not used"
+    );
+    assert!(!stale_marker.exists(), "hostile PATH jankurai was selected");
 }
 
 #[test]

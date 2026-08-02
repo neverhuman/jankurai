@@ -32,24 +32,24 @@ npm --workspace @jankurai/ux-qa run build
 npm --workspace @jankurai/ux-qa run test
 
 step "Install local jankurai"
-cargo install --path crates/jankurai --locked --force
+install_local_jankurai "${ARTIFACT_ROOT}/candidate-install"
 
 baseline="${ARTIFACT_ROOT}/accepted-baseline.json"
 cp "${CI_ROOT}/agent/baselines/main.repo-score.json" "$baseline"
 assert_nonempty "$baseline"
 
 step "Proofbind verify"
-jankurai proofbind verify .
+"${JANKURAI_CANDIDATE_BIN}" proofbind verify .
 
 step "Proofmark rust"
-jankurai proofmark rust . --obligations "${ARTIFACT_ROOT}/proofbind/obligations.json" || \
-  jankurai proofmark rust .
+"${JANKURAI_CANDIDATE_BIN}" proofmark rust . --obligations "${ARTIFACT_ROOT}/proofbind/obligations.json" || \
+  "${JANKURAI_CANDIDATE_BIN}" proofmark rust .
 
 step "Rust witness build"
-jankurai rust witness build .
+"${JANKURAI_CANDIDATE_BIN}" rust witness build .
 
 step "Security lane (strict, ci profile)"
-jankurai security run . --strict --profile ci --out "${ARTIFACT_ROOT}/security/evidence.json"
+"${JANKURAI_CANDIDATE_BIN}" security run . --strict --profile ci --out "${ARTIFACT_ROOT}/security/evidence.json"
 assert_nonempty "${ARTIFACT_ROOT}/security/evidence.json"
 
 step "UX QA smoke server"
@@ -64,14 +64,14 @@ for _ in $(seq 1 30); do
 done
 
 step "UX audit"
-jankurai ux audit --config "${CI_ROOT}/agent/ux-qa.toml" --out "${ARTIFACT_ROOT}/ux-qa.json"
+"${JANKURAI_CANDIDATE_BIN}" ux audit --config "${CI_ROOT}/agent/ux-qa.toml" --out "${ARTIFACT_ROOT}/ux-qa.json"
 assert_nonempty "${ARTIFACT_ROOT}/ux-qa.json"
 
 kill "$ux_pid" 2>/dev/null || true
 trap - EXIT
 
 step "Coverage audit (semantic)"
-jankurai coverage audit . \
+"${JANKURAI_CANDIDATE_BIN}" coverage audit . \
   --config "${CI_ROOT}/agent/coverage-sources.toml" \
   --json "${ARTIFACT_ROOT}/coverage/coverage-audit.json" \
   --md "${ARTIFACT_ROOT}/coverage/coverage-audit.md"
@@ -84,7 +84,7 @@ step "Migration evidence fixtures"
 cargo test -p jankurai --test migration_prompt_verify --test migration_slice_risk
 
 step "Final jankurai audit (ratchet)"
-jankurai audit . \
+"${JANKURAI_CANDIDATE_BIN}" audit . \
   --full \
   --mode ratchet \
   --baseline "$baseline" \

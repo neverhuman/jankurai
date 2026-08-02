@@ -41,6 +41,20 @@ ensure_dir() {
   mkdir -p "$1"
 }
 
+# Install the source candidate into a lane-owned root and bind every subsequent
+# proof command to those exact bytes. A bare `jankurai` lookup can resolve a
+# higher-precedence managed or developer installation instead of this build.
+install_local_jankurai() {
+  local install_root="${1:?candidate install root is required}"
+  ensure_dir "$install_root"
+  cargo install --path "${CI_ROOT}/crates/jankurai" --locked --force --root "$install_root"
+  JANKURAI_CANDIDATE_BIN="${install_root}/bin/jankurai"
+  if [[ ! -x "$JANKURAI_CANDIDATE_BIN" ]]; then
+    fail "candidate jankurai executable not produced: $JANKURAI_CANDIDATE_BIN"
+  fi
+  note "candidate jankurai bound: $JANKURAI_CANDIDATE_BIN"
+}
+
 # Print the contents of VERSION (trimmed). The release workflow uses this
 # to assert the pushed tag matches the canonical version.
 read_version() {
