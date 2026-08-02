@@ -291,9 +291,13 @@ fn resolve_baseline_score(repo: &Path, explicit: Option<&str>) -> Option<i32> {
 /// a full-repo audit.
 fn collect_changed_paths(repo: &Path, staged_only: bool) -> Vec<PathBuf> {
     let mut set: BTreeSet<PathBuf> = BTreeSet::new();
-    push_git_diff_names(repo, &["diff", "--name-only", "--cached"], &mut set);
+    push_git_diff_names(
+        repo,
+        &["diff", "--no-ext-diff", "--name-only", "--cached"],
+        &mut set,
+    );
     if !staged_only {
-        push_git_diff_names(repo, &["diff", "--name-only"], &mut set);
+        push_git_diff_names(repo, &["diff", "--no-ext-diff", "--name-only"], &mut set);
     }
     set.into_iter().collect()
 }

@@ -2394,7 +2394,7 @@ fn run_init_bootstrap_commit(args: InitArgs) -> anyhow::Result<()> {
 
     run_git(&repo, &["add", "-A"])?;
     let staged = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
+        .args(["diff", "--no-ext-diff", "--cached", "--quiet"])
         .current_dir(&repo)
         .status()?;
     if staged.success() {

@@ -275,9 +275,17 @@ fn git_ref_exists(repo: &Path, refname: &str) -> bool {
 fn collect_changed_paths(repo: &Path, base: &str) -> Result<Vec<PathBuf>> {
     let mut set: BTreeSet<PathBuf> = BTreeSet::new();
     let refspec = format!("{base}...HEAD");
-    push_git_diff_names(repo, &["diff", "--name-only", &refspec], &mut set)?;
-    push_git_diff_names(repo, &["diff", "--name-only", "--cached"], &mut set)?;
-    push_git_diff_names(repo, &["diff", "--name-only"], &mut set)?;
+    push_git_diff_names(
+        repo,
+        &["diff", "--no-ext-diff", "--name-only", &refspec],
+        &mut set,
+    )?;
+    push_git_diff_names(
+        repo,
+        &["diff", "--no-ext-diff", "--name-only", "--cached"],
+        &mut set,
+    )?;
+    push_git_diff_names(repo, &["diff", "--no-ext-diff", "--name-only"], &mut set)?;
     Ok(set.into_iter().collect())
 }
 

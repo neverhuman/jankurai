@@ -120,7 +120,11 @@ fn changed_lines_from_git(
     path: &str,
 ) -> Result<BTreeSet<u32>> {
     let mut command = GitProcess::new("git");
-    command.current_dir(repo).arg("diff").arg("--unified=0");
+    command
+        .current_dir(repo)
+        .arg("diff")
+        .arg("--no-ext-diff")
+        .arg("--unified=0");
     if let Some(base) = changed_from {
         command.arg(format!("{base}...HEAD"));
     }

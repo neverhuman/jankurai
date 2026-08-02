@@ -145,7 +145,7 @@ pub fn commit_repair(
     add.arg("-C").arg(repo).arg("add").arg("--").args(files);
     command_output(&mut add, "git add repair files")?;
 
-    if git_status(repo, ["diff", "--cached", "--quiet"])?.success() {
+    if git_status(repo, ["diff", "--no-ext-diff", "--cached", "--quiet"])?.success() {
         bail!("repair apply produced no staged changes");
     }
 

@@ -1729,7 +1729,7 @@ fn changed_lines_from_git(
     base: &str,
 ) -> Result<BTreeMap<String, BTreeSet<usize>>> {
     let output = Command::new("git")
-        .args(["diff", "--unified=0", base, "--"])
+        .args(["diff", "--no-ext-diff", "--unified=0", base, "--"])
         .current_dir(repo_root)
         .output()
         .with_context(|| format!("run git diff from {base}"))?;

@@ -75,7 +75,7 @@ pub(super) fn normalize_path(root: &Path, path: &Path) -> Option<String> {
 pub fn changed_paths_from_git(root: &Path, base: &str) -> Result<Vec<PathBuf>> {
     let refspec = format!("{base}...HEAD");
     let output = Command::new("git")
-        .args(["diff", "--name-only", refspec.as_str()])
+        .args(["diff", "--no-ext-diff", "--name-only", refspec.as_str()])
         .current_dir(root)
         .output()?;
     if !output.status.success() {

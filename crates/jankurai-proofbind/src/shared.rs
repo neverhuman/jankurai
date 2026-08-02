@@ -45,7 +45,7 @@ where
 pub fn changed_paths_from_git(repo: &Path, base: &str) -> Result<Vec<String>> {
     let refspec = format!("{base}...HEAD");
     let output = GitProcess::new("git")
-        .args(["diff", "--name-only", refspec.as_str()])
+        .args(["diff", "--no-ext-diff", "--name-only", refspec.as_str()])
         .current_dir(repo)
         .output()
         .with_context(|| format!("run git diff for {base}"))?;
@@ -62,7 +62,7 @@ pub fn changed_paths_from_git(repo: &Path, base: &str) -> Result<Vec<String>> {
 
 pub fn local_changed_paths_from_git(repo: &Path) -> Result<Vec<String>> {
     let output = GitProcess::new("git")
-        .args(["diff", "--name-only"])
+        .args(["diff", "--no-ext-diff", "--name-only"])
         .current_dir(repo)
         .output();
     let Ok(output) = output else {

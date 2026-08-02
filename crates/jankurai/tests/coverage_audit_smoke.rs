@@ -70,11 +70,16 @@ fn copy_fixture(repo: &Path, name: &str, dest: &str) {
 }
 
 fn run_coverage(repo: &Path, extra: &[&str]) -> (Output, Value) {
+    run_coverage_with_env(repo, extra, &[])
+}
+
+fn run_coverage_with_env(repo: &Path, extra: &[&str], envs: &[(&str, &str)]) -> (Output, Value) {
     let out_dir = repo.join("target/jankurai/coverage");
     fs::create_dir_all(&out_dir).unwrap();
     let json = out_dir.join("coverage-audit.json");
     let md = out_dir.join("coverage-audit.md");
-    let output = Command::new(binary_path())
+    let mut command = Command::new(binary_path());
+    command
         .arg("coverage")
         .arg("audit")
         .arg(repo)
@@ -85,9 +90,9 @@ fn run_coverage(repo: &Path, extra: &[&str]) -> (Output, Value) {
         .arg("--md")
         .arg(&md)
         .args(extra)
-        .current_dir(repo)
-        .output()
-        .expect("spawn coverage audit");
+        .current_dir(repo);
+    command.envs(envs.iter().copied());
+    let output = command.output().expect("spawn coverage audit");
     let value = if json.is_file() {
         serde_json::from_str(&fs::read_to_string(json).unwrap()).unwrap()
     } else {
@@ -127,6 +132,34 @@ fn valid_lcov_required_source_produces_no_findings() {
     );
 
     let (output, audit) = run_coverage(repo.path(), &["--changed-from", &base]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(audit["summary"]["hard_findings"], 0);
+    assert!(audit["findings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn changed_line_diff_ignores_inherited_empty_external_diff() {
+    let repo = tempdir().unwrap();
+    let base = seed_changed_repo(repo.path());
+    copy_fixture(repo.path(), "valid_lcov.info", "coverage/lcov.info");
+    write_config(
+        repo.path(),
+        &lcov_config("required", "coverage/lcov.info", ""),
+    );
+
+    let (output, audit) = run_coverage_with_env(
+        repo.path(),
+        &["--changed-from", &base],
+        &[
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "diff.external"),
+            ("GIT_CONFIG_VALUE_0", ""),
+        ],
+    );
     assert!(
         output.status.success(),
         "{}",
