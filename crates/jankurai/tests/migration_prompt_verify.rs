@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use tempfile::tempdir;
+use tempfile::{tempdir, tempdir_in};
 
 use jankurai::validation::{self, ArtifactSchema};
 
@@ -89,6 +89,53 @@ fn prompt_verifier_marks_ambiguous_matches_as_review() {
     assert_eq!(report["claims_total"], 1);
     assert_eq!(report["claims_review"], 1);
     assert_eq!(report["claims_invalid"], 0);
+}
+
+#[test]
+fn prompt_verifier_scans_repos_nested_beneath_target_ancestors() {
+    let outer = tempdir().unwrap();
+    let target_ancestor = outer.path().join("target");
+    fs::create_dir(&target_ancestor).unwrap();
+    let repo_dir = tempdir_in(&target_ancestor).unwrap();
+    fs::create_dir_all(repo_dir.path().join("src/nested")).unwrap();
+    fs::write(
+        repo_dir.path().join("prompt.md"),
+        "- good::build_client\n- shared::build_client\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("src/good.rs"),
+        "pub fn build_client() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("src/shared.rs"),
+        "pub fn build_client() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.path().join("src/nested/shared.rs"),
+        "pub fn build_client() {}\n",
+    )
+    .unwrap();
+
+    let (output, _dir, json_path, _) =
+        run_prompt_verify(&repo_dir.path().to_path_buf(), "prompt.md", false);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(report["decision"], "review");
+    assert_eq!(report["claims_total"], 2);
+    assert_eq!(report["claims_verified"], 1);
+    assert_eq!(report["claims_review"], 1);
+    assert_eq!(report["claims_invalid"], 0);
+    assert_eq!(report["claims"][0]["decision"], "verified");
+    assert_eq!(report["claims"][1]["decision"], "review");
 }
 
 #[test]
