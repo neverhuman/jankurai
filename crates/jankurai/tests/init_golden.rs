@@ -582,7 +582,18 @@ edition = "2021"
     )
     .unwrap();
     git(dir.path(), &["add", "docs/architecture/README.md"]);
-    git(dir.path(), &["commit", "-m", "Touch architecture docs"]);
+    // The sealed CI parent disables ambient hooks; this commit deliberately
+    // exercises the hook that the fixture just installed.
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "core.hooksPath=.git/hooks",
+            "commit",
+            "-m",
+            "Touch architecture docs",
+        ],
+    );
 
     let second_message = git_stdout(dir.path(), &["log", "-1", "--format=%B"]);
     assert!(
