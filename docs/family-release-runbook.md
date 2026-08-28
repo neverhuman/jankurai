@@ -34,33 +34,33 @@ manifest `release`); `ops/ci/release-build.sh`'s `RELEASE_TAG == VERSION` gate
 passes. Tags moved + `family.lock` re-pinned; 15/15 still audit-green, oracle 10/10.
 (The cargo crate `version =` fields are independent semver and were left as-is.)
 
-## Release pipeline — DONE (lives on the hub)
-`jankurai/.github/workflows/release.yml` (+ `ops/ci/release-*.sh`) now owns the
-signed release, on the hub so the installer's cosign identity
-(`github.com/neverhuman/jankurai/.github/workflows/release.yml@<tag>`) verifies.
-On a `v*.*.*` tag it runs: family-gate (`validate-family.sh`) -> build
-(`scripts/fuse.sh --source github --all` then `BUILD_DIR=.fusion bash
-ops/ci/release-build.sh`, Linux tar.gz + macOS pkg, cosign + attestation) ->
-publish (`gh release create` on `neverhuman/jankurai` with `jankurai-installer.sh`).
-Verified locally: yaml/bash valid, VERSION==tag gate passes, hub stays audit-green,
-the fuse build produces the binary. NOT testable offline: signing/notarization/
-publish need the Apple + Sigstore secrets on GitHub.
-(`jankurai-deploy/.github/workflows/release.yml` is superseded/inert — it triggers
-on `v*.*.*`, which only the hub ever receives; safe to delete.)
+## Historical release pipeline — transition state
 
-## Provision GitHub + Jeryu (you run this)
-With `gh` authenticated to `neverhuman` and the Jeryu remote reachable:
-```
-bash scripts/provision-family.sh --dry-run            # review every action
-bash scripts/provision-family.sh --visibility public  # create+push 15 repos to
-# GitHub AND Jeryu at parity (dependency-ordered: kernel/guard/proof → core →
-# rest), verify parity, then push the release tag to trigger the hub release.
-```
-Then `validate-family.sh` should be run in CI with `ripgrep` installed (this
-sandbox lacks it, so the workflow-action-SHA-pin check was skipped locally).
+The checked-in GitHub release workflow records the prior signed-release design,
+but GitHub is no longer a repository provisioning, tag, or publication route.
+The fail-closed `scripts/provision-family.sh` cannot trigger that workflow. A
+replacement artifact-distribution design is outside this Git-authority change;
+do not infer or simulate it from the retained historical workflow.
 
-## Safe to delete ~/jankurai when
-- All 15 pushed to GitHub + Jeryu at parity; tags + `family.lock` match.
-- The first hub release is green and the installer verifies + installs the binary.
-- `fuse --source github --all && .fusion/dev.sh build` reproduces the binary from
-  the public tags. (Until then keep `~/jankurai` as the rollback source.)
+## Forge provisioning
+
+The historical GitHub-plus-Jeryu provisioning script is deliberately disabled;
+it cannot create repositories, move tags, or push to GitHub. The tracked family
+manifest is the sole inventory, and its root projection is generated with
+`scripts/project-family-manifest.sh`. While `authority_forge` remains
+`local_transition`, releases continue through the protected local lifecycle.
+The final hosted flip is a separate protected manifest change after ref/LFS
+parity, private visibility, branch protection, accounts, and onboarding pass.
+No release step may infer that cutover from the presence of hosted URLs alone.
+
+## Legacy source retirement gate
+
+Do not remove any legacy source merely because repository provisioning changed.
+Retirement remains blocked until all of the following are proven:
+
+- All 15 authoritative refs and objects exist at the manifest-selected forge;
+  tags + `family.lock` match.
+- A replacement artifact-distribution path is reviewed and its installer
+  verifies and installs the binary.
+- After the protected dependency-URL migration, a fresh cache reproduces the
+  family from the private authority without GitHub or source-tree fallback.

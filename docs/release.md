@@ -32,10 +32,11 @@ Releases are cut by CI and the family deploy repo, not by hand:
    scan, and self-audit). The same lanes run in CI via
    [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), which delegates to
    `ops/ci/<lane>.sh` and uploads the `repo-score` artifacts.
-4. Push the version commit and tag the release commit with
-   `jankurai-v<version>-split.<N>`. The tag mirror in
-   [`.jeryu/repo.toml`](../.jeryu/repo.toml) publishes the immutable tag to the
-   public GitHub mirror.
+4. Merge through the protected lifecycle and create the immutable
+   `jankurai-v<version>-split.<N>` tag on the manifest-selected authority forge.
+   `authority_forge = "local_transition"` remains in force until the separate
+   protected hosted cutover. GitHub is retained only as readable history; it is
+   not a tag or release publication route.
 
 Release builds depend on immutable tags, never branches.
 

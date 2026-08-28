@@ -9,6 +9,7 @@ reusable libraries live in the `jankurai-tools-*` family repos.
 ```text
 hub (this repo)
   -> repos.manifest.toml   declares every family member
+  -> ../repos.manifest.toml generated runtime projection; never authority
   -> family.lock           pins each member to an immutable tag + commit SHA
   -> scripts/fuse.sh        materializes a local .fusion/ workspace from members
   -> action.yml            installs the released binary and runs an audit
@@ -19,9 +20,9 @@ hub (this repo)
 
 | Path | Role |
 | --- | --- |
-| `repos.manifest.toml` | Declares every split-family member repo and its role. |
+| `repos.manifest.toml` | Sole protected family inventory: paths, slugs, branches, checks, routes, and roles. |
 | `family.lock` | Pins each member repo to a release tag and commit SHA. |
-| `scripts/` | Family validation (`validate-family.sh`), local fusion (`fuse.sh`), CI runner (`ci-local.sh`). |
+| `scripts/` | Family validation, deterministic root-manifest projection, local fusion, and CI routing. |
 | `ops/ci/` | Thin per-lane CI scripts shared by `just` and GitHub Actions. |
 | `agent/` | Machine-readable owner/test/generated-zone maps and standard metadata. |
 | `docs/` | Architecture, boundaries, testing, release, and exception doctrine. |

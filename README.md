@@ -50,9 +50,13 @@ path patches are written.
 
 ## Repository Family
 
-The split family is declared in `repos.manifest.toml`. A release is pinned by
-`family.lock`, which records each member repo, tag, and commit SHA consumed by
-the fused release.
+The protected `repos.manifest.toml` in this hub is the sole family inventory.
+It declares all 15 canonical paths, forge slugs, default branches, and required
+checks. The container-root `../repos.manifest.toml` is a generated runtime
+projection; refresh or verify it with
+`scripts/project-family-manifest.sh --apply|--check`, never by hand. A release
+is pinned by `family.lock`, which records each member repo, tag, and commit SHA
+consumed by the fused release.
 
 | Repo | Role |
 | --- | --- |
