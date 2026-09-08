@@ -1,120 +1,96 @@
 name: release
-
-# Signed binary release for the jankurai family, published on the public hub
-# (neverhuman/jankurai) so the installer's cosign identity
-# (github.com/neverhuman/jankurai/.github/workflows/release.yml@<tag>) verifies.
-# The hub holds no crate: it fuses the published tool-crate tags into a workspace
-# (scripts/fuse.sh) and builds `-p jankurai` there (BUILD_DIR=.fusion). The
-# executable source of truth is ops/ci/release-*.sh, shared with local runs.
-# Every third-party action is pinned to a full 40-character commit SHA.
-
 on:
   push:
     tags: ['v*.*.*']
-
 permissions:
   contents: read
-
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-
 jobs:
-  family-gate:
-    name: family gate
-    runs-on: [self-hosted, Linux, X64, jankurai-ci]
-    timeout-minutes: 20
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Validate split family (lock pins, tags, no path-deps, SHA-pinned actions)
-        run: bash scripts/validate-family.sh
-
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: taiki-e/install-action@9ca1734d8940023f074414ee621fd530c4ce10f2
+        with:
+          tool: cargo-nextest@0.9.137,cargo-audit@0.22.1,cargo-deny@0.19.8,syft@1.40.0,zizmor@1.25.2
+          fallback: none
+      - run: bash ops/ci/github-setup.sh
+      - run: bash ops/ci/combined.sh
   build:
-    name: build (${{ matrix.target }})
-    needs: family-gate
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
       contents: read
       id-token: write
       attestations: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: [self-hosted, Linux, X64, jankurai-ci]
-            subject_path: dist/*.tar.gz
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            subject_path: dist/*.pkg
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Install Rust toolchain
-        run: rustup show
-      - name: Install cosign
-        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22
         with:
           cosign-release: v2.4.1
-      - name: Assemble the family workspace from published tags
-        run: bash scripts/fuse.sh --source github --all
-      - name: Build + sign release artifact
+      - run: bash ops/ci/github-setup.sh
+      - run: bash ops/ci/release-build.sh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           TARGET: ${{ matrix.target }}
-          BUILD_DIR: ${{ github.workspace }}/.fusion
-          APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 || '' }}
-          APPLE_DEVELOPER_ID_APPLICATION_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_APPLICATION_PASSWORD || '' }}
-          APPLE_DEVELOPER_ID_APPLICATION_IDENTITY: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_APPLICATION_IDENTITY || '' }}
-          APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 || '' }}
-          APPLE_DEVELOPER_ID_INSTALLER_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_INSTALLER_PASSWORD || '' }}
-          APPLE_DEVELOPER_ID_INSTALLER_IDENTITY: ${{ matrix.os == 'macos-latest' && secrets.APPLE_DEVELOPER_ID_INSTALLER_IDENTITY || '' }}
-          APPLE_NOTARYTOOL_APPLE_ID: ${{ matrix.os == 'macos-latest' && secrets.APPLE_NOTARYTOOL_APPLE_ID || '' }}
-          APPLE_NOTARYTOOL_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_NOTARYTOOL_PASSWORD || '' }}
-          APPLE_NOTARYTOOL_TEAM_ID: ${{ matrix.os == 'macos-latest' && secrets.APPLE_NOTARYTOOL_TEAM_ID || '' }}
-          APPLE_KEYCHAIN_PASSWORD: ${{ matrix.os == 'macos-latest' && secrets.APPLE_KEYCHAIN_PASSWORD || '' }}
-        run: bash ops/ci/release-build.sh
-      - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+      - run: bash ops/ci/sign-release.sh
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
         with:
-          subject-path: ${{ matrix.subject_path }}
-      - name: Upload build artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+          subject-path: dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: jankurai-${{ matrix.target }}
-          path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.tar.gz.sigstore.bundle
-            dist/*.pkg
-            dist/*.pkg.sha256
-            dist/*.pkg.sigstore.bundle
-          if-no-files-found: ignore
-
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
   publish:
-    name: publish release
     needs: build
-    runs-on: [self-hosted, Linux, X64, jankurai-ci]
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Download all build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist
           merge-multiple: true
-      - name: Create signed GitHub release (with installer)
+      - run: bash ops/ci/release-publish.sh
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
-        run: bash ops/ci/release-publish.sh

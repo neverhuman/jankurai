@@ -12,8 +12,16 @@ default:
 # One-command bootstrap: make the local CI scripts executable and resolve the
 # family manifest against the lockfile so the hub is ready to validate.
 setup:
-    chmod +x scripts/*.sh ops/ci/*.sh
-    bash scripts/validate-family.sh
+    bash scripts/family.sh setup
+
+pull:
+    bash scripts/family.sh pull
+
+build:
+    bash scripts/family.sh build
+
+status:
+    bash scripts/family.sh status
 
 # Aliases so `just install` and `just bootstrap` also resolve to setup.
 install: setup
@@ -27,7 +35,8 @@ fast:
     bash scripts/validate-family.sh
 
 # Run the full local check: fast lane, security scan, and self-audit.
-check: fast security audit
+check:
+    bash scripts/family.sh check
 
 # Verify is an alias of check for agents that look for a `verify` lane.
 verify: check
@@ -50,7 +59,7 @@ security:
 
 # Jankurai self-audit lane: writes the repo-score artifacts that CI uploads.
 audit:
-    /home/ubuntu/jankurai-split/jankurai/.fusion/target/debug/jankurai audit . --no-score-history --json .jankurai/repo-score.json --md .jankurai/repo-score.md
+    .fusion/target/debug/jankurai audit . --no-score-history --json .jankurai/repo-score.json --md .jankurai/repo-score.md
 
 # Print the declared hub version.
 versions:

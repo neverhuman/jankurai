@@ -1,27 +1,30 @@
-name: ci
+name: family-update
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: '17 * * * *'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: family-automation
+  cancel-in-progress: false
 jobs:
-  fast:
+  rotation:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: main
           persist-credentials: false
-      - run: bash ops/ci/fast.sh
-  integration:
+      - run: bash ops/ci/check-token-rotation.sh
+        env:
+          AUTOMATION_TOKEN_EXPIRES: ${{ vars.FAMILY_AUTOMATION_TOKEN_EXPIRES }}
+  collect:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
+    outputs:
+      changed: ${{ steps.candidate.outputs.changed }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -40,51 +43,41 @@ jobs:
           tool: cargo-nextest@0.9.137,cargo-audit@0.22.1,cargo-deny@0.19.8,syft@1.40.0,zizmor@1.25.2
           fallback: none
       - run: bash ops/ci/github-setup.sh
-      - run: bash ops/ci/combined.sh
+      - id: candidate
+        run: bash ops/ci/collect-family.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+        if: steps.candidate.outputs.changed == 'true'
         with:
-          name: integration-evidence
-          path: target/jankurai
+          name: candidate-locks
+          path: target/candidate/*
           if-no-files-found: error
-  release-build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: macos-14
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
-        with:
-          toolchain: 1.97.1
-          components: rustfmt, clippy
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
-        with:
-          node-version: 24
-          package-manager-cache: false
-      - run: bash ops/ci/github-setup.sh
-      - run: bash ops/ci/release-build.sh
-        env:
-          TARGET: ${{ matrix.target }}
-  required:
-    name: jankurai/required
-    if: always()
-    needs: [fast, integration, release-build]
+  publish:
+    needs: collect
+    if: needs.collect.outputs.changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: main
           persist-credentials: false
-      - run: bash ops/ci/aggregate.sh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-locks
+          path: target/candidate
+      - run: bash ops/ci/publish-family.sh publish
         env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ secrets.FAMILY_AUTOMATION_TOKEN }}
+  merge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          persist-credentials: false
+      - run: bash ops/ci/publish-family.sh merge
+        env:
+          GH_TOKEN: ${{ secrets.FAMILY_AUTOMATION_TOKEN }}
