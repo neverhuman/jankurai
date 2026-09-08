@@ -18,7 +18,7 @@ mkdir -p target/jankurai .jankurai
 # / release-readiness all adopt the ratchet audit command.
 log "tool-adoption: ratchet audit"
 bash ops/ci/prepare-baseline.sh
-jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --full
+jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full
 # Adopted artifacts: .jankurai/repo-score.json .jankurai/repo-score.md
 # target/jankurai/repair-queue.jsonl
 cp -f target/jankurai/repo-score.json .jankurai/repo-score.json
@@ -26,3 +26,4 @@ cp -f target/jankurai/repo-score.md .jankurai/repo-score.md
 
 assert_artifact .jankurai/repo-score.json
 assert_artifact .jankurai/repo-score.md
+assert_artifact target/jankurai/repair-queue.jsonl

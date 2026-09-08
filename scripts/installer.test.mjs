@@ -9,20 +9,56 @@ import test from 'node:test';
 
 const installer = path.join(path.dirname(path.dirname(fileURLToPath(import.meta.url))), 'jankurai-installer.sh');
 const sha256 = value => createHash('sha256').update(value).digest('hex');
-function fixture(t) {
+function fixture(t, platform = 'linux') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'release-ci-test-')), tools = path.join(root, 'tools');
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   fs.mkdirSync(tools);
-  const stem = 'jankurai-1.7.0-x86_64-unknown-linux-gnu', asset = `${stem}.tar.gz`, commit = '4'.repeat(40);
+  const target = platform === 'linux' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin';
+  const stem = `jankurai-1.7.0-${target}`, asset = `${stem}.tar.gz`, commit = '4'.repeat(40);
   const payload = { jankurai: '#!/bin/sh\nprintf "jankurai 1.7.0\\n"\n', 'family.lock': 'family fixture', 'Cargo.lock': 'cargo fixture', LICENSE: 'MIT' };
-  const provenance = { commit, target: 'x86_64-unknown-linux-gnu', version: '1.7.0',
+  const provenance = { schema: 'jankurai.release/v1', repository: 'https://github.com/neverhuman/jankurai', commit, target, version: '1.7.0',
     family_lock_sha256: sha256(payload['family.lock']), cargo_lock_sha256: sha256(payload['Cargo.lock']) };
   const tool = (name, source) => fs.writeFileSync(path.join(tools, name), '#!/usr/bin/env node\n' + source, { mode: 0o755 });
-  tool('uname', "console.log(process.argv[2] === '-s' ? 'Linux' : 'x86_64');");
+  tool('uname', `console.log(process.argv[2] === '-s' ? '${platform === 'linux' ? 'Linux' : 'Darwin'}' : '${platform === 'linux' ? 'x86_64' : 'arm64'}');`);
   tool('curl', "const fs=require('node:fs'),path=require('node:path'),a=process.argv; const url=a.find(x=>x.startsWith('https:')); fs.copyFileSync(path.join(process.env.FIXTURE_ROOT,url.split('/').at(-1)),a[a.indexOf('-o')+1]);");
-  tool('gh', "const a=process.argv; if(a[2]==='api') console.log(process.env.FIXTURE_COMMIT); else { if(!a.includes('--deny-self-hosted-runners') || a[a.indexOf('--cert-identity')+1]!==process.env.FIXTURE_IDENTITY) throw new Error('wrong attestation identity'); if(process.env.ATTESTATION_FAILURE) throw new Error('attestation rejected'); }");
-  tool('cosign', "const a=process.argv; if(a[a.indexOf('--certificate-identity')+1]!==process.env.FIXTURE_IDENTITY) throw new Error('wrong signature identity'); if(process.env.SIGNATURE_FAILURE) throw new Error('signature rejected');");
+  const gh = `const a=process.argv; const value=k=>a[a.indexOf(k)+1];
+    if(a[2]!=='attestation' || a[3]!=='verify') throw new Error('API access forbidden');
+    for(const key of ['GH_TOKEN','GITHUB_TOKEN','GH_ENTERPRISE_TOKEN','GITHUB_ENTERPRISE_TOKEN']) if(process.env[key]) throw new Error('credentials inherited');
+    if(!a.includes('--bundle') || !a.includes('--deny-self-hosted-runners') || value('--cert-identity')!==process.env.FIXTURE_IDENTITY || value('--repo')!=='neverhuman/jankurai' || value('--source-ref')!=='refs/tags/v1.7.0' || value('--source-digest')!==process.env.FIXTURE_COMMIT || value('--signer-digest')!==process.env.FIXTURE_COMMIT || value('--signer-workflow')!=='neverhuman/jankurai/.github/workflows/release.yml') throw new Error('attestation identity mismatch');
+    if(process.env.ATTESTATION_FAILURE) throw new Error('attestation rejected');`;
+  const cosign = `const a=process.argv; if(a[a.indexOf('--certificate-identity')+1]!==process.env.FIXTURE_IDENTITY || a[a.indexOf('--certificate-oidc-issuer')+1]!=='https://token.actions.githubusercontent.com') throw new Error('wrong signature identity'); if(process.env.SIGNATURE_FAILURE) throw new Error('signature rejected');`;
+  const archiveRoot = `gh_2.100.0_${platform === 'linux' ? 'linux_amd64' : 'macOS_arm64'}`;
+  fs.mkdirSync(path.join(root, archiveRoot, 'bin'), { recursive: true });
+  fs.writeFileSync(path.join(root, archiveRoot, 'bin/gh'), '#!/usr/bin/env node\n'+gh);
+  const ghArchive = archiveRoot + (platform === 'linux' ? '.tar.gz' : '.zip');
+  const packed = platform === 'linux'
+    ? spawnSync('tar', ['-czf', path.join(root, ghArchive), '-C', root, archiveRoot])
+    : spawnSync('zip', ['-q', '-r', ghArchive, archiveRoot], { cwd: root });
+  assert.equal(packed.status, 0);
+  const cosignAsset = platform === 'linux' ? 'cosign-linux-amd64' : 'cosign-darwin-arm64';
+  fs.writeFileSync(path.join(root, cosignAsset), '#!/usr/bin/env node\n'+cosign);
+  const jqAsset = platform === 'linux' ? 'jq-linux-amd64' : 'jq-macos-arm64';
+  const jqPath = spawnSync('sh', ['-c', 'command -v jq'], { encoding:'utf8' }).stdout.trim();
+  fs.copyFileSync(jqPath, path.join(root, jqAsset));
+  // Only the disposable test copy pins the controlled verifier fixture bytes.
+  // Production never accepts a verifier override or skips a hash check.
+  const hashes = platform === 'linux' ? [
+    'e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be',
+    '4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71',
+    'b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f'
+  ] : [
+    '45f9a62da2f6e641a7fad57e2ce39656dfd7ef331372d80a2a2aed65abb01642',
+    '5cf948c2f4dfe59687bdd0b8523709067383e03982cc543475c8a7dc70e92a76',
+    '2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e'
+  ];
+  let source = fs.readFileSync(installer, 'utf8');
+  for (const [i, name] of [ghArchive, cosignAsset, jqAsset].entries()) {
+    assert.ok(source.includes(hashes[i]));
+    source = source.replace(hashes[i], sha256(fs.readFileSync(path.join(root, name))));
+  }
+  const testInstaller = path.join(root, 'installer.sh'); fs.writeFileSync(testInstaller, source);
   const env = { ...process.env, PATH: tools + path.delimiter + process.env.PATH, FIXTURE_ROOT: root,
+    GH_TOKEN: 'fixture-credential-must-not-be-used', GITHUB_TOKEN: 'fixture-credential-must-not-be-used',
     FIXTURE_COMMIT: commit, FIXTURE_IDENTITY: 'https://github.com/neverhuman/jankurai/.github/workflows/release.yml@refs/tags/v1.7.0' };
   function pack(extra) {
     const stage = path.join(root, stem);
@@ -32,10 +68,11 @@ function fixture(t) {
     const result = spawnSync('tar', ['-czf', path.join(root, asset), '-C', root, stem]);
     assert.equal(result.status, 0);
     fs.writeFileSync(path.join(root, asset + '.sha256'), sha256(fs.readFileSync(path.join(root, asset))) + '  ' + asset + '\n');
-    fs.writeFileSync(path.join(root, asset + '.sigstore.bundle'), 'controlled verifier fixture');
+    for (const suffix of ['.sigstore.bundle', '.attestation.jsonl']) fs.writeFileSync(path.join(root, asset + suffix), 'controlled verifier fixture');
   }
-  const install = (...args) => spawnSync('bash', [installer, '--verify-only', '--tag', 'v1.7.0', ...args], { env, encoding: 'utf8' });
-  return { root, asset, payload, provenance, env, pack, install };
+  const run = (...args) => spawnSync('bash', [testInstaller, '--tag', 'v1.7.0', ...args], { env, encoding: 'utf8' });
+  const install = (...args) => run('--verify-only', ...args);
+  return { root, asset, payload, provenance, env, pack, install, run, ghArchive, cosignAsset };
 }
 test('valid asset requires both exact workflow verification identities', t => {
   const f = fixture(t); f.pack(); const result = f.install();
@@ -47,7 +84,7 @@ test('checksum tampering is rejected', t => {
 });
 test('provenance commit mismatch is rejected with a matching checksum', t => {
   const f = fixture(t); f.provenance.commit = '5'.repeat(40); f.pack();
-  const result = f.install(); assert.notEqual(result.status, 0); assert.match(result.stderr, /provenance mismatch/);
+  const result = f.install(); assert.notEqual(result.status, 0); assert.match(result.stderr, /attestation identity mismatch/);
 });
 test('embedded lock tampering is rejected', t => {
   const f = fixture(t); f.payload['family.lock'] = 'different family'; f.pack();
@@ -66,4 +103,29 @@ test('linked archive payload is rejected before extraction', t => {
 test('unexpected archive inventory is rejected', t => {
   const f = fixture(t); f.pack(stage => fs.writeFileSync(path.join(stage, 'unwanted'), 'data'));
   const result = f.install(); assert.notEqual(result.status, 0); assert.match(result.stderr, /archive inventory/);
+});
+
+test('macOS bootstrap extracts the pinned verifier from zip', t => {
+  const f = fixture(t, 'macos'); f.pack(); const result = f.install();
+  assert.equal(result.status, 0, result.stderr);
+});
+test('tampered verifier download is rejected before execution', t => {
+  const f = fixture(t); f.pack(); fs.appendFileSync(path.join(f.root, f.cosignAsset), 'tampered');
+  const result = f.install(); assert.notEqual(result.status, 0); assert.match(result.stderr, /verification tool checksum mismatch/);
+});
+test('installation atomically replaces an existing binary only after verification', t => {
+  const f = fixture(t); f.pack(); const dir = path.join(f.root, 'installed'); fs.mkdirSync(dir);
+  const installed = path.join(dir, 'jankurai'); fs.writeFileSync(installed, 'existing');
+  for (const key of ['ATTESTATION_FAILURE', 'SIGNATURE_FAILURE']) {
+    f.env[key]='yes'; assert.notEqual(f.run('--install-dir', dir).status, 0);
+    assert.equal(fs.readFileSync(installed, 'utf8'), 'existing'); delete f.env[key];
+  }
+  f.payload.jankurai = '#!/bin/sh\nprintf "jankurai 1.6.0\\n"\n'; f.pack();
+  assert.notEqual(f.run('--install-dir', dir).status, 0); assert.equal(fs.readFileSync(installed, 'utf8'), 'existing');
+  f.payload.jankurai = '#!/bin/sh\nexit 1\n'; f.pack();
+  assert.notEqual(f.run('--install-dir', dir).status, 0); assert.equal(fs.readFileSync(installed, 'utf8'), 'existing');
+  f.payload.jankurai = '#!/bin/sh\nprintf "jankurai 1.7.0\\n"\n'; f.pack();
+  const result = f.run('--install-dir', dir); assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readFileSync(installed, 'utf8'), f.payload.jankurai);
+  assert.deepEqual(fs.readdirSync(dir), ['jankurai']);
 });

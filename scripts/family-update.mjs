@@ -10,8 +10,8 @@ export function api(endpoint, body, method) {
   const output = run(args, { capture: true, input: body === undefined ? undefined : JSON.stringify(body) });
   return output ? JSON.parse(output) : undefined;
 }
-export function successful(repo, sha) {
-  const checks = api(`repos/${repo.slug}/commits/${sha}/check-runs?filter=latest&per_page=100`).check_runs;
+export function successful(repo, sha, request = api) {
+  const checks = request(`repos/${repo.slug}/commits/${sha}/check-runs?filter=latest&per_page=100`).check_runs;
   return checks.some(check => check.name === repo.required_check && check.head_sha === sha &&
     check.status === 'completed' && check.conclusion === 'success' && check.app.slug === 'github-actions');
 }

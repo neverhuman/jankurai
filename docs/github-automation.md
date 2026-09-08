@@ -19,6 +19,11 @@ expected automation actor, the content-derived `automation/family-*` branch name
 the same hub repository, the permitted changed files, eligible component pins,
 and a successful `jankurai/required` check for the exact PR head. GitHub enforces
 strict protected-branch checks and the merge API additionally binds the head SHA.
+If main advances, publication refreshes the same content-derived PR with a new
+commit that preserves its previous head and main as parents. The tree changes
+only the two lockfiles relative to main, and normal PR CI runs again. Repeating
+the same candidate against the same main creates no commit. Unexpected human
+changes in an updater PR stop publication.
 A later hourly run merges a candidate after normal PR CI has completed; the
 PAT-authenticated merge triggers post-merge CI.
 

@@ -12,17 +12,20 @@ for product in jankurai tuiwright; do
     --product "$product" --install-dir "$smoke_root/bin"
 done
 name="jankurai-ux-qa-${RELEASE_TAG#v}.tgz"
-for suffix in '' .sha256 .sigstore.bundle; do
+for suffix in '' .sha256 .sigstore.bundle .attestation.jsonl; do
   curl --proto '=https' --tlsv1.2 -fsSL \
     "https://github.com/$repo/releases/download/$RELEASE_TAG/$name$suffix" \
     -o "$smoke_root/$name$suffix"
 done
 (cd "$smoke_root" && shasum -a 256 -c "$name.sha256")
-gh attestation verify "$smoke_root/$name" --repo "$repo" \
-  --cert-identity "$identity" --deny-self-hosted-runners
+env -u GH_TOKEN -u GITHUB_TOKEN gh attestation verify "$smoke_root/$name" --repo "$repo" \
+  --bundle "$smoke_root/$name.attestation.jsonl" \
+  --cert-identity "$identity" --deny-self-hosted-runners \
+  --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$RELEASE_TAG"
 cosign verify-blob "$smoke_root/$name" --bundle "$smoke_root/$name.sigstore.bundle" \
   --certificate-identity "$identity" --certificate-oidc-issuer https://token.actions.githubusercontent.com
-npm install --prefix "$smoke_root/npm" "$smoke_root/$name" playwright@1.59.0
+npm install --prefix "$smoke_root/npm" "$smoke_root/$name" playwright@1.59.1
+[[ "$("$smoke_root/npm/node_modules/.bin/jankurai-ux-qa" --version)" == "jankurai-ux-qa ${RELEASE_TAG#v}" ]]
 (cd "$smoke_root/npm" && npm exec -- playwright install --with-deps chromium --only-shell)
 "$smoke_root/npm/node_modules/.bin/jankurai-ux-qa" audit \
   --url 'data:text/html,<html lang="en"><title>Release smoke</title><main><h1>Jankurai release</h1></main></html>' \
@@ -35,8 +38,10 @@ if cosign verify-blob "$smoke_root/tampered.tgz" --bundle "$smoke_root/$name.sig
   echo 'tampered package unexpectedly verified' >&2
   exit 1
 fi
-if gh attestation verify "$smoke_root/tampered.tgz" --repo "$repo" \
-  --cert-identity "$identity" --deny-self-hosted-runners; then
+if env -u GH_TOKEN -u GITHUB_TOKEN gh attestation verify "$smoke_root/tampered.tgz" --repo "$repo" \
+  --bundle "$smoke_root/$name.attestation.jsonl" \
+  --cert-identity "$identity" --deny-self-hosted-runners \
+  --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$RELEASE_TAG"; then
   echo 'tampered package attestation unexpectedly verified' >&2
   exit 1
 fi

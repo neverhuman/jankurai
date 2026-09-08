@@ -8,10 +8,10 @@ import { api, successful } from './family-update.mjs';
 import { isLink } from './family-lib.mjs';
 
 const repository = 'neverhuman/jankurai', files = ['family.lock', 'Cargo.lock'];
-const content = (file, ref) => Buffer.from(api(`repos/${repository}/contents/${file}?ref=${ref}`).content, 'base64').toString();
+const content = (file, ref, request = api) => Buffer.from(request(`repos/${repository}/contents/${file}?ref=${ref}`).content, 'base64').toString();
 export const branchFor = candidate => 'automation/family-' + createHash('sha256').update(candidate['family.lock'] + '\0' + candidate['Cargo.lock']).digest('hex').slice(0, 24);
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
-export function validateCandidate(family, candidate, base) {
+export function validateCandidate(family, candidate, base, request = api) {
   const old = TOML.parse(base['family.lock']), next = TOML.parse(candidate['family.lock']);
   if (!same(Object.keys(old), Object.keys(next)) || Object.keys(old).some(key => key !== 'repo' && !same(old[key], next[key]))) throw new Error('updater may only change component pins');
   if (old.repo.length !== next.repo.length) throw new Error('candidate changed family membership');
@@ -21,40 +21,60 @@ export function validateCandidate(family, candidate, base) {
     if (!same(Object.keys(previous), Object.keys(pin)) || Object.keys(previous).some(key => !['tag', 'commit'].includes(key) && !same(previous[key], pin[key]))) throw new Error('candidate changed repository metadata/order');
     if (same(previous, pin)) continue;
     changed = true;
-    validatePin(family, pin);
+    validatePin(family, pin, request);
   }
   if (!changed) throw new Error('candidate contains no component update');
   const cargo = TOML.parse(candidate['Cargo.lock']);
   if (cargo.version !== 4 || !Array.isArray(cargo.package)) throw new Error('invalid aggregate Cargo lock');
 }
-function validatePin(family, pin) {
+function validatePin(family, pin, request) {
   const sha = pin.commit;
   if (!/^[a-f0-9]{40}$/.test(sha) || pin.tag !== `ci-${sha}`) throw new Error('candidate needs an immutable exact-SHA CI tag');
   const repo = family.repos.find(repo => repo.name === pin.repo);
-  const ref = api(`repos/${repo.slug}/git/ref/tags/${pin.tag}`).object;
+  const ref = request(`repos/${repo.slug}/git/ref/tags/${pin.tag}`).object;
   if (ref.type !== 'commit' || ref.sha !== sha) throw new Error('candidate CI tag mismatch');
-  const comparison = api(`repos/${repo.slug}/compare/${sha}...${repo.default_branch}`);
-  if (!['ahead', 'identical'].includes(comparison.status) || !successful(repo, sha)) throw new Error('candidate is not a successful default-branch revision');
+  const comparison = request(`repos/${repo.slug}/compare/${sha}...${repo.default_branch}`);
+  if (!['ahead', 'identical'].includes(comparison.status) || !successful(repo, sha, request)) throw new Error('candidate is not a successful default-branch revision');
 }
-function publish(family, directory) {
+export function publish(family, directory, request = api) {
   const candidate = {};
   for (const file of files) {
     const name = path.join(directory, file);
     if (isLink(name) || !fs.statSync(name).isFile() || fs.statSync(name).size > 2_000_000) throw new Error('invalid candidate artifact');
     candidate[file] = fs.readFileSync(name, 'utf8');
   }
-  const baseSha = api(`repos/${repository}/git/ref/heads/main`).object.sha;
-  validateCandidate(family, candidate, Object.fromEntries(files.map(file => [file, content(file, baseSha)])));
+  const baseSha = request(`repos/${repository}/git/ref/heads/main`).object.sha;
+  validateCandidate(family, candidate, Object.fromEntries(files.map(file => [file, content(file, baseSha, request)])), request);
   const branch = branchFor(candidate);
-  const existing = api(`repos/${repository}/pulls?state=open&head=neverhuman:${branch}`);
-  if (existing.length) { console.log(existing[0].html_url); return; }
+  const existing = request(`repos/${repository}/pulls?state=open&head=neverhuman:${branch}`);
+  let previousHead;
+  if (existing.length) {
+    const pr = existing[0];
+    const changed = request(`repos/${repository}/pulls/${pr.number}/files?per_page=100`);
+    if (pr.head.repo?.full_name !== repository || pr.head.ref !== branch ||
+        changed.some(file => !files.includes(file.filename) || file.status !== 'modified')) {
+      throw new Error('existing updater PR contains unexpected changes');
+    }
+    for (const file of files) {
+      if (content(file, pr.head.sha, request) !== candidate[file]) throw new Error('existing updater candidate changed');
+    }
+    const comparison = request(`repos/${repository}/compare/${baseSha}...${pr.head.sha}`);
+    if (comparison.merge_base_commit.sha === baseSha) { console.log(pr.html_url); return; }
+    previousHead = pr.head.sha;
+  }
   const tree = files.map(file => ({ path: file, mode: '100644', type: 'blob', sha:
-    api(`repos/${repository}/git/blobs`, { content: candidate[file], encoding: 'utf-8' }).sha }));
-  const baseTree = api(`repos/${repository}/git/commits/${baseSha}`).tree.sha;
-  const treeSha = api(`repos/${repository}/git/trees`, { base_tree: baseTree, tree }).sha;
-  const commit = api(`repos/${repository}/git/commits`, { message: 'Update validated Jankurai family locks', tree: treeSha, parents: [baseSha] });
-  api(`repos/${repository}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.sha });
-  const pr = api(`repos/${repository}/pulls`, { title: 'Update validated Jankurai component revisions', head: branch, base: 'main',
+    request(`repos/${repository}/git/blobs`, { content: candidate[file], encoding: 'utf-8' }).sha }));
+  const baseTree = request(`repos/${repository}/git/commits/${baseSha}`).tree.sha;
+  const treeSha = request(`repos/${repository}/git/trees`, { base_tree: baseTree, tree }).sha;
+  const commit = request(`repos/${repository}/git/commits`, { message: 'Update validated Jankurai family locks', tree: treeSha,
+    parents: previousHead ? [previousHead, baseSha] : [baseSha] });
+  if (previousHead) {
+    request(`repos/${repository}/git/refs/heads/${branch}`, { sha: commit.sha, force: false }, 'PATCH');
+    console.log(`Refreshed ${existing[0].html_url}; ordinary PR CI must pass for ${commit.sha}`);
+    return;
+  }
+  request(`repos/${repository}/git/refs`, { ref: `refs/heads/${branch}`, sha: commit.sha });
+  const pr = request(`repos/${repository}/pulls`, { title: 'Update validated Jankurai component revisions', head: branch, base: 'main',
     body: 'Automated family update. Changed components have successful required checks and immutable CI tags. Candidate locks passed combined integration in a disposable CI checkout. Ordinary PR CI must pass before a protected merge.' });
   console.log(pr.html_url);
 }

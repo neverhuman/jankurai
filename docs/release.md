@@ -1,14 +1,15 @@
 # Release process
 
 The hub publishes releases from version tags. `VERSION`, the auditor version,
-and the UX npm package version must agree. The first post-migration release is
+the Tuiwright version, and the UX npm package version must agree. The first post-migration release is
 `v1.7.0`; publish its tag only after every component default branch, complete hub
 integration, and both release-platform checks pass.
 
 The release workflow independently checks the locked family, builds Linux x86-64
 and Apple Silicon macOS products, runs their version commands, signs every asset
 with Sigstore, generates GitHub attestations, verifies the complete inventory,
-and publishes a GitHub Release. No self-hosted runner or Apple signing account
+exports downloadable attestation bundles, installs and runs the staged native
+products, and publishes a GitHub Release only after both platforms pass. No self-hosted runner or Apple signing account
 is needed for the selected tarball distribution.
 
 Public assets include:
@@ -31,12 +32,13 @@ bash jankurai-installer.sh --tag v1.7.0
 bash jankurai-installer.sh --tag v1.7.0 --product tuiwright
 ```
 
-The installer requires curl, GitHub CLI with attestation support, cosign, and
-jq. It verifies the checksum, the Sigstore workflow identity and version
+The installer requires the platform shell, curl, archive tools, and SHA-256 tooling.
+It downloads temporary GitHub CLI, cosign, and jq binaries at exact versions and
+checks their embedded SHA-256 pins. No GitHub login is required. It verifies the checksum, the Sigstore workflow identity and version
 tag, the GitHub attestation identity and hosted runner, the release commit, the
 archive inventory, and the embedded lock digests before installing. Both platforms
 install to `~/.local/bin` by default. `--verify-only` performs all verification
-without installing. The GitHub Action uses the same installer and defaults to
+and runs the staged binary without installing. The GitHub Action uses the same installer and defaults to
 `v1.7.0`.
 
 To install the UX CLI, verify its downloaded checksum, Sigstore bundle, and GitHub

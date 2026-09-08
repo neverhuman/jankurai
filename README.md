@@ -1,18 +1,59 @@
 # Jankurai
 
-[![CI](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml/badge.svg)](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml)
+[**Jankurai v1.7.0**](https://github.com/neverhuman/jankurai/releases/tag/v1.7.0) · [CI](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml)
 
-[Agent instructions](AGENTS.md) · [Architecture](docs/architecture.md)
+Jankurai audits repositories for unsafe changes, missing proof, unclear ownership,
+and drift between code and its contracts. Use it locally or in CI to turn an
+AI-assisted change into a reviewable report and repair queue.
 
-GitHub is the primary home of Jankurai. This hub assembles 14 independently
-editable component repositories under [neverhuman](https://github.com/neverhuman).
-It owns the accepted family lock, combined checks, automatic updates, installer,
-GitHub Action, and public releases.
+## Install and run your first audit
 
-## Quick start
+Linux x86-64 and Apple Silicon macOS:
 
-Install Git, Rust (the toolchain is pinned in
-`rust-toolchain.toml`), and Node.js 24. Then:
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0
+export PATH="$HOME/.local/bin:$PATH"
+jankurai --version
+# jankurai 1.7.0
+```
+
+The installer verifies checksums, signatures, GitHub attestations, and embedded
+provenance, then runs the binary before replacing an existing installation.
+It downloads temporary, hash-pinned verification tools; Rust, Node.js, GitHub
+login, and preinstalled verifiers are unnecessary.
+
+From the repository you want to inspect:
+
+```sh
+jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+```
+
+Read `target/jankurai/repo-score.md` for findings and suggested repairs. Advisory
+mode is a useful first pass; [audit modes](docs/install.md#audit-modes) describe enforcing
+checks in CI. The [GitHub Action](action.yml) uses the same verified installer.
+
+Binaries install to `~/.local/bin`. Add the PATH line above to your shell profile
+if that directory is absent. Run the pinned install command again to upgrade or
+reinstall. Remove the auditor with `rm ~/.local/bin/jankurai`.
+See [installation options](docs/install.md) for a custom location and verification details.
+
+## Optional TUI and UX tools
+
+Install the TUI test CLI with the same verifier:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0 --product tuiwright
+tuiwright --version
+# tuiwright 1.7.0
+```
+
+The release also includes the built `@jankurai/ux-qa` npm package for browser
+geometry and accessibility checks. It requires Node.js and Playwright; follow
+[UX installation](docs/install.md#ux-package) for package verification and browser setup.
+
+## Build from a fresh clone
+
+Contributors need Git, Rust (pinned in `rust-toolchain.toml`), and Node.js 24:
 
 ```sh
 git clone https://github.com/neverhuman/jankurai.git workspace/jankurai
@@ -21,11 +62,10 @@ bash scripts/family.sh setup
 bash scripts/family.sh build
 ```
 
-Setup clones missing components alongside the hub, verifies immutable tags against
-`family.lock`, restores safe locked revisions, and installs Cargo/npm dependencies.
-No Jeryu service, URL rewrite, pre-existing sibling repository, or dependency cache
-is required. The generated `.fusion/components/` links point to the canonical
-component checkouts; edit those component repositories directly.
+This hub assembles 14 component repositories. Setup clones missing components
+alongside it, verifies immutable tags against `family.lock`, and installs locked
+Cargo/npm dependencies. No Jeryu service, Git rewrite, or existing cache is required.
+Edit components in their canonical checkouts; `.fusion/` provides local build links.
 
 | Shell command | Just recipe | Behavior |
 | --- | --- | --- |
@@ -52,8 +92,7 @@ removed standalone CI checkout; failed candidates leave accepted locks unchanged
 
 [Release and installation details](docs/release.md) describe Linux x86-64 and
 Apple Silicon macOS tarballs for `jankurai` and `tuiwright`, plus the built UX CLI
-npm package. The first release after the GitHub migration is `v1.7.0` and is gated
-on complete validation. The governed launcher and demo binary are not public assets.
+npm package. Release `v1.7.0` is gated on complete validation. The governed launcher and demo binary are not public assets.
 
 [Automation](docs/github-automation.md) explains immutable CI tags, hourly lock
 update PRs, exact-revision merge checks, and automation-token rotation.

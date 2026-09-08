@@ -20,7 +20,7 @@ try {
   fs.writeFileSync(provenanceFile, JSON.stringify(provenance, null, 2) + '\n');
   for (const binary of ['jankurai', 'tuiwright']) {
     const source = path.join(hub, '.fusion/target', target, 'release', binary), actual = output([source, '--version']);
-    if (binary === 'jankurai' && actual !== `jankurai ${version}`) throw new Error(`release auditor version mismatch: ${actual}`);
+    if (actual !== `${binary} ${version}`) throw new Error(`release binary version mismatch: ${actual}`);
     temporaryCI(dist, 'release-stage-', temporary => {
       const name = `${binary}-${version}-${target}`, stage = path.join(temporary, name);
       fs.mkdirSync(stage);
