@@ -1,2 +1,0 @@
-class Runner(WrongBase):
-    pass

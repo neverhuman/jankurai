@@ -1,162 +1,74 @@
 #!/usr/bin/env bash
-# Installer-first release entrypoint.
-# Downloads the immutable release artifact for the current OS/arch, verifies
-# the GitHub release, GitHub attestation, sha256 checksum, and Sigstore bundle,
-# then installs the binary.
-# Keep structured JSON diagnostics and telemetry in receipts so the next
-# agent can rerun the release proof without guessing at hidden state.
-
+# Install verified public tarballs from the immutable release workflow identity.
 set -euo pipefail
-
-fail() {
-  printf '\n!! %s\n' "$1" >&2
-  exit 1
-}
-
-step() {
-  printf '\n==> %s\n' "$1"
-}
-
-note() {
-  printf '... %s\n' "$1"
-}
-
-ensure_dir() {
-  mkdir -p "$1"
-}
-
-usage() {
-  cat <<'EOF'
-usage: jankurai-installer.sh [--repo owner/name] [--tag vX.Y.Z] [--install-dir path] [--verify-only] [--print-asset-name]
-
-Environment variables:
-  JANKURAI_RELEASE_REPO   release repository, default: neverhuman/jankurai
-  JANKURAI_RELEASE_TAG    release tag, required if --tag is omitted
-  JANKURAI_INSTALL_DIR    Linux install prefix, default: ~/.local/bin
-EOF
-}
-
+fail() { printf 'installer: %s\n' "$*" >&2; exit 1; }
 repo="${JANKURAI_RELEASE_REPO:-neverhuman/jankurai}"
-tag="${JANKURAI_RELEASE_TAG:-${RELEASE_TAG:-}}"
-install_dir="${JANKURAI_INSTALL_DIR:-${HOME}/.local/bin}"
-verify_only=0
-print_asset_name=0
-
+tag="${JANKURAI_RELEASE_TAG:-v1.7.0}"
+install_dir="${JANKURAI_INSTALL_DIR:-$HOME/.local/bin}"
+product=jankurai
+verify_only=false
+print_asset=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo) repo="${2:?missing repo value}"; shift 2 ;;
-    --tag) tag="${2:?missing tag value}"; shift 2 ;;
-    --install-dir) install_dir="${2:?missing install-dir value}"; shift 2 ;;
-    --verify-only) verify_only=1; shift ;;
-    --print-asset-name) print_asset_name=1; shift ;;
-    -h|--help) usage; exit 0 ;;
+    --repo) repo="${2:?missing repository}"; shift 2 ;;
+    --tag) tag="${2:?missing tag}"; shift 2 ;;
+    --product) product="${2:?missing product}"; shift 2 ;;
+    --install-dir) install_dir="${2:?missing directory}"; shift 2 ;;
+    --verify-only) verify_only=true; shift ;;
+    --print-asset-name) print_asset=true; shift ;;
+    --help|-h) printf 'usage: jankurai-installer.sh [--tag v1.7.0] [--product jankurai|tuiwright] [--repo owner/repo] [--install-dir path] [--verify-only] [--print-asset-name]\n'; exit 0 ;;
     *) fail "unknown argument: $1" ;;
   esac
 done
-
-[[ -n "${tag}" ]] || fail "set JANKURAI_RELEASE_TAG=vX.Y.Z or pass --tag vX.Y.Z"
-
-case "$(uname -s)" in
-  Darwin) os="darwin" ;;
-  Linux) os="linux" ;;
-  *) fail "unsupported operating system: $(uname -s)" ;;
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'invalid repository'
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || fail 'invalid version tag'
+[[ "$product" == jankurai || "$product" == tuiwright ]] || fail 'unsupported product'
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+  Darwin/arm64) target=aarch64-apple-darwin ;;
+  *) fail 'supported platforms: Linux x86-64 and Apple Silicon macOS' ;;
 esac
-
-case "$(uname -m)" in
-  x86_64|amd64) arch="x86_64" ;;
-  arm64|aarch64) arch="aarch64" ;;
-  *) fail "unsupported architecture: $(uname -m)" ;;
-esac
-
-release_url="https://github.com/${repo}/releases/download/${tag}"
-version="${tag#v}"
-case "${os}" in
-  darwin)
-    artifact_name="jankurai-${version}-${arch}-apple-darwin.pkg"
-    ;;
-  linux)
-    artifact_name="jankurai-${version}-${arch}-unknown-linux-gnu.tar.gz"
-    ;;
-esac
-
-artifact_url="${release_url}/${artifact_name}"
-checksum_url="${artifact_url}.sha256"
-bundle_url="${artifact_url}.sigstore.bundle"
-workdir="$(mktemp -d)"
-trap 'rm -rf "${workdir}"' EXIT
-
-if [[ "${print_asset_name}" == "1" ]]; then
-  printf '%s\n' "${artifact_name}"
-  exit 0
-fi
-
-download() {
-  local url="$1"
-  local out="$2"
-  curl -fsSLo "${out}" "${url}"
+stem="$product-${tag#v}-$target"
+asset="$stem.tar.gz"
+if "$print_asset"; then printf '%s\n' "$asset"; exit 0; fi
+for tool in curl gh cosign jq; do command -v "$tool" >/dev/null || fail "install $tool before running the installer"; done
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+base="https://github.com/$repo/releases/download/$tag"
+for name in "$asset" "$asset.sha256" "$asset.sigstore.bundle"; do
+  curl --proto '=https' --tlsv1.2 -fsSL "$base/$name" -o "$work/$name"
+done
+identity="https://github.com/$repo/.github/workflows/release.yml@refs/tags/$tag"
+gh attestation verify "$work/$asset" --repo "$repo" \
+  --cert-identity "$identity" --deny-self-hosted-runners
+cosign verify-blob "$work/$asset" --bundle "$work/$asset.sigstore.bundle" \
+  --certificate-identity "$identity" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+release_commit="$(gh api "repos/$repo/commits/$tag" --jq '.sha')"
+sha256() {
+  if command -v shasum >/dev/null; then shasum -a 256 "$1" | cut -d ' ' -f 1
+  else sha256sum "$1" | cut -d ' ' -f 1
+  fi
 }
+[[ "$(cat "$work/$asset.sha256")" == "$(sha256 "$work/$asset")  $asset" ]] || fail 'checksum mismatch'
+tar -tzf "$work/$asset" | sed 's:/$::' | LC_ALL=C sort > "$work/inventory"
+printf '%s\n' "$stem" "$stem/$product" "$stem/family.lock" "$stem/Cargo.lock" \
+  "$stem/LICENSE" "$stem/provenance.json" | LC_ALL=C sort > "$work/expected"
+cmp -s "$work/inventory" "$work/expected" || fail 'unexpected archive inventory'
+tar -tvzf "$work/$asset" > "$work/details"
+if LC_ALL=C grep -qv '^[-d]' "$work/details"; then fail 'unsafe archive entry'; fi
+mkdir "$work/payload"
+tar -xzf "$work/$asset" --no-same-owner -C "$work/payload"
+payload="$work/payload/$stem"
+jq -e --arg commit "$release_commit" --arg target "$target" --arg version "${tag#v}" \
+  '.commit == $commit and .target == $target and .version == $version' \
+  "$payload/provenance.json" >/dev/null || fail 'release provenance mismatch'
+jq -e --arg family "$(sha256 "$payload/family.lock")" --arg cargo "$(sha256 "$payload/Cargo.lock")" \
+  '.family_lock_sha256 == $family and .cargo_lock_sha256 == $cargo' \
+  "$payload/provenance.json" >/dev/null || fail 'lock provenance mismatch'
 
-require_tool() {
-  command -v "$1" >/dev/null 2>&1 || fail "$1 is required for release verification; use cargo install --path crates/jankurai --locked if you only need a local source install"
-}
-
-require_tool curl
-require_tool gh
-require_tool cosign
-
-step "Verify immutable release"
-gh release verify "${tag}" -R "${repo}"
-
-step "Download release assets"
-download "${artifact_url}" "${workdir}/${artifact_name}"
-download "${checksum_url}" "${workdir}/${artifact_name}.sha256"
-download "${bundle_url}" "${workdir}/${artifact_name}.sigstore.bundle"
-
-step "Verify GitHub artifact attestation"
-gh attestation verify "${workdir}/${artifact_name}" -R "${repo}"
-
-step "Verify sha256"
-if command -v shasum >/dev/null 2>&1; then
-  (
-    cd "${workdir}"
-    shasum -a 256 -c "${artifact_name}.sha256"
-  )
-else
-  (
-    cd "${workdir}"
-    sha256sum -c "${artifact_name}.sha256"
-  )
-fi
-
-step "Verify Sigstore bundle"
-cosign verify-blob "${workdir}/${artifact_name}" \
-  --bundle "${workdir}/${artifact_name}.sigstore.bundle" \
-  --certificate-identity "https://github.com/${repo}/.github/workflows/release.yml@refs/tags/${tag}" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
-
-if [[ "${verify_only}" == "1" ]]; then
-  step "Verify-only mode"
-  note "release artifact verified; install skipped by request"
-  exit 0
-fi
-
-case "${os}" in
-  darwin)
-    step "Install notarized pkg"
-    sudo installer -pkg "${workdir}/${artifact_name}" -target /
-    note "Installed to the system location provided by the pkg payload"
-    ;;
-  linux)
-    step "Install tarball payload"
-    payload_dir="${workdir}/payload"
-    ensure_dir "${payload_dir}"
-    tar -xzf "${workdir}/${artifact_name}" -C "${payload_dir}"
-
-    binary="$(find "${payload_dir}" -type f -name jankurai -perm -u+x | head -n 1)"
-    [[ -n "${binary}" ]] || fail "release archive did not contain an executable jankurai binary"
-
-    ensure_dir "${install_dir}"
-    install -m 0755 "${binary}" "${install_dir}/jankurai"
-    note "Installed to ${install_dir}/jankurai"
-    ;;
-esac
+if "$verify_only"; then printf 'Verified %s\n' "$asset"; exit 0; fi
+mkdir -p "$install_dir"
+install -m 0755 "$payload/$product" "$install_dir/$product"
+"$install_dir/$product" --version
+printf 'Installed %s/%s\n' "$install_dir" "$product"

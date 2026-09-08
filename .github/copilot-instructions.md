@@ -1,7 +1,15 @@
-<!-- jankurai generated adapter -->
-<!-- jankurai agent request v1 sha256:REPLACE_WITH_HASH -->
-Read `AGENTS.md` first. Use `agent/JANKURAI_STANDARD.md` as the canonical jankurai standard.
-When a user provides a paper, release, implementation, or handoff plan in the conversation, treat that plan as the controlling plan. Do not route such plans through the separate local phase workflow unless the user explicitly names MASTER_PLAN phase work.
-For explicit MASTER_PLAN/phase work only, read `agent/MASTER_PLAN.md`, then `tips/phases/00-phase-index.md`, then the active `tips/phases/*.md` phase file. Log explicit phase work in `tips/phases/logs/`.
-For explicit MASTER_PLAN/phase planning only, follow `agent/MASTER_PLAN.md#detailed-planner-protocol`.
-If jankurai is installed, run `jankurai update --client-start --quiet` before work; do not apply updates unless the user asks.
+# Copilot / agent instructions
+
+Thin adapter for IDE coding agents working in the jankurai hub. The canonical
+guidance lives in [`AGENTS.md`](../AGENTS.md), [`SPLIT.md`](../SPLIT.md), and
+[`docs/`](../docs/); this file only routes you there.
+
+- Read `AGENTS.md` and `SPLIT.md` before changing anything.
+- Prefer `agent/owner-map.json` and `agent/test-map.json` to find the owner and
+  proof command for a path; route to the narrowest proof lane.
+- The narrowest proof loop is `just fast` (runs `bash scripts/validate-family.sh`).
+  The full gate is `just check` (fast + security + audit).
+- Do not commit cross-repo `path = "../..."` dependencies; local path patches go
+  only into the generated `.fusion/` workspace.
+- Do not hand-edit generated zones listed in `agent/generated-zones.toml`.
+- Every third-party GitHub Action is pinned to a 40-character commit SHA.

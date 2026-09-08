@@ -8,6 +8,12 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
 
 ### Added
 
+- The tracked family manifest is now the sole Jankurai inventory, with exact
+  canonical path, forge slug, default-branch, required-check, and hosted-route
+  mappings for all 15 repositories. The container-root manifest is a generated,
+  hash-bound projection, and the legacy GitHub provisioning and hub mirror
+  routes fail closed while forge authority remains `local_transition`.
+
 - Installer-first release packaging: release builds now produce signed Linux
   tarballs, notarized macOS `.pkg` artifacts, Sigstore bundles, GitHub artifact
   attestations, a release-shipped `jankurai-installer.sh`, and refreshable
