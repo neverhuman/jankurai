@@ -17,6 +17,7 @@ mkdir -p target/jankurai .jankurai
 # audit-ci / proof-routing / contract-drift / authz-matrix / agent-tool-supply
 # / release-readiness all adopt the ratchet audit command.
 log "tool-adoption: ratchet audit"
+bash ops/ci/prepare-baseline.sh
 jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md
 # Adopted artifacts: .jankurai/repo-score.json .jankurai/repo-score.md
 # target/jankurai/repair-queue.jsonl

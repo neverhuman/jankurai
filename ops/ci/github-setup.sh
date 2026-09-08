@@ -12,5 +12,5 @@ if [[ "${CI_INSTALL_SECURITY:-1}" == 1 && "$(uname -s)" == Linux ]]; then
 fi
 bash scripts/family.sh setup
 if [[ "$(uname -s)" == Linux ]]; then
-  (cd ../jankurai-tools-ux && npm exec -- playwright install --with-deps chromium)
+  (cd ../jankurai-tools-ux && npm exec -- playwright install --with-deps chromium --only-shell)
 fi

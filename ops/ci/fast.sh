@@ -2,4 +2,4 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 bash scripts/validate-family.sh
-python3 -m unittest discover -s scripts -p 'test_*.py'
+npm test

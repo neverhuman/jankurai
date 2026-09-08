@@ -10,4 +10,4 @@ case "$TARGET" in
   *) echo "unsupported release target: $TARGET" >&2; exit 1 ;;
 esac
 bash scripts/family.sh build --release --target "$TARGET"
-python3 ops/ci/package-release.py "$TARGET"
+node ops/ci/package-release.mjs "$TARGET"

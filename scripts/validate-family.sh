@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$(dirname "${BASH_SOURCE[0]}")/validate_family.py" "$@"
+source "$(dirname "${BASH_SOURCE[0]}")/node-bootstrap.sh"
+exec node "$hub/scripts/validate-family.mjs" "$@"

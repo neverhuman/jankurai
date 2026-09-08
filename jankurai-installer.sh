@@ -31,7 +31,7 @@ esac
 stem="$product-${tag#v}-$target"
 asset="$stem.tar.gz"
 if "$print_asset"; then printf '%s\n' "$asset"; exit 0; fi
-for tool in curl gh cosign python3; do command -v "$tool" >/dev/null || fail "install $tool before running the installer"; done
+for tool in curl gh cosign jq; do command -v "$tool" >/dev/null || fail "install $tool before running the installer"; done
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 base="https://github.com/$repo/releases/download/$tag"
@@ -45,36 +45,30 @@ cosign verify-blob "$work/$asset" --bundle "$work/$asset.sigstore.bundle" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 release_commit="$(gh api "repos/$repo/commits/$tag" --jq '.sha')"
-python3 - "$work" "$asset" "$stem" "$product" "$release_commit" "$target" "${tag#v}" <<'PY_VERIFY'
-import hashlib, json, pathlib, sys, tarfile
-work, asset, stem, product, commit, target, version = sys.argv[1:]
-work = pathlib.Path(work)
-archive = work / asset
-expected = hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + asset + '\n'
-if (work / (asset + '.sha256')).read_text() != expected:
-    sys.exit('installer: checksum mismatch')
-with tarfile.open(archive) as tar:
-    names = (product, 'family.lock', 'Cargo.lock', 'LICENSE', 'provenance.json')
-    allowed = {stem, *(stem + '/' + n for n in names)}
-    members = tar.getmembers()
-    if len(members) != len(allowed) or {m.name for m in members} != allowed:
-        sys.exit('installer: unexpected archive inventory')
-    for member in members:
-        if member.name == stem and member.isdir():
-            continue
-        if not member.isfile() or member.size > 256 * 1024 * 1024:
-            sys.exit('installer: unsafe archive entry')
-    payload = {name: tar.extractfile(stem + '/' + name).read() for name in names}
-    provenance = json.loads(payload['provenance.json'])
-    if (provenance['commit'], provenance['target'], provenance['version']) != (commit, target, version):
-        sys.exit('installer: release provenance mismatch')
-    for name, key in [('family.lock', 'family_lock_sha256'), ('Cargo.lock', 'cargo_lock_sha256')]:
-        if hashlib.sha256(payload[name]).hexdigest() != provenance[key]:
-            sys.exit('installer: lock provenance mismatch')
-    (work / product).write_bytes(payload[product])
-PY_VERIFY
+sha256() {
+  if command -v shasum >/dev/null; then shasum -a 256 "$1" | cut -d ' ' -f 1
+  else sha256sum "$1" | cut -d ' ' -f 1
+  fi
+}
+[[ "$(cat "$work/$asset.sha256")" == "$(sha256 "$work/$asset")  $asset" ]] || fail 'checksum mismatch'
+tar -tzf "$work/$asset" | sed 's:/$::' | LC_ALL=C sort > "$work/inventory"
+printf '%s\n' "$stem" "$stem/$product" "$stem/family.lock" "$stem/Cargo.lock" \
+  "$stem/LICENSE" "$stem/provenance.json" | LC_ALL=C sort > "$work/expected"
+cmp -s "$work/inventory" "$work/expected" || fail 'unexpected archive inventory'
+tar -tvzf "$work/$asset" > "$work/details"
+if LC_ALL=C grep -qv '^[-d]' "$work/details"; then fail 'unsafe archive entry'; fi
+mkdir "$work/payload"
+tar -xzf "$work/$asset" --no-same-owner -C "$work/payload"
+payload="$work/payload/$stem"
+jq -e --arg commit "$release_commit" --arg target "$target" --arg version "${tag#v}" \
+  '.commit == $commit and .target == $target and .version == $version' \
+  "$payload/provenance.json" >/dev/null || fail 'release provenance mismatch'
+jq -e --arg family "$(sha256 "$payload/family.lock")" --arg cargo "$(sha256 "$payload/Cargo.lock")" \
+  '.family_lock_sha256 == $family and .cargo_lock_sha256 == $cargo' \
+  "$payload/provenance.json" >/dev/null || fail 'lock provenance mismatch'
+
 if "$verify_only"; then printf 'Verified %s\n' "$asset"; exit 0; fi
 mkdir -p "$install_dir"
-install -m 0755 "$work/$product" "$install_dir/$product"
+install -m 0755 "$payload/$product" "$install_dir/$product"
 "$install_dir/$product" --version
 printf 'Installed %s/%s\n' "$install_dir" "$product"

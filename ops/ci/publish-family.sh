@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec python3 "$(dirname "${BASH_SOURCE[0]}")/../../scripts/publish_family_update.py" "$@"
+source "$(dirname "${BASH_SOURCE[0]}")/../../scripts/node-bootstrap.sh"
+exec node "$hub/scripts/publish-family-update.mjs" "$@"

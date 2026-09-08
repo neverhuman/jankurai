@@ -1,98 +1,78 @@
 # Release process
 
-This document is the release control surface for the jankurai hub. It covers the
-version source, the changelog, the release automation, integrity and SBOM
-evidence, and rollback. Launch gates require every section below to be backed by
-a real artifact or command.
+The hub publishes releases from version tags. `VERSION`, the auditor version,
+and the UX npm package version must agree. The first post-migration release is
+`v1.7.0`; publish its tag only after every component default branch, complete hub
+integration, and both release-platform checks pass.
 
-## Version source
+The release workflow independently checks the locked family, builds Linux x86-64
+and Apple Silicon macOS products, runs their version commands, signs every asset
+with Sigstore, generates GitHub attestations, verifies the complete inventory,
+and publishes a GitHub Release. No self-hosted runner or Apple signing account
+is needed for the selected tarball distribution.
 
-The single source of truth for the hub version is the [`VERSION`](../VERSION)
-file at the repository root. The release tag and the version recorded in
-[`agent/split-member.toml`](../agent/split-member.toml) and
-[`agent/standard-version.toml`](../agent/standard-version.toml) MUST match
-`VERSION`. Tags follow the family pattern `jankurai-v<MAJOR.MINOR.PATCH>-split.<N>`
-as described in [`SPLIT.md`](../SPLIT.md).
+Public assets include:
 
-## Changelog
+- `jankurai-<version>-<target>.tar.gz`
+- `tuiwright-<version>-<target>.tar.gz`
+- `jankurai-ux-qa-<version>.tgz`, the built npm CLI package
+- `family.lock`, `Cargo.lock`, per-platform provenance, and the installer
+- SHA-256 checksums, Sigstore bundles, and GitHub artifact attestations
 
-Every release records its user-visible changes in
-[`CHANGELOG.md`](../CHANGELOG.md) under a heading that matches the new `VERSION`.
-The `Unreleased` section is promoted to a dated version heading at tag time.
+The governed launcher and `tuiwright-demo` remain internal build/test products.
+Tarballs contain only their selected executable, license, locks, and provenance.
 
-## Release automation
+## Installation
 
-Releases are cut by CI and the family deploy repo, not by hand:
+Download `jankurai-installer.sh` from the desired hub release, then:
 
-1. Bump [`VERSION`](../VERSION) and promote the `Unreleased` section of
-   [`CHANGELOG.md`](../CHANGELOG.md).
-2. Repin the family by updating [`family.lock`](../family.lock) so every member
-   resolves to an immutable tag and commit SHA, never a branch.
-3. Run the full local gate: `just check` (fast family validation, security
-   scan, and self-audit). The same lanes run in CI via
-   [`.github/workflows/ci.yml`](../.github/workflows/ci.yml), which delegates to
-   `ops/ci/<lane>.sh` and uploads the `repo-score` artifacts.
-4. Merge through the protected lifecycle and create the immutable
-   `jankurai-v<version>-split.<N>` tag on the manifest-selected authority forge.
-   `authority_forge = "local_transition"` remains in force until the separate
-   protected hosted cutover. GitHub is retained only as readable history; it is
-   not a tag or release publication route.
+```sh
+bash jankurai-installer.sh --tag v1.7.0
+bash jankurai-installer.sh --tag v1.7.0 --product tuiwright
+```
 
-Release builds depend on immutable tags, never branches.
+The installer requires curl, GitHub CLI with attestation support, cosign, and
+jq. It verifies the checksum, the Sigstore workflow identity and version
+tag, the GitHub attestation identity and hosted runner, the release commit, the
+archive inventory, and the embedded lock digests before installing. Both platforms
+install to `~/.local/bin` by default. `--verify-only` performs all verification
+without installing. The GitHub Action uses the same installer and defaults to
+`v1.7.0`.
 
-## Integrity, provenance, and SBOM
+To install the UX CLI, verify its downloaded checksum, Sigstore bundle, and GitHub
+attestation against the same release workflow identity before running
+`npm install -g ./jankurai-ux-qa-1.7.0.tgz`. Install the declared Playwright peer
+dependency and Chromium as required by the package.
 
-- **Dependency integrity**: the hub ships no Cargo.toml or package.json. Its
-  dependency surface is the family lock; `bash scripts/validate-family.sh`
-  verifies every `family.lock` pin resolves to an immutable tag and commit and
-  fails on branch dependencies, committed cross-repo path dependencies, or
-  missing lockfiles.
-- **SBOM**: the `repos.manifest.toml` + `family.lock` pair is the hub's bill of
-  materials — it enumerates every member repo, its role, and the exact tag and
-  commit consumed by a fused release. The deploy repo attaches this resolved set
-  as the release SBOM.
-- **Provenance**: the security job runs `gitleaks detect` for secret scanning and
-  the family-lock review for supply-chain drift; the audit job publishes the
-  `repo-score` artifacts that prove the release passed the jankurai gate. The
-  released binary installer (`jankurai-installer.sh`) additionally verifies the
-  GitHub release, artifact attestation, checksum, and Sigstore bundle before
-  installing.
-- **Action pinning**: every third-party GitHub Action in
-  [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is pinned to a
-  40-character commit SHA, and `scripts/validate-family.sh` reports the action
-  pinning posture so the supply chain of the pipeline itself is fixed.
+Releases and dependency tags are immutable. Roll back by explicitly selecting an
+earlier verified release or opening a protected PR that restores a previously
+accepted family lock. Preserve the existing GitHub release history and legacy
+refs during all migrations.
 
-## Launch gate
+## Release gate and recovery evidence
 
-A release does not ship until the launch gate passes. The launch gate is the
-artifact-backed checklist below; every item must be green before a tag is cut:
+Release readiness requires successful component aggregates, the hub integration
+artifact, and both platform jobs for the candidate. The release workflow repeats
+integration before packaging; failed or missing evidence blocks publication.
+Its security lane records an SBOM and checks secrets, dependencies, and workflow
+permissions. Installer tests exercise checksum and provenance tampering; the
+release smoke test must additionally verify actual downloaded signed assets on
+both platforms before declaring the release usable.
 
-- **Security**: `gitleaks detect` finds no committed secrets and the family-lock
-  review reports no supply-chain drift (`bash ops/ci/security.sh`).
-- **Backups**: the distribution surface is recoverable — every released artifact
-  is a backup-by-design immutable GitHub release asset, and the resolved
-  `repos.manifest.toml` + `family.lock` set is retained so any release can be
-  re-fused from its backup of pinned tags and commit SHAs.
-- **Monitoring**: the jankurai audit job uploads `repo-score.{json,md}` on every
-  push, providing continuous monitoring of the hub's conformance score; a
-  regression below the minimum score fails CI and alerts maintainers.
-- **Rollback**: the rollback procedure below is documented, tested against the
-  last known-good tag, and required to be exercised before a risky release.
-- **Abuse and rate limits**: the GitHub Action and installer are advisory by
-  default and apply GitHub API rate limits; abuse of the release surface (forged
-  artifacts) is blocked by the installer's attestation, checksum, and Sigstore
-  verification before anything is installed.
+Backup custody consists of preserved Git refs, immutable dependency tags, prior
+GitHub Releases, and a verified Git bundle before hub history migration. Record
+the bundle digest and `git bundle verify` result in the migration evidence.
+Rollback selects a prior verified release or restores accepted locks through a
+protected PR; never move an existing release tag.
 
-## Rollback
+Monitoring uses required-check failures, uploaded audit findings, release job
+status, and the hourly token-expiration job. Maintainers investigate failed
+checks before another publication attempt. Abuse controls include read-only
+build tokens, a hub-only publisher secret, bounded lock artifacts, exact-SHA
+checks, protected PR merges, immutable tags, and fixed installer asset inventory.
 
-If a release regresses:
-
-1. Identify the last known-good tag (`jankurai-v<version>-split.<N>`).
-2. Re-point consumers at that immutable tag; tags are never moved or deleted.
-3. Open a revert commit that restores the previous `VERSION`, `CHANGELOG.md`,
-   and `family.lock` pins, and add a `### Fixed` entry describing the rollback.
-4. Re-run `just check` to confirm the rolled-back tree is green before
-   re-publishing.
-
-Because tags are immutable and `family.lock` pins every member to a commit SHA,
-any prior release can be re-fused and rebuilt bit-for-bit from its tag.
+The CI budget is bounded by workflow job timeouts and concurrency groups; the
+updater runs once per hour and GitHub API rate limits bound its request quota.
+Failure, token expiry, or exhausted quota is a stop condition. Disabling the
+`family-update` workflow is the maintainer kill switch while investigating
+unexpected workload. No workflow retries indefinitely or purchases extra quota.

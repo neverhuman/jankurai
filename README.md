@@ -1,98 +1,62 @@
 # Jankurai
 
-Public hub for the Jankurai split family.
+[![CI](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml/badge.svg)](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml)
 
-Jankurai is an agent-native repository conformance standard and audit CLI for
-auditable AI-assisted merge. This hub intentionally stays thin: it carries the
-installer, GitHub Action, release notes, family manifest, lockfile, and local
-fusion script. The auditor source lives in `jankurai-core`; reusable tools live
-in the `jankurai-tools-*` family repos.
+[Agent instructions](AGENTS.md) · [Architecture](docs/architecture.md)
 
-## Install
+GitHub is the primary home of Jankurai. This hub assembles 14 independently
+editable component repositories under [neverhuman](https://github.com/neverhuman).
+It owns the accepted family lock, combined checks, automatic updates, installer,
+GitHub Action, and public releases.
 
-Install a released binary from this hub release surface:
+## Quick start
 
-```bash
-curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.7.0-split.0/jankurai-installer.sh \
-  | JANKURAI_RELEASE_TAG=v1.7.0-split.0 bash
+Install Git, Rust (the toolchain is pinned in
+`rust-toolchain.toml`), and Node.js 24. Then:
+
+```sh
+git clone https://github.com/neverhuman/jankurai.git workspace/jankurai
+cd workspace/jankurai
+bash scripts/family.sh setup
+bash scripts/family.sh build
 ```
 
-The installer verifies the GitHub release, artifact attestation, checksum, and
-Sigstore bundle before installing.
+Setup clones missing components alongside the hub, verifies immutable tags against
+`family.lock`, restores safe locked revisions, and installs Cargo/npm dependencies.
+No Jeryu service, URL rewrite, pre-existing sibling repository, or dependency cache
+is required. The generated `.fusion/components/` links point to the canonical
+component checkouts; edit those component repositories directly.
 
-## Fused Development
+| Shell command | Just recipe | Behavior |
+| --- | --- | --- |
+| `bash scripts/family.sh setup` | `just setup` | Bootstrap components and project dependencies at the accepted lock. |
+| `bash scripts/family.sh pull` | `just pull` | Fetch successful component revisions, test a candidate in a disposable CI checkout, and update the two locks only after success. |
+| `bash scripts/family.sh build` | `just build` | Build the auditor, Tuiwright CLI, and UX CLI; bootstrap missing components while preserving existing heads. |
+| `bash scripts/family.sh check` | `just check` | Run component checks, combined Rust/UX tests, conformance, security, and audit evidence. |
+| `bash scripts/family.sh status` | `just status` | Show branches, commits, dirty files, and differences from the accepted lock. |
 
-Public development from GitHub tags:
+Full checks also require Chromium, TeX/latexmk, nextest, and the security tools
+installed explicitly in `.github/workflows/ci.yml` and `ops/ci/github-setup.sh`.
+Normal Cargo builds use the committed aggregate `Cargo.lock` with `--locked`.
+The legacy `scripts/fuse.sh --source github --all` and `.fusion/dev.sh` entrypoints
+remain compatibility wrappers.
 
-```bash
-git clone https://github.com/neverhuman/jankurai
-cd jankurai
-./scripts/fuse.sh --source github --all
-.fusion/dev.sh build
-```
+## Work preservation
 
-Internal Jeryu development:
+Setup and pull reject dirty checkouts or changes that would discard ahead or
+divergent commits. Obtain a stopped-head handoff before changing a busy checkout.
+No command creates Git worktrees. Candidate integration uses an automatically
+removed standalone CI checkout; failed candidates leave accepted locks unchanged.
 
-```bash
-./scripts/fuse.sh --source jeryu --all
-.fusion/dev.sh build
-```
+## Releases and updates
 
-Local split-container development from sibling repos:
+[Release and installation details](docs/release.md) describe Linux x86-64 and
+Apple Silicon macOS tarballs for `jankurai` and `tuiwright`, plus the built UX CLI
+npm package. The first release after the GitHub migration is `v1.7.0` and is gated
+on complete validation. The governed launcher and demo binary are not public assets.
 
-```bash
-./scripts/fuse.sh --source local --all
-.fusion/dev.sh build
-```
-
-The `.fusion/` directory is generated and ignored. It is the only place local
-path patches are written.
-
-## Repository Family
-
-The protected `repos.manifest.toml` in this hub is the sole family inventory.
-It declares all 15 canonical paths, forge slugs, default branches, and required
-checks. The container-root `../repos.manifest.toml` is a generated runtime
-projection; refresh or verify it with
-`scripts/project-family-manifest.sh --apply|--check`, never by hand. A release
-is pinned by `family.lock`, which records each member repo, tag, and commit SHA
-consumed by the fused release.
-
-| Repo | Role |
-| --- | --- |
-| `jankurai` | Hub, installer, GitHub Action, release notes, manifest, lock, fusion script. |
-| `jankurai-core` | Rust package and binary source for the `jankurai` auditor. |
-| `jankurai-contracts` | Schemas, artifact contracts, generated type source, compatibility tests. |
-| `jankurai-standard` | Standard docs, mission, public conformance policy, agent-native text. |
-| `jankurai-conformance` | Fixtures, expected reports, acceptance corpus. |
-| `jankurai-paper` | TeX paper, data, generated table inputs, paper CI lane. |
-| `jankurai-tools-tui` | Tuiwright libraries, CLI, examples, docs. |
-| `jankurai-tools-ux` | `@jankurai/ux-qa`, UX policies, Playwright and axe wrapper. |
-| `jankurai-tools-guard` | Guard/save-gate runtime and standalone guard crate. |
-| `jankurai-tools-proof` | Proofbind, proofmark, receipts, proof schemas. |
-| `jankurai-tools-dedup` | Copy-code and dedup source snapshots for extraction hardening. |
-| `jankurai-tools-analyzers` | Analyzer source snapshots for extraction hardening. |
-| `jankurai-tools-fleet` | Fleet, score history, trend, and repair-task source snapshots. |
-| `jankurai-deploy` | Release builds, signing, installer publishing, mirroring, split tooling. |
-
-## GitHub Action
-
-```yaml
-- uses: neverhuman/jankurai@v1.7.0-split.0
-  with:
-    mode: advisory
-    release-tag: v1.7.0-split.0
-```
-
-The action installs the released `jankurai` binary from hub releases and then
-runs the requested audit mode against the caller repository.
-
-## Local Validation
-
-```bash
-bash scripts/validate-family.sh
-```
-
-The validator checks required split metadata, Jeryu mirror config, lockfile
-pins, missing lockfiles, branch dependencies, committed cross-repo path
-dependencies, and action pinning posture.
+[Automation](docs/github-automation.md) explains immutable CI tags, hourly lock
+update PRs, exact-revision merge checks, and automation-token rotation.
+All default branches require protected PR merges and `<repo>/required`.
+Historical Jeryu branches, dependency tags, and the hub's legacy GitHub history
+are preserved; public builds use GitHub exclusively.
