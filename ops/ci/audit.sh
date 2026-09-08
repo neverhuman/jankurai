@@ -6,8 +6,8 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 cd "$REPO_ROOT"
 
 mkdir -p .jankurai
-log "audit lane: jankurai audit . -> .jankurai/repo-score.{json,md}"
-jankurai audit . --no-score-history --json .jankurai/repo-score.json --md .jankurai/repo-score.md
+log "audit lane: jankurai audit . -> .jankurai/repo-score.{json,md}" --full
+jankurai audit . --no-score-history --json .jankurai/repo-score.json --md .jankurai/repo-score.md --full
 
 assert_artifact .jankurai/repo-score.json
 assert_artifact .jankurai/repo-score.md
