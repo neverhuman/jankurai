@@ -11,7 +11,7 @@ AI-assisted change into a reviewable report and repair queue.
 Linux x86-64 and Apple Silicon macOS:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0
+bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0'
 export PATH="$HOME/.local/bin:$PATH"
 jankurai --version
 # jankurai 1.7.0
@@ -21,6 +21,11 @@ The installer verifies checksums, signatures, GitHub attestations, and embedded
 provenance, then runs the binary before replacing an existing installation.
 It downloads temporary, hash-pinned verification tools; Rust, Node.js, GitHub
 login, and preinstalled verifiers are unnecessary.
+
+Native Windows (including PowerShell and Git Bash), Intel macOS, Linux ARM64,
+and Alpine/musl are not supported release targets. Source builds also require a
+supported Unix platform; the older monolithic `cargo install --path crates/jankurai`
+command does not apply to this split workspace.
 
 From the repository you want to inspect:
 
@@ -42,7 +47,7 @@ See [installation options](docs/install.md) for a custom location and verificati
 Install the TUI test CLI with the same verifier:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0 --product tuiwright
+bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0 --product tuiwright'
 tuiwright --version
 # tuiwright 1.7.0
 ```

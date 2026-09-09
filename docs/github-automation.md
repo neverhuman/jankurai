@@ -32,6 +32,11 @@ PAT-authenticated merge triggers post-merge CI.
 `FAMILY_AUTOMATION_TOKEN` is a repository secret on **neverhuman/jankurai only**.
 Only the trusted publication and merge jobs receive it. Build/test jobs receive
 no supplied automation token; candidate subprocesses also strip token variables.
+Candidate checkout, bootstrap, and checks run in the same sanitized child
+process: GitHub/enterprise tokens, SSH agents and askpass helpers are removed,
+Git system/global configuration and injected Git configuration are disabled,
+and interactive Git authentication is refused. Collection's read-only API token
+is used only outside that process to select eligible revisions.
 Publication parses bounded lock artifacts and writes Git blobs through the API;
 it never checks out or executes candidate component code with that token.
 

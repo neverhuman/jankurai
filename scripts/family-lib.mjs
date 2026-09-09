@@ -49,8 +49,11 @@ export function temporaryCI(parent, prefix, action) {
   const directory = fs.mkdtempSync(path.join(parent, prefix));
   try { return action(directory); } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 }
-export function buildEnvironment() {
-  const env = { ...process.env };
-  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'FAMILY_AUTOMATION_TOKEN']) delete env[key];
+export function buildEnvironment(source = process.env) {
+  const env = { ...source };
+  for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+    'FAMILY_AUTOMATION_TOKEN', 'SSH_AUTH_SOCK', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_CONFIG_PARAMETERS']) delete env[key];
+  for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_')) delete env[key];
+  Object.assign(env, { GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0' });
   return env;
 }

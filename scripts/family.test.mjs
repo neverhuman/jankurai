@@ -120,10 +120,19 @@ test('publisher rejects metadata changes before any remote lookup', t => {
   assert.throws(() => validateCandidate(family, candidate, base), /metadata/);
   assert.notEqual(branchFor(base), branchFor(candidate));
 });
-test('publication credentials are removed from candidate build environment', () => {
-  const before = process.env.GH_TOKEN;
-  try { process.env.GH_TOKEN = 'controlled-test-value'; assert.equal(buildEnvironment().GH_TOKEN, undefined); }
-  finally { if (before === undefined) delete process.env.GH_TOKEN; else process.env.GH_TOKEN = before; }
+test('candidate checkout environment excludes credentials and injected Git authentication', t => {
+  const { hub } = fixture(t);
+  const secrets = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+    'FAMILY_AUTOMATION_TOKEN', 'SSH_AUTH_SOCK', 'GIT_ASKPASS', 'SSH_ASKPASS'];
+  const source = { ...process.env, ...Object.fromEntries(secrets.map(key => [key, 'controlled-test-value'])),
+    GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: 'Authorization: controlled-test-value' };
+  const env = buildEnvironment(source);
+  for (const key of secrets) assert.equal(env[key], undefined);
+  const result = git(hub, ['config', '--get', 'http.extraHeader'], { env, capture: true, check: false });
+  assert.equal(result.status, 1); assert.equal(result.stdout, '');
+  assert.equal(env.GIT_CONFIG_GLOBAL, '/dev/null'); assert.equal(env.GIT_CONFIG_NOSYSTEM, '1');
+  assert.equal(env.GIT_TERMINAL_PROMPT, '0');
+  assert.equal(source.GH_TOKEN, 'controlled-test-value');
 });
 
 function publicationFixture(t) {

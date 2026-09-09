@@ -29,7 +29,10 @@ function inventory(t) {
     fs.writeFileSync(path.join(dist, name + '.sigstore.bundle'), 'fixture signature');
     fs.writeFileSync(path.join(dist, name + '.attestation.jsonl'), 'fixture attestation');
   }
-  const verify = () => spawnSync(process.execPath, ['ops/ci/verify-release-assets.mjs', dist], { cwd: hub, encoding: 'utf8' });
+  // The collected-artifact jobs have Node but do not install npm dependencies.
+  fs.copyFileSync(path.join(hub, 'ops/ci/verify-release-assets.mjs'), path.join(root, 'verify.mjs'));
+  fs.writeFileSync(path.join(root, 'VERSION'), '1.7.0\n');
+  const verify = () => spawnSync(process.execPath, ['verify.mjs', dist], { cwd: root, encoding: 'utf8' });
   return { root, dist, verify };
 }
 test('release inventory accepts exactly the public products and verification companions', t => {

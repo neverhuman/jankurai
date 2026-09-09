@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { Family } from './family-model.mjs';
+import { fileURLToPath } from 'node:url';
 import { atomicWrite, buildEnvironment, clean, git, gitText, run, temporaryCI } from './family-lib.mjs';
 
 export function api(endpoint, body, method) {
@@ -17,8 +17,9 @@ export function successful(repo, sha, request = api) {
 }
 export function eligible(family, repo) {
   const directory = family.path(repo), branch = repo.default_branch;
-  git(directory, ['fetch', '--no-tags', repo.github, `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
-  git(directory, ['fetch', '--no-tags', repo.github, 'refs/tags/ci-*:refs/tags/ci-*']);
+  const env = buildEnvironment();
+  git(directory, ['fetch', '--no-tags', repo.github, `refs/heads/${branch}:refs/remotes/origin/${branch}`], { env });
+  git(directory, ['fetch', '--no-tags', repo.github, 'refs/tags/ci-*:refs/tags/ci-*'], { env });
   const tags = new Set(gitText(directory, 'tag', '--list', 'ci-*').split('\n'));
   for (const sha of gitText(directory, 'rev-list', `refs/remotes/origin/${branch}`).split('\n')) {
     if (tags.has(`ci-${sha}`) && gitText(directory, 'rev-parse', `refs/tags/ci-${sha}^{commit}`) === sha && successful(repo, sha)) return sha;
@@ -63,17 +64,9 @@ export function update(family, hooks = {}) {
   console.log('family pull: validated candidate locks ready for a protected PR');
 }
 function testCandidate(family, directory, candidate) {
-  const hub = path.join(directory, 'jankurai');
-  run(['git', 'clone', '--no-hardlinks', '--no-checkout', family.hub, hub]);
-  git(hub, ['checkout', '--detach', gitText(family.hub, 'rev-parse', 'HEAD')]);
-  atomicWrite(path.join(hub, 'family.lock'), candidate);
-  const sandbox = new Family(hub);
-  sandbox.bootstrap(true);
-  sandbox.fuse(false);
-  const env = buildEnvironment();
-  run(['cargo', 'generate-lockfile'], { cwd: sandbox.fusion, env });
-  const cargo = fs.readFileSync(path.join(sandbox.fusion, 'Cargo.lock'), 'utf8');
-  atomicWrite(path.join(hub, 'Cargo.lock'), cargo);
-  run(['bash', 'scripts/family.sh', 'check'], { cwd: hub, env });
-  return cargo;
+  atomicWrite(path.join(directory, 'candidate.lock'), candidate);
+  // Strip credentials and Git rewrites before any candidate checkout/bootstrap.
+  const script = fileURLToPath(new URL('./check-family-candidate.mjs', import.meta.url));
+  run([process.execPath, script, family.hub, gitText(family.hub, 'rev-parse', 'HEAD'), directory], { env: buildEnvironment() });
+  return fs.readFileSync(path.join(directory, 'jankurai/Cargo.lock'), 'utf8');
 }

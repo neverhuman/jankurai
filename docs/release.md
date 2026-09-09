@@ -61,6 +61,21 @@ permissions. Installer tests exercise checksum and provenance tampering; the
 release smoke test must additionally verify actual downloaded signed assets on
 both platforms before declaring the release usable.
 
+The read-only verification job checks the collected platform inventory and every
+signature/attestation before passing assets to the publishing job. Enable GitHub
+immutable releases before creating the version tag. Publication resumes an
+interrupted draft by matching each existing asset's uploaded state, size, and
+SHA-256 digest against the verified candidate. It uploads only missing assets
+and refuses conflicting, duplicate, or extra files. A retry against a matching
+published immutable release performs verification only; it never overwrites
+assets or moves a tag. The final stable publication explicitly becomes latest.
+
+Public native installation checks run before CI installs Node or verification
+tools, with an empty credential environment and a PATH containing only documented
+system utilities. They execute the README install command verbatim, run an audit,
+verify the downloadable installer asset, install TUI, repeat installation, and
+test removal. UX's Node/browser smoke runs separately afterward.
+
 Backup custody consists of preserved Git refs, immutable dependency tags, prior
 GitHub Releases, and a verified Git bundle before hub history migration. Record
 the bundle digest and `git bundle verify` result in the migration evidence.

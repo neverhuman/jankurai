@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { run } from '../../scripts/family-lib.mjs';
+import { execFileSync } from 'node:child_process';
 
 try {
   const dist = process.argv[2], version = fs.readFileSync('VERSION', 'utf8').trim();
@@ -11,10 +11,10 @@ try {
     for (const product of ['jankurai', 'tuiwright']) {
       const stem = `${product}-${version}-${target}`, name = `${stem}.tar.gz`;
       assets.push(name);
-      const entries = run(['tar', '-tzf', path.join(dist, name)], { capture: true }).split('\n').map(entry => entry.replace(/\/$/, '')).sort();
+      const entries = execFileSync('tar', ['-tzf', path.join(dist, name)], { encoding: 'utf8' }).trim().split('\n').map(entry => entry.replace(/\/$/, '')).sort();
       const allowed = [stem, ...[product, 'LICENSE', 'family.lock', 'Cargo.lock', 'provenance.json'].map(file => `${stem}/${file}`)].sort();
       if (JSON.stringify(entries) !== JSON.stringify(allowed)) throw new Error(`unexpected payload: ${name}`);
-      const details = run(['tar', '-tvzf', path.join(dist, name)], { capture: true }).split('\n');
+      const details = execFileSync('tar', ['-tvzf', path.join(dist, name)], { encoding: 'utf8' }).trim().split('\n');
       if (details.some(entry => !/^[d-]/.test(entry))) throw new Error(`linked/special payload: ${name}`);
     }
   }

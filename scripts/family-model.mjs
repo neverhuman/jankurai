@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { readToml, exists, isLink, gitText, git, clean, atomicWrite, run } from './family-lib.mjs';
+import { readToml, exists, isLink, gitText, git, clean, atomicWrite, run, buildEnvironment } from './family-lib.mjs';
 
 export class Family {
   constructor(hub) {
@@ -44,7 +44,7 @@ export class Family {
   }
   fetchPin(repo) {
     const pin = this.pins.get(repo.name), directory = this.path(repo);
-    git(directory, ['fetch', '--no-tags', repo.github, `refs/tags/${pin.tag}:refs/tags/${pin.tag}`]);
+    git(directory, ['fetch', '--no-tags', repo.github, `refs/tags/${pin.tag}:refs/tags/${pin.tag}`], { env: buildEnvironment() });
     if (gitText(directory, 'rev-parse', `refs/tags/${pin.tag}^{commit}`) !== pin.commit) throw new Error(`${repo.name}: immutable tag differs from lock`);
   }
   bootstrap(restore = false) {
@@ -53,7 +53,7 @@ export class Family {
     for (const repo of this.components()) {
       const directory = this.path(repo), pin = this.pins.get(repo.name);
       if (!exists(directory)) {
-        run(['git', 'clone', '--no-checkout', '--origin', 'origin', repo.github, directory]);
+        run(['git', 'clone', '--no-checkout', '--origin', 'origin', repo.github, directory], { env: buildEnvironment() });
         this.fetchPin(repo);
         git(directory, ['checkout', '--detach', pin.commit]);
       } else if (restore) this.fetchPin(repo);
