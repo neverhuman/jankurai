@@ -28,6 +28,10 @@ install: setup
 
 bootstrap: setup
 
+# Verify the committed README preview and 1080p audit GIFs.
+demo:
+    npm run demo:verify
+
 # Deterministic fast lane: the narrowest proof loop for agent iteration.
 # Validates required split metadata, Jeryu mirror config, lockfile pins, branch
 # dependencies, committed cross-repo path dependencies, and action pinning.

@@ -17,6 +17,7 @@ root. The same commands run locally and in CI (see
 | `security` | `gitleaks detect` + family-lock review | no committed secrets, no supply-chain drift |
 | `audit` | `jankurai audit . --json .jankurai/repo-score.json --md .jankurai/repo-score.md` | repo passes the jankurai standard |
 | `check` | `fast` + `security` + `audit` | the full local gate |
+| `demo` | `npm run demo:verify` | committed README and 1080p GIFs stay lossless, exact-palette, and under 50 MB |
 
 Every real top-level path is routed to a proof command in
 [`agent/test-map.json`](../agent/test-map.json). The narrowest agent loop is

@@ -12,6 +12,14 @@ Jankurai audits repositories for unsafe changes, missing proof, unclear ownershi
 and drift between code and its contracts. Use it locally or in CI to turn an
 AI-assisted change into a reviewable report and repair queue.
 
+![Jankurai audit](docs/demo/audit-readme.gif)
+
+The preview is a 960×540 lossless GIF of a real `jankurai audit` run against an
+isolated sample. Open the [1920×1080 full-resolution GIF](docs/demo/audit-1080p.gif)
+for the same recording at cinema size. Both files use an exact 16-color palette
+(no dither, no dimming), stay under 50 MB, and are rebuilt by
+[`scripts/demo/`](scripts/demo/). Catalog: [`docs/demo/`](docs/demo/README.md).
+
 ## Family scores
 
 First-party Jankurai score icons from each split-family repository. Each SVG is
@@ -84,6 +92,14 @@ tuiwright --version
 The release also includes the built `@jankurai/ux-qa` npm package for browser
 geometry and accessibility checks. It requires Node.js and Playwright; follow
 [UX installation](docs/install.md#ux-package) for package verification and browser setup.
+
+## GitHub Action and local hooks
+
+`action.yml` in this repository adds a configurable score floor. The immutable
+`v1.7.0` Action metadata does not accept `fail-under` and must not be used as
+an example of that gate. Pin a later hub commit, not `@v1.7.0`, until a
+qualified release ships. Updated local hooks need a producer that supports
+`--no-badge`. See [Action qualification](docs/action.md).
 
 ## Build from a fresh clone
 
