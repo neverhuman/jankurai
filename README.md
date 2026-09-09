@@ -4,19 +4,13 @@
 [![Jankurai score: 91/100](agent/jankurai-badge.svg)](agent/jankurai-badge.json)
 <!-- jankurai-badge:end -->
 
-[**Current release v1.5.1**](https://github.com/neverhuman/jankurai/releases/tag/v1.5.1)
-· [Next release v1.7.0](https://github.com/neverhuman/jankurai/releases)
+[**Current release v1.7.0**](https://github.com/neverhuman/jankurai/releases/tag/v1.7.0)
 · [CI](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml)
 · [AGENTS.md](AGENTS.md)
 
 Jankurai audits repositories for unsafe changes, missing proof, unclear ownership,
 and drift between code and its contracts. Use it locally or in CI to turn an
 AI-assisted change into a reviewable report and repair queue.
-
-The installer commands below target **v1.7.0**. Until that tag is published,
-install [v1.5.1](https://github.com/neverhuman/jankurai/releases/tag/v1.5.1)
-or clone and build from source. After v1.7.0 is published, the same commands
-are the supported binary path.
 
 ## Family scores
 
@@ -132,7 +126,7 @@ removed standalone CI checkout; failed candidates leave accepted locks unchanged
 
 [Release and installation details](docs/release.md) describe Linux x86-64 and
 Apple Silicon macOS tarballs for `jankurai` and `tuiwright`, plus the built UX CLI
-npm package. Release `v1.7.0` is gated on complete validation. The governed launcher and demo binary are not public assets.
+npm package. The governed launcher and demo binary are not public assets.
 
 [Automation](docs/github-automation.md) explains immutable CI tags, hourly lock
 update PRs, exact-revision merge checks, and automation-token rotation.
