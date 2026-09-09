@@ -6,7 +6,9 @@ export const phases = ['resolve changed paths', 'load audit mode', 'scan reposit
 
 export function parsePhase(text) {
   const plain = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
-  const progress = plain.match(/(?:^|\s)(\d+)\/(\d+)\s+(.+)$/);
+  // Only bar or percent progress markers count. Scorecard lines such as
+  // "35/100" must not be treated as audit phases.
+  const progress = plain.match(/(?:\]|\d+%)\s+(\d+)\/(\d+)\s+(.+)$/);
   if (!progress) return null;
   const position = Number(progress[1]), label = progress[3].trim();
   if (Number(progress[2]) !== 8 || !((position > 0 && position < 8 && label === phases[position - 1])
