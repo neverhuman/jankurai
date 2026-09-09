@@ -85,7 +85,7 @@ for file in "$package" "$provenance"; do
   env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
     gh attestation verify "$file" --bundle "$file.attestation.jsonl" --repo "$repo" \
     --cert-identity "$identity" --cert-oidc-issuer https://token.actions.githubusercontent.com \
-    --deny-self-hosted-runners --signer-workflow "$repo/.github/workflows/release.yml" \
+    --deny-self-hosted-runners \
     --signer-digest "$commit" --source-digest "$commit" --source-ref "refs/tags/$tag"
 done
 ```

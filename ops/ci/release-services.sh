@@ -31,7 +31,7 @@ case "${1:-}" in
       anonymous gh attestation verify "$1" --bundle "$asset.attestation.jsonl" \
         --repo "$2" --cert-identity "$3" \
         --cert-oidc-issuer https://token.actions.githubusercontent.com \
-        --signer-workflow "$workflow" --signer-digest "$GITHUB_SHA" \
+        --signer-digest "$GITHUB_SHA" \
         --source-digest "$4" --source-ref "$5" --deny-self-hosted-runners
     }
     verify_signature() {

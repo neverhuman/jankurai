@@ -18,6 +18,6 @@ for asset in dist/*; do
     GH_CONFIG_DIR="$config" gh attestation verify "$asset" \
     --bundle "$asset.attestation.jsonl" --repo "$GITHUB_REPOSITORY" \
     --cert-identity "$identity" --cert-oidc-issuer https://token.actions.githubusercontent.com \
-    --deny-self-hosted-runners --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+    --deny-self-hosted-runners \
     --signer-digest "$GITHUB_SHA" --source-digest "$GITHUB_SHA" --source-ref "refs/tags/$RELEASE_TAG"
 done

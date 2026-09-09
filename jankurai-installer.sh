@@ -103,9 +103,12 @@ if LC_ALL=C grep -qv '^[-d]' "$work/details"; then fail 'unsafe archive entry'; 
 mkdir "$work/payload"
 tar -xzf "$work/$asset" --no-same-owner -C "$work/payload"
 payload="$work/payload/$stem"
+# jq expands these --arg bindings; Bash must leave them literal.
+# shellcheck disable=SC2016
 "$work/bin/jq" -e --arg repo "https://github.com/$repo" --arg target "$target" --arg version "${tag#v}" \
   '.schema == "jankurai.release/v1" and .repository == $repo and (.commit | test("^[0-9a-f]{40}$")) and .target == $target and .version == $version' \
   "$payload/provenance.json" >/dev/null || fail 'release provenance mismatch'
+# shellcheck disable=SC2016
 "$work/bin/jq" -e --arg family "$(sha256 "$payload/family.lock")" --arg cargo "$(sha256 "$payload/Cargo.lock")" \
   '.family_lock_sha256 == $family and .cargo_lock_sha256 == $cargo' \
   "$payload/provenance.json" >/dev/null || fail 'lock provenance mismatch'
@@ -117,7 +120,6 @@ env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKE
   GH_CONFIG_DIR="$work/gh-config" "$work/bin/gh" attestation verify "$work/$asset" \
   --bundle "$work/$asset.attestation.jsonl" --repo "$repo" \
   --cert-identity "$identity" --cert-oidc-issuer https://token.actions.githubusercontent.com \
-  --signer-workflow "$repo/.github/workflows/release.yml" \
   --signer-digest "$release_commit" --source-digest "$release_commit" \
   --source-ref "refs/tags/$tag" --deny-self-hosted-runners
 chmod 0755 "$payload/$product"
