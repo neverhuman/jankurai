@@ -27,7 +27,8 @@ export function atomicWrite(file, content) {
   } finally { if (created && exists(temporary)) fs.unlinkSync(temporary); }
 }
 export function clean(directory) {
-  if (gitText(directory, 'status', '--porcelain')) throw new Error(`${path.basename(directory)}: dirty checkout; obtain a stopped-head handoff`);
+  const dirty = gitText(directory, 'status', '--porcelain');
+  if (dirty) throw new Error(`${path.basename(directory)}: dirty checkout; obtain a stopped-head handoff\n${dirty}`);
   const gd = gitText(directory, 'rev-parse', '--absolute-git-dir');
   for (const marker of ['index.lock', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'rebase-merge', 'rebase-apply']) {
     if (exists(path.join(gd, marker))) throw new Error(`${directory}: Git operation in progress (${marker})`);

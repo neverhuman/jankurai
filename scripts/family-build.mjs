@@ -7,9 +7,9 @@ export function dependencies(family) {
     if (exists(path.join(family.path(repo), 'package-lock.json'))) run(['npm', 'ci'], { cwd: family.path(repo) });
   }
 }
-export function build(family, { release = false, target } = {}) {
+export function build(family, { release = false, target, isolate = false } = {}) {
   family.bootstrap();
-  family.fuse();
+  family.fuse(true, isolate);
   const args = ['cargo', 'build', '--locked', '-p', 'jankurai', '-p', 'tuiwright-cli'];
   if (release) args.push('--release');
   if (target) args.push('--target', target);
@@ -24,7 +24,9 @@ export function check(family) {
     clean(family.path(repo));
     if (gitText(family.path(repo), 'rev-parse', 'HEAD') !== family.pins.get(repo.name).commit) throw new Error(`${repo.name}: integration requires the accepted locked revision`);
   }
-  build(family);
+  // Isolate fusion members so workspace cargo test cannot write through
+  // live sibling checkouts. Live trees stay the accepted source.
+  build(family, { isolate: true });
   dependencies(family);
   run(['cargo', 'test', '--workspace', '--locked'], { cwd: family.fusion });
   const ux = path.join(family.root, 'jankurai-tools-ux');

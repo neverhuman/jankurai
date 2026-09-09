@@ -71,13 +71,23 @@ export class Family {
       if (gitText(directory, 'rev-parse', 'HEAD') !== pin.commit) git(directory, ['checkout', '--detach', pin.commit]);
     }
   }
-  fuse(copyLock = true) {
+  fuse(copyLock = true, isolate = false) {
     const links = path.join(this.fusion, 'components'), members = [], patches = new Map();
     fs.mkdirSync(links, { recursive: true });
     for (const repo of this.components()) {
       const directory = this.path(repo), link = path.join(links, repo.name);
       if (!this.existing(repo)) throw new Error(`missing component: ${repo.name}`);
-      if (isLink(link)) {
+      if (isolate) {
+        if (exists(link) || isLink(link)) fs.rmSync(link, { recursive: true, force: true });
+        fs.cpSync(directory, link, {
+          recursive: true,
+          dereference: true,
+          filter: source => {
+            const base = path.basename(source);
+            return base !== 'target' && base !== 'node_modules';
+          },
+        });
+      } else if (isLink(link)) {
         if (fs.realpathSync(link) !== directory) throw new Error(`refusing mismatched link: ${link}`);
       } else if (exists(link)) throw new Error(`refusing to overwrite directory: ${link}`);
       else fs.symlinkSync(path.relative(links, directory), link, 'dir');
