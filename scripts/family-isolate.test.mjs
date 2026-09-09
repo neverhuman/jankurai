@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { Family } from './family-model.mjs';
 
@@ -192,7 +193,7 @@ test('forged filename membership does not authorize deleting unique bytes', () =
       commit: '0'.repeat(40),
       files: ['valuable'],
     }));
-    assert.throws(() => family.fuse(false, true), /identity|incomplete|record/);
+    assert.throws(() => family.fuse(false, true), /identity|incomplete|record|authority/);
     assert.equal(fs.readFileSync(path.join(dest, 'valuable'), 'utf8'), 'UNIQUE');
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -234,6 +235,138 @@ test('execution refuses a redirected root and changed copy contents', () => {
       files: [{ name: 'owned.txt', type: 'file', mode: 0o644, sha256: 'ab'.repeat(32), target: null }],
     }));
     assert.throws(() => family.executionPath(core), /redirected|live source|changed/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('unknown empty directory is preserved and refuses rematerialize', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-emptydir-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const family = familyAt(root, [core]);
+    family.fuse(false, true);
+    const dest = path.join(family.fusion, 'components', 'jankurai-core');
+    fs.mkdirSync(path.join(dest, 'unknown-empty'));
+    assert.throws(() => family.fuse(false, true), /changed|inventory|material/);
+    assert.equal(fs.existsSync(path.join(dest, 'unknown-empty')), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('chained symlink that escapes the isolate is refused', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-chain-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const directory = path.join(root, 'jankurai-core');
+    const sentinel = path.join(root, 'outside-sentinel');
+    fs.writeFileSync(sentinel, 'PRESERVE');
+    fs.symlinkSync('.', path.join(directory, 'a'));
+    fs.symlinkSync('a/../outside-sentinel', path.join(directory, 'b'));
+    git(directory, ['add', 'a', 'b']);
+    git(directory, ['commit', '--quiet', '-m', 'chained escape']);
+    const family = familyAt(root, [core]);
+    assert.throws(() => family.fuse(false, true), /escaped isolate|cycle/);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'PRESERVE');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('shaped self-hashed marker cannot authorize delete or execute', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-authority-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const family = familyAt(root, [core]);
+    const dest = path.join(family.fusion, 'components', 'jankurai-core');
+    fs.mkdirSync(dest, { recursive: true });
+    const unique = Buffer.from('UNIQUE OWNER BYTES');
+    fs.writeFileSync(path.join(dest, 'valuable.txt'), unique);
+    fs.writeFileSync(`${dest}.jankurai-isolate`, JSON.stringify({
+      kind: 'owned-execution-copy',
+      source: path.join(root, 'jankurai-core'),
+      commit: '0'.repeat(40),
+      tree: '1'.repeat(40),
+      files: [{
+        name: 'valuable.txt', type: 'file', mode: 0o644,
+        sha256: createHash('sha256').update(unique).digest('hex'),
+        target: null, size: unique.length,
+      }],
+    }));
+    assert.throws(() => family.materializeIsolate(path.join(root, 'jankurai-core'), dest), /authority|owned|identity/);
+    assert.equal(fs.readFileSync(path.join(dest, 'valuable.txt'), 'utf8'), 'UNIQUE OWNER BYTES');
+    assert.throws(() => family.fuse(false, false), /authority|owned|identity|overwrite/);
+    assert.equal(fs.readFileSync(path.join(dest, 'valuable.txt'), 'utf8'), 'UNIQUE OWNER BYTES');
+    family.disposeIsolates();
+    assert.equal(fs.readFileSync(path.join(dest, 'valuable.txt'), 'utf8'), 'UNIQUE OWNER BYTES');
+    assert.throws(() => family.executionPath(core), /authority|owned|identity|missing/);
+    assert.equal(fs.readFileSync(path.join(dest, 'valuable.txt'), 'utf8'), 'UNIQUE OWNER BYTES');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('materialize writes committed bytes without running smudge filters', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-smudge-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const directory = path.join(root, 'jankurai-core');
+    fs.writeFileSync(path.join(directory, '.gitattributes'), 'owned.txt filter=probe\n');
+    git(directory, ['add', '.gitattributes']);
+    git(directory, ['commit', '--quiet', '-m', 'filter']);
+    git(directory, ['config', 'filter.probe.smudge', 'printf "%s" "$ISOLATE_CONTROL_VALUE" > "$ISOLATE_CONTROL_OUTPUT"; cat']);
+    const family = familyAt(root, [core]);
+    const output = path.join(root, 'outside-copy-filter-output');
+    process.env.ISOLATE_CONTROL_VALUE = 'AUTHORED TEST VALUE';
+    process.env.ISOLATE_CONTROL_OUTPUT = output;
+    try {
+      family.fuse(false, true);
+      assert.equal(fs.existsSync(output), false);
+      const dest = path.join(family.fusion, 'components', 'jankurai-core');
+      assert.equal(fs.readFileSync(path.join(dest, 'owned.txt'), 'utf8'), 'jankurai-core committed\n');
+    } finally {
+      delete process.env.ISOLATE_CONTROL_VALUE;
+      delete process.env.ISOLATE_CONTROL_OUTPUT;
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('execution refuses an isolate after the accepted source advances', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-advance-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const directory = path.join(root, 'jankurai-core');
+    const family = familyAt(root, [core]);
+    family.fuse(false, true);
+    fs.writeFileSync(path.join(directory, 'owned.txt'), 'advanced source\n');
+    git(directory, ['add', 'owned.txt']);
+    git(directory, ['commit', '--quiet', '-m', 'advance']);
+    assert.throws(() => family.executionPath(core), /accepted revision|source/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('required copy Git HEAD is the accepted component revision', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-gitid-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const family = familyAt(root, [core]);
+    const hub = path.join(root, 'jankurai');
+    git(hub, ['init', '--quiet']);
+    fs.writeFileSync(path.join(hub, 'hub.txt'), 'authored hub');
+    git(hub, ['add', 'hub.txt']);
+    git(hub, ['commit', '--quiet', '-m', 'hub']);
+    family.rematerializeIsolates();
+    const required = family.executionPath(core);
+    const observed = git(required, ['rev-parse', 'HEAD']);
+    const accepted = git(path.join(root, 'jankurai-core'), ['rev-parse', 'HEAD']);
+    const hubHead = git(hub, ['rev-parse', 'HEAD']);
+    assert.equal(observed, accepted);
+    assert.notEqual(observed, hubHead);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

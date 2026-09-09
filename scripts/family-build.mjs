@@ -5,9 +5,11 @@ export function dependencies(family) {
   run(['cargo', 'fetch', '--locked'], { cwd: family.fusion });
   for (const repo of family.components()) {
     const live = family.path(repo);
-    const isolated = path.join(family.fusion, 'components', repo.name);
     const directories = [live];
-    if (exists(isolated) && isolated !== live) directories.push(isolated);
+    for (const root of ['components', 'required-components']) {
+      const isolated = path.join(family.fusion, root, repo.name);
+      if (exists(isolated) && isolated !== live) directories.push(isolated);
+    }
     for (const directory of directories) {
       if (exists(path.join(directory, 'package-lock.json'))) run(['npm', 'ci'], { cwd: directory });
     }
