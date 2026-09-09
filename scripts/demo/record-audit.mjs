@@ -26,6 +26,7 @@ const identity = { executableSha256: sha256(fs.readFileSync(bin)), executable: b
   repository: repo, commit: sourceGit('rev-parse', 'HEAD'), tree: sourceGit('rev-parse', 'HEAD^{tree}'),
   statusBefore: sourceGit('status', '--porcelain=v1', '--untracked-files=all'), argv };
 const events = [{ atMs: 0, position: 0, label: 'starting audit process' }];
+const startedEpochMs = Date.now();
 const started = performance.now();
 const now = () => Math.round(performance.now() - started);
 let bytes = 0, error = null, stderr = '', stdout = '', pending = '';
@@ -71,8 +72,8 @@ child.on('close', (exitCode, signal) => {
   identity.statusAfter = sourceGit('status', '--porcelain=v1', '--untracked-files=all');
   fs.writeFileSync(path.join(output, 'stdout.txt'), stdout, { flag: 'wx' });
   fs.writeFileSync(path.join(output, 'stderr.txt'), stderr, { flag: 'wx' });
-  const recording = { schema: 1, kind: 'recorded-process', identity, events,
-    result: { atMs: completedAtMs, exitCode, signal, error, report, reportSha256 },
+  const recording = { schema: 1, kind: 'recorded-process', identity, events, startedEpochMs,
+    result: { atMs: completedAtMs, completedEpochMs: Date.now(), exitCode, signal, error, report, reportSha256 },
     stdoutSha256: sha256(stdout), stderrSha256: sha256(stderr) };
   fs.writeFileSync(path.join(output, 'recording.json'), JSON.stringify(recording, null, 2) + '\n', { flag: 'wx' });
   // Artifact generation must not turn an execution failure into green CI.

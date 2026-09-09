@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { sha256, validateRecording, outcome } from './audit-recording.mjs';
 import { render } from './render-audit-gif.mjs';
 import { cleanupSample } from './sample-cleanup.mjs';
+import { captureProducerState } from './producer-state.mjs';
 
 const [auditor, destination] = process.argv.slice(2);
 if (!auditor || !path.isAbsolute(auditor) || !destination) throw new Error('usage: generate-demo.mjs /absolute/qualified-auditor /new-output-directory');
@@ -27,6 +28,7 @@ for (let index = 0; index < 2000; index++) {
   write(`src/sample_${String(index).padStart(4, '0')}.rs`, functions);
 }
 const capture = path.join(root, 'recording');
+const producerOutputs = [];
 try {
   const execution = spawnSync(process.execPath, [path.join(here, 'record-audit.mjs'), auditor, sample, capture], { stdio: 'inherit' });
   const recordingBytes = fs.readFileSync(path.join(capture, 'recording.json'));
@@ -39,6 +41,7 @@ try {
       || result.passed || recording.result.exitCode !== 1) {
     throw new Error('sample audit did not complete with a consistent real policy outcome');
   }
+  producerOutputs.push(captureProducerState(sample, recording, capture));
   // This job verifies an honest demo; an explicitly displayed sample policy FAIL
   // is allowed. Missing execution/report and contradictory outcomes remain fatal.
   const rendered = path.join(root, 'rendered');
@@ -47,15 +50,9 @@ try {
   if (verify.status !== 0) throw new Error('independent decoded pixel verification failed');
   fs.writeFileSync(path.join(capture, 'sample-inputs.json'), JSON.stringify({
     description: 'Real audit of an authored sample repository; policy failures are preserved.',
-    inventory, sourceSha256: sha256(JSON.stringify(inventory)),
+    inventory, sourceSha256: sha256(JSON.stringify(inventory)), producerOutputs,
     recordingSha256: sha256(recordingBytes), expectedSampleOutcome: 'FAIL', measuredOutcome: result,
   }, null, 2) + '\n', { flag: 'wx' });
 } finally {
-  for (const extra of ['target', '.jankurai']) {
-    const ephemeral = path.join(sample, extra);
-    if (fs.existsSync(ephemeral) && !fs.lstatSync(ephemeral).isSymbolicLink()) {
-      fs.rmSync(ephemeral, { recursive: true, force: true });
-    }
-  }
-  cleanupSample(sample, inventory);
+  cleanupSample(sample, [...inventory, ...producerOutputs]);
 }
