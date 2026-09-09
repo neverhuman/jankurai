@@ -1,7 +1,13 @@
-# Install Jankurai 1.7.0
+# Install Jankurai
+
+The current published release is
+[v1.5.1](https://github.com/neverhuman/jankurai/releases/tag/v1.5.1).
+The next release is **v1.7.0**. Until that tag exists, the v1.7.0 installer URL
+below will 404; install v1.5.1 or [build from a clone](../README.md#build-from-a-fresh-clone).
+After publication, the same v1.7.0 commands are the supported binary path.
 
 The [v1.7.0 release](https://github.com/neverhuman/jankurai/releases/tag/v1.7.0)
-provides native Linux x86-64 and Apple Silicon macOS binaries.
+will provide native Linux x86-64 and Apple Silicon macOS binaries.
 
 ```sh
 bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0'
