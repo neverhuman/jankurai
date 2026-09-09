@@ -12,6 +12,11 @@ Jankurai audits repositories for unsafe changes, missing proof, unclear ownershi
 and drift between code and its contracts. Use it locally or in CI to turn an
 AI-assisted change into a reviewable report and repair queue.
 
+![Jankurai audit TUI](docs/demo/audit-readme.gif)
+
+The 1920×1080 lossless-palette recording is produced by the same CI script and
+published as the `audit-demo-gifs` artifact (`docs/demo/audit-1080p.gif`).
+
 ## Family scores
 
 First-party Jankurai score icons from each split-family repository. Each SVG is
@@ -84,6 +89,32 @@ tuiwright --version
 The release also includes the built `@jankurai/ux-qa` npm package for browser
 geometry and accessibility checks. It requires Node.js and Playwright; follow
 [UX installation](docs/install.md#ux-package) for package verification and browser setup.
+
+## GitHub Action and local hooks
+
+Publish this repository as a GitHub Marketplace Action (`neverhuman/jankurai`).
+Other projects can block merges under a configurable score floor (default 85):
+
+```yaml
+- uses: neverhuman/jankurai@v1.7.0
+  with:
+    mode: standard
+    fail-under: 85   # or 90
+```
+
+`mode: advisory` still writes the report; the Action then fails the job when
+the score is below `fail-under` unless you set `fail-under: 0`.
+
+Install the same gate locally:
+
+```sh
+jankurai hooks install --yes
+# optional blocking floor for this checkout:
+# echo 'JANKURAI_HOOK_MODE=standard' >> "$(git rev-parse --git-dir)/jankurai/env"
+# echo 'JANKURAI_FAIL_UNDER=85' >> "$(git rev-parse --git-dir)/jankurai/env"
+```
+
+Or generate a workflow with `jankurai ci install --github`.
 
 ## Build from a fresh clone
 

@@ -1,5 +1,6 @@
 name: "Jankurai"
-description: "Anti-vibe coding standard and local audit CLI for auditable AI-assisted merge"
+description: "Audit a repository and fail CI when the Jankurai score is under a configurable floor (default 85)."
+author: "neverhuman"
 branding:
   icon: "check-circle"
   color: "green"
@@ -10,13 +11,21 @@ inputs:
     required: false
     default: "v1.7.0"
   mode:
-    description: "Audit mode: advisory, ratchet, or release"
+    description: "Audit mode: standard (blocking), advisory, ratchet, or release"
     required: false
-    default: "advisory"
+    default: "standard"
+  fail-under:
+    description: "Minimum accepted score. The job fails when score is below this value. Use 90 for a tighter gate; 0 disables the floor."
+    required: false
+    default: "85"
   baseline:
     description: "Path to accepted baseline score JSON (required for ratchet or release mode)"
     required: false
     default: "agent/baselines/main.repo-score.json"
+  path:
+    description: "Repository path to audit"
+    required: false
+    default: "."
 
 runs:
   using: "composite"
@@ -37,12 +46,43 @@ runs:
       env:
         AUDIT_MODE: ${{ inputs.mode }}
         AUDIT_BASELINE: ${{ inputs.baseline }}
+        AUDIT_PATH: ${{ inputs.path }}
+        FAIL_UNDER: ${{ inputs.fail-under }}
       run: |
-        if [ "$AUDIT_MODE" = "ratchet" ] || [ "$AUDIT_MODE" = "release" ]; then
-          "$HOME/.local/bin/jankurai" audit . --mode "$AUDIT_MODE" --baseline "$AUDIT_BASELINE" --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --sarif target/jankurai/jankurai.sarif --github-step-summary target/jankurai/summary.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl
-        else
-          "$HOME/.local/bin/jankurai" audit . --mode "$AUDIT_MODE" --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --sarif target/jankurai/jankurai.sarif --github-step-summary target/jankurai/summary.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+        set -euo pipefail
+        extra=()
+        if [ "$FAIL_UNDER" != "0" ]; then
+          extra+=(--fail-under "$FAIL_UNDER")
         fi
+        if [ "$AUDIT_MODE" = "ratchet" ] || [ "$AUDIT_MODE" = "release" ]; then
+          extra+=(--baseline "$AUDIT_BASELINE")
+        fi
+        "$HOME/.local/bin/jankurai" audit "$AUDIT_PATH" \
+          --mode "$AUDIT_MODE" \
+          "${extra[@]}" \
+          --json target/jankurai/repo-score.json \
+          --md target/jankurai/repo-score.md \
+          --sarif target/jankurai/jankurai.sarif \
+          --github-step-summary target/jankurai/summary.md \
+          --repair-queue-jsonl target/jankurai/repair-queue.jsonl
+
+    - name: Enforce score floor
+      shell: bash
+      if: always()
+      env:
+        FAIL_UNDER: ${{ inputs.fail-under }}
+      run: |
+        set -euo pipefail
+        if [ "$FAIL_UNDER" = "0" ]; then
+          echo "score floor disabled"
+          exit 0
+        fi
+        test -s target/jankurai/repo-score.json
+        jq -e --argjson floor "$FAIL_UNDER" '
+          .score >= $floor
+          and ((.decision.hard_findings // 0) == 0)
+        ' target/jankurai/repo-score.json >/dev/null
+        echo "score floor $FAIL_UNDER passed"
 
     - name: Publish jankurai summary
       shell: bash

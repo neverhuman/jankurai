@@ -3,3 +3,4 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 bash scripts/validate-family.sh
 npm test
+node scripts/demo/render-audit-gif.mjs
