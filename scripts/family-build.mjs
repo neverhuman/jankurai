@@ -31,12 +31,11 @@ export function check(family) {
   run(['npm', 'exec', '--', 'playwright', 'install', 'chromium', '--only-shell'], { cwd: ux });
   run(['npm', 'test'], { cwd: ux });
   const env = { ...process.env, PATH: path.join(family.fusion, 'target/debug') + path.delimiter + process.env.PATH };
-  // Fusion members are live checkouts. Workspace cargo test can rewrite
-  // sibling Cargo.lock files through those path links. Restore tracked files
-  // so hub integration still sees the accepted locked pins.
+  // Fusion members are live checkouts. Tests must leave their accepted source
+  // intact; preserve any mutation for inspection and refuse further acceptance.
   for (const repo of family.components()) {
-    if (!family.existing(repo)) continue;
-    run(['git', '-C', family.path(repo), 'checkout', '--', '.']);
+    if (!family.existing(repo)) throw new Error(`missing component: ${repo.name}`);
+    clean(family.path(repo));
     if (gitText(family.path(repo), 'rev-parse', 'HEAD') !== family.pins.get(repo.name).commit) {
       throw new Error(`${repo.name}: integration requires the accepted locked revision`);
     }
@@ -49,5 +48,14 @@ export function check(family) {
     // already in CARGO_HOME.
     if (exists(path.join(directory, 'Cargo.lock'))) run(['cargo', 'fetch', '--locked'], { cwd: directory });
     run(['bash', 'scripts/ci-local.sh', 'required'], { cwd: directory, env });
+  }
+  // Required lanes can also mutate source through the fusion links. Recheck
+  // every component after all lanes, including changes to an earlier sibling.
+  for (const repo of family.components()) {
+    if (!family.existing(repo)) throw new Error(`missing component: ${repo.name}`);
+    clean(family.path(repo));
+    if (gitText(family.path(repo), 'rev-parse', 'HEAD') !== family.pins.get(repo.name).commit) {
+      throw new Error(`${repo.name}: integration requires the accepted locked revision`);
+    }
   }
 }
