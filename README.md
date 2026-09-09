@@ -7,6 +7,7 @@
 [**Current release v1.5.1**](https://github.com/neverhuman/jankurai/releases/tag/v1.5.1)
 · [Next release v1.7.0](https://github.com/neverhuman/jankurai/releases)
 · [CI](https://github.com/neverhuman/jankurai/actions/workflows/ci.yml)
+· [AGENTS.md](AGENTS.md)
 
 Jankurai audits repositories for unsafe changes, missing proof, unclear ownership,
 and drift between code and its contracts. Use it locally or in CI to turn an
