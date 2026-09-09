@@ -1,169 +1,123 @@
-# Installing jankurai
+# Install Jankurai
 
-Jankurai adoption is no-write first, advisory by default, and ratcheted only
-after a baseline exists. The preferred install path is the release-shipped
-installer, which verifies the immutable tag, GitHub artifact attestation,
-sha256 checksum, and Sigstore bundle before it installs the binary:
+The current published release is
+[v1.5.1](https://github.com/neverhuman/jankurai/releases/tag/v1.5.1).
+The next release is **v1.7.0**. Until that tag exists, the v1.7.0 installer URL
+below will 404; install v1.5.1 or [build from a clone](../README.md#build-from-a-fresh-clone).
+After publication, the same v1.7.0 commands are the supported binary path.
 
-Prerequisites for the installer path: `curl`, `gh`, `cosign`, and `sudo`
-permission for the macOS pkg installer if you are on macOS.
+The [v1.7.0 release](https://github.com/neverhuman/jankurai/releases/tag/v1.7.0)
+will provide native Linux x86-64 and Apple Silicon macOS binaries.
 
-```bash
-curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.6.0/jankurai-installer.sh \
-  | JANKURAI_RELEASE_TAG=v1.6.0 bash
+```sh
+bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0'
+export PATH="$HOME/.local/bin:$PATH"
+jankurai --version
 ```
 
-If you need the fallback source install, clone the repo and build from the
-workspace:
+The result is `jankurai 1.7.0`. The default directory is `~/.local/bin`; add the
+PATH line to `~/.bashrc` or `~/.zshrc` if needed. Pass `--install-dir /your/bin`
+to select a different writable directory. No sudo, Rust, Node.js, GitHub login,
+or preinstalled verifier is needed for the auditor or Tuiwright. The platform
+must provide Bash, curl, tar, a SHA-256 tool, gzip on Linux, and unzip on macOS.
 
-```bash
-git clone https://github.com/neverhuman/jankurai.git
-cd jankurai
-cargo install --path crates/jankurai --locked
-jankurai version
-jankurai versions
+Native Windows (PowerShell or Git Bash), Intel macOS, Linux ARM64, and Alpine/musl
+are unsupported. Source builds require a supported Unix platform too. Do not use
+the historical monolithic `cargo install --path crates/jankurai` instructions.
+The installer is also attached to the release for download and inspection.
+
+Run the command again to upgrade or reinstall. It checks the staged binary and
+replaces the installed file atomically. A download, verification, or version
+failure preserves the existing binary. Remove it with `rm ~/.local/bin/jankurai`;
+the installer keeps no permanent verification tools or background services.
+Repository audit reports remain yours to retain or remove separately.
+
+## Audit modes
+
+Run this from the repository you want to inspect:
+
+```sh
+jankurai audit . --mode advisory --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl
 ```
 
-Human terminal output uses color and progress bars when attached to a terminal.
-For demos or logs, force rich output with `JANKURAI_COLOR=always` and
-`JANKURAI_PROGRESS=always`.
+Advisory mode emits findings for review. Ratchet mode additionally takes
+`--baseline path/to/accepted-score.json` and rejects regressions. Release mode
+also takes a baseline and applies release policy. Use `jankurai audit --help`
+for the available policy and output options.
 
-`jankurai version` prints the installed CLI/version/source diagnostics and the
-recommended upgrade command. The installer path prefers the notarized macOS
-`pkg` or the Linux tarball produced by release CI; source install remains the
-fallback for air-gapped or tool-minimal environments.
+## Tuiwright
 
-## Optional: pre-commit hooks
-
-Install [pre-commit](https://pre-commit.com/) to mirror the CI gates locally:
-
-```bash
-pipx install pre-commit   # or: pip install --user pre-commit
-pre-commit install
+```sh
+bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 -fsSL https://raw.githubusercontent.com/neverhuman/jankurai/v1.7.0/jankurai-installer.sh | bash -s -- --tag v1.7.0 --product tuiwright'
+tuiwright --version
 ```
 
-The repository's `.pre-commit-config.yaml` runs `cargo fmt --check`,
-`cargo clippy -D warnings`, `gitleaks`, and verifies that the README test-surface
-chart is in sync with the source tree. Skip a single commit with
-`SKIP=cargo-clippy git commit ...` when you intentionally want to bypass a hook.
+Expected: `tuiwright 1.7.0`. Remove it with
+`rm ~/.local/bin/tuiwright`.
 
-`jankurai versions` checks the source checkout against `VERSION`,
-`crates/jankurai/Cargo.toml`, `packages/ux-qa/package.json`,
-`agent/standard-version.toml`, `docs/agent-native-standard.md`,
-`agent/JANKURAI_STANDARD.md`, and `paper/jankurai.md`.
+## UX package
 
-For any external repo, start with artifacts under `target/jankurai/`:
+The built `jankurai-ux-qa-1.7.0.tgz` is attached to the release. Browser auditing
+requires Node.js 24, npm, Playwright 1.59.1, and Chromium. This optional package's
+manual verification uses [GitHub CLI 2.100.0](https://github.com/cli/cli/releases/tag/v2.100.0),
+[cosign 3.1.3](https://github.com/sigstore/cosign/releases/tag/v3.1.3), and
+[jq 1.8.2](https://github.com/jqlang/jq/releases/tag/jq-1.8.2). Install those tools
+using their verified upstream distribution before continuing; no GitHub login is
+needed. Auditor and TUI installation above bootstrap their own temporary verifiers.
 
-```bash
-jankurai audit /path/to/repo --mode advisory \
-  --json /path/to/repo/target/jankurai/repo-score.json \
-  --md /path/to/repo/target/jankurai/repo-score.md
-jankurai adopt /path/to/repo --mode observe \
-  --out /path/to/repo/target/jankurai/adoption-plan.json \
-  --md /path/to/repo/target/jankurai/adoption-plan.md
-```
-
-Use `jankurai update --check` for a read-only upgrade plan. `jankurai upgrade`
-is the write-capable refresh path, and `jankurai upgrade --score` runs the
-follow-on scoring lane after the install refresh. `jankurai score` is the main
-scoring command; with no subcommand it runs the audit lane, and `diff` and
-`trend` remain available.
-
-## Profiles
-
-Bundled init profiles are defined as JSON validated against `schemas/init-profile.schema.json`.
-
-- **`rust-ts-postgres`** (aliases: `rust-ts-vite-react-postgres`, `rust-ts-vite-react-postgres-bounded-python`) is the default full scaffold: agent constitution, IDE adapters, `contracts/` and `db/` README slots, `docs/architecture/` and `docs/decisions/` stubs, and `tools/security-lane.sh` stub. The historical bounded-Python alias does not authorize Python code; agents may add Python only for rare dated advanced-ML/data exceptions under `python/ai-service`.
-- **`rust-api`**, **`react-web`**, **`b2b-saas`**, **`ai-product`**, **`regulated-saas`**, **`migration-target`** ship as bundled manifests under `crates/jankurai/templates/profiles/`.
-- **`--profile-file path/to/profile.json`** loads a repo-local or shared manifest (same schema). Bundled `--profile` is not used to resolve the manifest when this flag is set. Plan JSON uses the manifest **`id`** as **`profile`**.
-- Unknown bundled `--profile` values fail fast with an error listing supported IDs.
-
-The canonical default manifest is `crates/jankurai/templates/profiles/rust-ts-postgres.json`. Planned file actions in dry-run / plan JSON are exactly the paths in `generatedPaths` (sorted); each path must have a matching entry in `crates/jankurai/src/init/templates.rs`.
-
-Dry-run first:
+Run this in Bash, in a new directory for the downloaded package. The Linux
+provenance describes the workflow that built the platform-independent npm asset:
 
 ```bash
-jankurai init /path/to/repo --profile rust-ts-vite-react-postgres \
-  --ide all --mode advisory --dry-run \
-  --plan-json /path/to/repo/target/jankurai/init-plan.json
+set -euo pipefail
+repo=neverhuman/jankurai
+tag=v1.7.0
+package=jankurai-ux-qa-1.7.0.tgz
+provenance=provenance-x86_64-unknown-linux-gnu.json
+identity="https://github.com/$repo/.github/workflows/release.yml@refs/tags/$tag"
+for file in "$package" "$provenance"; do
+  for suffix in '' .sha256 .sigstore.bundle .attestation.jsonl; do
+    curl --proto '=https' --tlsv1.2 -fsSL \
+      "https://github.com/$repo/releases/download/$tag/$file$suffix" -o "$file$suffix"
+  done
+  if command -v shasum >/dev/null; then shasum -a 256 -c "$file.sha256"
+  else sha256sum -c "$file.sha256"; fi
+  cosign verify-blob "$file" --bundle "$file.sigstore.bundle" \
+    --certificate-identity "$identity" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+done
+commit="$(jq -er '.commit | select(test("^[0-9a-f]{40}$"))' "$provenance")"
+for file in "$package" "$provenance"; do
+  env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN \
+    gh attestation verify "$file" --bundle "$file.attestation.jsonl" --repo "$repo" \
+    --cert-identity "$identity" --cert-oidc-issuer https://token.actions.githubusercontent.com \
+    --deny-self-hosted-runners \
+    --signer-digest "$commit" --source-digest "$commit" --source-ref "refs/tags/$tag"
+done
 ```
 
-Apply when the plan looks right:
+Only after every verification command succeeds:
 
-```bash
-jankurai init /path/to/repo --profile rust-ts-vite-react-postgres \
-  --ide all --mode advisory --yes
-jankurai doctor /path/to/repo --fail-on high
-jankurai audit /path/to/repo --mode advisory \
-  --json /path/to/repo/target/jankurai/repo-score.json \
-  --md /path/to/repo/target/jankurai/repo-score.md
-jankurai ci install /path/to/repo --github --mode observe --dry-run
-jankurai ci install /path/to/repo --github --mode observe
-jankurai agent verify /path/to/repo
+```sh
+npm install -g ./jankurai-ux-qa-1.7.0.tgz playwright@1.59.1
+npx playwright@1.59.1 install chromium
+jankurai-ux-qa --version
+jankurai-ux-qa audit --url https://example.com --out ux-report.json
 ```
 
-After `init --yes`, start Codex, Cursor, Claude, Copilot, or another agent in
-the same repository root and say: `Read AGENTS.md, follow the jankurai standard,
-then run the proof lane for my change.`
+Expected: `jankurai-ux-qa 1.7.0`. Remove it with
+`npm uninstall -g @jankurai/ux-qa`; remove Playwright separately if unused.
 
-`init --yes` creates missing paths from the profile and uses the profile manifest's optional `mergePolicy` for existing `generatedPaths`. Bundled profiles explicitly declare their mergeable paths. A custom `--profile-file` without `mergePolicy` keeps the legacy suffix-based behavior for compatibility.
+## Verification and source builds
 
-Allowed `mergePolicy` actions:
+The installer pins GitHub CLI 2.100.0, cosign 3.1.3, and jq 1.8.2 by version and
+SHA-256 for each platform. It verifies the asset checksum, Sigstore identity,
+archive inventory and file types, repository and lock provenance, and the local
+GitHub attestation bundle. Attestation policy binds the source commit, tag,
+release workflow, and GitHub-hosted runner. `--verify-only` also executes the
+verified staged binary. Maintainers use `--assets-dir dist` to test signed staged
+assets before publication; the same verification policy applies.
 
-- **`merge-json`**: additive object/array merge.
-- **`merge-toml`**: additive table/array merge.
-- **`merge-lines`**: append template lines that are not already present.
-- **`merge-marker`**: append an HTML merge marker for manual review.
-- **`keep-existing`**: leave existing user-owned content unchanged.
-
-Run **`jankurai init ... --dry-run`** (or **`--plan-json`**) first; the printed plan lists the action for each `generatedPaths` entry.
-
-For agent repair work, use the narrow packet commands:
-
-```bash
-jankurai context-pack --task "repair agent context routing" --out target/jankurai/context-pack.json
-jankurai repair-plan --from .jankurai/repo-score.json --out target/jankurai/repair-plan.json
-```
-
-## Greenfield Sequence
-
-Use `rust-ts-postgres` unless the product is clearly narrower:
-
-```bash
-mkdir my-product
-jankurai init my-product --profile rust-ts-postgres --dry-run \
-  --plan-json my-product/target/jankurai/init-plan.json
-jankurai init my-product --profile rust-ts-postgres --yes
-jankurai audit my-product --mode advisory \
-  --json my-product/target/jankurai/repo-score.json \
-  --md my-product/target/jankurai/repo-score.md
-```
-
-## Brownfield Sequence
-
-For an existing repo, do not install gates first:
-
-```bash
-jankurai adopt . --mode observe
-jankurai migrate . --analyze --out target/jankurai/migration-report.json \
-  --md target/jankurai/migration-report.md
-jankurai init . --profile migration-target --dry-run \
-  --plan-json target/jankurai/init-plan.json
-jankurai ci install . --github --mode observe --dry-run
-```
-
-Use `--profile rust-api`, `--profile react-web`, or `--profile rust-ts-postgres`
-only when the adoption plan recommends that profile. Use `migration-target`
-when the repo is far from the standard; that route produces containment and
-slice-planning docs without claiming full compliance.
-
-## Ratchet Sequence
-
-After the team accepts a baseline score, preserve it and then install ratchet
-mode:
-
-```bash
-cp target/jankurai/repo-score.json target/jankurai/baseline-score.json
-jankurai ci install . --github --mode ratchet \
-  --baseline target/jankurai/baseline-score.json --min-score 85
-```
+Contributor builds and family commands are documented in the
+[README](../README.md#build-from-a-fresh-clone). Standard and schema versions
+remain independent of the public CLI release number.

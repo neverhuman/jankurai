@@ -1,142 +1,66 @@
-set shell := ["bash", "-lc"]
+# jankurai hub root command surface.
+# One-command setup and validation lanes for agents and CI.
+# This repo is the thin public hub: it carries the installer, GitHub Action,
+# family manifest, lockfile, and the local fusion script. Every lane below is
+# deterministic, hermetic, and runnable from the repo root. The same commands
+# run in CI via ops/ci/<lane>.sh so local and CI execution match exactly.
 
-default: check
+# Default: list available lanes.
+default:
+    @just --list
 
-fast:
-    mkdir -p target/jankurai/coverage
-    cargo run -p jankurai -- coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md
-    cargo check -p jankurai
-    cargo run -p jankurai -- . --json target/jankurai/fast-score.json --md target/jankurai/fast-score.md
-
+# One-command bootstrap: make the local CI scripts executable and resolve the
+# family manifest against the lockfile so the hub is ready to validate.
 setup:
-    npm ci
+    bash scripts/family.sh setup
 
-versions:
-    cargo run -p jankurai -- versions
+pull:
+    bash scripts/family.sh pull
 
-ux-qa:
-    npm --workspace @jankurai/ux-qa run build
-    npm --workspace @jankurai/ux-qa run test
+build:
+    bash scripts/family.sh build
 
-quality:
-    cargo fmt --all -- --check
-    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-    cargo test --workspace --all-targets --all-features --locked
-    npm --workspace @jankurai/ux-qa run build
-    npm --workspace @jankurai/ux-qa run test
+status:
+    bash scripts/family.sh status
 
-check: quality security-strict conformance score paper
+# Aliases so `just install` and `just bootstrap` also resolve to setup.
+install: setup
 
-validate: check
+bootstrap: setup
 
-paper:
-    latexmk -pdf -interaction=nonstopmode -halt-on-error -outdir=paper paper/jankurai.tex
+# Deterministic fast lane: the narrowest proof loop for agent iteration.
+# Validates required split metadata, Jeryu mirror config, lockfile pins, branch
+# dependencies, committed cross-repo path dependencies, and action pinning.
+fast:
+    bash scripts/validate-family.sh
 
-score:
-    mkdir -p target/jankurai/coverage
-    cargo run -p jankurai -- coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md
-    cargo run -p jankurai -- . --json .jankurai/repo-score.json --md .jankurai/repo-score.md --score-history .jankurai/score-history.jsonl --score-history-csv .jankurai/score-history.csv
+# Run the full local check: fast lane, security scan, and self-audit.
+check:
+    bash scripts/family.sh check
 
-audit-fast base="origin/main":
-    cargo run -p jankurai -- audit . --changed-fast --changed-from {{base}} --json target/jankurai/audit-fast.json --md target/jankurai/audit-fast.md --timings-json target/jankurai/audit-timings.json
+# Verify is an alias of check for agents that look for a `verify` lane.
+verify: check
 
-compat:
-    cargo test -p jankurai --test report_compatibility_guard
+# Run the hub validation suite (alias of the fast lane).
+test:
+    bash scripts/validate-family.sh
 
-conformance:
-    test -f conformance/README.md
-    test "$(find conformance/fixtures -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = "10"
-    test "$(find conformance/expected -type f -name '*.json' | wc -l | tr -d ' ')" = "12"
-    cargo run -p jankurai -- conformance run --fixtures conformance/fixtures --expected conformance/expected --out target/jankurai/conformance-results.json --md target/jankurai/conformance-results.md --tex paper/tex/generated/conformance_results_table.tex
-    cargo test -p jankurai conformance
-
-self-audit:
-    cargo run -p jankurai -- audit . --self-audit --json target/jankurai/self-audit.json --md target/jankurai/self-audit.md
-
+# Security lane: secret scanning, supply-chain SBOM, and workflow linting.
+# gitleaks scans the tracked tree for committed secrets; syft generates a
+# CycloneDX SBOM from the family manifest/lock supply-chain surface; actionlint
+# lints the pinned GitHub Actions workflows; and the manifest scan verifies every
+# family lock pin resolves to an immutable tag and commit (this hub's
+# dependency-audit surface, since no Cargo.toml/package.json is shipped).
 security:
-    cargo run -p jankurai -- security run . --out target/jankurai/security/evidence.json
+    gitleaks detect --source . --no-banner --redact
+    syft scan dir:. -o cyclonedx-json=target/jankurai/security/sbom.json
+    actionlint .github/workflows/ci.yml
+    bash scripts/validate-family.sh
 
-security-strict:
-    cargo run -p jankurai -- security run . --strict --profile ci --out target/jankurai/security/evidence.json
+# Jankurai self-audit lane: writes the repo-score artifacts that CI uploads.
+audit:
+    .fusion/target/debug/jankurai audit . --no-score-history --json .jankurai/repo-score.json --md .jankurai/repo-score.md
 
-contract-drift:
-    cargo test -p jankurai --test boundaries_manifest_smoke
-    cargo test -p jankurai --test contract_source_smoke
-    cargo semver-checks check-release
-
-security-bash:
-    bash tools/security-lane.sh
-
-phase12:
-    mkdir -p target/jankurai/public
-    cargo run -p jankurai -- bench . --out target/jankurai/p12-benchmark-report.json --md target/jankurai/p12-benchmark-report.md
-    cargo run -p jankurai -- certify . --out target/jankurai/p12-certification.json --md target/jankurai/p12-certification.md
-    cargo run -p jankurai -- govern . --out target/jankurai/p12-governance-policy.json --md target/jankurai/p12-governance-policy.md
-    cargo run -p jankurai -- publish . --certification target/jankurai/p12-certification.json --benchmark target/jankurai/p12-benchmark-report.json --governance target/jankurai/p12-governance-policy.json --out target/jankurai/public/p12-public-evidence.json --md target/jankurai/public/p12-public-evidence.md --badge-json target/jankurai/public/jankurai-badge.json --badge-svg target/jankurai/public/jankurai-badge.svg
-
-phase13:
-    mkdir -p target/jankurai
-    cargo run -p jankurai -- optimize . --mode all --out target/jankurai/p13-optimization-report.json --md target/jankurai/p13-optimization-report.md
-    cargo run -p jankurai -- exceptions expire . --warning-days 7 --strict --out target/jankurai/p13-exception-expiry.json --md target/jankurai/p13-exception-expiry.md
-
-cov:
-    bash ops/ci/coverage-llvm.sh
-
-test-surface:
-    bash scripts/render-test-surface.sh
-
-test-surface-check:
-    bash scripts/render-test-surface.sh --check
-
-# Local mirror of CI. Each recipe reproduces a GitHub Actions job so
-# breakage is caught before push, never first on GitHub.
-ci-doctor:
-    bash scripts/ci-doctor.sh
-
-bootstrap:
-    git config core.hooksPath ops/git-hooks
-    bash scripts/ci-doctor.sh
-
-ci-quick:
-    bash scripts/ci-local.sh quick
-
-ci-coverage:
-    bash scripts/ci-local.sh coverage
-
-ci-audit:
-    bash scripts/ci-local.sh audit
-
-ci-release:
-    bash scripts/ci-local.sh release
-
-ci-release-build:
-    bash scripts/ci-local.sh release-build
-
-ci-release-publish:
-    bash scripts/ci-local.sh release-publish
-
-ci-shadow:
-    bash scripts/ci-local.sh shadow
-
-ci:
-    bash scripts/ci-local.sh all
-
-ci-container:
-    bash ops/ci/run-in-container.sh "bash ops/ci/audit.sh"
-
-zizmor:
-    zizmor .github/workflows
-
-tuiwright-test:
-    cargo test -p tuiwright --lib
-    cargo test -p tuiwright --test smoke -- --test-threads=1
-    cargo test -p tuiwright-cli
-
-tuiwright-demo:
-    cargo run -p tuiwright-demo
-
-# jankurai-guard: cross-platform tests always run; the FUSE backend is
-# Linux-only and feature-gated, so its mount integration test runs there.
-guard-test:
-    cargo test -p jankurai-guard
-    if [ "$(uname -s)" = "Linux" ]; then cargo test -p jankurai-guard --features fuse --test fuse_mount -- --ignored; fi
+# Print the declared hub version.
+versions:
+    cat VERSION

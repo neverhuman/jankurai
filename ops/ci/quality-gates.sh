@@ -1,21 +1,12 @@
 #!/usr/bin/env bash
-# Quality gates lane: fmt, clippy, workspace tests, README test-surface.
-# Used by both jankurai.yml#test-matrix and `just ci-quick`.
+# Aggregate quality gate run by the pre-push hook and the local runner.
+# Executes the same lanes CI runs so a green local gate means a green CI run.
+set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+cd "$REPO_ROOT"
 
-ensure_fuse_dev
-
-step "cargo fmt"
-cargo fmt --all -- --check
-
-step "cargo clippy"
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-step "cargo test --workspace"
-cargo test --workspace --exclude tuiwright --all-targets --all-features --locked
-
-step "cargo test -p tuiwright --serial"
-cargo test -p tuiwright --all-targets --locked -- --test-threads=1
-
-step "README test surface in sync"
-bash "${CI_ROOT}/scripts/render-test-surface.sh" --check
+log "quality gates: required -> fast -> security -> audit"
+bash ops/ci/required.sh
+bash ops/ci/fast.sh
+bash ops/ci/security.sh
+bash ops/ci/audit.sh

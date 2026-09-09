@@ -1,15 +1,34 @@
-# Ops Guidance
+# ops Agent Instructions
 
-## Workspace Boundary
+This cell owns the hub's CI and operational surface. Read the root
+[`AGENTS.md`](../AGENTS.md) and [`SPLIT.md`](../SPLIT.md) first.
 
-- Work only in the user-named active repo/worktree.
-- Never switch to sibling clones, archives, backups, resolved symlink targets, `/tmp` worktrees, or duplicate roots.
-- Never create repo copies or side folders outside the active repo; preserve work with git branches.
-- Before edits, report `pwd`, `git rev-parse --show-toplevel`, and `git status --short --branch`.
-- Use Jeryu APIs/CLI for local GitLab/MR work; no `glab`, credential scraping, or raw local GitLab API calls.
+## Owns
 
-Read `agent/JANKURAI_STANDARD.md` first.
+- `ops/ci/*.sh` — thin per-lane CI scripts (`fast`, `security`, `audit`,
+  `tool-adoption`, `required`, `quality-gates`) sourced by both
+  `scripts/ci-local.sh` and `.github/workflows/ci.yml`.
+- `ops/ci/lib.sh` — shared tool-version pins and artifact assertions; the single
+  source of truth so local runs and CI execute the same commands.
+- `ops/git-hooks/pre-push` — the mandatory pre-push gate; wire it with
+  `git config core.hooksPath ops/git-hooks`.
 
-Owns CI, release, deploy, observability, and security routing under `ops/`.
-Forbidden: product feature code, domain policy, and direct DB writes.
-Proof lane: security lane and workflow lint.
+## Forbidden
+
+- Do not put lane logic in `.github/workflows/ci.yml`; jobs only call
+  `bash ops/ci/<lane>.sh` so CI and local stay identical.
+- Do not unpin a third-party GitHub Action. Every `uses:` is pinned to a
+  40-character commit SHA.
+- Do not hand-edit generated zones listed in
+  [`agent/generated-zones.toml`](../agent/generated-zones.toml).
+
+## Proof lane
+
+Run the security lane and family validation before handing off ops changes:
+
+```bash
+bash ops/ci/security.sh
+bash scripts/validate-family.sh
+```
+
+The narrowest gate is `just fast`; the full gate is `just check`.

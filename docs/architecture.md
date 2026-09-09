@@ -1,38 +1,52 @@
-# jankurai Architecture
+# jankurai Hub Architecture
 
-jankurai is a paper, standard, and audit workspace. The product standard it
-defines is:
+`jankurai` is the public hub of the Jankurai split family. It is intentionally
+thin: it carries the release installer, the published GitHub Action, the family
+manifest and lockfile, the release notes, and the local fusion script. No
+product source lives here — the auditor source lives in `jankurai-core` and the
+reusable libraries live in the `jankurai-tools-*` family repos.
 
 ```text
-Rust core + TypeScript/React/Vite product surface + PostgreSQL truth
-+ generated contracts + exception-only Python AI/data service
+hub (this repo)
+  -> repos.manifest.toml   declares every family member
+  -> ../repos.manifest.toml generated runtime projection; never authority
+  -> family.lock           pins each member to an immutable tag + commit SHA
+  -> scripts/fuse.sh        materializes a local .fusion/ workspace from members
+  -> action.yml            installs the released binary and runs an audit
+  -> jankurai-installer.sh  verifies + installs a released binary
 ```
 
-New implementation should be Rust-first. Agents must not write Python for repo
-tools, proof lanes, product services, general backend glue, authorization, or
-production database writes. Python is allowed only for rare advanced ML/data
-library work that has no practical Rust/TypeScript/service alternative, stays
-boxed to `python/ai-service`, and carries a dated exception.
-
-The canonical architecture is documented in:
-
-- `docs/agent-native-standard.md`
-- `agent/JANKURAI_STANDARD.md`
-- `paper/tex/sections/09_winner_architecture.tex`
-
-The Markdown files under `paper/sections/` are legacy-only planning companions.
-They are not canonical release sources.
-
-Local workspace ownership:
+## What the hub owns
 
 | Path | Role |
 | --- | --- |
-| `paper/` | canonical TeX manuscript, figures, citation ledgers, legacy companions |
-| `tools/` | dependency-free audit script |
-| `docs/` | mission, standard, research, release, audit doctrine |
-| `agent/` | machine-readable maps and agent bootstrap |
-| `reference/` | read-only copied source corpus |
-| `tips/` | short reusable guidance distilled from the paper |
+| `repos.manifest.toml` | Sole protected family inventory: paths, slugs, branches, checks, routes, and roles. |
+| `family.lock` | Pins each member repo to a release tag and commit SHA. |
+| `scripts/` | Family validation, deterministic root-manifest projection, local fusion, and CI routing. |
+| `ops/ci/` | Thin per-lane CI scripts shared by `just` and GitHub Actions. |
+| `agent/` | Machine-readable owner/test/generated-zone maps and standard metadata. |
+| `docs/` | Architecture, boundaries, testing, release, and exception doctrine. |
+| `action.yml` | The published GitHub Action entrypoint. |
+| `jankurai-installer.sh` | The release installer. |
+| `assets/` | Published hub imagery referenced by the README. |
 
-Agents should prefer `agent/owner-map.json` and `agent/test-map.json` for
-changes, then route to the smallest proof lane.
+## Boundaries
+
+There is no Rust crate, web surface, PostgreSQL database, or Python AI/data
+service committed in this hub, so those stack arms of the family standard are
+not applicable here. The prose boundary companion is
+[`docs/boundaries.md`](boundaries.md).
+
+## Generated zones
+
+The hub never hand-edits generated output. The generated trees are `target/`
+(local audit/CI state) and `.fusion/` (the fused workspace produced by
+`scripts/fuse.sh`), both declared in
+[`agent/generated-zones.toml`](../agent/generated-zones.toml) and ignored by
+git.
+
+## Ownership and proof
+
+Agents should prefer [`agent/owner-map.json`](../agent/owner-map.json) and
+[`agent/test-map.json`](../agent/test-map.json) for changes, then route to the
+smallest proof lane: `just fast` (which runs `bash scripts/validate-family.sh`).
