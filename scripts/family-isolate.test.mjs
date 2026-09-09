@@ -68,7 +68,14 @@ test('isolate replaces only a marked owned copy', () => {
     fs.writeFileSync(path.join(dest, 'valuable.txt'), 'UNIQUE\n');
     assert.throws(() => family.fuse(false, true), /overwrite|owned|outside|isolate/);
     assert.equal(fs.readFileSync(path.join(dest, 'valuable.txt'), 'utf8'), 'UNIQUE\n');
-    fs.writeFileSync(`${dest}.jankurai-isolate`, 'owned-execution-copy\n');
+    fs.writeFileSync(`${dest}.jankurai-isolate`, JSON.stringify({
+      kind: 'owned-execution-copy',
+      source: path.join(root, 'jankurai-core'),
+      commit: git(path.join(root, 'jankurai-core'), ['rev-parse', 'HEAD']),
+      files: ['owned.txt', '.gitignore'],
+    }) + '\n');
+    assert.throws(() => family.fuse(false, true), /unexpected isolate edit/);
+    fs.unlinkSync(path.join(dest, 'valuable.txt'));
     family.fuse(false, true);
     assert.equal(fs.existsSync(path.join(dest, 'valuable.txt')), false);
     assert.equal(fs.existsSync(path.join(dest, 'owned.txt')), true);
@@ -121,7 +128,8 @@ test('isolate may unlink a fuse symlink that points at the live checkout', () =>
     family.fuse(false, true);
     const dest = path.join(family.fusion, 'components', 'jankurai-core');
     assert.equal(fs.lstatSync(dest).isSymbolicLink(), false);
-    assert.equal(fs.existsSync(`${dest}.jankurai-isolate`), true);
+    const record = JSON.parse(fs.readFileSync(`${dest}.jankurai-isolate`, 'utf8'));
+    assert.equal(record.kind, 'owned-execution-copy');
     assert.equal(fs.existsSync(path.join(dest, '.jankurai-isolate')), false);
     assert.equal(fs.readFileSync(path.join(root, 'jankurai-core', 'owned.txt'), 'utf8'), 'jankurai-core committed\n');
   } finally {

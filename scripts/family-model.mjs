@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { readToml, exists, isLink, gitText, git, clean, atomicWrite, run, buildEnvironment } from './family-lib.mjs';
 
@@ -121,16 +122,28 @@ export class Family {
       fs.unlinkSync(dest);
     }
     if (exists(dest) && !isolateMarker(dest)) throw new Error(`refusing to overwrite directory: ${dest}`);
-    if (exists(dest)) removeOwned(dest, links);
+    if (exists(dest)) {
+      assertOwnedIsolate(dest, links, directory);
+      assertNoUnexpectedIsolateEdits(dest);
+      removeOwned(dest, links);
+    }
     fs.mkdirSync(dest, { recursive: true });
-    const archive = `${dest}.git-archive.tar`;
-    run(['git', '-C', directory, 'archive', '--format=tar', '-o', archive, 'HEAD']);
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'jankurai-isolate-'));
+    const archive = path.join(work, 'HEAD.tar');
     try {
+      fs.closeSync(fs.openSync(archive, 'wx'));
+      run(['git', '-C', directory, 'archive', '--format=tar', '-o', archive, 'HEAD']);
       run(['tar', '-xf', archive, '-C', dest]);
     } finally {
-      if (exists(archive)) fs.unlinkSync(archive);
+      fs.rmSync(work, { recursive: true, force: true });
     }
-    writeIsolateMarker(dest);
+    const files = gitText(directory, 'ls-files', '-z').split('\0').filter(Boolean);
+    writeIsolateMarker(dest, {
+      kind: 'owned-execution-copy',
+      source: directory,
+      commit: gitText(directory, 'rev-parse', 'HEAD'),
+      files,
+    });
   }
   rematerializeIsolates() {
     const links = this.ownedComponentRoot(true);
@@ -149,7 +162,11 @@ export class Family {
   }
   executionPath(repo) {
     const isolated = path.join(this.fusion, 'components', repo.name);
-    if (exists(isolated) && isolateMarker(isolated)) return isolated;
+    const links = path.join(this.fusion, 'components');
+    if (exists(isolated) && isolateMarker(isolated)) {
+      assertOwnedIsolate(isolated, links, this.path(repo));
+      return isolated;
+    }
     if (this.allowLiveRequired) return this.path(repo);
     throw new Error(`missing isolated execution copy: ${repo.name}`);
   }
@@ -170,11 +187,55 @@ function isolateMarkPath(directory) {
 }
 
 function isolateMarker(directory) {
-  return exists(isolateMarkPath(directory));
+  return exists(isolateMarkPath(directory)) && !isLink(isolateMarkPath(directory));
 }
 
-function writeIsolateMarker(directory) {
-  fs.writeFileSync(isolateMarkPath(directory), 'owned-execution-copy\n');
+function readIsolateMarker(directory) {
+  const mark = isolateMarkPath(directory);
+  if (isLink(mark)) throw new Error(`refusing symlinked isolate marker: ${mark}`);
+  const record = JSON.parse(fs.readFileSync(mark, 'utf8'));
+  if (record?.kind !== 'owned-execution-copy' || !Array.isArray(record.files)) {
+    throw new Error(`invalid isolate ownership record: ${mark}`);
+  }
+  return record;
+}
+
+function writeIsolateMarker(directory, record) {
+  const mark = isolateMarkPath(directory);
+  if (exists(mark) || isLink(mark)) fs.unlinkSync(mark);
+  fs.writeFileSync(mark, JSON.stringify(record) + '\n', { flag: 'wx' });
+}
+
+function assertOwnedIsolate(dest, links, source) {
+  if (isLink(dest)) throw new Error(`refusing symlinked isolate copy: ${dest}`);
+  const realDest = fs.realpathSync(dest);
+  const realLinks = fs.realpathSync(links);
+  if (realDest === realLinks || !realDest.startsWith(realLinks + path.sep)) {
+    throw new Error(`isolate copy escaped .fusion/components: ${dest}`);
+  }
+  const record = readIsolateMarker(dest);
+  if (source && fs.realpathSync(record.source) !== fs.realpathSync(source)) {
+    throw new Error(`isolate source identity mismatch: ${dest}`);
+  }
+}
+
+function assertNoUnexpectedIsolateEdits(dest) {
+  const record = readIsolateMarker(dest);
+  const expected = new Set(record.files);
+  const walk = rel => {
+    const full = rel ? path.join(dest, rel) : dest;
+    const stat = fs.lstatSync(full);
+    if (stat.isSymbolicLink()) {
+      if (rel && !expected.has(rel)) throw new Error(`preserving unexpected isolate symlink: ${rel}`);
+      return;
+    }
+    if (stat.isDirectory()) {
+      for (const child of fs.readdirSync(full)) walk(rel ? path.join(rel, child) : child);
+      return;
+    }
+    if (!rel || !expected.has(rel)) throw new Error(`preserving unexpected isolate edit: ${rel || dest}`);
+  };
+  walk('');
 }
 
 function removeOwned(dest, links) {
