@@ -33,8 +33,8 @@ export function check(family) {
   run(['npm', 'exec', '--', 'playwright', 'install', 'chromium', '--only-shell'], { cwd: ux });
   run(['npm', 'test'], { cwd: ux });
   const env = { ...process.env, PATH: path.join(family.fusion, 'target/debug') + path.delimiter + process.env.PATH };
-  // Fusion members are live checkouts. Tests must leave their accepted source
-  // intact; preserve any mutation for inspection and refuse further acceptance.
+  // Isolated copies absorb workspace tests. Live trees must stay the accepted
+  // source; any mutation there is preserved and refuses further acceptance.
   for (const repo of family.components()) {
     if (!family.existing(repo)) throw new Error(`missing component: ${repo.name}`);
     clean(family.path(repo));
@@ -44,15 +44,19 @@ export function check(family) {
   }
   run(['bash', 'ops/ci/integration.sh'], { cwd: family.hub, env });
   for (const repo of family.components()) {
-    const directory = family.path(repo);
+    const live = family.path(repo);
+    const isolated = path.join(family.fusion, 'components', repo.name);
+    // Prefer the isolated fusion copy when check() materialized one. Portable
+    // preservation tests mock fuse() and keep cwd on the live fixture.
+    const directory = exists(isolated) ? isolated : live;
     // Component required lanes run cargo --offline. Prefetch each lockfile so
     // alternate Git sources (for example core's www.github.com kernel pin) are
     // already in CARGO_HOME.
     if (exists(path.join(directory, 'Cargo.lock'))) run(['cargo', 'fetch', '--locked'], { cwd: directory });
     run(['bash', 'scripts/ci-local.sh', 'required'], { cwd: directory, env });
   }
-  // Required lanes can also mutate source through the fusion links. Recheck
-  // every component after all lanes, including changes to an earlier sibling.
+  // Required lanes must not mutate accepted live trees. Recheck every
+  // component after all lanes, including changes to an earlier sibling.
   for (const repo of family.components()) {
     if (!family.existing(repo)) throw new Error(`missing component: ${repo.name}`);
     clean(family.path(repo));
