@@ -112,6 +112,22 @@ test('missing isolate copy fails instead of running required on live source', ()
   }
 });
 
+test('isolate may unlink a fuse symlink that points at the live checkout', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-relink-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const family = familyAt(root, [core]);
+    family.fuse(false, false);
+    family.fuse(false, true);
+    const dest = path.join(family.fusion, 'components', 'jankurai-core');
+    assert.equal(fs.lstatSync(dest).isSymbolicLink(), false);
+    assert.equal(fs.existsSync(path.join(dest, '.jankurai-isolate')), true);
+    assert.equal(fs.readFileSync(path.join(root, 'jankurai-core', 'owned.txt'), 'utf8'), 'jankurai-core committed\n');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('default fuse can replace a marked isolate directory', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-reuse-'));
   try {

@@ -116,7 +116,10 @@ export class Family {
   }
   materializeIsolate(directory, dest) {
     const links = path.join(this.fusion, 'components');
-    if (isLink(dest)) throw new Error(`refusing to replace symlink: ${dest}`);
+    if (isLink(dest)) {
+      if (fs.realpathSync(dest) !== directory) throw new Error(`refusing to replace symlink: ${dest}`);
+      fs.unlinkSync(dest);
+    }
     if (exists(dest) && !isolateMarker(dest)) throw new Error(`refusing to overwrite directory: ${dest}`);
     if (exists(dest)) removeOwned(dest, links);
     fs.mkdirSync(dest, { recursive: true });
