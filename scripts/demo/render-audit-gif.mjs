@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PALETTE, gif } from './gif-encode.mjs';
+import { PRESETS, MAX_BYTES } from './demo-catalog.mjs';
 import { sha256, validateRecording, outcome } from './audit-recording.mjs';
 
 const fontBytes = fs.readFileSync(new URL('./audit-mono.json', import.meta.url));
@@ -80,8 +81,9 @@ export function render(recordingBytes, outDir, options = {}) {
   const recording = validateRecording(JSON.parse(recordingBytes), options);
   fs.mkdirSync(outDir); // Never silently replace prior artifacts.
   const states = timeline(recording), outputs = [];
-  for (const [name, scale] of [['audit-readme.gif', 1], ['audit-1080p.gif', 2]]) {
-    const expectedFrames = [], width = 960 * scale, height = 540 * scale;
+  for (const preset of PRESETS) {
+    const scale = preset.width / 960, name = preset.name;
+    const expectedFrames = [], width = preset.width, height = preset.height;
     function* frames() {
       for (const state of states) {
         const frame = { ...raster(recording, state, scale), delay: state.delay };
@@ -92,7 +94,7 @@ export function render(recordingBytes, outDir, options = {}) {
       }
     }
     const encoded = gif(frames(), width, height);
-    if (encoded.length >= 50_000_000) throw new Error('GIF must be smaller than 50 MB');
+    if (encoded.length >= MAX_BYTES) throw new Error(`${name} must be smaller than 50 MB`);
     fs.writeFileSync(path.join(outDir, name), encoded, { flag: 'wx' });
     outputs.push({ name, width, height, bytes: encoded.length, sha256: sha256(encoded), frames: expectedFrames });
   }

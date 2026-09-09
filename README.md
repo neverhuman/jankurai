@@ -12,11 +12,13 @@ Jankurai audits repositories for unsafe changes, missing proof, unclear ownershi
 and drift between code and its contracts. Use it locally or in CI to turn an
 AI-assisted change into a reviewable report and repair queue.
 
-![Jankurai audit TUI](docs/demo/audit-readme.gif)
+![Jankurai audit](docs/demo/audit-readme.gif)
 
-The 1920×1080 recording is a verified render of an isolated sample audit, not
-this hub checkout. CI uploads a fresh `audit-demo-gifs` artifact from
-`target/audit-demo/` without rewriting tracked files.
+The preview is a 960×540 lossless GIF of a real `jankurai audit` run against an
+isolated sample. Open the [1920×1080 full-resolution GIF](docs/demo/audit-1080p.gif)
+for the same recording at cinema size. Both files use an exact 16-color palette
+(no dither, no dimming), stay under 50 MB, and are rebuilt by
+[`scripts/demo/`](scripts/demo/). Catalog: [`docs/demo/`](docs/demo/README.md).
 
 ## Family scores
 
