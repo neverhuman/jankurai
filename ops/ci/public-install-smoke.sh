@@ -7,7 +7,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 smoke="$(mktemp -d)"
 trap 'rm -rf "$smoke"' EXIT
 mkdir -p "$smoke/system-bin" "$smoke/home" "$smoke/tmp" "$smoke/repository"
-for tool in bash curl tar cmp shasum sha256sum cut cat chmod cp sed sort grep mkdir mktemp rm env install mv uname unzip; do
+for tool in bash curl tar gzip cmp shasum sha256sum cut cat chmod cp sed sort grep mkdir mktemp rm env install mv uname unzip; do
   executable="$(command -v "$tool" || true)"
   if [[ -n "$executable" ]]; then ln -s "$executable" "$smoke/system-bin/$tool"; fi
 done

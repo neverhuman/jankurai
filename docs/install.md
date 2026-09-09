@@ -13,7 +13,7 @@ The result is `jankurai 1.7.0`. The default directory is `~/.local/bin`; add the
 PATH line to `~/.bashrc` or `~/.zshrc` if needed. Pass `--install-dir /your/bin`
 to select a different writable directory. No sudo, Rust, Node.js, GitHub login,
 or preinstalled verifier is needed for the auditor or Tuiwright. The platform
-must provide Bash, curl, tar, a SHA-256 tool, and (on macOS) unzip.
+must provide Bash, curl, tar, a SHA-256 tool, gzip on Linux, and unzip on macOS.
 
 Native Windows (PowerShell or Git Bash), Intel macOS, Linux ARM64, and Alpine/musl
 are unsupported. Source builds require a supported Unix platform too. Do not use

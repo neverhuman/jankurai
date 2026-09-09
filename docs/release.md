@@ -61,6 +61,15 @@ permissions. Installer tests exercise checksum and provenance tampering; the
 release smoke test must additionally verify actual downloaded signed assets on
 both platforms before declaring the release usable.
 
+Before creating the immutable tag, require a successful `release services` run
+on Linux and Apple Silicon macOS. It signs a disposable text probe, exports the
+real GitHub attestation, verifies both anonymously with the pinned tools, and
+rejects modified content and wrong repository, workflow, source commit, and tag.
+The workflow runs when its source or verifier setup changes on migration branches
+or main, and supports manual dispatch. Its branch/workflow identity is separate
+from release identity; its artifacts cannot satisfy the release installer.
+This service check supplements the required signed native staging tests.
+
 The read-only verification job checks the collected platform inventory and every
 signature/attestation before passing assets to the publishing job. Enable GitHub
 immutable releases before creating the version tag. Publication resumes an
