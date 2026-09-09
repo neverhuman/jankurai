@@ -46,7 +46,7 @@ try {
   // is allowed. Missing execution/report and contradictory outcomes remain fatal.
   const rendered = path.join(root, 'rendered');
   render(recordingBytes, rendered);
-  const verify = spawnSync(process.execPath, [path.join(here, 'verify-audit-gif.mjs'), rendered], { stdio: 'inherit' });
+  const verify = spawnSync(process.execPath, [path.join(here, 'verify-audit-gif.mjs'), rendered, '--pixels-only'], { stdio: 'inherit' });
   if (verify.status !== 0) throw new Error('independent decoded pixel verification failed');
   fs.writeFileSync(path.join(capture, 'sample-inputs.json'), JSON.stringify({
     description: 'Real audit of an authored sample repository; policy failures are preserved.',

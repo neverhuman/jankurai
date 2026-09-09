@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { decodeGif } from './gif-decode.mjs';
 import { PALETTE } from './gif-encode.mjs';
-import { PUBLIC_DIR, RECEIPT } from './demo-catalog.mjs';
+import { PUBLIC_DIR, PUBLIC_FILES, RECEIPT } from './demo-catalog.mjs';
 
 const hub = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const catalog = path.join(hub, PUBLIC_DIR);
@@ -28,11 +28,12 @@ test('independent decoder matches committed RGB frame hashes', () => {
 function mutateAndVerify(mutate) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jankurai-gif-neg-'));
   try {
-    for (const name of ['audit-readme.gif', 'audit-1080p.gif', RECEIPT]) {
+    for (const name of PUBLIC_FILES) {
       fs.copyFileSync(path.join(catalog, name), path.join(dir, name));
     }
     mutate(dir);
-    const result = spawnSync(process.execPath, [verify, dir], { encoding: 'utf8' });
+    const result = spawnSync(process.execPath, [verify, dir], { encoding: 'utf8', timeout: 60000 });
+    assert.equal(result.signal, null); assert.equal(result.error, undefined);
     assert.notEqual(result.status, 0, result.stdout + result.stderr);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -62,7 +63,8 @@ test('wrong palette fails closed', () => {
 test('corrupt LZW bytes fail closed', () => {
   mutateAndVerify(dir => {
     const raw = Buffer.from(fs.readFileSync(path.join(dir, 'audit-readme.gif')));
-    for (let i = 80; i < 120; i++) raw[i] ^= 0xff;
+    // Corrupt only compressed LZW bytes, preserving all GIF headers.
+    raw[100] = 0xff; raw[101] = 0xff;
     fs.writeFileSync(path.join(dir, 'audit-readme.gif'), raw);
     const receipt = JSON.parse(fs.readFileSync(path.join(dir, RECEIPT), 'utf8'));
     receipt.outputs[0].sha256 = createHash('sha256').update(raw).digest('hex');
