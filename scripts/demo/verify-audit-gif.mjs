@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { PALETTE } from './gif-encode.mjs';
 import { decodeGif } from './gif-decode.mjs';
+import { verifyEvidence } from './demo-evidence.mjs';
 import { PRESETS, MAX_BYTES, RECEIPT } from './demo-catalog.mjs';
 
 function sha256(bytes) {
@@ -33,7 +34,7 @@ for (const output of manifest.outputs) {
   const raw = fs.readFileSync(file);
   if (raw.length !== output.bytes || raw.length >= MAX_BYTES) throw new Error(`${output.name} size`);
   if (sha256(raw) !== output.sha256) throw new Error(`${output.name} digest`);
-  const decoded = decodeGif(raw);
+  const decoded = decodeGif(raw, { includePixels: false });
   if (decoded.width !== output.width || decoded.height !== output.height) throw new Error(`${output.name} geometry`);
   if (decoded.frames.length !== output.frames.length) throw new Error(`${output.name} frame count`);
   decoded.frames.forEach((frame, index) => {
@@ -44,3 +45,7 @@ for (const output of manifest.outputs) {
   });
   console.log(`${output.name}: ${decoded.frames.length} decoded RGB frames, ${raw.length} bytes, ${output.width}x${output.height}`);
 }
+
+// Fresh generator output has its capture beside rendered/, while a published
+// catalog carries the complete flat capture. Pixel-only checks are explicit.
+if (!process.argv.includes('--pixels-only')) verifyEvidence(directory);

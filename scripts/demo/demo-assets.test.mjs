@@ -26,6 +26,7 @@ test('committed catalog GIFs are exact-palette, sized, and under 50 MB', () => {
   });
   assert.equal(verify.status, 0, verify.stderr || verify.stdout);
   const receipt = JSON.parse(fs.readFileSync(path.join(catalog, RECEIPT), 'utf8'));
+  assert.equal(MAX_BYTES, 50_000_000);
   assert.deepEqual(receipt.palette, PALETTE);
   PRESETS.forEach((preset, index) => {
     const output = receipt.outputs[index];

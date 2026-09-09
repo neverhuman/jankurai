@@ -7,6 +7,8 @@ import { readToml, exists, isLink, gitText, git, clean, atomicWrite, run, buildE
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const GIT = '/usr/bin/git';
+// Disk receipts cannot authorize a copy imported by a different process.
+const isolateSeals = new Map();
 
 export class Family {
   constructor(hub) {
@@ -177,8 +179,8 @@ export class Family {
       fs.renameSync(staging, dest);
       const record = { kind: 'owned-execution-copy', source: path.resolve(directory), commit, tree, files };
       writeIsolateMarker(dest, record);
-      writeIsolateAuthority(this.fusion, dest, record);
       writeComponentGitIdentity(dest, directory, commit);
+      writeIsolateAuthority(this.fusion, dest, record);
     } catch (error) {
       fs.rmSync(staging, { recursive: true, force: true });
       throw error;
@@ -321,9 +323,12 @@ function writeIsolateAuthority(fusion, dest, record) {
   } finally {
     fs.closeSync(fd);
   }
+  // Keep an immutable private digest; readable JSON is a receipt, not authority.
+  isolateSeals.set(file, sealIsolateMetadata(fusion, dest));
 }
 
 function readIsolateAuthority(fusion, dest) {
+  verifyIsolateSeal(fusion, dest);
   const file = isolateAuthorityPath(fusion, dest);
   if (!exists(file) || isLink(file)) throw new Error(`missing coordinator isolate authority: ${dest}`);
   const record = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -351,6 +356,13 @@ function writeComponentGitIdentity(dest, source, commit) {
     fs.writeFileSync(fd, `gitdir: ${path.resolve(gitDir)}\n`);
   } finally {
     fs.closeSync(fd);
+  }
+  // Populate the accepted index without a checkout or any content filters.
+  for (const args of [['read-tree', commit], ['update-index', '--refresh']]) {
+    const result = spawnSync(GIT, [`--git-dir=${gitDir}`, `--work-tree=${dest}`, ...args], {
+      encoding: 'utf8', env: isolateGitEnv(), maxBuffer: 32 * 1024 * 1024,
+    });
+    if (result.error || result.status !== 0) throw new Error(`isolate Git index failed: ${result.error?.message || result.stderr}`);
   }
 }
 
@@ -589,6 +601,7 @@ function assertExactOwnedIsolate(dest, links, source, fusion) {
 }
 
 function removeOwned(dest, links, fusion) {
+  verifyIsolateSeal(fusion, dest);
   if (isLink(dest)) throw new Error(`refusing to delete symlink: ${dest}`);
   if (!exists(dest)) return;
   const realDest = fs.realpathSync(dest);
@@ -603,4 +616,64 @@ function removeOwned(dest, links, fusion) {
   if (exists(gitDir) && !isLink(gitDir)) fs.rmSync(gitDir, { recursive: true, force: false });
   const authority = isolateAuthorityPath(fusion, dest);
   if (exists(authority) && !isLink(authority)) fs.unlinkSync(authority);
+  isolateSeals.delete(authority);
+}
+
+// Bound regular metadata reads and refuse links/special files before cleanup.
+// This is process ownership, not durable recovery or a same-UID sandbox.
+function sealIsolateMetadata(fusion, dest) {
+  const entries = [];
+  let budget = 64 * 1024 * 1024;
+  let count = 0;
+  function directoryIdentity(directory) {
+    let cursor = path.parse(path.resolve(directory)).root;
+    for (const part of path.resolve(directory).slice(cursor.length).split(path.sep).filter(Boolean)) {
+      cursor = path.join(cursor, part);
+      const info = fs.lstatSync(cursor);
+      if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`redirected isolate metadata directory: ${cursor}`);
+    }
+    const info = fs.lstatSync(directory);
+    entries.push([directory, 'root', info.dev, info.ino, info.mode & 0o777]);
+  }
+  function visit(file) {
+    if (++count > 100000) throw new Error('isolate metadata entry limit exceeded');
+    const info = fs.lstatSync(file);
+    if (info.isSymbolicLink()) throw new Error(`changed isolate metadata link preserved: ${file}`);
+    if (info.isDirectory()) {
+      entries.push([file, 'dir', info.dev, info.ino, info.mode & 0o777]);
+      for (const name of fs.readdirSync(file).sort()) visit(path.join(file, name));
+      return;
+    }
+    if (!info.isFile() || info.size > budget) throw new Error(`unsupported or oversized isolate metadata preserved: ${file}`);
+    budget -= info.size;
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (opened.dev !== info.dev || opened.ino !== info.ino || opened.size !== info.size) throw new Error('isolate metadata changed while opening');
+      const hash = createHash('sha256'), buffer = Buffer.alloc(65536);
+      let total = 0, read;
+      while ((read = fs.readSync(fd, buffer, 0, buffer.length, null)) !== 0) {
+        total += read;
+        if (total > info.size) throw new Error('isolate metadata grew while reading');
+        hash.update(buffer.subarray(0, read));
+      }
+      if (total !== info.size) throw new Error('isolate metadata changed while reading');
+      entries.push([file, 'file', info.dev, info.ino, info.mode & 0o777, hash.digest('hex')]);
+    } finally { fs.closeSync(fd); }
+  }
+  directoryIdentity(fusion);
+  directoryIdentity(path.dirname(dest));
+  directoryIdentity(dest);
+  directoryIdentity(path.join(fusion, '.isolate-owned'));
+  visit(isolateMarkPath(dest));
+  visit(isolateAuthorityPath(fusion, dest));
+  visit(path.join(dest, '.git'));
+  visit(isolateGitDir(dest));
+  return digest(JSON.stringify(entries));
+}
+
+function verifyIsolateSeal(fusion, dest) {
+  const expected = isolateSeals.get(isolateAuthorityPath(fusion, dest));
+  if (!expected) throw new Error(`missing process-owned isolate authority: ${dest}`);
+  if (sealIsolateMetadata(fusion, dest) !== expected) throw new Error(`changed isolate authority or Git metadata preserved: ${dest}`);
 }
