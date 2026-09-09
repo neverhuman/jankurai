@@ -11,8 +11,8 @@ install_release() {
   local archive="${binary}_${version}_linux_${architecture}.tar.gz"
   local checksums="${binary}_${version}_checksums.txt"
   local base="https://github.com/$repository/releases/download/v$version"
-  curl --proto '=https' --tlsv1.2 -fsSL "$base/$archive" -o "$archive_root/$archive"
-  curl --proto '=https' --tlsv1.2 -fsSL "$base/$checksums" -o "$archive_root/$checksums"
+  curl --proto '=https' --tlsv1.2 --retry 8 --retry-all-errors --retry-delay 3 -fsSL "$base/$archive" -o "$archive_root/$archive"
+  curl --proto '=https' --tlsv1.2 --retry 8 --retry-all-errors --retry-delay 3 -fsSL "$base/$checksums" -o "$archive_root/$checksums"
   (cd "$archive_root" && awk -v name="$archive" '$2 == name { print; count++ } END { if (count != 1) exit 1 }' "$checksums" > selected.sha256 && sha256sum -c selected.sha256)
   tar -xzf "$archive_root/$archive" -C "$archive_root" "$binary"
   install -m 0755 "$archive_root/$binary" "$install_root/$binary"
