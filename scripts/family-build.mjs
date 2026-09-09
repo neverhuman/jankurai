@@ -31,6 +31,9 @@ export function check(family) {
   run(['npm', 'exec', '--', 'playwright', 'install', 'chromium', '--only-shell'], { cwd: ux });
   run(['npm', 'test'], { cwd: ux });
   const env = { ...process.env, PATH: path.join(family.fusion, 'target/debug') + path.delimiter + process.env.PATH };
+  // Hub integration checks that component checkouts are still clean locked
+  // pins. Run it before sibling required lanes write score artifacts.
+  run(['bash', 'ops/ci/integration.sh'], { cwd: family.hub, env });
   for (const repo of family.components()) {
     const directory = family.path(repo);
     // Component required lanes run cargo --offline. Prefetch each lockfile so
@@ -39,5 +42,4 @@ export function check(family) {
     if (exists(path.join(directory, 'Cargo.lock'))) run(['cargo', 'fetch', '--locked'], { cwd: directory });
     run(['bash', 'scripts/ci-local.sh', 'required'], { cwd: directory, env });
   }
-  run(['bash', 'ops/ci/integration.sh'], { cwd: family.hub, env });
 }
