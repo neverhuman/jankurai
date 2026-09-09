@@ -119,6 +119,23 @@ test('missing isolate copy fails instead of running required on live source', ()
   }
 });
 
+test('sidecar marker symlink is refused and the target is unchanged', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-marker-link-'));
+  try {
+    const core = repoFixture(root, 'jankurai-core');
+    const family = familyAt(root, [core]);
+    const dest = path.join(family.fusion, 'components', 'jankurai-core');
+    const sentinel = path.join(root, 'sentinel.txt');
+    fs.writeFileSync(sentinel, 'KEEP\n');
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.symlinkSync(sentinel, `${dest}.jankurai-isolate`);
+    assert.throws(() => family.fuse(false, true), /isolate marker|symlink/);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'KEEP\n');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('isolate may unlink a fuse symlink that points at the live checkout', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'isolate-relink-'));
   try {

@@ -202,8 +202,13 @@ function readIsolateMarker(directory) {
 
 function writeIsolateMarker(directory, record) {
   const mark = isolateMarkPath(directory);
-  if (exists(mark) || isLink(mark)) fs.unlinkSync(mark);
-  fs.writeFileSync(mark, JSON.stringify(record) + '\n', { flag: 'wx' });
+  if (exists(mark) || isLink(mark)) throw new Error(`refusing to replace isolate marker: ${mark}`);
+  const fd = fs.openSync(mark, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(record) + '\n');
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function assertOwnedIsolate(dest, links, source) {
