@@ -15,7 +15,7 @@ inputs:
     required: false
     default: "standard"
   fail-under:
-    description: "Minimum accepted score. The job fails when score is below this value. Use 90 for a tighter gate; 0 disables the floor."
+    description: "Minimum accepted score. The job fails when score is below this value. Use 90 for a tighter gate; 0 removes only this additional floor. Existing audit policy still applies."
     required: false
     default: "85"
   baseline:
@@ -27,21 +27,32 @@ inputs:
     required: false
     default: "."
 
+outputs:
+  report-json:
+    description: "Fresh JSON report in the runner temporary directory"
+    value: ${{ steps.audit.outputs.report-json }}
+  report-md:
+    description: "Fresh Markdown report in the runner temporary directory"
+    value: ${{ steps.audit.outputs.report-md }}
+  report-directory:
+    description: "Fresh audit artifacts; upload with if: always() to retain failed-run evidence"
+    value: ${{ steps.audit.outputs.report-directory }}
+
 runs:
   using: "composite"
   steps:
+    - name: Set up gate runtime
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+      with:
+        node-version: 24
+        package-manager-cache: false
     - name: Install released jankurai
       shell: bash
       env:
         JANKURAI_RELEASE_TAG: ${{ inputs.release-tag }}
-      run: |
-        bash "$GITHUB_ACTION_PATH/jankurai-installer.sh"
-
-    - name: Prepare jankurai artifact directories
-      shell: bash
-      run: mkdir -p target/jankurai target/jankurai/security
-
-    - name: Run jankurai audit
+      run: bash "$GITHUB_ACTION_PATH/jankurai-installer.sh"
+    - name: Run full audit and enforce score floor
+      id: audit
       shell: bash
       env:
         AUDIT_MODE: ${{ inputs.mode }}
@@ -49,45 +60,5 @@ runs:
         AUDIT_PATH: ${{ inputs.path }}
         FAIL_UNDER: ${{ inputs.fail-under }}
       run: |
-        set -euo pipefail
-        extra=()
-        if [ "$FAIL_UNDER" != "0" ]; then
-          extra+=(--fail-under "$FAIL_UNDER")
-        fi
-        if [ "$AUDIT_MODE" = "ratchet" ] || [ "$AUDIT_MODE" = "release" ]; then
-          extra+=(--baseline "$AUDIT_BASELINE")
-        fi
-        "$HOME/.local/bin/jankurai" audit "$AUDIT_PATH" \
-          --mode "$AUDIT_MODE" \
-          "${extra[@]}" \
-          --json target/jankurai/repo-score.json \
-          --md target/jankurai/repo-score.md \
-          --sarif target/jankurai/jankurai.sarif \
-          --github-step-summary target/jankurai/summary.md \
-          --repair-queue-jsonl target/jankurai/repair-queue.jsonl
-
-    - name: Enforce score floor
-      shell: bash
-      if: always()
-      env:
-        FAIL_UNDER: ${{ inputs.fail-under }}
-      run: |
-        set -euo pipefail
-        if [ "$FAIL_UNDER" = "0" ]; then
-          echo "score floor disabled"
-          exit 0
-        fi
-        test -s target/jankurai/repo-score.json
-        jq -e --argjson floor "$FAIL_UNDER" '
-          .score >= $floor
-          and ((.decision.hard_findings // 0) == 0)
-        ' target/jankurai/repo-score.json >/dev/null
-        echo "score floor $FAIL_UNDER passed"
-
-    - name: Publish jankurai summary
-      shell: bash
-      if: always()
-      run: |
-        if [ -f target/jankurai/summary.md ]; then
-          cat target/jankurai/summary.md >> "$GITHUB_STEP_SUMMARY"
-        fi
+        bash "$GITHUB_ACTION_PATH/scripts/run-action-audit.sh" \
+          "$HOME/.local/bin/jankurai" "$AUDIT_PATH" "$AUDIT_MODE" "$AUDIT_BASELINE" "$FAIL_UNDER"

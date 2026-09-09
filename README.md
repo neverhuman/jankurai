@@ -92,29 +92,11 @@ geometry and accessibility checks. It requires Node.js and Playwright; follow
 
 ## GitHub Action and local hooks
 
-Publish this repository as a GitHub Marketplace Action (`neverhuman/jankurai`).
-Other projects can block merges under a configurable score floor (default 85):
-
-```yaml
-- uses: neverhuman/jankurai@v1.7.0
-  with:
-    mode: standard
-    fail-under: 85   # or 90
-```
-
-`mode: advisory` still writes the report; the Action then fails the job when
-the score is below `fail-under` unless you set `fail-under: 0`.
-
-Install the same gate locally:
-
-```sh
-jankurai hooks install --yes
-# optional blocking floor for this checkout:
-# echo 'JANKURAI_HOOK_MODE=standard' >> "$(git rev-parse --git-dir)/jankurai/env"
-# echo 'JANKURAI_FAIL_UNDER=85' >> "$(git rev-parse --git-dir)/jankurai/env"
-```
-
-Or generate a workflow with `jankurai ci install --github`.
+`action.yml` in this repository adds a configurable score floor. The immutable
+`v1.7.0` Action metadata does not accept `fail-under` and must not be used as
+an example of that gate. Pin a later hub commit, not `@v1.7.0`, until a
+qualified release ships. Updated local hooks need a producer that supports
+`--no-badge`. See [Action qualification](docs/action.md).
 
 ## Build from a fresh clone
 
