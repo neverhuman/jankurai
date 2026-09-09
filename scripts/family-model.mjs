@@ -1,7 +1,11 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { readToml, exists, isLink, gitText, git, clean, atomicWrite, run, buildEnvironment } from './family-lib.mjs';
+
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
 export class Family {
   constructor(hub) {
@@ -81,6 +85,7 @@ export class Family {
       else if (isLink(link)) {
         if (fs.realpathSync(link) !== directory) throw new Error(`refusing mismatched link: ${link}`);
       } else if (exists(link) && isolateMarker(link)) {
+        assertExactOwnedIsolate(link, links, directory);
         removeOwned(link, links);
         fs.symlinkSync(path.relative(links, directory), link, 'dir');
       } else if (exists(link)) throw new Error(`refusing to overwrite directory: ${link}`);
@@ -115,59 +120,79 @@ export class Family {
     if (isolate && fs.realpathSync(links) !== links) throw new Error('refusing redirected .fusion/components');
     return links;
   }
+  ownedRequiredRoot() {
+    if (isLink(this.fusion)) throw new Error('refusing symlinked .fusion');
+    const required = path.join(this.fusion, 'required-components');
+    if (isLink(required)) throw new Error('refusing symlinked .fusion/required-components');
+    fs.mkdirSync(required, { recursive: true });
+    if (isLink(required) || fs.realpathSync(required) !== required) throw new Error('refusing redirected .fusion/required-components');
+    return required;
+  }
   materializeIsolate(directory, dest) {
-    const links = path.join(this.fusion, 'components');
+    const parent = path.dirname(dest);
+    if (isLink(parent) || fs.realpathSync(parent) !== parent) throw new Error(`refusing redirected isolate parent: ${parent}`);
     if (isLink(dest)) {
       if (fs.realpathSync(dest) !== directory) throw new Error(`refusing to replace symlink: ${dest}`);
       fs.unlinkSync(dest);
     }
     if (exists(dest) && !isolateMarker(dest)) throw new Error(`refusing to overwrite directory: ${dest}`);
     if (exists(dest)) {
-      assertOwnedIsolate(dest, links, directory);
-      assertNoUnexpectedIsolateEdits(dest);
-      removeOwned(dest, links);
+      assertExactOwnedIsolate(dest, parent, directory);
+      removeOwned(dest, parent);
     }
+    const commit = gitText(directory, 'rev-parse', 'HEAD');
+    const tree = gitText(directory, 'rev-parse', `${commit}^{tree}`);
+    if (!/^[a-f0-9]{40}$/.test(commit) || !/^[a-f0-9]{40}$/.test(tree)) throw new Error('unfrozen isolate revision');
     fs.mkdirSync(dest, { recursive: true });
     const work = fs.mkdtempSync(path.join(os.tmpdir(), 'jankurai-isolate-'));
-    const archive = path.join(work, 'HEAD.tar');
     try {
-      fs.closeSync(fs.openSync(archive, 'wx'));
-      run(['git', '-C', directory, 'archive', '--format=tar', '-o', archive, 'HEAD']);
-      run(['tar', '-xf', archive, '-C', dest]);
+      const gitDir = gitText(directory, 'rev-parse', '--absolute-git-dir');
+      if (isLink(gitDir) || isLink(path.join(directory, '.git'))) throw new Error('refusing symlinked git dir');
+      const index = path.join(work, 'index');
+      const env = { ...process.env, GIT_INDEX_FILE: index, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+      run(['git', `--git-dir=${gitDir}`, `--work-tree=${dest}`, 'read-tree', commit], { env });
+      run(['git', `--git-dir=${gitDir}`, `--work-tree=${dest}`, 'checkout-index', '--all', '--quiet'], { env });
+      if (gitText(directory, 'rev-parse', `${commit}^{tree}`) !== tree) throw new Error('isolate source tree changed during materialization');
+      const files = isolateInventory(dest);
+      assertCommittedInventory(directory, commit, files);
+      writeIsolateMarker(dest, { kind: 'owned-execution-copy', source: directory, commit, tree, files });
+    } catch (error) {
+      throw error;
     } finally {
       fs.rmSync(work, { recursive: true, force: true });
     }
-    const files = gitText(directory, 'ls-files', '-z').split('\0').filter(Boolean);
-    writeIsolateMarker(dest, {
-      kind: 'owned-execution-copy',
-      source: directory,
-      commit: gitText(directory, 'rev-parse', 'HEAD'),
-      files,
-    });
   }
   rematerializeIsolates() {
-    const links = this.ownedComponentRoot(true);
+    const required = this.ownedRequiredRoot();
     for (const repo of this.components()) {
       if (!this.existing(repo)) throw new Error(`missing component: ${repo.name}`);
-      this.materializeIsolate(this.path(repo), path.join(links, repo.name));
+      this.materializeIsolate(this.path(repo), path.join(required, repo.name));
     }
   }
   disposeIsolates() {
-    const links = path.join(this.fusion, 'components');
-    if (!exists(links) || isLink(links)) return;
-    for (const repo of this.components()) {
-      const dest = path.join(links, repo.name);
-      if (exists(dest) && isolateMarker(dest)) removeOwned(dest, links);
+    for (const rootName of ['components', 'required-components']) {
+      const links = path.join(this.fusion, rootName);
+      if (!exists(links) || isLink(links)) continue;
+      for (const repo of this.components()) {
+        const dest = path.join(links, repo.name);
+        if (!exists(dest) || !isolateMarker(dest)) continue;
+        try { assertExactOwnedIsolate(dest, links, this.path(repo)); }
+        catch { continue; }
+        removeOwned(dest, links);
+      }
     }
   }
   executionPath(repo) {
-    const isolated = path.join(this.fusion, 'components', repo.name);
-    const links = path.join(this.fusion, 'components');
-    if (exists(isolated) && isolateMarker(isolated)) {
-      assertOwnedIsolate(isolated, links, this.path(repo));
+    const live = this.path(repo);
+    for (const rootName of ['required-components', 'components']) {
+      const links = path.join(this.fusion, rootName);
+      const isolated = path.join(links, repo.name);
+      if (!exists(isolated) || !isolateMarker(isolated)) continue;
+      if (isLink(links)) throw new Error(`refusing redirected isolate root: ${links}`);
+      assertExactOwnedIsolate(isolated, links, live);
       return isolated;
     }
-    if (this.allowLiveRequired) return this.path(repo);
+    if (this.allowLiveRequired) return live;
     throw new Error(`missing isolated execution copy: ${repo.name}`);
   }
   status() {
@@ -211,36 +236,91 @@ function writeIsolateMarker(directory, record) {
   }
 }
 
-function assertOwnedIsolate(dest, links, source) {
-  if (isLink(dest)) throw new Error(`refusing symlinked isolate copy: ${dest}`);
-  const realDest = fs.realpathSync(dest);
-  const realLinks = fs.realpathSync(links);
-  if (realDest === realLinks || !realDest.startsWith(realLinks + path.sep)) {
-    throw new Error(`isolate copy escaped .fusion/components: ${dest}`);
-  }
-  const record = readIsolateMarker(dest);
-  if (source && fs.realpathSync(record.source) !== fs.realpathSync(source)) {
-    throw new Error(`isolate source identity mismatch: ${dest}`);
-  }
+function containedLexical(root, candidate) {
+  const rel = path.relative(path.resolve(root), path.resolve(candidate));
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
-function assertNoUnexpectedIsolateEdits(dest) {
-  const record = readIsolateMarker(dest);
-  const expected = new Set(record.files);
+function isolateInventory(dest) {
+  if (isLink(dest)) throw new Error(`refusing symlinked isolate copy: ${dest}`);
+  const files = [];
   const walk = rel => {
     const full = rel ? path.join(dest, rel) : dest;
     const stat = fs.lstatSync(full);
     if (stat.isSymbolicLink()) {
-      if (rel && !expected.has(rel)) throw new Error(`preserving unexpected isolate symlink: ${rel}`);
+      const target = fs.readlinkSync(full);
+      if (!containedLexical(dest, path.resolve(path.dirname(full), target))) {
+        throw new Error(`archive link escaped isolate: ${rel}`);
+      }
+      files.push({ name: rel, type: 'link', mode: stat.mode & 0o777, sha256: null, target });
       return;
     }
     if (stat.isDirectory()) {
-      for (const child of fs.readdirSync(full)) walk(rel ? path.join(rel, child) : child);
+      for (const child of fs.readdirSync(full).sort()) walk(rel ? path.join(rel, child) : child);
       return;
     }
-    if (!rel || !expected.has(rel)) throw new Error(`preserving unexpected isolate edit: ${rel || dest}`);
+    if (!stat.isFile() || !rel) throw new Error(`unsupported isolate entry: ${rel || dest}`);
+    const bytes = fs.readFileSync(full);
+    files.push({ name: rel, type: 'file', mode: stat.mode & 0o777, sha256: digest(bytes), target: null, size: bytes.length });
   };
   walk('');
+  return files;
+}
+
+function gitBlob(directory, hash) {
+  const result = spawnSync('git', ['-C', directory, 'cat-file', 'blob', hash], { encoding: 'buffer', maxBuffer: 32 * 1024 * 1024 });
+  if (result.status !== 0) throw new Error(`missing committed blob ${hash}`);
+  return result.stdout;
+}
+
+function assertCommittedInventory(directory, commit, files) {
+  const listed = gitText(directory, 'ls-tree', '-r', '-z', commit).split('\0').filter(Boolean).map(line => {
+    const tab = line.indexOf('\t');
+    const [mode, type, hash] = line.slice(0, tab).split(' ');
+    return { mode, type, hash, name: line.slice(tab + 1) };
+  });
+  if (listed.length !== files.length) throw new Error('isolate inventory does not match the frozen commit tree');
+  const byName = new Map(files.map(file => [file.name, file]));
+  for (const entry of listed) {
+    const file = byName.get(entry.name);
+    if (!file) throw new Error(`isolate missing committed path: ${entry.name}`);
+    const blob = gitBlob(directory, entry.hash);
+    if (entry.mode === '120000') {
+      if (file.type !== 'link' || file.target !== blob.toString()) throw new Error(`isolate link mismatch: ${entry.name}`);
+    } else if (entry.mode === '100644' || entry.mode === '100755') {
+      if (file.type !== 'file' || file.sha256 !== digest(blob)) throw new Error(`isolate blob mismatch: ${entry.name}`);
+    } else throw new Error(`unsupported committed mode: ${entry.mode}`);
+  }
+}
+
+function assertExactOwnedIsolate(dest, links, source) {
+  if (isLink(dest) || isLink(links)) throw new Error(`refusing redirected isolate path: ${dest}`);
+  const realDest = fs.realpathSync(dest);
+  const realLinks = fs.realpathSync(links);
+  if (realDest === realLinks || !realDest.startsWith(realLinks + path.sep)) {
+    throw new Error(`isolate copy escaped owned root: ${dest}`);
+  }
+  if (source && realDest === fs.realpathSync(source)) throw new Error(`isolate copy resolved to live source: ${dest}`);
+  const record = readIsolateMarker(dest);
+  if (!/^[a-f0-9]{40}$/.test(record.commit || '') || !/^[a-f0-9]{40}$/.test(record.tree || '') || !Array.isArray(record.files)) {
+    throw new Error(`incomplete isolate ownership record: ${dest}`);
+  }
+  if (!record.files.every(file => file && typeof file.name === 'string' && ['file', 'link'].includes(file.type)
+      && Number.isInteger(file.mode) && (file.type === 'link' ? typeof file.target === 'string' : /^[a-f0-9]{64}$/.test(file.sha256)))) {
+    throw new Error(`isolate record lacks exact identity: ${dest}`);
+  }
+  if (source && fs.realpathSync(record.source) !== fs.realpathSync(source)) {
+    throw new Error(`isolate source identity mismatch: ${dest}`);
+  }
+  const actual = isolateInventory(dest);
+  if (actual.length !== record.files.length) throw new Error(`preserving changed isolate inventory: ${dest}`);
+  for (let i = 0; i < actual.length; i++) {
+    const got = actual[i], want = record.files[i];
+    if (got.name !== want.name || got.type !== want.type || got.mode !== want.mode
+        || got.sha256 !== want.sha256 || got.target !== want.target) {
+      throw new Error(`preserving changed isolate material: ${got.name || dest}`);
+    }
+  }
 }
 
 function removeOwned(dest, links) {
@@ -249,7 +329,7 @@ function removeOwned(dest, links) {
   const realDest = fs.realpathSync(dest);
   const realLinks = fs.realpathSync(links);
   if (realDest !== realLinks && !realDest.startsWith(realLinks + path.sep)) {
-    throw new Error(`refusing to delete outside .fusion/components: ${dest}`);
+    throw new Error(`refusing to delete outside owned isolate root: ${dest}`);
   }
   fs.rmSync(dest, { recursive: true, force: false });
   const mark = isolateMarkPath(dest);
