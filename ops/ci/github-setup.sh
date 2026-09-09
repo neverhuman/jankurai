@@ -11,4 +11,8 @@ fi
 bash scripts/family.sh setup
 if [[ "$(uname -s)" == Linux ]]; then
   (cd ../jankurai-tools-ux && npm exec -- playwright install --with-deps chromium --only-shell)
+  # Proof's required lane checks a governed public-API digest.
+  rustup toolchain install nightly-2026-06-16 --profile minimal
+  rustup component add rust-docs --toolchain nightly-2026-06-16 || true
+  cargo install cargo-public-api --version 0.52.0 --locked
 fi
