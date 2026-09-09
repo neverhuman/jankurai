@@ -5,8 +5,8 @@ export function dependencies(family) {
   run(['cargo', 'fetch', '--locked'], { cwd: family.fusion });
   for (const repo of family.components()) {
     const live = family.path(repo);
-    const isolated = path.join(family.fusion, 'components', repo.name);
     const directories = [live];
+    const isolated = path.join(family.fusion, 'components', repo.name);
     if (exists(isolated) && isolated !== live) directories.push(isolated);
     for (const directory of directories) {
       if (exists(path.join(directory, 'package-lock.json'))) run(['npm', 'ci'], { cwd: directory });
@@ -49,12 +49,13 @@ export function check(family) {
     }
   }
   run(['bash', 'ops/ci/integration.sh'], { cwd: family.hub, env });
+  if (typeof family.rematerializeIsolates === 'function') family.rematerializeIsolates();
+  dependencies(family);
   for (const repo of family.components()) {
-    const live = family.path(repo);
-    const isolated = path.join(family.fusion, 'components', repo.name);
-    // Prefer the isolated fusion copy when check() materialized one. Portable
-    // preservation tests mock fuse() and keep cwd on the live fixture.
-    const directory = exists(isolated) ? isolated : live;
+    const directory = family.executionPath(repo);
+    // Accept the exact required copy first, then install into that copy. npm ci
+    // before executionPath would look like an unknown inventory edit.
+    if (exists(path.join(directory, 'package-lock.json'))) run(['npm', 'ci'], { cwd: directory });
     // Component required lanes run cargo --offline. Prefetch each lockfile so
     // alternate Git sources (for example core's www.github.com kernel pin) are
     // already in CARGO_HOME.
@@ -70,4 +71,5 @@ export function check(family) {
       throw new Error(`${repo.name}: integration requires the accepted locked revision`);
     }
   }
+  if (typeof family.disposeIsolates === 'function') family.disposeIsolates();
 }
