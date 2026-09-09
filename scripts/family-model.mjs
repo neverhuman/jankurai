@@ -130,7 +130,7 @@ export class Family {
     } finally {
       if (exists(archive)) fs.unlinkSync(archive);
     }
-    fs.writeFileSync(path.join(dest, '.jankurai-isolate'), 'owned-execution-copy\n');
+    writeIsolateMarker(dest);
   }
   rematerializeIsolates() {
     const links = this.ownedComponentRoot(true);
@@ -165,8 +165,16 @@ export class Family {
   }
 }
 
+function isolateMarkPath(directory) {
+  return `${directory}.jankurai-isolate`;
+}
+
 function isolateMarker(directory) {
-  return exists(path.join(directory, '.jankurai-isolate'));
+  return exists(isolateMarkPath(directory));
+}
+
+function writeIsolateMarker(directory) {
+  fs.writeFileSync(isolateMarkPath(directory), 'owned-execution-copy\n');
 }
 
 function removeOwned(dest, links) {
@@ -178,4 +186,6 @@ function removeOwned(dest, links) {
     throw new Error(`refusing to delete outside .fusion/components: ${dest}`);
   }
   fs.rmSync(dest, { recursive: true, force: false });
+  const mark = isolateMarkPath(dest);
+  if (exists(mark) && !isLink(mark)) fs.unlinkSync(mark);
 }
