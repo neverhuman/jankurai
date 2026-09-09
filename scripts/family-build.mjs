@@ -6,10 +6,8 @@ export function dependencies(family) {
   for (const repo of family.components()) {
     const live = family.path(repo);
     const directories = [live];
-    for (const root of ['components', 'required-components']) {
-      const isolated = path.join(family.fusion, root, repo.name);
-      if (exists(isolated) && isolated !== live) directories.push(isolated);
-    }
+    const isolated = path.join(family.fusion, 'components', repo.name);
+    if (exists(isolated) && isolated !== live) directories.push(isolated);
     for (const directory of directories) {
       if (exists(path.join(directory, 'package-lock.json'))) run(['npm', 'ci'], { cwd: directory });
     }
@@ -55,6 +53,9 @@ export function check(family) {
   dependencies(family);
   for (const repo of family.components()) {
     const directory = family.executionPath(repo);
+    // Accept the exact required copy first, then install into that copy. npm ci
+    // before executionPath would look like an unknown inventory edit.
+    if (exists(path.join(directory, 'package-lock.json'))) run(['npm', 'ci'], { cwd: directory });
     // Component required lanes run cargo --offline. Prefetch each lockfile so
     // alternate Git sources (for example core's www.github.com kernel pin) are
     // already in CARGO_HOME.
