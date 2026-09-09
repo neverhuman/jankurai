@@ -14,8 +14,9 @@ AI-assisted change into a reviewable report and repair queue.
 
 ![Jankurai audit TUI](docs/demo/audit-readme.gif)
 
-The 1920×1080 lossless-palette recording is produced by the same CI script and
-published as the `audit-demo-gifs` artifact (`docs/demo/audit-1080p.gif`).
+The 1920×1080 recording is a verified render of an isolated sample audit, not
+this hub checkout. CI uploads a fresh `audit-demo-gifs` artifact from
+`target/audit-demo/` without rewriting tracked files.
 
 ## Family scores
 

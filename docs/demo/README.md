@@ -1,19 +1,14 @@
 # Audit demo GIFs
 
-`scripts/demo/render-audit-gif.mjs` is the only producer. CI runs it on every
-fast lane. It writes:
+These GIFs replay observed phases from a real audit of an authored sample
+repository. A sample failure stays FAIL with its measured score. This is a
+terminal-style rendering of recorded events, not a screen recording and not an
+audit of this hub checkout.
 
-| File | Role |
-| --- | --- |
-| `audit-readme.gif` | README embed (smaller, bright palette) |
-| `audit-1080p.gif` | 1920×1080 lossless-palette GIF, under 50MB |
-| `audit-demo.json` | exact sizes, score source, and paths |
-
-Colors are a 16-entry saturated table with solid cells. There is no dithering
-or dim gray wash. If `jankurai` is on `PATH` (or `JANKURAI_BIN`), the score
-card uses a live advisory audit of a disposable fixture; otherwise the
-renderer uses the committed hub badge score.
+Normal CI writes fresh output under `target/audit-demo/` and uploads it. It does
+not rewrite the tracked files in this directory. Copy a verified render here
+only when refreshing the README preview.
 
 ```sh
-node scripts/demo/render-audit-gif.mjs
+node scripts/demo/generate-demo.mjs /absolute/path/to/jankurai "$PWD/target/audit-demo"
 ```
