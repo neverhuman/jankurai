@@ -15,10 +15,10 @@ Jankurai is 1.0. Public CLI behavior, report schemas, generated scaffold paths, 
   routes fail closed while forge authority remains `local_transition`.
 
 - Installer-first release packaging: release builds now produce signed Linux
-  tarballs, notarized macOS `.pkg` artifacts, Sigstore bundles, GitHub artifact
-  attestations, a release-shipped `jankurai-installer.sh`, and refreshable
-  Homebrew formula metadata. The installer verifies release immutability,
-  checksum, Sigstore bundle, and GitHub attestation before installing.
+  x86-64 and Apple Silicon macOS tarballs, Sigstore bundles, GitHub artifact
+  attestations, and a release-shipped `jankurai-installer.sh`. The installer
+  verifies release immutability, checksum, Sigstore bundle, and GitHub
+  attestation before installing.
 
 ## 1.6.10 - 2026-05-31
 
