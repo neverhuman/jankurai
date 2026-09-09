@@ -31,6 +31,13 @@ export function check(family) {
   run(['npm', 'exec', '--', 'playwright', 'install', 'chromium', '--only-shell'], { cwd: ux });
   run(['npm', 'test'], { cwd: ux });
   const env = { ...process.env, PATH: path.join(family.fusion, 'target/debug') + path.delimiter + process.env.PATH };
-  for (const repo of family.components()) run(['bash', 'scripts/ci-local.sh', 'required'], { cwd: family.path(repo), env });
+  for (const repo of family.components()) {
+    const directory = family.path(repo);
+    // Component required lanes run cargo --offline. Prefetch each lockfile so
+    // alternate Git sources (for example core's www.github.com kernel pin) are
+    // already in CARGO_HOME.
+    if (exists(path.join(directory, 'Cargo.lock'))) run(['cargo', 'fetch', '--locked'], { cwd: directory });
+    run(['bash', 'scripts/ci-local.sh', 'required'], { cwd: directory, env });
+  }
   run(['bash', 'ops/ci/integration.sh'], { cwd: family.hub, env });
 }

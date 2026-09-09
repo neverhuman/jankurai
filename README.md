@@ -1,7 +1,7 @@
 # Jankurai
 
 <!-- jankurai-badge:start -->
-[![Jankurai score: 88/100](agent/jankurai-badge.svg)](agent/jankurai-badge.json)
+[![Jankurai score: 91/100](agent/jankurai-badge.svg)](agent/jankurai-badge.json)
 <!-- jankurai-badge:end -->
 
 [**Current release v1.5.1**](https://github.com/neverhuman/jankurai/releases/tag/v1.5.1)
