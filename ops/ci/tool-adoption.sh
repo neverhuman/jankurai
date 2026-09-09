@@ -17,9 +17,10 @@ mkdir -p target/jankurai .jankurai
 # audit-ci / proof-routing / contract-drift / authz-matrix / agent-tool-supply
 # / release-readiness all adopt the ratchet audit command.
 log "tool-adoption: ratchet audit"
-    # Ratchet the split hub against its reviewed committed score, not the
-    # pre-migration monolithic main tree.
-    jankurai audit . --mode ratchet --baseline agent/baselines/main.repo-score.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full
+    # Copy the reviewed split-hub score into the catalog path. Do not recompute
+    # origin/main: pre-migration main still scores as the monolith (96).
+    cp -f agent/baselines/main.repo-score.json target/jankurai/accepted-baseline.json
+    jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full
 # Adopted artifacts: .jankurai/repo-score.json .jankurai/repo-score.md
 # target/jankurai/repair-queue.jsonl
 cp -f target/jankurai/repo-score.json .jankurai/repo-score.json
