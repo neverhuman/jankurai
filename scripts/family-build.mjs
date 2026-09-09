@@ -31,8 +31,16 @@ export function check(family) {
   run(['npm', 'exec', '--', 'playwright', 'install', 'chromium', '--only-shell'], { cwd: ux });
   run(['npm', 'test'], { cwd: ux });
   const env = { ...process.env, PATH: path.join(family.fusion, 'target/debug') + path.delimiter + process.env.PATH };
-  // Hub integration checks that component checkouts are still clean locked
-  // pins. Run it before sibling required lanes write score artifacts.
+  // Fusion members are live checkouts. Workspace cargo test can rewrite
+  // sibling Cargo.lock files through those path links. Restore tracked files
+  // so hub integration still sees the accepted locked pins.
+  for (const repo of family.components()) {
+    if (!family.existing(repo)) continue;
+    run(['git', '-C', family.path(repo), 'checkout', '--', '.']);
+    if (gitText(family.path(repo), 'rev-parse', 'HEAD') !== family.pins.get(repo.name).commit) {
+      throw new Error(`${repo.name}: integration requires the accepted locked revision`);
+    }
+  }
   run(['bash', 'ops/ci/integration.sh'], { cwd: family.hub, env });
   for (const repo of family.components()) {
     const directory = family.path(repo);
