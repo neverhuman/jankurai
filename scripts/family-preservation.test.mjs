@@ -85,8 +85,9 @@ for (const [scenario, stage, kind] of cases) await test(scenario, async () => {
     const component = { name: 'component' };
     const other = { name: 'second' };
     const repoPath = repo => repo.name === component.name ? directory : second;
-    const family = { root: temp, hub: temp, fusion: temp,
+    const family = { root: temp, hub: temp, fusion: temp, allowLiveRequired: true,
       components: () => [component, other], existing: repo => fs.existsSync(repoPath(repo)), path: repoPath,
+      executionPath: repoPath, rematerializeIsolates() {}, disposeIsolates() {},
       pins: new Map([['component', { commit: expectedHead }], ['second', { commit: secondHead }]]), bootstrap() {}, fuse() {} };
     let error;
     try { module.check(family); } catch (failure) { error = failure.message; }

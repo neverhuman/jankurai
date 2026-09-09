@@ -72,23 +72,16 @@ export class Family {
     }
   }
   fuse(copyLock = true, isolate = false) {
-    const links = path.join(this.fusion, 'components'), members = [], patches = new Map();
-    fs.mkdirSync(links, { recursive: true });
+    const links = this.ownedComponentRoot(isolate), members = [], patches = new Map();
     for (const repo of this.components()) {
       const directory = this.path(repo), link = path.join(links, repo.name);
       if (!this.existing(repo)) throw new Error(`missing component: ${repo.name}`);
-      if (isolate) {
-        if (exists(link) || isLink(link)) fs.rmSync(link, { recursive: true, force: true });
-        fs.cpSync(directory, link, {
-          recursive: true,
-          dereference: true,
-          filter: source => {
-            const base = path.basename(source);
-            return base !== 'target' && base !== 'node_modules';
-          },
-        });
-      } else if (isLink(link)) {
+      if (isolate) this.materializeIsolate(directory, link);
+      else if (isLink(link)) {
         if (fs.realpathSync(link) !== directory) throw new Error(`refusing mismatched link: ${link}`);
+      } else if (exists(link) && isolateMarker(link)) {
+        removeOwned(link, links);
+        fs.symlinkSync(path.relative(links, directory), link, 'dir');
       } else if (exists(link)) throw new Error(`refusing to overwrite directory: ${link}`);
       else fs.symlinkSync(path.relative(links, directory), link, 'dir');
       if (!exists(path.join(directory, 'Cargo.toml'))) continue;
@@ -110,6 +103,53 @@ export class Family {
     atomicWrite(path.join(this.fusion, 'dev.sh'), '#!/usr/bin/env bash\nset -euo pipefail\nexec bash "$(dirname "${BASH_SOURCE[0]}")/../scripts/family.sh" "${@:-build}"\n');
     fs.chmodSync(path.join(this.fusion, 'dev.sh'), 0o755);
   }
+  ownedComponentRoot(isolate) {
+    if (isLink(this.fusion)) throw new Error('refusing symlinked .fusion');
+    fs.mkdirSync(this.fusion, { recursive: true });
+    if (isLink(this.fusion)) throw new Error('refusing symlinked .fusion');
+    const links = path.join(this.fusion, 'components');
+    if (isLink(links)) throw new Error('refusing symlinked .fusion/components');
+    fs.mkdirSync(links, { recursive: true });
+    if (isLink(links)) throw new Error('refusing symlinked .fusion/components');
+    if (isolate && fs.realpathSync(links) !== links) throw new Error('refusing redirected .fusion/components');
+    return links;
+  }
+  materializeIsolate(directory, dest) {
+    const links = path.join(this.fusion, 'components');
+    if (isLink(dest)) throw new Error(`refusing to replace symlink: ${dest}`);
+    if (exists(dest) && !isolateMarker(dest)) throw new Error(`refusing to overwrite directory: ${dest}`);
+    if (exists(dest)) removeOwned(dest, links);
+    fs.mkdirSync(dest, { recursive: true });
+    const archive = `${dest}.git-archive.tar`;
+    run(['git', '-C', directory, 'archive', '--format=tar', '-o', archive, 'HEAD']);
+    try {
+      run(['tar', '-xf', archive, '-C', dest]);
+    } finally {
+      if (exists(archive)) fs.unlinkSync(archive);
+    }
+    fs.writeFileSync(path.join(dest, '.jankurai-isolate'), 'owned-execution-copy\n');
+  }
+  rematerializeIsolates() {
+    const links = this.ownedComponentRoot(true);
+    for (const repo of this.components()) {
+      if (!this.existing(repo)) throw new Error(`missing component: ${repo.name}`);
+      this.materializeIsolate(this.path(repo), path.join(links, repo.name));
+    }
+  }
+  disposeIsolates() {
+    const links = path.join(this.fusion, 'components');
+    if (!exists(links) || isLink(links)) return;
+    for (const repo of this.components()) {
+      const dest = path.join(links, repo.name);
+      if (exists(dest) && isolateMarker(dest)) removeOwned(dest, links);
+    }
+  }
+  executionPath(repo) {
+    const isolated = path.join(this.fusion, 'components', repo.name);
+    if (exists(isolated) && isolateMarker(isolated)) return isolated;
+    if (this.allowLiveRequired) return this.path(repo);
+    throw new Error(`missing isolated execution copy: ${repo.name}`);
+  }
   status() {
     for (const repo of this.repos) {
       if (!this.existing(repo)) { console.log(`${repo.name}: missing`); continue; }
@@ -120,4 +160,19 @@ export class Family {
       if (dirty) console.log(dirty);
     }
   }
+}
+
+function isolateMarker(directory) {
+  return exists(path.join(directory, '.jankurai-isolate'));
+}
+
+function removeOwned(dest, links) {
+  if (isLink(dest)) throw new Error(`refusing to delete symlink: ${dest}`);
+  if (!exists(dest)) return;
+  const realDest = fs.realpathSync(dest);
+  const realLinks = fs.realpathSync(links);
+  if (realDest !== realLinks && !realDest.startsWith(realLinks + path.sep)) {
+    throw new Error(`refusing to delete outside .fusion/components: ${dest}`);
+  }
+  fs.rmSync(dest, { recursive: true, force: false });
 }
