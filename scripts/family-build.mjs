@@ -1,8 +1,12 @@
 import path from 'node:path';
 import { clean, exists, gitText, run } from './family-lib.mjs';
 
+// libgit2 rejects https://www.github.com/... with intermittent HTTP 403 on
+// GitHub-hosted runners; git CLI follows the redirect to github.com.
+const cargoGitFetchEnv = env => ({ ...env, CARGO_NET_GIT_FETCH_WITH_CLI: 'true' });
+
 export function dependencies(family) {
-  run(['cargo', 'fetch', '--locked'], { cwd: family.fusion });
+  run(['cargo', 'fetch', '--locked'], { cwd: family.fusion, env: cargoGitFetchEnv(process.env) });
   for (const repo of family.components()) {
     const live = family.path(repo);
     const directories = [live];
@@ -58,8 +62,11 @@ export function check(family) {
     if (exists(path.join(directory, 'package-lock.json'))) run(['npm', 'ci'], { cwd: directory });
     // Component required lanes run cargo --offline. Prefetch each lockfile so
     // alternate Git sources (for example core's www.github.com kernel pin) are
-    // already in CARGO_HOME.
-    if (exists(path.join(directory, 'Cargo.lock'))) run(['cargo', 'fetch', '--locked'], { cwd: directory });
+    // already in CARGO_HOME. Use git-fetch-with-cli so www.github.com redirects
+    // do not fail under cargo's libgit2 (HTTP 403 on Actions runners).
+    if (exists(path.join(directory, 'Cargo.lock'))) {
+      run(['cargo', 'fetch', '--locked'], { cwd: directory, env: cargoGitFetchEnv(process.env) });
+    }
     run(['bash', 'scripts/ci-local.sh', 'required'], { cwd: directory, env });
   }
   // Required lanes must not mutate accepted live trees. Recheck every
