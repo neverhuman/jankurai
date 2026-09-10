@@ -15,8 +15,8 @@ assert.match(required, /^      - run: bash ops\/ci\/aggregate\.sh --hosted$/m);
 assert.match(required, /^          NEEDS_JSON: \$\{\{ toJSON\(needs\) \}\}$/m);
 assert.match(aggregateScript, /node scripts\/ci-aggregate\.mjs "\$@"/);
 
-function aggregate(value) {
-  const result = spawnSync('bash', [path.join(root, 'ops/ci/aggregate.sh')], {
+function aggregate(value, args = []) {
+  const result = spawnSync('bash', [path.join(root, 'ops/ci/aggregate.sh'), ...args], {
     encoding: 'utf8',
     env: { PATH: process.env.PATH, NEEDS_JSON: value },
   });
@@ -27,6 +27,10 @@ function aggregate(value) {
 const success = { result: 'success', outputs: {} };
 const lanes = ['fast', 'integration', 'release-build'];
 const successfulJobs = Object.fromEntries(lanes.map(lane => [lane, success]));
+
+test('hosted aggregate refuses missing authenticated run identity', () => {
+  assert.equal(aggregate(JSON.stringify(successfulJobs), ['--hosted']), false);
+});
 
 test('all successful required jobs pass regardless of key order', () => {
   assert.equal(aggregate(JSON.stringify(successfulJobs)), true);

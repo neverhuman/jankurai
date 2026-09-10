@@ -89,7 +89,7 @@ function main(args) {
     }
     // The expected inventory is smaller than one page. Reject truncation or
     // unexpected expansion, rather than trusting an incomplete page of jobs.
-    const result = spawnSync('gh', ['api', `repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`], {
+    const result = spawnSync('gh', ['api', '--hostname', 'github.com', `repos/${repo}/actions/runs/${runId}/jobs?filter=latest&per_page=100`], {
       encoding: 'utf8', timeout: 20000, maxBuffer: 4 * 1024 * 1024,
     });
     if (result.error || result.status !== 0) throw new Error('cannot read actual hosted job inventory');
