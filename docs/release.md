@@ -69,21 +69,48 @@ The workflow runs when its source or verifier setup changes on migration branche
 or main, and supports manual dispatch. Its branch/workflow identity is separate
 from release identity; its artifacts cannot satisfy the release installer.
 This service check supplements the required signed native staging tests.
-Locally, before tagging, run `node scripts/pre-tag-qualify.mjs <evidence-dir>`
-against a directory that contains the successful `release-services` `result.txt`
-bound to workflow run (`cert-identity` for `release-services.yml`), source digest,
-artifact (`probe.txt`), and signature/attestation files. A lone success marker is
-refused. Evidence that presents `release.yml` as the release-services identity is
-refused. This local gate does not weaken release floors.
+Download both `release-service-probe-*` artifacts from the successful run, keeping
+one directory per artifact. From the exact main checkout that will be tagged, run
+`node scripts/pre-tag-qualify.mjs <downloaded-run-directory> <run-id>`.
+The command obtains the expected source from Git HEAD, checks the hosted run and
+both successful platform jobs, then verifies private snapshots of both probes
+with Cosign and GitHub CLI. Certificate fields must bind the expected repository,
+workflow, source, run and attempt. Authored success messages cannot authorize
+qualification. The returned receipt qualifies signing services; the complete
+release candidate still needs its own signed native staging qualification before
+tagging. Use Node24 and Cosign3.1.3, then install and select the pinned GitHub
+verifier before invoking the command:
 
-The read-only verification job checks the collected platform inventory and every
-signature/attestation before passing assets to the publishing job. Enable GitHub
-immutable releases before creating the version tag. Publication resumes an
+```sh
+bash ops/ci/install-gh.sh
+export PATH="${RUNNER_TEMP:-$PWD/target}/jankurai-ci-tools/bin:$PATH"
+node scripts/pre-tag-qualify.mjs <downloaded-run-directory> <run-id>
+```
+
+Older GitHub CLI versions lack the required source-digest flags and are refused.
+
+Build jobs use read-only tokens and upload unsigned assets. A fresh signing job
+validates the complete unsigned inventory and signs it without building or
+executing the candidate products. Separate read-only jobs verify the signatures
+and run the staged native products on both supported platforms.
+
+Enable GitHub immutable releases before creating the version tag. Publication resumes an
 interrupted draft by matching each existing asset's uploaded state, size, and
 SHA-256 digest against the verified candidate. It uploads only missing assets
-and refuses conflicting, duplicate, or extra files. A retry against a matching
-published immutable release performs verification only; it never overwrites
-assets or moves a tag. The final stable publication explicitly becomes latest.
+and refuses conflicting, duplicate, or extra files, then publishes the complete
+asset set as an immutable prerelease. A retry against a matching published
+release performs verification only; it never overwrites assets or moves a tag.
+
+Both public native smoke jobs must succeed before stable/latest promotion. The
+promotion command reads GitHub's jobs for the exact workflow run and source
+commit, requiring the latest execution of every named build, signing, verification,
+staging, publication, and native smoke prerequisite. Failed or incomplete smoke leaves the
+release as a prerelease. Retry failed jobs in the same run to reuse successful
+prerequisites and the retained verified assets; an older success cannot override a
+later failure. The promotion job must belong to the current attempt. Promotion
+changes only the release flags and verifies that all asset IDs, sizes, and digests
+remain unchanged. GitHub supports changing
+these flags on an [immutable release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository#editing-a-release).
 
 Public native installation checks run before CI installs Node or verification
 tools, with an empty credential environment and a PATH containing only documented

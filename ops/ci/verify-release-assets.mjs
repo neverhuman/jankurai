@@ -5,6 +5,8 @@ import { execFileSync } from 'node:child_process';
 
 try {
   const dist = process.argv[2], version = fs.readFileSync('VERSION', 'utf8').trim();
+  const unsigned = process.argv[3] === '--unsigned';
+  if (!dist || process.argv.length > (unsigned ? 4 : 3)) throw new Error('usage: verify-release-assets.mjs <directory> [--unsigned]');
   const assets = ['family.lock', 'Cargo.lock', 'jankurai-installer.sh', `jankurai-ux-qa-${version}.tgz`];
   for (const target of ['x86_64-unknown-linux-gnu', 'aarch64-apple-darwin']) {
     assets.push(`provenance-${target}.json`);
@@ -18,7 +20,8 @@ try {
       if (details.some(entry => !/^[d-]/.test(entry))) throw new Error(`linked/special payload: ${name}`);
     }
   }
-  const expected = assets.flatMap(name => [name, `${name}.sha256`, `${name}.sigstore.bundle`, `${name}.attestation.jsonl`]).sort();
+  const expected = assets.flatMap(name => unsigned ? [name, `${name}.sha256`]
+    : [name, `${name}.sha256`, `${name}.sigstore.bundle`, `${name}.attestation.jsonl`]).sort();
   if (JSON.stringify(fs.readdirSync(dist).sort()) !== JSON.stringify(expected)) throw new Error('unexpected release asset inventory');
   for (const name of expected) {
     if (!fs.lstatSync(path.join(dist, name)).isFile()) throw new Error(`non-regular release asset: ${name}`);
@@ -26,8 +29,10 @@ try {
   for (const name of assets) {
     const file = path.join(dist, name), digest = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
     if (fs.readFileSync(`${file}.sha256`, 'utf8') !== `${digest}  ${name}\n`) throw new Error(`checksum mismatch: ${name}`);
-    if (!fs.statSync(`${file}.sigstore.bundle`).size) throw new Error(`missing signature: ${name}`);
-    if (!fs.statSync(`${file}.attestation.jsonl`).size) throw new Error(`missing attestation bundle: ${name}`);
+    if (!unsigned) {
+      if (!fs.statSync(`${file}.sigstore.bundle`).size) throw new Error(`missing signature: ${name}`);
+      if (!fs.statSync(`${file}.attestation.jsonl`).size) throw new Error(`missing attestation bundle: ${name}`);
+    }
   }
   console.log(`verified release inventory: ${assets.length} products and metadata files`);
 } catch (error) { console.error(`release inventory: ${error.message}`); process.exitCode = 1; }
