@@ -22,7 +22,8 @@ function git(directory, ...args) {
 }
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'family-recovery-'));
+  // Match Family's canonical hub path, including macOS /var -> /private/var.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'family-recovery-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const hub = path.join(root, 'jankurai'), source = path.join(root, 'jankurai-core');
   fs.mkdirSync(hub); fs.mkdirSync(source);
