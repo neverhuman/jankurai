@@ -32,7 +32,7 @@ function inventory(t) {
   // The collected-artifact jobs have Node but do not install npm dependencies.
   fs.copyFileSync(path.join(hub, 'ops/ci/verify-release-assets.mjs'), path.join(root, 'verify.mjs'));
   fs.writeFileSync(path.join(root, 'VERSION'), '1.7.0\n');
-  const verify = () => spawnSync(process.execPath, ['verify.mjs', dist], { cwd: root, encoding: 'utf8' });
+  const verify = (...args) => spawnSync(process.execPath, ['verify.mjs', dist, ...args], { cwd: root, encoding: 'utf8' });
   return { root, dist, verify };
 }
 test('release inventory accepts exactly the public products and verification companions', t => {
@@ -47,4 +47,14 @@ test('release inventory rejects missing attestations and linked metadata', t => 
   const lock = path.join(f.dist, 'family.lock'), outside = path.join(f.root, 'lock');
   fs.renameSync(lock, outside); fs.symlinkSync(outside, lock);
   const result = f.verify(); assert.notEqual(result.status, 0); assert.match(result.stderr, /non-regular release asset/);
+});
+
+test('unsigned signing input requires the complete inventory and cannot masquerade as verified output', t => {
+  const f = inventory(t);
+  assert.notEqual(f.verify('--unsigned').status, 0);
+  for (const name of fs.readdirSync(f.dist)) if (/\.(sigstore\.bundle|attestation\.jsonl)$/.test(name)) fs.unlinkSync(path.join(f.dist, name));
+  const valid = f.verify('--unsigned'); assert.equal(valid.status, 0, valid.stderr);
+  assert.notEqual(f.verify().status, 0);
+  fs.unlinkSync(path.join(f.dist, 'family.lock.sha256'));
+  assert.notEqual(f.verify('--unsigned').status, 0);
 });

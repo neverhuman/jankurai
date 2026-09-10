@@ -76,14 +76,25 @@ artifact (`probe.txt`), and signature/attestation files. A lone success marker i
 refused. Evidence that presents `release.yml` as the release-services identity is
 refused. This local gate does not weaken release floors.
 
-The read-only verification job checks the collected platform inventory and every
-signature/attestation before passing assets to the publishing job. Enable GitHub
-immutable releases before creating the version tag. Publication resumes an
+Build jobs use read-only tokens and upload unsigned assets. A fresh signing job
+validates the complete unsigned inventory and signs it without building or
+executing the candidate products. Separate read-only jobs verify the signatures
+and run the staged native products on both supported platforms.
+
+Enable GitHub immutable releases before creating the version tag. Publication resumes an
 interrupted draft by matching each existing asset's uploaded state, size, and
 SHA-256 digest against the verified candidate. It uploads only missing assets
-and refuses conflicting, duplicate, or extra files. A retry against a matching
-published immutable release performs verification only; it never overwrites
-assets or moves a tag. The final stable publication explicitly becomes latest.
+and refuses conflicting, duplicate, or extra files, then publishes the complete
+asset set as an immutable prerelease. A retry against a matching published
+release performs verification only; it never overwrites assets or moves a tag.
+
+Both public native smoke jobs must succeed before stable/latest promotion. The
+promotion command reads GitHub's jobs for the exact workflow run, attempt, and
+source commit, requiring every named build, signing, verification, staging,
+publication, and native smoke prerequisite. Failed or incomplete smoke leaves the
+release as a prerelease. Promotion changes only the release flags and verifies
+that all asset IDs, sizes, and digests remain unchanged. GitHub supports changing
+these flags on an [immutable release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository#editing-a-release).
 
 Public native installation checks run before CI installs Node or verification
 tools, with an empty credential environment and a PATH containing only documented
