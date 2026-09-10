@@ -3,7 +3,7 @@
 use std::ffi::{CString, c_char};
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
@@ -50,11 +50,7 @@ fn exchange(left: &Path, right: &Path) -> io::Result<()> {
     right_dir.sync_all()
 }
 
-fn recover(lock: &Path, node: &str, module: &str, hub: &str, command: &str) -> io::Result<i32> {
-    // The permanent inode is never removed. The child inherits this flock, so
-    // interrupting the supervisor cannot admit another recovery writer.
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
-        .mode(0o600).custom_flags(NOFOLLOW).open(lock)?;
+fn lock_identity(file: &File, lock: &Path) -> io::Result<()> {
     let held = file.metadata()?;
     if !held.is_file() { return Err(io::Error::other("refusing non-regular recovery lock")); }
     if unsafe { flock(file.as_raw_fd(), 2 | 4) } != 0 { return Err(io::Error::last_os_error()); }
@@ -62,6 +58,15 @@ fn recover(lock: &Path, node: &str, module: &str, hub: &str, command: &str) -> i
     if !current.is_file() || (held.dev(), held.ino()) != (current.dev(), current.ino()) {
         return Err(io::Error::other("recovery lock inode changed"));
     }
+    Ok(())
+}
+
+fn recover(lock: &Path, node: &str, module: &str, hub: &str, command: &str) -> io::Result<i32> {
+    // The permanent inode is never removed. The child inherits this flock, so
+    // interrupting the supervisor cannot admit another recovery writer.
+    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .mode(0o600).custom_flags(NOFOLLOW).open(lock)?;
+    lock_identity(&file, lock)?;
     // File opens with CLOEXEC. Clear only that flag for the one owned lease.
     let flags = unsafe { fcntl(file.as_raw_fd(), 1) };
     if flags < 0 || unsafe { fcntl(file.as_raw_fd(), 2, flags & !1) } < 0 {
@@ -110,6 +115,14 @@ fn run(args: &[String]) -> io::Result<i32> {
     match args {
         [_, operation, left, right] if operation == "exchange" => exchange(Path::new(left), Path::new(right)).map(|()| 0),
         [_, operation, lock, node, module, hub, command] if operation == "recover" => recover(Path::new(lock), node, module, hub, command),
+        [_, operation, lock] if operation == "validate-lease" => {
+            // Node explicitly passes its lease as fd 3. Re-locking the shared
+            // open file description is idempotent; a separately opened fd
+            // cannot evade another writer's lock with forged environment data.
+            if unsafe { fcntl(3, 1) } < 0 { return Err(io::Error::last_os_error()); }
+            let file = unsafe { File::from_raw_fd(3) };
+            lock_identity(&file, Path::new(lock)).map(|()| 0)
+        }
         #[cfg(target_os = "macos")]
         [_, operation, pid] if operation == "darwin-process" => {
             let pid = pid.parse::<i32>().map_err(io::Error::other)?;

@@ -69,10 +69,11 @@ function nativeProgram() {
   nativeExecutable = { path: executable, identity: identities[1], sourceIdentity: original };
   return executable;
 }
-function native(args) {
+function native(args, lease) {
   const executable = nativeProgram();
   const result = spawnSync(executable, args, {
     env: nativeEnvironment(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: args[0] === 'recover' ? 60000 : 10000,
+    stdio: lease === undefined ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'pipe', 'pipe', lease],
   });
   assertIdentity(executable, nativeExecutable.identity, 'compiled recovery helper');
   if (result.error) throw result.error;
@@ -838,6 +839,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url) && process.argv[2] === '-
     if (!held.isFile() || !current.isFile() || held.dev !== current.dev || held.ino !== current.ino) {
       throw new Error('recovery lock identity changed');
     }
+    native(['validate-lease', path.join(path.dirname(operationRoot(hub)), 'family-recovery.lock')], fd);
     const report = buildReport(hub);
     if (!report.present) throw new Error('no family-operation to recover');
     refuseLive(report);

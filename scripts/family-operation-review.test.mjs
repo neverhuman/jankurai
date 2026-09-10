@@ -314,13 +314,25 @@ try:
     child = subprocess.run([sys.argv[2], '--input-type=module', '-e', sys.argv[3]], capture_output=True, text=True, timeout=10)
     assert child.returncode != 0, child.stdout
     assert 'Resource temporarily unavailable' in child.stderr, child.stderr
+    # The internal worker must not trust a matching but unlocked descriptor,
+    # even with a matching parent id and attacker-selected environment fields.
+    separate = os.open(sys.argv[1], os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        env = dict(os.environ, JANKURAI_RECOVERY_FD=str(separate), JANKURAI_RECOVERY_PARENT=str(os.getpid()))
+        forged = subprocess.run([sys.argv[2], sys.argv[4], '--recovery-worker', sys.argv[5], 'finish'],
+            capture_output=True, text=True, timeout=10, env=env, pass_fds=(separate,))
+        assert forged.returncode != 0, forged.stdout
+        assert 'Resource temporarily unavailable' in forged.stderr, forged.stderr
+    finally:
+        os.close(separate)
 finally:
     os.close(fd)
 `;
     const module = new URL('./family-operation.mjs', import.meta.url).href;
     const result = spawnSync('/usr/bin/python3', ['-I', '-c', code, path.join(hub, '.git/family-recovery.lock'),
-      process.execPath, `import { finish } from ${JSON.stringify(module)}; finish(${JSON.stringify(hub)});`], {
-      encoding: 'utf8', timeout: 15000,
+      process.execPath, `import { finish } from ${JSON.stringify(module)}; finish(${JSON.stringify(hub)});`,
+      fileURLToPath(module), hub], {
+      encoding: 'utf8', timeout: 30000,
     });
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(fs.readFileSync(op.journalPath(root)), before);
