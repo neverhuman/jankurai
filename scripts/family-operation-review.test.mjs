@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import * as op from './family-operation.mjs';
 
 const self = fileURLToPath(import.meta.url);
+// Allow the native compiler's 30-second limit plus bounded Git/setup work.
+const CHILD_TIMEOUT_MS = 45_000;
 
 function git(directory, ...args) {
   const r = spawnSync('/usr/bin/git', ['-C', directory, ...args], {
@@ -118,7 +120,7 @@ test('compiler overrides and substitution of a compiled helper cannot execute ca
 
 test('finishAdmissible allows naturally persisted mid-replace crash recovery', t => {
   fixture(t, hub => {
-    const r = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const r = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(r.status, 37, r.stderr);
     const report = op.inspect(hub);
     assert.equal(report.writerStatus, 'stopped');
@@ -201,7 +203,7 @@ test('absent or unreadable procfs reports uncertain writer status', { skip: proc
 
 for (const command of ['finish', 'rollback']) test(`real crash after atomic exchange before bookkeeping permits ${command}`, t => {
   fixture(t, hub => {
-    const result = spawnSync(process.execPath, [self, 'rename-crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const result = spawnSync(process.execPath, [self, 'rename-crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(result.status, 38, result.stderr);
     const report = op.inspect(hub);
     assert.equal(report.locks['Cargo.lock'].class, 'own-after');
@@ -218,7 +220,7 @@ for (const command of ['finish', 'rollback']) test(`real crash after atomic exch
 for (const name of op.LOCK_FILES) for (const side of ['before', 'after']) {
   test(`corrupted ${name} ${side} image blocks both recovery paths before mutation`, t => {
     fixture(t, hub => {
-      const result = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+      const result = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
       assert.equal(result.status, 37, result.stderr);
       const root = op.operationRoot(hub);
       fs.writeFileSync(op.imagePath(root, name, side), 'CORRUPTED UNVALIDATED IMAGE');
@@ -237,7 +239,7 @@ for (const name of op.LOCK_FILES) for (const side of ['before', 'after']) {
 
 test('source advancement prevents finish and rollback and retains recovery evidence', t => {
   fixture(t, hub => {
-    const result = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const result = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(result.status, 37, result.stderr);
     git(hub, 'commit', '--quiet', '--allow-empty', '-m', 'concurrent source advance');
     assert.throws(() => op.finish(hub), /source HEAD\/tree changed/);
@@ -304,7 +306,7 @@ test('legacy wall-clock fallback cannot declare an extant writer stopped', () =>
 
 test('concurrent recovery lock excludes a second real recovery process', t => {
   fixture(t, hub => {
-    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(crashed.status, 37, crashed.stderr);
     const root = op.operationRoot(hub), before = fs.readFileSync(op.journalPath(root));
     const code = `import fcntl, os, subprocess, sys
@@ -342,7 +344,7 @@ finally:
 
 test('uncommitted source edits block recovery and remain untouched', t => {
   fixture(t, hub => {
-    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(crashed.status, 37, crashed.stderr);
     fs.writeFileSync(path.join(hub, 'source-change'), 'UNCOMMITTED CONCURRENT SOURCE');
     for (const command of ['finish', 'rollback']) assert.throws(() => op[command](hub), /source has concurrent edits/);
@@ -355,7 +357,7 @@ test('uncommitted source edits block recovery and remain untouched', t => {
 for (const relative of ['', 'journal', 'journal/images', 'journal/swaps']) {
   test(`redirected recovery directory ${relative || 'root'} preserves evidence and blocks mutation`, t => {
     fixture(t, hub => {
-      const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding:'utf8', timeout:10000 });
+      const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding:'utf8', timeout:CHILD_TIMEOUT_MS });
       assert.equal(crashed.status, 37, crashed.stderr);
       const root = op.operationRoot(hub), directory = path.join(root, relative), retained = `${directory}.retained`;
       const before = fs.readFileSync(op.journalPath(root));
@@ -393,7 +395,7 @@ test('native exchange refuses an ancestor redirected at the replacement boundary
 
 for (const kind of ['symlink', 'fifo', 'oversized']) test(`non-regular or oversized ${kind} image is refused before recovery`, t => {
   fixture(t, hub => {
-    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(crashed.status, 37, crashed.stderr);
     const root = op.operationRoot(hub), image = op.imagePath(root, 'Cargo.lock', 'before');
     fs.renameSync(image, `${image}.retained`);
@@ -416,7 +418,7 @@ for (const kind of ['symlink', 'fifo', 'oversized']) test(`non-regular or oversi
 
 for (const command of ['finish', 'rollback']) test(`prepared crash before either replacement permits ${command}`, t => {
   fixture(t, hub => {
-    const crashed = spawnSync(process.execPath, [self, 'prepared-crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const crashed = spawnSync(process.execPath, [self, 'prepared-crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(crashed.status, 36, crashed.stderr);
     assert.equal(op.inspect(hub).finishAdmissible, true);
     assert.equal(op[command](hub).state, command === 'finish' ? 'committed' : 'rolled-back');
@@ -426,7 +428,7 @@ for (const command of ['finish', 'rollback']) test(`prepared crash before either
 
 test('real crash during rollback can restart and complete rollback', t => {
   fixture(t, hub => {
-    const crashed = spawnSync(process.execPath, [self, 'rollback-crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    const crashed = spawnSync(process.execPath, [self, 'rollback-crash-child', hub], { encoding: 'utf8', timeout: CHILD_TIMEOUT_MS });
     assert.equal(crashed.status, 39, crashed.stderr);
     assert.equal(op.inspect(hub).journal.state, 'rolling-back');
     assert.equal(op.rollback(hub).state, 'rolled-back');
