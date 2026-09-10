@@ -22,7 +22,8 @@ function git(directory, ...args) {
 }
 
 function fixture(t) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'family-recovery-'));
+  // Match Family's canonical hub path, including macOS /var -> /private/var.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'family-recovery-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const hub = path.join(root, 'jankurai'), source = path.join(root, 'jankurai-core');
   fs.mkdirSync(hub); fs.mkdirSync(source);
@@ -66,44 +67,28 @@ test('successful paired write commits both locks and clears the operation', t =>
   assert.equal(fs.existsSync(operationRoot(hub)), false);
 });
 
-test('concurrent Cargo edit during second rename failure preserves unknown bytes and journal', t => {
+test('concurrent Cargo edit during second exchange failure preserves unknown bytes and journal', t => {
   const { hub, execute, read } = fixture(t);
-  const rename = fs.renameSync;
-  let injected = false;
-  fs.renameSync = (from, to) => {
-    if (!injected && to === path.join(hub, 'family.lock')) {
-      injected = true;
+  const error = execute(undefined, { observe(event, detail) {
+    if (event === 'before-atomic-exchange' && detail.name === 'family.lock' && detail.direction === 'replace') {
       fs.writeFileSync(path.join(hub, 'Cargo.lock'), 'UNIQUE EDIT');
-      throw new Error('authored second rename failure');
+      throw new Error('authored second exchange failure');
     }
-    return rename(from, to);
-  };
-  let error;
-  try { error = execute(); }
-  finally { fs.renameSync = rename; }
+  } });
   assert.ok(error);
   assert.equal(read('Cargo.lock'), 'UNIQUE EDIT');
   assert.equal(fs.existsSync(operationRoot(hub)), true);
-  const report = inspect(hub);
-  assert.equal(report.locks['Cargo.lock'].class, 'unknown');
-  assert.ok(report.journal);
+  assert.equal(inspect(hub).locks['Cargo.lock'].class, 'unknown');
 });
 
-test('second rename failure conditionally rolls back only own writes', t => {
-  const { hub, execute, read, before } = fixture(t);
-  const rename = fs.renameSync;
-  let injected = false;
-  fs.renameSync = (from, to) => {
-    if (!injected && to === path.join(hub, 'family.lock')) {
-      injected = true;
-      throw new Error('authored second rename failure');
+test('second exchange failure conditionally rolls back only own writes', t => {
+  const { execute, read, before } = fixture(t);
+  const error = execute(undefined, { observe(event, detail) {
+    if (event === 'before-atomic-exchange' && detail.name === 'family.lock' && detail.direction === 'replace') {
+      throw new Error('authored second exchange failure');
     }
-    return rename(from, to);
-  };
-  let error;
-  try { error = execute(); }
-  finally { fs.renameSync = rename; }
-  assert.ok(error);
+  } });
+  assert.match(error, /authored second exchange failure/);
   assert.equal(read('Cargo.lock'), 'BEFORE CARGO');
   assert.equal(read('family.lock'), before);
 });
@@ -166,15 +151,25 @@ test('recover inspect works with malformed family.lock', t => {
   assert.equal(report.present, true);
   assert.equal(report.journal.state, 'needs-recovery');
   assert.ok(report.locks['family.lock']);
-  const script = path.join(hub, '..', '..'); // unused
-  void script;
-  const familyJs = new URL('./family.mjs', import.meta.url);
-  const result = spawnSync(process.execPath, [familyJs.pathname, 'recover', 'inspect', '--json'], {
-    encoding: 'utf8',
-    cwd: hub,
-    env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null' },
-  });
-  // recover uses repo root from script location (isolate hub), not fixture — call inspect API instead.
+  const scripts = path.join(hub, 'scripts');
+  fs.mkdirSync(scripts);
+  for (const file of ['family.mjs', 'family-operation.mjs', 'family-native.rs', 'family.sh']) {
+    fs.copyFileSync(new URL(`./${file}`, import.meta.url), path.join(scripts, file));
+  }
+  // Copy only the actual command surface into a fixture with no family parser,
+  // package manifest, bootstrap script or node_modules. Both public entry paths
+  // must inspect the malformed lock without trying any of those dependencies.
+  for (const command of [[process.execPath, path.join(scripts, 'family.mjs')], ['bash', path.join(scripts, 'family.sh')]]) {
+    const result = spawnSync(command[0], [...command.slice(1), 'recover', 'inspect', '--json'], {
+      encoding: 'utf8', cwd: hub, timeout: 10000,
+      env: { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin`, GIT_CONFIG_GLOBAL: '/dev/null' },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const actual = JSON.parse(result.stdout);
+    assert.equal(actual.hub, fs.realpathSync(hub));
+    assert.equal(actual.journal.state, 'needs-recovery');
+    assert.equal(actual.finishAdmissible, false);
+  }
   assert.equal(report.finishAdmissible, false);
   assert.ok(['unknown', 'original', 'unknown-same-bytes', 'unreadable'].includes(report.locks['family.lock'].class)
     || report.locks['family.lock'].class === 'unknown');

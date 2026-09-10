@@ -94,7 +94,7 @@ test('lock rendering changes only the selected immutable pin', t => {
   assert.match(lockText(original, family.pins), /commit = "1{40}"/);
   assert.equal(fs.readFileSync(path.join(hub, 'family.lock'), 'utf8'), original);
 });
-test('failed candidate preserves locks and heads and removes its CI sandbox', t => {
+test('failed candidate preserves raw audit diagnostics before removing its CI sandbox', t => {
   const { hub, repo, sha, family } = fixture(t);
   fs.writeFileSync(path.join(hub, 'Cargo.lock'), 'version = 4\n');
   fs.writeFileSync(path.join(hub, '.gitignore'), 'target/\n');
@@ -106,12 +106,22 @@ test('failed candidate preserves locks and heads and removes its CI sandbox', t 
   const before = fs.readFileSync(path.join(hub, 'family.lock'), 'utf8');
   assert.throws(() => update(family, { eligible: () => candidate, testCandidate: (_family, directory) => {
     assert.equal(fs.statSync(directory).isDirectory(), true);
+    fs.mkdirSync(path.join(directory, 'jankurai/.jankurai'), { recursive: true });
+    fs.writeFileSync(path.join(directory, 'jankurai/.jankurai/repo-score.json'), '{incomplete failed audit');
     throw new Error('candidate integration failed');
   } }), /candidate integration failed/);
   assert.equal(fs.readFileSync(path.join(hub, 'family.lock'), 'utf8'), before);
   assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'version = 4\n');
   assert.equal(gitText(repo, 'rev-parse', 'HEAD'), sha);
-  assert.deepEqual(fs.readdirSync(path.join(hub, 'target')), []);
+  assert.deepEqual(fs.readdirSync(path.join(hub, 'target')), ['family-diagnostics']);
+  const parent = path.join(hub, 'target/family-diagnostics');
+  const [entry] = fs.readdirSync(parent);
+  const manifest = JSON.parse(fs.readFileSync(path.join(parent, entry, 'manifest.json')));
+  assert.equal(manifest.trust, 'untrusted-candidate-diagnostics');
+  assert.equal(manifest.failure, 'candidate integration failed');
+  const report = manifest.files.find(file => file.source === 'jankurai/.jankurai/repo-score.json');
+  assert.equal(report.status, 'preserved');
+  assert.equal(fs.readFileSync(path.join(parent, entry, report.file), 'utf8'), '{incomplete failed audit');
 });
 test('publisher rejects metadata changes before any remote lookup', t => {
   const { hub, family } = fixture(t), lock = fs.readFileSync(path.join(hub, 'family.lock'), 'utf8');

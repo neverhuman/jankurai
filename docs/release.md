@@ -135,3 +135,39 @@ updater runs once per hour and GitHub API rate limits bound its request quota.
 Failure, token expiry, or exhausted quota is a stop condition. Disabling the
 `family-update` workflow is the maintainer kill switch while investigating
 unexpected workload. No workflow retries indefinitely or purchases extra quota.
+
+
+### Recover an interrupted family update
+
+Use `node scripts/family.mjs recover inspect --json`,
+`bash scripts/family.sh recover inspect --json`, or `just recover-inspect` before
+choosing `finish` or `rollback` (Just recipes: `recover-finish`, `recover-rollback`).
+These paths run before lockfile parsing or npm bootstrap. They require Node24,
+Git at `/usr/bin/git`, and the ordinary pinned Rust1.97.1 toolchain. The small
+native helper compiles directly with rustc in a private temporary directory; it
+uses no Cargo manifest, dependencies, network, or package bootstrap. It resolves
+the exact host toolchain from the operating-system account's `.rustup`,
+`/usr/local/rustup`, `/opt/rustup`, or `/opt/hostedtoolcache/rustup`. Repository
+environment overrides do not select the compiler. Inspection reports compiler
+availability and its digest; unavailable native capabilities block mutation.
+The compiler, source and compiled helper identities are checked around execution.
+Linux requires `renameat2(RENAME_EXCHANGE)`, and macOS requires
+`renameatx_np(RENAME_SWAP)` on the checkout filesystem. Unsupported atomic
+exchange or uncertain process identity refuses mutation.
+
+Both before/after lock images and source identities are synced before replacement.
+Recovery verifies their digests, the recorded source revision, and current lock
+ownership. A live writer or another recovery process blocks recovery. Concurrent
+lock edits are preserved; changed source or damaged images require inspection.
+Successful completion moves the entire operation directory into
+`.git/family-operation-history/`, preserving displaced files and unknown additions.
+Keep this history and any refused operation for review; do not delete the active
+operation or permanent `.git/family-recovery.lock` to bypass ownership checks.
+
+Failed candidate validation preserves the candidate locks, accepted baseline and
+available raw audit reports under `target/family-diagnostics/run-*` before its
+temporary checkout is removed. Each directory has a manifest with file hashes
+and the original failure; malformed or truncated report bytes remain available
+as diagnostics. The updater uploads these directories on failure. They do not
+grant proof coverage or establish a successful audit. If export fails, the
+temporary candidate directory is retained and its path is reported for recovery.

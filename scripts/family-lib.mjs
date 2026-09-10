@@ -54,10 +54,19 @@ export function clean(directory) {
     if (exists(path.join(gd, marker))) throw new Error(`${directory}: Git operation in progress (${marker})`);
   }
 }
-export function temporaryCI(parent, prefix, action) {
+export function temporaryCI(parent, prefix, action, { onFailure } = {}) {
   fs.mkdirSync(parent, { recursive: true });
   const directory = fs.mkdtempSync(path.join(parent, prefix));
-  try { return action(directory); } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  let removable = true;
+  try { return action(directory); }
+  catch (error) {
+    try { onFailure?.(directory, error); }
+    catch (preservationError) {
+      removable = false;
+      throw new AggregateError([error, preservationError], `candidate failed and diagnostic export failed; source retained at ${directory}`);
+    }
+    throw error;
+  } finally { if (removable) fs.rmSync(directory, { recursive: true, force: true }); }
 }
 export function buildEnvironment(source = process.env) {
   const env = { ...source };

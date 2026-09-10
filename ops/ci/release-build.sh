@@ -9,5 +9,7 @@ case "$TARGET" in
   x86_64-unknown-linux-gnu|aarch64-apple-darwin) ;;
   *) echo "unsupported release target: $TARGET" >&2; exit 1 ;;
 esac
+# Exercise the native exchange and recovery primitives on both supported hosts.
+node --test scripts/family-operation-review.test.mjs scripts/family-recovery.test.mjs
 bash scripts/family.sh build --release --target "$TARGET"
 node ops/ci/package-release.mjs "$TARGET"
