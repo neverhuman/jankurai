@@ -49,14 +49,24 @@ function fixture(t, body) {
 }
 
 if (process.argv[2] === 'rename-crash-child') {
-  const hub = process.argv[3], rename = fs.renameSync;
-  fs.renameSync = (from, to) => {
-    const result = rename(from, to);
-    if (to === path.join(hub, 'Cargo.lock')) process.exit(38);
-    return result;
-  };
-  commit(hub);
-  throw new Error('rename crash point not reached');
+  commit(process.argv[3], (event, detail) => {
+    if (event === 'after-atomic-exchange' && detail.name === 'Cargo.lock' && detail.direction === 'replace') process.exit(38);
+  });
+  throw new Error('exchange crash point not reached');
+}
+
+if (process.argv[2] === 'prepared-crash-child') {
+  const { tx } = prepare(process.argv[3]);
+  op.setJournalState(tx, 'prepared');
+  process.exit(36);
+}
+
+if (process.argv[2] === 'rollback-crash-child') {
+  commit(process.argv[3], (event, detail) => {
+    if (event === 'before-replace' && detail.name === 'family.lock') throw new Error('force rollback');
+    if (event === 'after-atomic-exchange' && detail.direction === 'rollback') process.exit(39);
+  });
+  throw new Error('rollback crash point not reached');
 }
 
 if (process.argv[2] === 'crash-child') {
@@ -130,7 +140,7 @@ test('rollback refuses unique concurrent edit observed at before-rollback-write'
   });
 });
 
-test('absent or unreadable procfs reports uncertain writer status', () => {
+test('absent or unreadable procfs reports uncertain writer status', { skip: process.platform !== 'linux' }, () => {
   const writer = op.writerIdentity();
   const stat = fs.statSync;
   fs.statSync = (file, ...args) => {
@@ -149,7 +159,7 @@ test('absent or unreadable procfs reports uncertain writer status', () => {
 });
 
 
-for (const command of ['finish', 'rollback']) test(`real crash after rename before bookkeeping permits ${command}`, t => {
+for (const command of ['finish', 'rollback']) test(`real crash after atomic exchange before bookkeeping permits ${command}`, t => {
   fixture(t, hub => {
     const result = spawnSync(process.execPath, [self, 'rename-crash-child', hub], { encoding: 'utf8', timeout: 10000 });
     assert.equal(result.status, 38, result.stderr);
@@ -214,5 +224,121 @@ test('completed operations archive unknown additions and links without deleting 
     assert.equal(fs.readFileSync(path.join(archive, 'unknown-writer.txt'), 'utf8'), 'UNKNOWN CONCURRENT EVIDENCE');
     assert.equal(fs.readlinkSync(path.join(archive, 'unknown-link')), 'unknown-writer.txt');
     assert.equal(fs.existsSync(path.join(archive, 'journal/journal.json')), true);
+  });
+});
+
+
+for (const direction of ['replace', 'rollback']) test(`post-assertion edit at actual ${direction} exchange remains at its original path`, t => {
+  fixture(t, hub => {
+    let injected = false;
+    assert.throws(() => commit(hub, (event, detail) => {
+      if (direction === 'rollback' && event === 'before-replace' && detail.name === 'family.lock') throw new Error('force rollback');
+      if (event === 'before-atomic-exchange' && detail.name === 'Cargo.lock' && detail.direction === direction) {
+        injected = true;
+        fs.writeFileSync(path.join(hub, 'Cargo.lock'), 'UNIQUE POST-ASSERTION EDIT');
+      }
+    }), /concurrent edit preserved|force rollback/);
+    assert.equal(injected, true);
+    assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'UNIQUE POST-ASSERTION EDIT');
+    assert.equal(fs.existsSync(op.operationRoot(hub)), true);
+  });
+});
+
+
+test('live writer blocks both recovery commands without journal or lock mutation', t => {
+  fixture(t, hub => {
+    const { tx } = prepare(hub);
+    const journal = fs.readFileSync(op.journalPath(tx.root));
+    const locks = op.LOCK_FILES.map(name => op.captureFileIdentity(path.join(hub, name)));
+    for (const command of ['finish', 'rollback']) assert.throws(() => op[command](hub), /recorded writer is live/);
+    assert.deepEqual(fs.readFileSync(op.journalPath(tx.root)), journal);
+    for (const [i, name] of op.LOCK_FILES.entries()) assert.equal(op.sameIdentity(path.join(hub, name), locks[i]), true);
+  });
+});
+
+test('legacy wall-clock fallback cannot declare an extant writer stopped', () => {
+  const writer = { ...op.writerIdentity(), startTime: String(Date.now()) };
+  delete writer.startKind;
+  assert.equal(op.writerStatus(writer), 'uncertain');
+});
+
+test('concurrent recovery lock excludes a second real recovery process', t => {
+  fixture(t, hub => {
+    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(crashed.status, 37, crashed.stderr);
+    const root = op.operationRoot(hub), before = fs.readFileSync(op.journalPath(root));
+    const code = `import fcntl, os, subprocess, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+try:
+    child = subprocess.run([sys.argv[2], '--input-type=module', '-e', sys.argv[3]], capture_output=True, text=True, timeout=10)
+    assert child.returncode != 0, child.stdout
+    assert 'Resource temporarily unavailable' in child.stderr, child.stderr
+finally:
+    os.close(fd)
+`;
+    const module = new URL('./family-operation.mjs', import.meta.url).href;
+    const result = spawnSync('/usr/bin/python3', ['-I', '-c', code, path.join(hub, '.git/family-recovery.lock'),
+      process.execPath, `import { finish } from ${JSON.stringify(module)}; finish(${JSON.stringify(hub)});`], {
+      encoding: 'utf8', timeout: 15000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fs.readFileSync(op.journalPath(root)), before);
+    assert.equal(op.finish(hub).state, 'committed');
+  });
+});
+
+test('uncommitted source edits block recovery and remain untouched', t => {
+  fixture(t, hub => {
+    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(crashed.status, 37, crashed.stderr);
+    fs.writeFileSync(path.join(hub, 'source-change'), 'UNCOMMITTED CONCURRENT SOURCE');
+    for (const command of ['finish', 'rollback']) assert.throws(() => op[command](hub), /source has concurrent edits/);
+    assert.equal(fs.readFileSync(path.join(hub, 'source-change'), 'utf8'), 'UNCOMMITTED CONCURRENT SOURCE');
+    assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'AFTER CARGO');
+    assert.equal(fs.existsSync(op.operationRoot(hub)), true);
+  });
+});
+
+for (const kind of ['symlink', 'fifo', 'oversized']) test(`non-regular or oversized ${kind} image is refused before recovery`, t => {
+  fixture(t, hub => {
+    const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(crashed.status, 37, crashed.stderr);
+    const root = op.operationRoot(hub), image = op.imagePath(root, 'Cargo.lock', 'before');
+    fs.renameSync(image, `${image}.retained`);
+    if (kind === 'symlink') fs.symlinkSync(`${image}.retained`, image);
+    if (kind === 'fifo') {
+      const mkfifo = spawnSync('/usr/bin/mkfifo', [image], { encoding: 'utf8' });
+      assert.equal(mkfifo.status, 0, mkfifo.stderr);
+    }
+    if (kind === 'oversized') { fs.writeFileSync(image, ''); fs.truncateSync(image, 64 * 1024 * 1024 + 1); }
+    const report = op.inspect(hub);
+    assert.equal(report.finishAdmissible, false);
+    assert.equal(report.rollbackAdmissible, false);
+    for (const command of ['finish', 'rollback']) assert.throws(() => op[command](hub));
+    assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'AFTER CARGO');
+    assert.equal(fs.existsSync(root), true);
+    assert.equal(fs.readFileSync(`${image}.retained`, 'utf8'), 'BEFORE CARGO');
+  });
+});
+
+
+for (const command of ['finish', 'rollback']) test(`prepared crash before either replacement permits ${command}`, t => {
+  fixture(t, hub => {
+    const crashed = spawnSync(process.execPath, [self, 'prepared-crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(crashed.status, 36, crashed.stderr);
+    assert.equal(op.inspect(hub).finishAdmissible, true);
+    assert.equal(op[command](hub).state, command === 'finish' ? 'committed' : 'rolled-back');
+    for (const name of op.LOCK_FILES) assert.match(fs.readFileSync(path.join(hub, name), 'utf8'), command === 'finish' ? /^AFTER/ : /^BEFORE/);
+  });
+});
+
+test('real crash during rollback can restart and complete rollback', t => {
+  fixture(t, hub => {
+    const crashed = spawnSync(process.execPath, [self, 'rollback-crash-child', hub], { encoding: 'utf8', timeout: 10000 });
+    assert.equal(crashed.status, 39, crashed.stderr);
+    assert.equal(op.inspect(hub).journal.state, 'rolling-back');
+    assert.equal(op.rollback(hub).state, 'rolled-back');
+    for (const name of op.LOCK_FILES) assert.match(fs.readFileSync(path.join(hub, name), 'utf8'), /^BEFORE/);
   });
 });

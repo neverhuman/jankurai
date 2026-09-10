@@ -135,3 +135,24 @@ updater runs once per hour and GitHub API rate limits bound its request quota.
 Failure, token expiry, or exhausted quota is a stop condition. Disabling the
 `family-update` workflow is the maintainer kill switch while investigating
 unexpected workload. No workflow retries indefinitely or purchases extra quota.
+
+
+### Recover an interrupted family update
+
+Use `node scripts/family.mjs recover inspect --json`,
+`bash scripts/family.sh recover inspect --json`, or `just recover-inspect` before
+choosing `finish` or `rollback` (Just recipes: `recover-finish`, `recover-rollback`).
+These paths run before lockfile parsing or npm bootstrap. They require Node24,
+Git at `/usr/bin/git`, and Python3 at `/usr/bin/python3`; no Python packages are
+needed. Linux requires `renameat2(RENAME_EXCHANGE)`, and macOS requires
+`renameatx_np(RENAME_SWAP)` on the checkout filesystem. Unsupported atomic
+exchange or uncertain process identity refuses mutation.
+
+Both before/after lock images and source identities are synced before replacement.
+Recovery verifies their digests, the recorded source revision, and current lock
+ownership. A live writer or another recovery process blocks recovery. Concurrent
+lock edits are preserved; changed source or damaged images require inspection.
+Successful completion moves the entire operation directory into
+`.git/family-operation-history/`, preserving displaced files and unknown additions.
+Keep this history and any refused operation for review; do not delete the active
+operation or permanent `.git/family-recovery.lock` to bypass ownership checks.
