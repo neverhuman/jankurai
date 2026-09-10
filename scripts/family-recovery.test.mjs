@@ -180,23 +180,11 @@ test('recover inspect works with malformed family.lock', t => {
     || report.locks['family.lock'].class === 'unknown');
 });
 
-test('pre-tag-qualify accepts bound release-services evidence and refuses release.yml identity', t => {
+test('authored pre-tag text and empty bundles cannot establish expected source or execution', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pre-tag-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  assert.throws(() => qualifyPreTag(root), /missing release-services result/);
-  fs.writeFileSync(path.join(root, 'result.txt'), 'not success\n');
-  assert.throws(() => qualifyPreTag(root), /does not record a successful/);
-  fs.writeFileSync(path.join(root, 'result.txt'), `${SUCCESS_MARKER}\n`);
-  assert.throws(() => qualifyPreTag(root), /cert-identity|workflow run identity/);
-  const source = '0123456789abcdef0123456789abcdef01234567';
-  fs.writeFileSync(path.join(root, 'identity.txt'),
-    `cert-identity=https://github.com/neverhuman/jankurai/.github/workflows/release-services.yml@refs/heads/main\nsource=${source}\nartifact=probe.txt\n`);
-  fs.writeFileSync(path.join(root, 'probe.txt'), `source=${source}\n`);
-  fs.writeFileSync(path.join(root, 'probe.txt.sigstore.bundle'), '{}\n');
-  fs.writeFileSync(path.join(root, 'probe.txt.attestation.jsonl'), '{}\n');
-  assert.equal(qualifyPreTag(root).ok, true);
-  fs.writeFileSync(path.join(root, 'identity.txt'),
-    'cert-identity=https://github.com/neverhuman/jankurai/.github/workflows/release.yml@refs/heads/main\n'
-    + `source=${source}\nartifact=probe.txt\n`);
-  assert.throws(() => qualifyPreTag(root), /refusing/);
+  fs.writeFileSync(path.join(root, 'result.txt'), SUCCESS_MARKER);
+  fs.writeFileSync(path.join(root, 'probe.txt.sigstore.bundle'), '{}');
+  fs.writeFileSync(path.join(root, 'probe.txt.attestation.jsonl'), '{}');
+  assert.throws(() => qualifyPreTag(root), /expected source SHA and run ID/);
 });

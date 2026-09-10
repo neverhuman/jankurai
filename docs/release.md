@@ -69,12 +69,16 @@ The workflow runs when its source or verifier setup changes on migration branche
 or main, and supports manual dispatch. Its branch/workflow identity is separate
 from release identity; its artifacts cannot satisfy the release installer.
 This service check supplements the required signed native staging tests.
-Locally, before tagging, run `node scripts/pre-tag-qualify.mjs <evidence-dir>`
-against a directory that contains the successful `release-services` `result.txt`
-bound to workflow run (`cert-identity` for `release-services.yml`), source digest,
-artifact (`probe.txt`), and signature/attestation files. A lone success marker is
-refused. Evidence that presents `release.yml` as the release-services identity is
-refused. This local gate does not weaken release floors.
+Download both `release-service-probe-*` artifacts from the successful run, keeping
+one directory per artifact. From the exact main checkout that will be tagged, run
+`node scripts/pre-tag-qualify.mjs <downloaded-run-directory> <run-id>`.
+The command obtains the expected source from Git HEAD, checks the hosted run and
+both successful platform jobs, then verifies private snapshots of both probes
+with Cosign and GitHub CLI. Certificate fields must bind the expected repository,
+workflow, source, run and attempt. Authored success messages cannot authorize
+qualification. The returned receipt qualifies signing services; the complete
+release candidate still needs its own signed native staging qualification before
+tagging. Use the pinned verifier setup above.
 
 Build jobs use read-only tokens and upload unsigned assets. A fresh signing job
 validates the complete unsigned inventory and signs it without building or

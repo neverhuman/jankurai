@@ -1,121 +1,140 @@
 #!/usr/bin/env node
-// Local pre-tag gate: require successful release-services evidence bound to
-// workflow run / source / artifact / signature identity; refuse release.yml masquerade.
+// Re-verify signing probes. Recorded messages and repository files grant no trust.
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const SUCCESS_MARKER =
   'Real anonymous signatures and attestations verified; modified content and wrong repository/workflow/source/tag rejected.';
+const REPO = 'neverhuman/jankurai';
+const WORKFLOW = '.github/workflows/release-services.yml';
+const REF = 'refs/heads/main';
+const IDENTITY = `https://github.com/${REPO}/${WORKFLOW}@${REF}`;
+const ISSUER = 'https://token.actions.githubusercontent.com';
+const PLATFORMS = { 'ubuntu-24.04': 'Linux/x86_64', 'macos-14': 'Darwin/arm64' };
+const FILES = ['probe.txt', 'probe.txt.sigstore.bundle', 'probe.txt.attestation.jsonl'];
+const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 
-const RELEASE_SERVICES_WORKFLOW = '.github/workflows/release-services.yml';
-const RELEASE_WORKFLOW = '.github/workflows/release.yml';
-
-function walkFiles(directory, files = []) {
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-    const full = path.join(directory, entry.name);
-    if (entry.isDirectory()) walkFiles(full, files);
-    else if (entry.isFile()) files.push(full);
-  }
-  return files;
-}
-
-function readIfFile(file) {
+function readEvidence(file) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
-    if (fs.existsSync(file) && fs.statSync(file).isFile()) return fs.readFileSync(file, 'utf8');
-  } catch { /* missing */ }
-  return null;
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size < 1 || st.size > 4 * 1024 * 1024) throw new Error(`invalid evidence file: ${file}`);
+    const buffer = Buffer.alloc(st.size + 1);
+    let used = 0, count;
+    while (used < buffer.length && (count = fs.readSync(fd, buffer, used, buffer.length - used, null)) > 0) used += count;
+    if (used !== st.size) throw new Error(`evidence changed size: ${file}`);
+    return buffer.subarray(0, used);
+  } finally { fs.closeSync(fd); }
 }
 
-function refuseReleaseYml(text) {
-  if (!text.includes(RELEASE_WORKFLOW)) return;
-  if (text.includes(`/${RELEASE_WORKFLOW}@`) || /cert-identity=.*\.github\/workflows\/release\.yml/i.test(text)) {
-    throw new Error('pre-tag-qualify: refusing release.yml identity as release-services identity');
-  }
-  if (!text.includes(RELEASE_SERVICES_WORKFLOW)) {
-    throw new Error('pre-tag-qualify: refusing release.yml identity as release-services evidence');
+function directory(file) {
+  if (!fs.lstatSync(file).isDirectory()) throw new Error(`evidence directory required: ${file}`);
+}
+
+export function validateProbeRun(run, jobs, { source, runId }) {
+  if (run.id !== Number(runId) || run.repository?.full_name !== REPO || run.head_repository?.full_name !== REPO ||
+      run.head_sha !== source || run.head_branch !== 'main' || run.path !== WORKFLOW ||
+      !['push', 'workflow_dispatch'].includes(run.event) || run.status !== 'completed' || run.conclusion !== 'success' ||
+      !Number.isSafeInteger(run.run_attempt) || run.run_attempt < 1) throw new Error('release-services run identity or result mismatch');
+  const names = Object.keys(PLATFORMS).map(platform => `verify (${platform})`);
+  const ids = new Set();
+  if (!Array.isArray(jobs) || jobs.length !== names.length) throw new Error('release-services requires both exact platform jobs');
+  for (const job of jobs) {
+    if (!names.includes(job.name) || jobs.filter(other => other.name === job.name).length !== 1 ||
+        !Number.isSafeInteger(job.id) || job.id < 1 || ids.has(job.id) || job.run_id !== run.id ||
+        job.run_attempt !== run.run_attempt || job.head_sha !== source ||
+        job.status !== 'completed' || job.conclusion !== 'success') throw new Error('release-services job identity or result mismatch');
+    ids.add(job.id);
   }
 }
 
-function requireRegularNonempty(file, label) {
-  if (!fs.existsSync(file) || !fs.statSync(file).isFile() || fs.statSync(file).size < 1) {
-    throw new Error(`pre-tag-qualify: missing ${label}`);
+export function validateProbeAttestation(results, { source, runId, attempt, artifactSha256 }) {
+  if (!Array.isArray(results) || results.length !== 1) throw new Error('expected one verified probe attestation');
+  const result = results[0]?.verificationResult;
+  const cert = result?.signature?.certificate;
+  const statement = result?.statement;
+  if (cert?.subjectAlternativeName?.value !== IDENTITY || cert.issuer !== ISSUER ||
+      cert.buildSignerURI !== IDENTITY || cert.buildSignerDigest !== source ||
+      cert.sourceRepositoryURI !== `https://github.com/${REPO}` || cert.sourceRepositoryDigest !== source ||
+      cert.sourceRepositoryRef !== REF || cert.runnerEnvironment !== 'github-hosted' ||
+      cert.runInvocationURI !== `https://github.com/${REPO}/actions/runs/${runId}/attempts/${attempt}` ||
+      !Array.isArray(result.verifiedTimestamps) || result.verifiedTimestamps.length === 0 ||
+      statement?.predicateType !== 'https://slsa.dev/provenance/v1' ||
+      !Array.isArray(statement.subject) || statement.subject.length !== 1 ||
+      statement.subject[0]?.digest?.sha256 !== artifactSha256) {
+    throw new Error('verified certificate, invocation or artifact binding mismatch');
   }
 }
 
-/** Bind workflow run / source / artifact / signature; refuse lone SUCCESS_MARKER. */
-function bindEvidence(resultFile, text) {
-  const dir = path.dirname(resultFile);
-  const identityText = readIfFile(path.join(dir, 'identity.txt')) ?? '';
-  refuseReleaseYml(text);
-  refuseReleaseYml(identityText);
+const execute = (command, args, env) => execFileSync(command, args, {
+  env, encoding: 'utf8', timeout: 60_000, maxBuffer: 16 * 1024 * 1024,
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
 
-  if (!(text.includes(SUCCESS_MARKER) || text.trim() === SUCCESS_MARKER.trim())) {
-    return false;
-  }
-
-  const combined = `${text}\n${identityText}`;
-  const cert = /(?:^|\n)cert-identity=(https:\/\/github\.com\/[^\s]+)(?:\n|$)/.exec(combined);
-  if (!cert) {
-    throw new Error('pre-tag-qualify: missing release-services cert-identity (workflow run identity)');
-  }
-  if (!cert[1].includes(RELEASE_SERVICES_WORKFLOW) || cert[1].includes(RELEASE_WORKFLOW)) {
-    throw new Error('pre-tag-qualify: refusing non-release-services workflow identity');
-  }
-
-  const source = /(?:^|\n)source=([0-9a-f]{40})(?:\n|$)/.exec(combined);
-  if (!source) {
-    throw new Error('pre-tag-qualify: missing source identity binding');
-  }
-
-  const artifactName = /(?:^|\n)artifact=([^\s]+)(?:\n|$)/.exec(combined)?.[1] ?? 'probe.txt';
-  const artifactPath = path.join(dir, artifactName);
-  requireRegularNonempty(artifactPath, `artifact identity file: ${artifactName}`);
-  const artifactText = fs.readFileSync(artifactPath, 'utf8');
-  const artifactSource = /(?:^|\n)source=([0-9a-f]{40})(?:\n|$)/.exec(`\n${artifactText}\n`);
-  if (!artifactSource) {
-    throw new Error('pre-tag-qualify: artifact missing source identity');
-  }
-  if (artifactSource[1] !== source[1]) {
-    throw new Error('pre-tag-qualify: artifact source digest disagrees with identity binding');
-  }
-
-  requireRegularNonempty(path.join(dir, `${artifactName}.sigstore.bundle`), 'signature bundle identity');
-  requireRegularNonempty(path.join(dir, `${artifactName}.attestation.jsonl`), 'attestation / signature identity');
-  return true;
-}
-
-export function qualifyPreTag(evidenceDir) {
-  if (!evidenceDir) throw new Error('usage: node scripts/pre-tag-qualify.mjs <evidence-dir>');
+export function qualifyPreTag(evidenceDir, { source, runId, run = execute } = {}) {
+  if (!evidenceDir || !/^[a-f0-9]{40}$/.test(source ?? '') || !/^[1-9]\d*$/.test(String(runId ?? '')) ||
+      !Number.isSafeInteger(Number(runId))) throw new Error('pre-tag qualification requires an expected source SHA and run ID');
   const root = path.resolve(evidenceDir);
-  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
-    throw new Error(`pre-tag-qualify: evidence directory missing: ${root}`);
-  }
-  const resultFile = path.join(root, 'result.txt');
-  if (!fs.existsSync(resultFile)) {
-    const matches = walkFiles(root).filter(file => path.basename(file) === 'result.txt');
-    if (!matches.length) throw new Error('pre-tag-qualify: missing release-services result.txt (fail closed)');
-    return qualifyResultFiles(matches);
-  }
-  return qualifyResultFiles([resultFile]);
-}
-
-function qualifyResultFiles(files) {
-  let accepted = false;
-  for (const file of files) {
-    const text = fs.readFileSync(file, 'utf8');
-    if (bindEvidence(file, text)) accepted = true;
-  }
-  if (!accepted) throw new Error('pre-tag-qualify: result.txt does not record a successful release-services verification');
-  return { ok: true, results: files };
+  directory(root);
+  // Fixed names only: no authored artifact paths, recursive searches, or success-marker authority.
+  const inputs = Object.entries(PLATFORMS).map(([platform, native]) => {
+    const dir = path.join(root, `release-service-probe-${platform}`);
+    directory(dir);
+    const bytes = Object.fromEntries(FILES.map(name => [name, readEvidence(path.join(dir, name))]));
+    const expected = `Non-release signing probe\nsource=${source}\nplatform=${native}\n`;
+    if (!bytes['probe.txt'].equals(Buffer.from(expected))) throw new Error(`${platform}: probe source or platform mismatch`);
+    return { platform, bytes };
+  });
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'jankurai-pretag-'));
+  try {
+    // Every verifier reads these same private snapshots, with empty homes/config and no injected environment.
+    const env = { PATH: process.env.PATH, HOME: temporary, GH_CONFIG_DIR: temporary,
+      XDG_CACHE_HOME: temporary, LANG: 'C.UTF-8' };
+    const apiEnv = { ...env };
+    if (process.env.GH_TOKEN) apiEnv.GH_TOKEN = process.env.GH_TOKEN;
+    else if (process.env.GITHUB_TOKEN) apiEnv.GH_TOKEN = process.env.GITHUB_TOKEN;
+    const api = route => JSON.parse(run('gh', ['api', '--hostname', 'github.com', `repos/${REPO}/${route}`], apiEnv));
+    const workflowRun = api(`actions/runs/${runId}`);
+    if (!Number.isSafeInteger(workflowRun?.run_attempt) || workflowRun.run_attempt < 1) throw new Error('invalid run attempt');
+    const jobPage = api(`actions/runs/${runId}/attempts/${workflowRun.run_attempt}/jobs?per_page=100`);
+    if (jobPage.total_count !== 2) throw new Error('release-services requires both exact platform jobs');
+    validateProbeRun(workflowRun, jobPage.jobs, { source, runId });
+    const probes = [];
+    for (const { platform, bytes } of inputs) {
+      const dir = path.join(temporary, platform);
+      fs.mkdirSync(dir);
+      for (const name of FILES) fs.writeFileSync(path.join(dir, name), bytes[name], { flag: 'wx', mode: 0o600 });
+      const asset = path.join(dir, 'probe.txt');
+      run('cosign', ['verify-blob', asset, '--bundle', `${asset}.sigstore.bundle`,
+        '--certificate-identity', IDENTITY, '--certificate-oidc-issuer', ISSUER], env);
+      const verified = JSON.parse(run('gh', ['attestation', 'verify', asset, '--bundle', `${asset}.attestation.jsonl`,
+        '--repo', REPO, '--cert-identity', IDENTITY, '--cert-oidc-issuer', ISSUER,
+        '--signer-digest', source, '--source-digest', source, '--source-ref', REF,
+        '--deny-self-hosted-runners', '--format', 'json'], env));
+      const artifactSha256 = sha256(bytes['probe.txt']);
+      validateProbeAttestation(verified, { source, runId, attempt: workflowRun.run_attempt, artifactSha256 });
+      probes.push({ platform, sha256: artifactSha256,
+        signature_sha256: sha256(bytes['probe.txt.sigstore.bundle']),
+        attestation_sha256: sha256(bytes['probe.txt.attestation.jsonl']) });
+    }
+    return { ok: true, kind: 'signing-service-probes', source, run_id: Number(runId),
+      run_attempt: workflowRun.run_attempt, probes };
+  } finally { fs.rmSync(temporary, { recursive: true, force: true }); }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const result = qualifyPreTag(process.argv[2]);
-    console.log(`pre-tag-qualify: ok (${result.results.length} result.txt)`);
+    const [evidenceDir, runId, ...extra] = process.argv.slice(2);
+    if (extra.length) throw new Error('usage: node scripts/pre-tag-qualify.mjs <downloaded-run-directory> <run-id>');
+    const hub = fileURLToPath(new URL('..', import.meta.url));
+    const source = execFileSync('git', ['-C', hub, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    console.log(JSON.stringify(qualifyPreTag(evidenceDir, { source, runId }), null, 2));
   } catch (error) {
-    console.error(error.message);
+    console.error(`pre-tag-qualify: ${error.message}`);
     process.exitCode = 1;
   }
 }
