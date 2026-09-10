@@ -734,6 +734,9 @@ export function inspect(hub) {
 }
 
 function refuseLive(report) {
+  if (!report.journal) {
+    throw new Error(`recovery admission failed: ${report.reasons.join('; ') || 'journal unavailable'}`);
+  }
   if (report.recoveryWriterStatus !== 'stopped' && report.recoveryWriter?.pid !== process.pid) {
     throw new Error('refusing recovery while another recovery writer is active or uncertain');
   }
