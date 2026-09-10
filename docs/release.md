@@ -163,3 +163,11 @@ Successful completion moves the entire operation directory into
 `.git/family-operation-history/`, preserving displaced files and unknown additions.
 Keep this history and any refused operation for review; do not delete the active
 operation or permanent `.git/family-recovery.lock` to bypass ownership checks.
+
+Failed candidate validation preserves the candidate locks, accepted baseline and
+available raw audit reports under `target/family-diagnostics/run-*` before its
+temporary checkout is removed. Each directory has a manifest with file hashes
+and the original failure; malformed or truncated report bytes remain available
+as diagnostics. The updater uploads these directories on failure. They do not
+grant proof coverage or establish a successful audit. If export fails, the
+temporary candidate directory is retained and its path is reported for recovery.

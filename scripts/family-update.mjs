@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWrite, buildEnvironment, clean, git, gitText, run, temporaryCI } from './family-lib.mjs';
+import { preserveCandidateDiagnostics } from './family-diagnostics.mjs';
 import {
   beginPairedJournal, captureFileIdentity, captureSource, commitPairedReplace,
   identityMeta, operation, recordAfterImages, setJournalState, assertIdentity,
@@ -103,7 +104,7 @@ function updateWithTx(family, hooks, tx) {
     commitPairedReplace(tx, afterBytes, Object.fromEntries(
       Object.entries(beforeIdentities).map(([name, id]) => [name, identityMeta(id)]),
     ), { observe: hooks.observe });
-  });
+  }, { onFailure: (directory, error) => preserveCandidateDiagnostics(directory, path.join(family.hub, 'target/family-diagnostics'), error) });
   console.log('family pull: validated candidate locks ready for a protected PR');
 }
 
