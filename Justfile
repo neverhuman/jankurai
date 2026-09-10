@@ -68,3 +68,13 @@ audit:
 # Print the declared hub version.
 versions:
     cat VERSION
+
+# Durable paired-lock recovery: inspect journal without npm bootstrap.
+recover-inspect:
+    bash scripts/family.sh recover inspect --json
+
+recover-finish:
+    bash scripts/family.sh recover finish
+
+recover-rollback:
+    bash scripts/family.sh recover rollback

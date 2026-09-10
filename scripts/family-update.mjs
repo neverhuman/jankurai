@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { atomicWrite, buildEnvironment, clean, git, gitText, run, temporaryCI } from './family-lib.mjs';
+import {
+  beginPairedJournal, captureFileIdentity, captureSource, commitPairedReplace,
+  identityMeta, operation, recordAfterImages, setJournalState, assertIdentity,
+} from './family-operation.mjs';
 
 export function api(endpoint, body, method) {
   const args = ['gh', 'api', endpoint];
@@ -34,35 +38,80 @@ export function lockText(original, pins) {
     return block.replace(/^tag = "[^"]+"$/m, `tag = "${pin.tag}"`).replace(/^commit = "[^"]+"$/m, `commit = "${pin.commit}"`);
   });
 }
-export function update(family, hooks = {}) {
+
+function captureSources(family) {
+  const components = {};
+  for (const repo of family.components()) {
+    if (!family.existing(repo)) continue;
+    components[repo.name] = captureSource(family.path(repo));
+  }
+  return { hub: captureSource(family.hub), components };
+}
+
+function assertSources(family, expected) {
+  const hub = captureSource(family.hub);
+  if (hub.head !== expected.hub.head || hub.tree !== expected.hub.tree) {
+    throw new Error('hub HEAD/tree changed while validating; accepted locks preserved');
+  }
+  for (const repo of family.components()) {
+    if (!family.existing(repo)) continue;
+    const current = captureSource(family.path(repo));
+    const prior = expected.components[repo.name];
+    if (!prior || current.head !== prior.head || current.tree !== prior.tree) {
+      throw new Error(`${repo.name}: HEAD/tree changed while validating; accepted locks preserved`);
+    }
+  }
+}
+
+function updateWithTx(family, hooks, tx) {
   clean(family.hub);
   for (const repo of family.components()) if (family.existing(repo)) clean(family.path(repo));
   family.bootstrap();
+  const source = captureSources(family);
+  const beforeIdentities = Object.fromEntries(
+    ['family.lock', 'Cargo.lock'].map(name => [name, captureFileIdentity(path.join(family.hub, name))]),
+  );
+  beginPairedJournal(tx, {
+    source,
+    locks: beforeIdentities,
+  });
   const pins = new Map([...family.pins].map(([name, pin]) => [name, { ...pin }]));
-  const before = Object.fromEntries(['family.lock', 'Cargo.lock'].map(name => [name, fs.readFileSync(path.join(family.hub, name), 'utf8')]));
   for (const repo of family.components()) {
     const sha = (hooks.eligible ?? eligible)(family, repo), directory = family.path(repo);
-    if (git(directory, ['merge-base', '--is-ancestor', gitText(directory, 'rev-parse', 'HEAD'), sha], { check: false }).status !== 0) throw new Error(`${repo.name}: candidate would leave divergent local work behind`);
+    if (git(directory, ['merge-base', '--is-ancestor', gitText(directory, 'rev-parse', 'HEAD'), sha], { check: false }).status !== 0) {
+      throw new Error(`${repo.name}: candidate would leave divergent local work behind`);
+    }
     if (sha !== pins.get(repo.name).commit) Object.assign(pins.get(repo.name), { commit: sha, tag: `ci-${sha}` });
   }
-  const candidate = lockText(before['family.lock'], pins);
-  if (candidate === before['family.lock']) { console.log('family pull: no newer successful revisions'); return; }
+  const candidate = lockText(beforeIdentities['family.lock'].bytes.toString('utf8'), pins);
+  if (candidate === beforeIdentities['family.lock'].bytes.toString('utf8')) {
+    console.log('family pull: no newer successful revisions');
+    setJournalState(tx, 'rolled-back');
+    return;
+  }
+  setJournalState(tx, 'validating');
   temporaryCI(path.join(family.hub, 'target'), 'family-ci-', directory => {
     const cargo = (hooks.testCandidate ?? testCandidate)(family, directory, candidate);
-    for (const [name, previous] of Object.entries(before)) {
-      if (fs.readFileSync(path.join(family.hub, name), 'utf8') !== previous) throw new Error(`${name} changed while testing; accepted locks preserved`);
+    assertSources(family, source);
+    for (const name of ['family.lock', 'Cargo.lock']) {
+      assertIdentity(path.join(family.hub, name), beforeIdentities[name], name);
     }
     for (const repo of family.components()) clean(family.path(repo));
-    try {
-      atomicWrite(path.join(family.hub, 'Cargo.lock'), cargo);
-      atomicWrite(path.join(family.hub, 'family.lock'), candidate);
-    } catch (error) {
-      for (const [name, previous] of Object.entries(before)) atomicWrite(path.join(family.hub, name), previous);
-      throw error;
-    }
+    assertSources(family, source);
+    const afterBytes = { 'Cargo.lock': cargo, 'family.lock': candidate };
+    recordAfterImages(tx, afterBytes);
+    commitPairedReplace(tx, afterBytes, Object.fromEntries(
+      Object.entries(beforeIdentities).map(([name, id]) => [name, identityMeta(id)]),
+    ), { observe: hooks.observe });
   });
   console.log('family pull: validated candidate locks ready for a protected PR');
 }
+
+export function update(family, hooks = {}, tx) {
+  if (!tx) return operation(family.hub, inner => updateWithTx(family, hooks, inner), { observe: hooks.observe });
+  return updateWithTx(family, hooks, tx);
+}
+
 function testCandidate(family, directory, candidate) {
   atomicWrite(path.join(directory, 'candidate.lock'), candidate);
   // Strip credentials and Git rewrites before any candidate checkout/bootstrap.

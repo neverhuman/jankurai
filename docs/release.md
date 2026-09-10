@@ -69,6 +69,10 @@ The workflow runs when its source or verifier setup changes on migration branche
 or main, and supports manual dispatch. Its branch/workflow identity is separate
 from release identity; its artifacts cannot satisfy the release installer.
 This service check supplements the required signed native staging tests.
+Locally, before tagging, run `node scripts/pre-tag-qualify.mjs <evidence-dir>`
+against a directory that contains the successful `release-services` `result.txt`
+(and refuse any evidence that presents `release.yml` as the release-services
+identity). This local gate does not weaken release floors.
 
 The read-only verification job checks the collected platform inventory and every
 signature/attestation before passing assets to the publishing job. Enable GitHub
