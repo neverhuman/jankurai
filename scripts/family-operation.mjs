@@ -45,6 +45,7 @@ export function imagePath(root, name, side) {
 
 export function captureSource(directory) {
   return {
+    directory: path.resolve(directory),
     head: gitText(directory, 'rev-parse', 'HEAD'),
     tree: gitText(directory, 'rev-parse', 'HEAD^{tree}'),
   };
@@ -136,7 +137,7 @@ function writeExclusive(file, raw, mode = 0o644) {
   } finally { fs.closeSync(fd); }
 }
 
-export function durableWriteFile(file, raw, mode = 0o644) {
+export function durableWriteFile(file, raw, mode = 0o644, prepared) {
   const temporary = `${file}.${process.pid}.tmp`;
   let created = false;
   try {
@@ -146,6 +147,8 @@ export function durableWriteFile(file, raw, mode = 0o644) {
       fs.writeFileSync(fd, raw);
       fs.fsyncSync(fd);
     } finally { fs.closeSync(fd); }
+    // Persist the intended inode before the replacement syscall can succeed.
+    prepared?.(captureFileIdentity(temporary));
     fs.renameSync(temporary, file);
     syncDirectory(path.dirname(file));
   } finally {
@@ -271,8 +274,31 @@ export function markLockStage(tx, name, stage) {
 
 function loadImage(root, name, side) {
   const file = imagePath(root, name, side);
-  const bytes = fs.readFileSync(file);
-  return { bytes, sha256: digest(bytes), size: bytes.length };
+  const expected = readJournal(root)?.locks?.[name]?.[side];
+  const actual = captureFileIdentity(file);
+  if (!expected || actual.sha256 !== expected.sha256 || actual.size !== expected.size) {
+    throw new Error(`${name}: saved ${side} image disagrees with journal`);
+  }
+  return { bytes: actual.bytes, sha256: actual.sha256, size: actual.size };
+}
+
+function validateRecoveryInputs(hub, root) {
+  const journal = readJournal(root);
+  if (!journal?.source?.hub || !journal.source.components) throw new Error('missing journal source identities');
+  const sources = [[hub, journal.source.hub], ...Object.entries(journal.source.components).map(([name, source]) => {
+    if (!source.directory || !path.isAbsolute(source.directory)) throw new Error(`${name}: missing recorded source directory`);
+    return [source.directory, source];
+  })];
+  for (const [directory, expected] of sources) {
+    const actual = captureSource(directory);
+    if (actual.head !== expected.head || actual.tree !== expected.tree ||
+        (expected.directory && actual.directory !== expected.directory)) throw new Error('recorded source HEAD/tree changed; recovery refused');
+  }
+  for (const name of LOCK_FILES) {
+    loadImage(root, name, 'before');
+    if (journal.locks[name]?.after) loadImage(root, name, 'after');
+  }
+  return journal;
 }
 
 function afterIdentityRecorded(after) {
@@ -302,6 +328,9 @@ export function classifyLock(hub, root, name, record) {
   }
   const before = record?.before;
   const after = record?.after;
+  if (record?.restored && matchesRecordedIdentity(actual, record.restored)) {
+    return { class: 'original', identity: identityMeta(actual) };
+  }
   if (before && actual.sha256 === before.sha256 && actual.dev === before.dev && actual.ino === before.ino
       && (before.mode == null || actual.mode === before.mode)) {
     return { class: 'original', identity: identityMeta(actual) };
@@ -337,7 +366,10 @@ function replaceLock(tx, name, afterBytes, expectedPrior) {
   // Re-assert immediately before write so unique concurrent edits at before-replace are not overwritten.
   assertIdentity(target, expectedPrior, name);
   const bytes = Buffer.isBuffer(afterBytes) ? afterBytes : Buffer.from(afterBytes);
-  durableWriteFile(target, bytes, expectedPrior.mode & 0o777);
+  const saved = loadImage(tx.root, name, 'after');
+  if (digest(bytes) !== saved.sha256) throw new Error(`${name}: replacement differs from validated after image`);
+  durableWriteFile(target, bytes, expectedPrior.mode & 0o777,
+    prepared => recordWrittenAfter(tx, name, prepared, 'replacing'));
   const written = captureFileIdentity(target);
   if (written.sha256 !== digest(bytes)) throw new Error(`${name}: post-replace digest mismatch`);
   recordWrittenAfter(tx, name, written, 'replaced');
@@ -375,7 +407,7 @@ export function commitPairedReplace(tx, afterBytes, beforeIdentities, { observe 
 
 /** Restore only members that still match this operation's after-image. */
 export function conditionalRollback(tx) {
-  const journal = readJournal(tx.root);
+  const journal = validateRecoveryInputs(tx.hub, tx.root);
   setJournalState(tx, 'rolling-back');
   const restored = [];
   const preservedUnknown = [];
@@ -392,7 +424,11 @@ export function conditionalRollback(tx) {
       tx.observe?.('before-rollback-write', { name });
       // Re-assert owned after identity at write; unique concurrent edits stay put.
       assertIdentity(path.join(tx.hub, name), afterRecord, name);
-      durableWriteFile(path.join(tx.hub, name), before.bytes, mode & 0o777);
+      durableWriteFile(path.join(tx.hub, name), before.bytes, mode & 0o777, prepared => {
+        const current = readJournal(tx.root);
+        current.locks[name].restored = identityMeta(prepared);
+        tx.journal = writeJournal(tx.root, current, tx.observe);
+      });
       const actual = captureFileIdentity(path.join(tx.hub, name));
       if (actual.sha256 !== before.sha256) throw new Error(`${name}: rollback digest mismatch`);
       markLockStage(tx, name, 'restored');
@@ -421,13 +457,22 @@ export function conditionalRollback(tx) {
 }
 
 function releaseRoot(root) {
-  fs.rmSync(root, { recursive: true, force: true });
-  try { syncDirectory(path.dirname(root)); } catch { /* parent may be gone in tests */ }
+  // Preserve complete journals, displaced evidence and unknown additions. Never recursively delete them.
+  if (!fs.lstatSync(root).isDirectory()) throw new Error('operation root is not a regular directory');
+  const history = path.join(path.dirname(root), 'family-operation-history');
+  try { fs.mkdirSync(history, { mode: 0o700 }); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+  if (!fs.lstatSync(history).isDirectory()) throw new Error('operation history is not a regular directory');
+  const destination = path.join(history, randomUUID());
+  fs.renameSync(root, destination);
+  syncDirectory(history);
+  syncDirectory(path.dirname(root));
+  return destination;
 }
 
 export function release(tx, { force = false } = {}) {
   if (!force && tx.retain) return false;
   const journal = safeReadJournal(tx.root);
+  if (!journal && fs.existsSync(journalPath(tx.root))) return false;
   if (!force && journal && ABNORMAL.has(journal.state) && journal.state !== 'committed' && journal.state !== 'rolled-back') {
     return false;
   }
@@ -509,19 +554,23 @@ function buildReport(hub) {
   }
   report.writerStatus = writerStatus(journal.writer ?? report.writer);
   for (const name of LOCK_FILES) {
-    report.locks[name] = classifyLock(hub, root, name, journal.locks?.[name] ?? emptyLocks()[name]);
+    try { report.locks[name] = classifyLock(hub, root, name, journal.locks?.[name] ?? emptyLocks()[name]); }
+    catch (error) { report.locks[name] = { class: 'unreadable', error: error.message }; }
   }
   if (report.writerStatus === 'live') report.reasons.push('recorded writer is live');
   if (report.writerStatus === 'foreign-host') report.reasons.push('recorded writer host differs');
   if (report.writerStatus === 'uncertain') report.reasons.push('writer liveness uncertain');
+  let inputsValid = false;
+  try { validateRecoveryInputs(hub, root); inputsValid = true; }
+  catch (error) { report.reasons.push(error.message); }
   const classes = LOCK_FILES.map(name => report.locks[name].class);
   const onlyOwnOrOriginal = classes.every(c => c === 'original' || c === 'own-after');
-  report.rollbackAdmissible = report.writerStatus === 'stopped' && onlyOwnOrOriginal
+  report.rollbackAdmissible = report.writerStatus === 'stopped' && inputsValid && onlyOwnOrOriginal
     && !['committed', 'rolled-back'].includes(journal.state);
   // Allow finish for naturally persisted mid-replace crashes (replacing / partial own-after+original),
   // not only the prepared checkpoint.
   const finishStates = new Set(['prepared', 'replacing', 'verifying', 'needs-recovery']);
-  report.finishAdmissible = report.writerStatus === 'stopped'
+  report.finishAdmissible = report.writerStatus === 'stopped' && inputsValid
     && finishStates.has(journal.state)
     && classes.includes('own-after')
     && classes.every(c => c === 'original' || c === 'own-after')
@@ -564,7 +613,7 @@ export function finish(hub, { observe } = {}) {
   const report = buildReport(hub);
   if (!report.present) throw new Error('no family-operation to finish');
   refuseLive(report);
-  const journal = readJournal(report.operationRoot);
+  const journal = validateRecoveryInputs(hub, report.operationRoot);
   if (journal.state === 'committed') {
     releaseRoot(report.operationRoot);
     return { state: 'committed', cleaned: true };
@@ -587,7 +636,8 @@ export function finish(hub, { observe } = {}) {
       const mode = (journal.locks[name].before?.mode ?? 0o644) & 0o777;
       const target = path.join(tx.hub, name);
       assertIdentity(target, journal.locks[name].before, name);
-      durableWriteFile(target, after.bytes, mode);
+      durableWriteFile(target, after.bytes, mode,
+        prepared => recordWrittenAfter(tx, name, prepared, 'replacing'));
       const written = captureFileIdentity(target);
       if (written.sha256 !== after.sha256) throw new Error(`${name}: finish digest mismatch`);
       recordWrittenAfter(tx, name, written, 'replaced');
