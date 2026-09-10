@@ -1,32 +1,57 @@
 // OS primitives for lock recovery. Compiled directly by the pinned rustc;
 // no Cargo, package bootstrap, dependency resolution, or inherited environment.
 use std::ffi::{CString, c_char};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
 const NOFOLLOW: i32 = 0x20000;
 #[cfg(target_os = "macos")]
 const NOFOLLOW: i32 = 0x100;
+#[cfg(target_os = "linux")]
+const CREATE: i32 = 0x40;
+#[cfg(target_os = "macos")]
+const CREATE: i32 = 0x200;
 
 unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
     fn fcntl(fd: i32, command: i32, ...) -> i32;
+    fn openat(fd: i32, name: *const c_char, flags: i32, ...) -> i32;
     #[cfg(target_os = "linux")]
     fn renameat2(left_dir: i32, left: *const c_char, right_dir: i32, right: *const c_char, flags: u32) -> i32;
     #[cfg(target_os = "macos")]
     fn renameatx_np(left_dir: i32, left: *const c_char, right_dir: i32, right: *const c_char, flags: u32) -> i32;
 }
 
+fn open_directory(path: &Path) -> io::Result<File> {
+    if !path.is_absolute() { return Err(io::Error::other("native directory must be absolute")); }
+    let mut directory = File::open("/")?;
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => CString::new(name.as_bytes()).map_err(io::Error::other)?,
+            _ => return Err(io::Error::other("unsafe native directory component")),
+        };
+        // Walk from directory descriptors: an ancestor rename cannot redirect
+        // the remaining walk, and no component may be a symlink.
+        let fd = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), NOFOLLOW) };
+        if fd < 0 { return Err(io::Error::last_os_error()); }
+        let next = unsafe { File::from_raw_fd(fd) };
+        if !next.metadata()?.is_dir() { return Err(io::Error::other("native parent is not a directory")); }
+        if unsafe { fcntl(fd, 2, 1) } < 0 { return Err(io::Error::last_os_error()); }
+        directory = next;
+    }
+    Ok(directory)
+}
+
 fn exchange(left: &Path, right: &Path) -> io::Result<()> {
     let open_parent = |file: &Path| -> io::Result<File> {
-        let directory = OpenOptions::new().read(true).custom_flags(NOFOLLOW)
-            .open(file.parent().ok_or_else(|| io::Error::other("missing parent"))?)?;
+        let directory = open_directory(file.parent().ok_or_else(|| io::Error::other("missing parent"))?)?;
         if !directory.metadata()?.is_dir() || !std::fs::symlink_metadata(file)?.is_file() {
             return Err(io::Error::other("atomic exchange requires directories and regular files"));
         }
@@ -64,8 +89,12 @@ fn lock_identity(file: &File, lock: &Path) -> io::Result<()> {
 fn recover(lock: &Path, node: &str, module: &str, hub: &str, command: &str) -> io::Result<i32> {
     // The permanent inode is never removed. The child inherits this flock, so
     // interrupting the supervisor cannot admit another recovery writer.
-    let file = OpenOptions::new().read(true).write(true).create(true).truncate(false)
-        .mode(0o600).custom_flags(NOFOLLOW).open(lock)?;
+    let directory = open_directory(lock.parent().ok_or_else(|| io::Error::other("missing lock parent"))?)?;
+    let name = CString::new(lock.file_name().ok_or_else(|| io::Error::other("missing lock name"))?.as_bytes())
+        .map_err(io::Error::other)?;
+    let fd = unsafe { openat(directory.as_raw_fd(), name.as_ptr(), 2 | CREATE | NOFOLLOW, 0o600u32) };
+    if fd < 0 { return Err(io::Error::last_os_error()); }
+    let file = unsafe { File::from_raw_fd(fd) };
     lock_identity(&file, lock)?;
     // File opens with CLOEXEC. Clear only that flag for the one owned lease.
     let flags = unsafe { fcntl(file.as_raw_fd(), 1) };

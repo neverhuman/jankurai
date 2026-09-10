@@ -352,6 +352,45 @@ test('uncommitted source edits block recovery and remain untouched', t => {
   });
 });
 
+for (const relative of ['', 'journal', 'journal/images', 'journal/swaps']) {
+  test(`redirected recovery directory ${relative || 'root'} preserves evidence and blocks mutation`, t => {
+    fixture(t, hub => {
+      const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding:'utf8', timeout:10000 });
+      assert.equal(crashed.status, 37, crashed.stderr);
+      const root = op.operationRoot(hub), directory = path.join(root, relative), retained = `${directory}.retained`;
+      const before = fs.readFileSync(op.journalPath(root));
+      fs.renameSync(directory, retained);
+      fs.symlinkSync(retained, directory, 'dir');
+      const report = op.inspect(hub);
+      assert.equal(report.finishAdmissible, false);
+      assert.equal(report.rollbackAdmissible, false);
+      assert.match(report.reasons.join('\n'), /unsafe recovery directory/);
+      for (const command of ['finish', 'rollback']) assert.throws(() => op[command](hub), /unsafe recovery directory/);
+      assert.deepEqual(fs.readFileSync(op.journalPath(root)), before);
+      assert.equal(fs.lstatSync(directory).isSymbolicLink(), true);
+      assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'AFTER CARGO');
+      assert.equal(fs.readFileSync(path.join(hub, 'family.lock'), 'utf8'), 'BEFORE FAMILY');
+    });
+  });
+}
+
+test('native exchange refuses an ancestor redirected at the replacement boundary', t => {
+  fixture(t, hub => {
+    let redirected = false;
+    assert.throws(() => commit(hub, (event, detail) => {
+      if (event !== 'before-atomic-exchange' || detail.direction !== 'replace' || redirected) return;
+      const journal = path.join(op.operationRoot(hub), 'journal');
+      fs.renameSync(journal, `${journal}.retained`);
+      fs.symlinkSync(`${journal}.retained`, journal, 'dir');
+      redirected = true;
+    }), /unsafe recovery directory/);
+    assert.equal(redirected, true);
+    assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'BEFORE CARGO');
+    assert.equal(fs.readFileSync(path.join(hub, 'family.lock'), 'utf8'), 'BEFORE FAMILY');
+    assert.equal(fs.lstatSync(path.join(op.operationRoot(hub), 'journal')).isSymbolicLink(), true);
+  });
+});
+
 for (const kind of ['symlink', 'fifo', 'oversized']) test(`non-regular or oversized ${kind} image is refused before recovery`, t => {
   fixture(t, hub => {
     const crashed = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });

@@ -99,7 +99,7 @@ function preservingExchange(tx, name, target, swap, incoming, outgoing, directio
 }
 function lockedRecovery(hub, command) {
   const lock = path.join(path.dirname(operationRoot(hub)), 'family-recovery.lock');
-  return JSON.parse(native(['recover', lock, process.execPath, fileURLToPath(import.meta.url), path.resolve(hub), command]));
+  return JSON.parse(native(['recover', lock, process.execPath, fileURLToPath(import.meta.url), fs.realpathSync(hub), command]));
 }
 
 
@@ -136,7 +136,7 @@ export function imagePath(root, name, side) {
 
 export function captureSource(directory) {
   return {
-    directory: path.resolve(directory),
+    directory: fs.realpathSync(directory),
     head: gitText(directory, 'rev-parse', 'HEAD'),
     tree: gitText(directory, 'rev-parse', 'HEAD^{tree}'),
   };
@@ -258,6 +258,7 @@ export function durableWriteFile(file, raw, mode = 0o644, prepared) {
 }
 
 function readJournal(root) {
+  assertRecoveryDirectories(root);
   const file = journalPath(root);
   if (!fs.existsSync(file)) return null;
   const data = JSON.parse(captureFileIdentity(file).bytes.toString('utf8'));
@@ -266,6 +267,7 @@ function readJournal(root) {
 }
 
 function writeJournal(root, data, observe) {
+  assertRecoveryDirectories(root);
   data.generation = (data.generation ?? 0) + 1;
   data.updatedAt = new Date().toISOString();
   const dir = journalDir(root);
@@ -302,7 +304,7 @@ export function acquire(hub, { observe } = {}) {
   durableWriteFile(path.join(root, 'owner.json'), `${JSON.stringify(writer, null, 2)}\n`);
   syncDirectory(root);
   const tx = {
-    hub: path.resolve(hub),
+    hub: fs.realpathSync(hub),
     root,
     writer,
     journal: null,
@@ -625,6 +627,14 @@ export function operation(hub, action, { observe } = {}) {
   }
 }
 
+function assertRecoveryDirectories(root) {
+  for (const directory of [root, journalDir(root), path.join(journalDir(root), 'images'), path.join(journalDir(root), 'swaps')]) {
+    try {
+      if (!fs.lstatSync(directory).isDirectory()) throw new Error(`unsafe recovery directory: ${directory}`);
+    } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+}
+
 function buildReport(hub) {
   const root = operationRoot(hub);
   const present = fs.existsSync(root);
@@ -646,6 +656,8 @@ function buildReport(hub) {
     report.reasons.push('no family-operation directory');
     return report;
   }
+  try { assertRecoveryDirectories(root); }
+  catch (error) { report.reasons.push(error.message); return report; }
   try {
     report.writer = JSON.parse(captureFileIdentity(path.join(root, 'owner.json')).bytes.toString('utf8'));
   } catch {
@@ -735,7 +747,7 @@ function rollbackUnlocked(hub, { observe } = {}) {
   if (!report.present) throw new Error('no family-operation to roll back');
   refuseLive(report);
   const tx = {
-    hub: path.resolve(hub),
+    hub: fs.realpathSync(hub),
     root: report.operationRoot,
     writer: report.writer,
     journal: report.journal,
@@ -763,7 +775,7 @@ function finishUnlocked(hub, { observe } = {}) {
     throw new Error(`finish not admissible: ${(report.reasons.join('; ') || journal.state)}`);
   }
   const tx = {
-    hub: path.resolve(hub),
+    hub: fs.realpathSync(hub),
     root: report.operationRoot,
     writer: report.writer,
     journal,
