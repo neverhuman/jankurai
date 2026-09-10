@@ -29,6 +29,7 @@ for (let index = 0; index < 2000; index++) {
 }
 const capture = path.join(root, 'recording');
 const producerOutputs = [];
+let fatal = null;
 try {
   const execution = spawnSync(process.execPath, [path.join(here, 'record-audit.mjs'), auditor, sample, capture], { stdio: 'inherit' });
   const recordingBytes = fs.readFileSync(path.join(capture, 'recording.json'));
@@ -53,6 +54,13 @@ try {
     inventory, sourceSha256: sha256(JSON.stringify(inventory)), producerOutputs,
     recordingSha256: sha256(recordingBytes), expectedSampleOutcome: 'FAIL', measuredOutcome: result,
   }, null, 2) + '\n', { flag: 'wx' });
+} catch (error) {
+  fatal = error;
 } finally {
-  cleanupSample(sample, [...inventory, ...producerOutputs]);
+  try {
+    cleanupSample(sample, [...inventory, ...producerOutputs]);
+  } catch (cleanupError) {
+    fatal ||= cleanupError;
+  }
 }
+if (fatal) throw fatal;

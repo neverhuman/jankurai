@@ -13,8 +13,13 @@ const recording = () => ({ schema: 1, kind: 'synthetic-test', identity: { execut
 
 test('released and updated forced progress formats are observed without invented phases', () => {
   assert.deepEqual(parsePhase('\x1b[1;38;5;141m| [==========------------------] 3/8 scan repository\x1b[0m'), { position: 3, label: 'scan repository' });
-  assert.deepEqual(parsePhase('⠸ █████░░░░ 38%  3/8  scan repository'), { position: 3, label: 'scan repository' });
+  assert.deepEqual(parsePhase('⠇ █████░░░░ 38%  3/8  scan repository'), { position: 3, label: 'scan repository' });
+  assert.deepEqual(parsePhase('⠋ ████████████████████████████████ 100%   8/8  score 36 raw 36 findings 22'),
+    { position: 8, label: 'score 36 raw 36 findings 22' });
   assert.equal(parsePhase('[progress] scoring repository'), null);
+  // Bright TUI scorecard uses "36/100"; that must not look like a progress phase.
+  assert.equal(parsePhase('│   36/100   raw 36    FAIL      │'), null);
+  assert.equal(parsePhase('score=36 raw=36 caps=10 findings=22'), null);
   assert.throws(() => parsePhase('| [==] 3/9 scan repository'), /unsupported/);
   assert.throws(() => parsePhase('| [==] 3/8 invented scan'), /unsupported/);
 });
