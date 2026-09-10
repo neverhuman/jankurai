@@ -17,8 +17,9 @@ if [[ -f agent/badge.toml ]]; then
   grep -q 'jankurai-badge:start' README.md
   test -s agent/jankurai-badge.svg
   test -s agent/jankurai-badge.json
+  node ops/ci/verify-badge-source.mjs
   jankurai badge --check \
-    --score agent/baselines/main.repo-score.json \
+    --score agent/badge-source/repo-score.json \
     --out agent/jankurai-badge.svg \
     --json-out agent/jankurai-badge.json \
     --readme README.md \
