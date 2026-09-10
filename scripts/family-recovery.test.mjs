@@ -165,7 +165,7 @@ test('recover inspect works with malformed family.lock', t => {
     });
     assert.equal(result.status, 0, result.stderr);
     const actual = JSON.parse(result.stdout);
-    assert.equal(actual.hub, hub);
+    assert.equal(actual.hub, fs.realpathSync(hub));
     assert.equal(actual.journal.state, 'needs-recovery');
     assert.equal(actual.finishAdmissible, false);
   }
