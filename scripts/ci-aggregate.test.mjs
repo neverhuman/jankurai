@@ -105,6 +105,11 @@ function assertWorkflowLanes(source) {
   assert.match(source, /^      - run: bash ops\/ci\/aggregate\.sh --hosted$/m);
   assert.match(source, /^          EXPECTED_HEAD_SHA: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}$/m);
   assert.match(source, /^          NEEDS_JSON: \$\{\{ toJSON\(needs\) \}\}$/m);
+  for (const lane of lanes) {
+    const body = source.split(`\n  ${lane}:\n`)[1]?.split(/^  [\w-]+:$/m)[0];
+    assert.ok(body, `missing ${lane} job`);
+    assert.match(body, /- uses: dtolnay\/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b\n        with:\n          toolchain: 1\.97\.1\n/);
+  }
   assert.match(
     source,
     /include:\n(?: {10}.+\n)*? {10}- os: ubuntu-24\.04\n {12}target: x86_64-unknown-linux-gnu\n {10}- os: macos-14\n {12}target: aarch64-apple-darwin/,
@@ -134,6 +139,8 @@ test('workflow mutations removing a dependency, job, matrix leg, or always gate 
     workflow.replace(/^    if: always\(\)\n/m, ''),
     workflow.replace('bash ops/ci/aggregate.sh', 'bash ops/ci/required.sh'),
     workflow.replace('bash ops/ci/aggregate.sh --hosted', 'bash ops/ci/aggregate.sh'),
+    workflow.replace(/      - uses: dtolnay\/rust-toolchain@[^\n]+\n        with:\n          toolchain: 1\.97\.1\n/, ''),
+    workflow.replace('toolchain: 1.97.1', 'toolchain: stable'),
   ]) {
     assert.notEqual(changed, workflow);
     assert.throws(() => assertWorkflowLanes(changed));
