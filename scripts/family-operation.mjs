@@ -1,5 +1,5 @@
 // Durable paired-lock journal and recovery. No npm/TOML bootstrap.
-// Atomic exchange and recovery exclusion use Python standard-library OS primitives.
+// Atomic exchange and recovery exclusion use a standalone Rust helper compiled before package bootstrap.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,13 +12,69 @@ export const LOCK_FILES = ['Cargo.lock', 'family.lock'];
 const ABNORMAL = new Set(['needs-recovery', 'rolling-back', 'replacing', 'verifying', 'prepared', 'validating', 'preparing']);
 
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-const nativeHelper = fileURLToPath(new URL('./family-native.py', import.meta.url));
+const nativeSource = fileURLToPath(new URL('./family-native.rs', import.meta.url));
+let nativeExecutable;
 const nativeEnvironment = () => ({ PATH: '/usr/bin:/bin', LANG: 'C.UTF-8',
   GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' });
+function nativeCompiler() {
+  const arch = { x64: 'x86_64', arm64: 'aarch64' }[process.arch];
+  const platform = { linux: 'unknown-linux-gnu', darwin: 'apple-darwin' }[process.platform];
+  if (!arch || !platform) throw new Error('native lock recovery is unsupported on this platform');
+  // Resolve only account-owned or system installation locations. Repository
+  // overrides (PATH, HOME, RUSTC, RUSTUP_HOME and RUSTUP_TOOLCHAIN) have no authority.
+  const roots = [path.join(os.userInfo().homedir, '.rustup'), '/usr/local/rustup', '/opt/rustup', '/opt/hostedtoolcache/rustup'];
+  for (const root of roots) {
+    const compiler = path.join(root, 'toolchains', `1.97.1-${arch}-${platform}`, 'bin', 'rustc');
+    if (!fs.existsSync(compiler)) continue;
+    const identity = captureFileIdentity(compiler);
+    const version = spawnSync(compiler, ['--version', '--verbose'], { env: nativeEnvironment(), encoding: 'utf8', timeout: 10000 });
+    assertIdentity(compiler, identity, 'pinned Rust compiler');
+    if (version.status !== 0 || !/^rustc 1\.97\.1 /.test(version.stdout ?? '') ||
+        !version.stdout.includes(`host: ${arch}-${platform}\n`)) {
+      throw new Error(`native lock recovery requires Rust1.97.1 for ${arch}-${platform}: ${compiler}`);
+    }
+    return { compiler, identity };
+  }
+  throw new Error('native lock recovery requires pinned Rust1.97.1 in an approved account or system rustup installation');
+}
+function nativeProgram() {
+  if (nativeExecutable) {
+    assertIdentity(nativeExecutable.path, nativeExecutable.identity, 'compiled recovery helper');
+    assertIdentity(nativeSource, nativeExecutable.sourceIdentity, 'native helper source');
+    return nativeExecutable.path;
+  }
+  const { compiler, identity: compilerIdentity } = nativeCompiler();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'jankurai-family-native-'));
+  const source = path.join(directory, 'helper.rs'), executable = path.join(directory, 'helper');
+  const original = captureFileIdentity(nativeSource);
+  writeExclusive(source, original.bytes, 0o600);
+  const result = spawnSync(compiler, ['--edition=2024', '-Dwarnings', source, '-o', executable], {
+    env: nativeEnvironment(), encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024,
+  });
+  if (result.status !== 0) throw new Error(`native recovery helper compilation failed; retained ${directory}: ${result.stderr ?? result.error}`);
+  assertIdentity(compiler, compilerIdentity, 'pinned Rust compiler');
+  assertIdentity(nativeSource, original, 'native helper source');
+  const identities = [source, executable].map(captureFileIdentity);
+  if (!identities[1].size || !(identities[1].mode & 0o111)) throw new Error(`native recovery helper is not executable; retained ${directory}`);
+  const fd = fs.openSync(executable, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+  syncDirectory(directory);
+  process.once('exit', () => {
+    // Delete only this process's unchanged private build files; retain unknown additions.
+    try {
+      for (const [i, file] of [source, executable].entries()) if (sameIdentity(file, identities[i])) fs.unlinkSync(file);
+      fs.rmdirSync(directory);
+    } catch { /* preserve unknown or failed cleanup evidence */ }
+  });
+  nativeExecutable = { path: executable, identity: identities[1], sourceIdentity: original };
+  return executable;
+}
 function native(args) {
-  const result = spawnSync('/usr/bin/python3', ['-I', nativeHelper, ...args], {
+  const executable = nativeProgram();
+  const result = spawnSync(executable, args, {
     env: nativeEnvironment(), encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: args[0] === 'recover' ? 60000 : 10000,
   });
+  assertIdentity(executable, nativeExecutable.identity, 'compiled recovery helper');
   if (result.error) throw result.error;
   if (result.status !== 0) throw new Error(`family native operation failed: ${result.stderr}`);
   return result.stdout;
@@ -651,7 +707,17 @@ function buildReport(hub) {
 }
 
 export function inspect(hub) {
-  return buildReport(hub);
+  const report = buildReport(hub);
+  try {
+    const { compiler, identity } = nativeCompiler();
+    report.nativeCapability = { available: true, compiler, compilerSha256: identity.sha256 };
+  } catch (error) {
+    report.nativeCapability = { available: false, reason: error.message };
+    report.finishAdmissible = false;
+    report.rollbackAdmissible = false;
+    report.reasons.push(error.message);
+  }
+  return report;
 }
 
 function refuseLive(report) {

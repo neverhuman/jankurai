@@ -143,8 +143,15 @@ Use `node scripts/family.mjs recover inspect --json`,
 `bash scripts/family.sh recover inspect --json`, or `just recover-inspect` before
 choosing `finish` or `rollback` (Just recipes: `recover-finish`, `recover-rollback`).
 These paths run before lockfile parsing or npm bootstrap. They require Node24,
-Git at `/usr/bin/git`, and Python3 at `/usr/bin/python3`; no Python packages are
-needed. Linux requires `renameat2(RENAME_EXCHANGE)`, and macOS requires
+Git at `/usr/bin/git`, and the ordinary pinned Rust1.97.1 toolchain. The small
+native helper compiles directly with rustc in a private temporary directory; it
+uses no Cargo manifest, dependencies, network, or package bootstrap. It resolves
+the exact host toolchain from the operating-system account's `.rustup`,
+`/usr/local/rustup`, `/opt/rustup`, or `/opt/hostedtoolcache/rustup`. Repository
+environment overrides do not select the compiler. Inspection reports compiler
+availability and its digest; unavailable native capabilities block mutation.
+The compiler, source and compiled helper identities are checked around execution.
+Linux requires `renameat2(RENAME_EXCHANGE)`, and macOS requires
 `renameatx_np(RENAME_SWAP)` on the checkout filesystem. Unsupported atomic
 exchange or uncertain process identity refuses mutation.
 

@@ -152,7 +152,7 @@ test('recover inspect works with malformed family.lock', t => {
   assert.ok(report.locks['family.lock']);
   const scripts = path.join(hub, 'scripts');
   fs.mkdirSync(scripts);
-  for (const file of ['family.mjs', 'family-operation.mjs', 'family-native.py', 'family.sh']) {
+  for (const file of ['family.mjs', 'family-operation.mjs', 'family-native.rs', 'family.sh']) {
     fs.copyFileSync(new URL(`./${file}`, import.meta.url), path.join(scripts, file));
   }
   // Copy only the actual command surface into a fixture with no family parser,

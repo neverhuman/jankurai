@@ -76,6 +76,46 @@ if (process.argv[2] === 'crash-child') {
   throw new Error('crash point not reached');
 }
 
+if (process.argv[2] === 'helper-substitution-child') {
+  const hub = process.argv[3];
+  let replaced = false;
+  assert.throws(() => commit(hub, (event, detail) => {
+    if (event !== 'after-atomic-exchange' || detail.name !== 'Cargo.lock' || detail.direction !== 'replace') return;
+    const builds = fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('jankurai-family-native-'));
+    assert.equal(builds.length, 1);
+    const helper = path.join(os.tmpdir(), builds[0], 'helper');
+    fs.writeFileSync(helper, `#!/bin/sh\nprintf substituted > '${path.join(hub, '.git/substituted')}'\n`, { mode: 0o700 });
+    replaced = true;
+  }), /compiled recovery helper: lock identity changed/);
+  assert.equal(replaced, true);
+  assert.equal(fs.existsSync(path.join(hub, '.git/substituted')), false);
+  assert.equal(fs.existsSync(path.join(hub, '.git/fake-compiler-invoked')), false);
+  process.exit(0);
+}
+
+test('compiler overrides and substitution of a compiled helper cannot execute candidate bytes', t => {
+  fixture(t, hub => {
+    const tmp = path.join(hub, '.git/native-test');
+    fs.mkdirSync(tmp);
+    const fake = path.join(hub, '.git/fake-rustc');
+    fs.writeFileSync(fake, `#!/bin/sh\nprintf invoked > '${path.join(hub, '.git/fake-compiler-invoked')}'\necho 'rustc 1.97.1 forged'\n`, { mode: 0o700 });
+    const child = spawnSync(process.execPath, [self, 'helper-substitution-child', hub], {
+      encoding: 'utf8', timeout: 60000,
+      env: { ...process.env, TMPDIR: tmp, HOME: path.join(hub, '.git'), RUSTC: fake,
+        RUSTUP_HOME: path.join(hub, '.git'), RUSTUP_TOOLCHAIN: 'nightly' },
+    });
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(fs.readFileSync(path.join(hub, 'Cargo.lock'), 'utf8'), 'AFTER CARGO');
+    assert.equal(fs.readFileSync(path.join(hub, 'family.lock'), 'utf8'), 'BEFORE FAMILY');
+    assert.equal(fs.existsSync(op.operationRoot(hub)), true);
+    const report = op.inspect(hub);
+    assert.equal(report.nativeCapability.available, true);
+    assert.match(report.nativeCapability.compilerSha256, /^[a-f0-9]{64}$/);
+    assert.equal(op.finish(hub).state, 'committed');
+    assert.equal(fs.readFileSync(path.join(hub, 'family.lock'), 'utf8'), 'AFTER FAMILY');
+  });
+});
+
 test('finishAdmissible allows naturally persisted mid-replace crash recovery', t => {
   fixture(t, hub => {
     const r = spawnSync(process.execPath, [self, 'crash-child', hub], { encoding: 'utf8', timeout: 10000 });
