@@ -125,8 +125,19 @@ jobs:
             echo "missing accepted baseline {baseline}" >&2
             exit 1
           fi
-      - name: Install jankurai
-        run: cargo install jankurai --locked
+      - name: Install pinned Jankurai 1.6.11
+        run: |
+          set -euo pipefail
+          tag=v1.6.11-deadlang-precision-split.3
+          name=jankurai-1.6.11-deadlang-precision-split.3-x86_64-unknown-linux-gnu
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$name.tar.gz" \
+            "https://github.com/neverhuman/jankurai/releases/download/$tag/$name.tar.gz"
+          echo "9e6b8857a26f6004d4c74e510e13b06d880f2e2ae0c89502698889ed690c5d6c  $name/jankurai" > expected.sha256
+          tar -xzf "$name.tar.gz"
+          sha256sum -c expected.sha256
+          sudo install -m 0755 "$name/jankurai" /usr/bin/jankurai
+      - name: jankurai badge --check
+        run: jankurai badge --check --update-readme
       - run: jankurai --version
       - name: Proofbind verify
         run: jankurai proofbind verify . --changed-from origin/main --mode required
@@ -180,7 +191,8 @@ mod tests {
     #[test]
     fn ratchet_workflow_uses_installed_jankurai_and_score_gate() {
         let rendered = workflow("ratchet", 85, Some(".jankurai/repo-score.json"));
-        assert!(rendered.contains("cargo install jankurai --locked"));
+        assert!(rendered.contains("jankurai-1.6.11-deadlang-precision-split.3"));
+        assert!(!rendered.contains("cargo install jankurai"));
         assert!(rendered.contains("--mode ratchet"));
         assert!(rendered.contains("target/jankurai/accepted-baseline.json"));
         assert!(rendered.contains("jankurai security run . --strict --profile ci"));

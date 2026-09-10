@@ -510,6 +510,7 @@ fn level_allowed_paths(level: InitLevel) -> BTreeSet<&'static str> {
             "crates/domain/AGENTS.md",
             "crates/workers/AGENTS.md",
             "agent/audit-policy.toml",
+            "agent/badge.toml",
             "agent/generated-zones.toml",
             "agent/jankurai-install.toml",
             "agent/owner-map.json",

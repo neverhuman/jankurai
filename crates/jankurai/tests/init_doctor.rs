@@ -445,7 +445,8 @@ standard_version = "0.0.0"
         fs::read_to_string(ci_dir.path().join(".github/workflows/jankurai.yml")).unwrap();
     assert!(workflow.contains("target/jankurai/accepted-baseline.json"));
     assert!(workflow.contains("jankurai security run . --strict --profile ci"));
-    assert!(workflow.contains("cargo install jankurai --locked"));
+    assert!(workflow.contains("jankurai-1.6.11-deadlang-precision-split.3"));
+    assert!(!workflow.contains("cargo install jankurai"));
     assert!(workflow.contains("jankurai audit . --mode ratchet"));
     assert!(!workflow.contains("cargo run -p jankurai"));
 

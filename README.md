@@ -22,23 +22,39 @@ Jankurai is not a model, hosted AI service, or "open source AI" system. It is re
 
 ## Install
 
-Preferred path: release installer with release-tag verification, GitHub
-artifact attestation, sha256, and Sigstore bundle checks.
+Jeryu pins **Jankurai 1.6.11**. Tag `v1.6.11-deadlang-precision-split.3` does
+not move. Do not `cargo install jankurai`. Verify the linux binary SHA-256
+`9e6b8857a26f6004d4c74e510e13b06d880f2e2ae0c89502698889ed690c5d6c`.
+
+30s signed tarball install (stranger path):
 
 ```bash
-curl -fsSL https://github.com/neverhuman/jankurai/releases/download/v1.6.0/jankurai-installer.sh \
-  | JANKURAI_RELEASE_TAG=v1.6.0 bash
+tag=v1.6.11-deadlang-precision-split.3
+name=jankurai-1.6.11-deadlang-precision-split.3-x86_64-unknown-linux-gnu
+curl -fsSL -o "$name.tar.gz" \
+  "https://github.com/neverhuman/jankurai/releases/download/$tag/$name.tar.gz"
+curl -fsSL -O \
+  "https://github.com/neverhuman/jankurai/releases/download/$tag/$name.tar.gz.sha256"
+sha256sum -c "$name.tar.gz.sha256"
+tar -xzf "$name.tar.gz"
+install -m 0755 "$name/jankurai" "$HOME/.local/bin/jankurai"
+jankurai --version    # jankurai 1.6.11
+sha256sum "$(command -v jankurai)"
+# 9e6b8857a26f6004d4c74e510e13b06d880f2e2ae0c89502698889ed690c5d6c
 ```
 
-Fallback source install:
+30s adopt a repository:
 
 ```bash
-git clone https://github.com/neverhuman/jankurai.git
-cd jankurai
-cargo install --path crates/jankurai --locked
-jankurai version
-jankurai versions
+jankurai init --apply --yes --level full --bootstrap-commit
+jankurai audit . --full --mode standard --no-score-history
+jankurai badge --update-readme
 ```
+
+The pre-commit hook runs `jankurai gate`. Bypass only with `JANKURAI_SKIP_HOOKS=1`.
+`jankurai adopt` stays plan-only.
+
+v1.7.0 exists as a later signed line. It is not the Jeryu family pin.
 
 For demos or CI logs, force rich terminal output:
 
