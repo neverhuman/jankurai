@@ -53,6 +53,9 @@ case "${1:-}" in
     reject verify_attestation "$asset" "$GITHUB_REPOSITORY" "$identity" 0000000000000000000000000000000000000000 "$GITHUB_REF"
     reject verify_attestation "$asset" "$GITHUB_REPOSITORY" "$identity" "$GITHUB_SHA" refs/tags/v1.7.0
     printf 'Real anonymous signatures and attestations verified; modified content and wrong repository/workflow/source/tag rejected.\n' > "$output/result.txt"
+    # Bind workflow run / source / artifact / signature identity for local pre-tag qualify.
+    printf 'cert-identity=%s\nworkflow=%s\nsource=%s\nartifact=probe.txt\n' \
+      "$identity" "$workflow" "$GITHUB_SHA" > "$output/identity.txt"
     cat "$output/result.txt"
     ;;
   *) echo 'usage: release-services.sh prepare|verify' >&2; exit 1 ;;

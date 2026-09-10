@@ -73,14 +73,15 @@ export function sameIdentity(file, expected) {
   try {
     const actual = captureFileIdentity(file);
     return actual.sha256 === expected.sha256 && actual.dev === expected.dev && actual.ino === expected.ino
-      && actual.size === expected.size;
+      && actual.size === expected.size
+      && (expected.mode == null || actual.mode === expected.mode);
   } catch {
     return false;
   }
 }
 
 export function assertIdentity(file, expected, label = file) {
-  if (!sameIdentity(file, expected)) throw new Error(`${label}: lock identity changed (dev/ino/bytes)`);
+  if (!sameIdentity(file, expected)) throw new Error(`${label}: lock identity changed (dev/ino/mode/bytes)`);
 }
 
 function processStartTicks(pid) {
@@ -88,6 +89,20 @@ function processStartTicks(pid) {
   const close = raw.lastIndexOf(')');
   if (close < 0) throw new Error('unreadable process identity');
   return raw.slice(close + 2).split(' ')[19];
+}
+
+/** True when /proc is present and readable enough to interpret pid absence as stopped. */
+export function procfsUsable() {
+  try {
+    const st = fs.statSync('/proc');
+    if (!st.isDirectory()) return false;
+    fs.accessSync('/proc', fs.constants.R_OK);
+    // Confirm the interface we read — missing here means absent/unreadable procfs, not a dead pid.
+    fs.accessSync('/proc/self/stat', fs.constants.R_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function writerIdentity() {
@@ -101,11 +116,13 @@ export function writerIdentity() {
 export function writerStatus(writer) {
   if (!writer?.pid) return 'uncertain';
   if (writer.hostname && writer.hostname !== os.hostname()) return 'foreign-host';
+  if (!procfsUsable()) return 'uncertain';
   try {
     const start = processStartTicks(writer.pid);
     if (writer.startTime != null && String(writer.startTime) !== String(start)) return 'stopped';
     return 'live';
   } catch (error) {
+    // With usable procfs, missing /proc/<pid>/stat means the process is gone.
     if (error?.code === 'ENOENT') return 'stopped';
     return 'uncertain';
   }
@@ -258,6 +275,23 @@ function loadImage(root, name, side) {
   return { bytes, sha256: digest(bytes), size: bytes.length };
 }
 
+function afterIdentityRecorded(after) {
+  return after
+    && after.sha256
+    && after.dev != null
+    && after.ino != null
+    && after.mode != null
+    && after.size != null;
+}
+
+function matchesRecordedIdentity(actual, recorded) {
+  return actual.sha256 === recorded.sha256
+    && actual.dev === recorded.dev
+    && actual.ino === recorded.ino
+    && actual.size === recorded.size
+    && actual.mode === recorded.mode;
+}
+
 export function classifyLock(hub, root, name, record) {
   const file = path.join(hub, name);
   let actual;
@@ -268,18 +302,31 @@ export function classifyLock(hub, root, name, record) {
   }
   const before = record?.before;
   const after = record?.after;
-  if (before && actual.sha256 === before.sha256 && actual.dev === before.dev && actual.ino === before.ino) {
+  if (before && actual.sha256 === before.sha256 && actual.dev === before.dev && actual.ino === before.ino
+      && (before.mode == null || actual.mode === before.mode)) {
     return { class: 'original', identity: identityMeta(actual) };
   }
   if (after && actual.sha256 === after.sha256) {
-    // Own after-image by content; inode may be the written file.
-    const image = loadImage(root, name, 'after');
-    if (image.sha256 === actual.sha256) return { class: 'own-after', identity: identityMeta(actual) };
+    // Own after only when recorded after inode/dev/mode match — content alone is not ownership.
+    if (afterIdentityRecorded(after) && matchesRecordedIdentity(actual, after)) {
+      const image = loadImage(root, name, 'after');
+      if (image.sha256 === actual.sha256) return { class: 'own-after', identity: identityMeta(actual) };
+    }
+    return { class: 'unknown-same-bytes', identity: identityMeta(actual) };
   }
-  if (before && actual.sha256 === before.sha256 && (actual.dev !== before.dev || actual.ino !== before.ino)) {
+  if (before && actual.sha256 === before.sha256 && (actual.dev !== before.dev || actual.ino !== before.ino
+      || (before.mode != null && actual.mode !== before.mode))) {
     return { class: 'unknown-same-bytes', identity: identityMeta(actual) };
   }
   return { class: 'unknown', identity: identityMeta(actual) };
+}
+
+function recordWrittenAfter(tx, name, written, stage = 'replaced') {
+  const current = readJournal(tx.root);
+  current.locks[name].after = identityMeta(written);
+  current.locks[name].stage = stage;
+  tx.journal = writeJournal(tx.root, current, tx.observe);
+  return written;
 }
 
 function replaceLock(tx, name, afterBytes, expectedPrior) {
@@ -287,11 +334,13 @@ function replaceLock(tx, name, afterBytes, expectedPrior) {
   assertIdentity(target, expectedPrior, name);
   markLockStage(tx, name, 'replacing');
   tx.observe?.('before-replace', { name });
+  // Re-assert immediately before write so unique concurrent edits at before-replace are not overwritten.
+  assertIdentity(target, expectedPrior, name);
   const bytes = Buffer.isBuffer(afterBytes) ? afterBytes : Buffer.from(afterBytes);
   durableWriteFile(target, bytes, expectedPrior.mode & 0o777);
   const written = captureFileIdentity(target);
   if (written.sha256 !== digest(bytes)) throw new Error(`${name}: post-replace digest mismatch`);
-  markLockStage(tx, name, 'replaced');
+  recordWrittenAfter(tx, name, written, 'replaced');
   tx.observe?.('after-replace', { name, identity: identityMeta(written) });
   return written;
 }
@@ -336,7 +385,13 @@ export function conditionalRollback(tx) {
     if (classification.class === 'own-after') {
       const before = loadImage(tx.root, name, 'before');
       const mode = journal.locks[name].before?.mode ?? 0o644;
+      const afterRecord = journal.locks[name].after;
+      if (!afterIdentityRecorded(afterRecord)) {
+        throw new Error(`${name}: own-after missing recorded after inode/dev/mode`);
+      }
       tx.observe?.('before-rollback-write', { name });
+      // Re-assert owned after identity at write; unique concurrent edits stay put.
+      assertIdentity(path.join(tx.hub, name), afterRecord, name);
       durableWriteFile(path.join(tx.hub, name), before.bytes, mode & 0o777);
       const actual = captureFileIdentity(path.join(tx.hub, name));
       if (actual.sha256 !== before.sha256) throw new Error(`${name}: rollback digest mismatch`);
@@ -463,8 +518,11 @@ function buildReport(hub) {
   const onlyOwnOrOriginal = classes.every(c => c === 'original' || c === 'own-after');
   report.rollbackAdmissible = report.writerStatus === 'stopped' && onlyOwnOrOriginal
     && !['committed', 'rolled-back'].includes(journal.state);
+  // Allow finish for naturally persisted mid-replace crashes (replacing / partial own-after+original),
+  // not only the prepared checkpoint.
+  const finishStates = new Set(['prepared', 'replacing', 'verifying', 'needs-recovery']);
   report.finishAdmissible = report.writerStatus === 'stopped'
-    && journal.state === 'prepared'
+    && finishStates.has(journal.state)
     && classes.includes('own-after')
     && classes.every(c => c === 'original' || c === 'own-after')
     && journal.locks
@@ -526,8 +584,13 @@ export function finish(hub, { observe } = {}) {
     const classification = report.locks[name];
     if (classification.class === 'original') {
       const after = loadImage(tx.root, name, 'after');
-      durableWriteFile(path.join(tx.hub, name), after.bytes, (journal.locks[name].before?.mode ?? 0o644) & 0o777);
-      markLockStage(tx, name, 'replaced');
+      const mode = (journal.locks[name].before?.mode ?? 0o644) & 0o777;
+      const target = path.join(tx.hub, name);
+      assertIdentity(target, journal.locks[name].before, name);
+      durableWriteFile(target, after.bytes, mode);
+      const written = captureFileIdentity(target);
+      if (written.sha256 !== after.sha256) throw new Error(`${name}: finish digest mismatch`);
+      recordWrittenAfter(tx, name, written, 'replaced');
     } else if (classification.class !== 'own-after') {
       throw new Error(`${name}: finish refused for class ${classification.class}`);
     }
