@@ -89,11 +89,14 @@ asset set as an immutable prerelease. A retry against a matching published
 release performs verification only; it never overwrites assets or moves a tag.
 
 Both public native smoke jobs must succeed before stable/latest promotion. The
-promotion command reads GitHub's jobs for the exact workflow run, attempt, and
-source commit, requiring every named build, signing, verification, staging,
-publication, and native smoke prerequisite. Failed or incomplete smoke leaves the
-release as a prerelease. Promotion changes only the release flags and verifies
-that all asset IDs, sizes, and digests remain unchanged. GitHub supports changing
+promotion command reads GitHub's jobs for the exact workflow run and source
+commit, requiring the latest execution of every named build, signing, verification,
+staging, publication, and native smoke prerequisite. Failed or incomplete smoke leaves the
+release as a prerelease. Retry failed jobs in the same run to reuse successful
+prerequisites and the retained verified assets; an older success cannot override a
+later failure. The promotion job must belong to the current attempt. Promotion
+changes only the release flags and verifies that all asset IDs, sizes, and digests
+remain unchanged. GitHub supports changing
 these flags on an [immutable release](https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository#editing-a-release).
 
 Public native installation checks run before CI installs Node or verification

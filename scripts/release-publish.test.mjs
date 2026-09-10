@@ -15,14 +15,14 @@ function fixture(t) {
     GITHUB_REPOSITORY: options.repository, GITHUB_RUN_ID: '123', GITHUB_RUN_ATTEMPT: '2', GITHUB_JOB: 'promote' };
   const state = { release: null, assets: [], mutations: [], uploads: [], failUpload: false, tag: options.commit,
     nextAssetId: 100, run: { head_sha: options.commit, event: 'push', path: '.github/workflows/release.yml', run_attempt: 2, status: 'in_progress' },
-    jobs: [...PROMOTION_JOBS, 'promote'].map(name => ({ name, head_sha: options.commit,
+    jobs: [...PROMOTION_JOBS, 'promote'].map((name, index) => ({ name, id: 1000 + index, run_id: 123, run_attempt: 2, head_sha: options.commit,
       status: name === 'promote' ? 'in_progress' : 'completed', conclusion: name === 'promote' ? null : 'success' })) };
   const asset = file => ({ id: state.nextAssetId++, name: path.basename(file), state: 'uploaded', size: fs.statSync(file).size,
     digest: 'sha256:' + createHash('sha256').update(fs.readFileSync(file)).digest('hex') });
   const api = (endpoint, body, method) => {
     if (method) state.mutations.push({ endpoint, body, method });
     if (endpoint.endsWith('/actions/runs/123')) return structuredClone(state.run);
-    if (endpoint.includes('/attempts/2/jobs?')) return { jobs: structuredClone(state.jobs) };
+    if (endpoint.includes('/jobs?filter=all&')) return { jobs: structuredClone(state.jobs) };
     if (endpoint.includes('/git/ref/tags/')) return { object: { type: 'commit', sha: state.tag } };
     if (endpoint.includes('/releases/tags/')) return state.release;
     if (endpoint.endsWith('/releases') && method === 'POST') return state.release = { id: 7, tag_name: body.tag_name, draft: body.draft, prerelease: body.prerelease };
@@ -46,7 +46,7 @@ test('publication uploads a complete draft and exposes only an immutable prerele
   assert.ok(f.state.mutations.every(x => x.body.make_latest === 'false'));
 });
 test('retry preserves a matching partial draft and uploads only missing assets', t => {
-  const f = fixture(t); f.state.release = { id: 7, tag_name: 'v1.7.0', draft: true };
+  const f = fixture(t); f.state.release = { id: 7, tag_name: 'v1.7.0', draft: true, prerelease: true };
   f.state.assets.push(f.asset(path.join(f.options.directory, 'binary.tar.gz')));
   f.state.failUpload = true; assert.throws(f.run, /interrupted upload/);
   assert.equal(f.state.release.draft, true); assert.equal(f.state.assets.length, 1);
@@ -55,7 +55,7 @@ test('retry preserves a matching partial draft and uploads only missing assets',
 });
 test('conflicting, extra, duplicate, or incomplete upload records are never replaced', t => {
   for (const defect of ['digest', 'extra', 'duplicate', 'duplicate-id', 'invalid-id', 'state']) {
-    const f = fixture(t); f.state.release = { id: 7, tag_name: 'v1.7.0', draft: true };
+    const f = fixture(t); f.state.release = { id: 7, tag_name: 'v1.7.0', draft: true, prerelease: true };
     const asset = f.asset(path.join(f.options.directory, 'binary.tar.gz'));
     if (defect === 'digest') asset.digest = 'sha256:' + '0'.repeat(64);
     if (defect === 'extra') asset.name = 'unreviewed';
@@ -80,7 +80,7 @@ test('wrong source tags and non-immutable published releases fail closed', t => 
   assert.throws(f.run, /not immutable/); assert.deepEqual(f.state.mutations, []);
 });
 
-test('promotion changes only flags after every exact current-attempt prerequisite succeeds', t => {
+test('promotion changes only flags after every exact prerequisite succeeds', t => {
   const f = fixture(t); f.run();
   const assets = structuredClone(f.state.assets);
   f.state.mutations = []; f.state.uploads = [];
@@ -139,6 +139,9 @@ test('promotion preserves drafts, incomplete inventories and changed tags on ref
   for (const change of [
     f => { f.state.release.draft = true; },
     f => { f.state.release.immutable = false; },
+    f => { f.state.release.immutable = 'true'; },
+    f => { delete f.state.release.draft; },
+    f => { f.state.release.prerelease = 'true'; },
     f => { f.state.assets.pop(); },
     f => { f.state.assets[0].digest = 'sha256:' + '0'.repeat(64); },
     f => { f.state.tag = 'b'.repeat(40); },
@@ -158,4 +161,30 @@ test('promotion fails on unavailable GitHub evidence and verifies post-promotion
     return result;
   }), /asset identity changed/);
   assert.equal(f.state.mutations.length, 1); assert.equal(f.state.uploads.length, 2);
+});
+
+
+test('failed-job reruns reuse successful prerequisites from this run without rebuilding immutable assets', t => {
+  const f = fixture(t); f.run(); f.state.mutations = []; f.state.uploads = [];
+  for (const job of f.state.jobs) if (job.name !== 'promote' && !job.name.startsWith('smoke ')) job.run_attempt = 1;
+  const smoke = f.state.jobs.find(job => job.name === 'smoke (ubuntu-24.04)');
+  f.state.jobs.push({ ...smoke, id: 2000, run_attempt: 1, conclusion: 'failure' });
+  assert.equal(f.promote().prerelease, false);
+  assert.deepEqual(f.state.uploads, []);
+});
+
+test('an older success cannot hide a later failure or malformed job identity', t => {
+  for (const change of [
+    f => { f.state.jobs.push({ ...f.state.jobs[0], id: 2000, run_attempt: 1 }); f.state.jobs[0].conclusion = 'failure'; },
+    f => { f.state.jobs[0].run_id = 124; },
+    f => { f.state.jobs[0].run_attempt = 3; },
+    f => { f.state.jobs[0].run_attempt = 0; },
+    f => { delete f.state.jobs[0].run_attempt; },
+    f => { f.state.jobs[0].id = f.state.jobs[1].id; },
+    f => { f.state.jobs.at(-1).run_attempt = 1; },
+    f => { f.state.jobs.push({ ...f.state.jobs[0], id: 2000 }); },
+  ]) {
+    const f = fixture(t); f.run(); f.state.mutations = []; change(f);
+    assert.throws(f.promote); assert.deepEqual(f.state.mutations, []); assert.equal(f.state.release.prerelease, true);
+  }
 });

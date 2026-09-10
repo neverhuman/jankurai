@@ -38,7 +38,8 @@ function releaseContext({ repository, tag, commit, version, directory }, api) {
   }));
   if (!expected.size) throw new Error('empty release inventory');
   const checkAssets = (release, complete) => {
-    if (release.tag_name !== tag || !Number.isSafeInteger(release.id) || release.id < 1) throw new Error('release identity mismatch');
+    if (release.tag_name !== tag || !Number.isSafeInteger(release.id) || release.id < 1 ||
+        typeof release.draft !== 'boolean' || typeof release.prerelease !== 'boolean') throw new Error('release identity mismatch');
     const seen = new Map(), ids = new Set();
     for (let page = 1; ; page++) {
       const assets = api(`${prefix}/releases/${release.id}/assets?per_page=100&page=${page}`);
@@ -73,7 +74,7 @@ export function publishRelease(options, api = request, put = upload) {
   }, 'POST');
   if (!release.draft) {
     checkAssets(release, true);
-    if (!release.immutable || typeof release.prerelease !== 'boolean') throw new Error('existing release is not immutable');
+    if (release.immutable !== true || typeof release.prerelease !== 'boolean') throw new Error('existing release is not immutable');
     return release;
   }
   const existing = checkAssets(release, false);
@@ -83,7 +84,7 @@ export function publishRelease(options, api = request, put = upload) {
   const id = release.id;
   api(`${prefix}/releases/${id}`, { draft: false, prerelease: true, make_latest: 'false' }, 'PATCH');
   release = api(`${prefix}/releases/${id}`);
-  if (release.id !== id || release.draft || !release.prerelease || !release.immutable) throw new Error('published release did not become an immutable prerelease');
+  if (release.id !== id || release.draft !== false || release.prerelease !== true || release.immutable !== true) throw new Error('published release did not become an immutable prerelease');
   sameAssets(before, checkAssets(release, true));
   verifyTag();
   return release;
@@ -113,24 +114,36 @@ function requirePromotionJobs({ repository, tag, commit }, env, api) {
       (run.status === 'completed' && run.conclusion !== 'success')) throw new Error('release workflow identity mismatch');
   const jobs = [];
   for (let page = 1; ; page++) {
-    const result = api(`${prefix}/attempts/${attempt}/jobs?per_page=100&page=${page}`);
+    const result = api(`${prefix}/jobs?filter=all&per_page=100&page=${page}`);
     if (!Array.isArray(result.jobs)) throw new Error('invalid release job inventory');
     jobs.push(...result.jobs);
     if (result.jobs.length < 100) break;
     if (page >= 100) throw new Error('release job inventory exceeds supported bound');
   }
-  const names = jobs.map(item => item.name).sort();
+  // Failed-job reruns retain successful prerequisite jobs from earlier attempts.
+  // Use the latest execution of each exact job, never an older success after failure.
+  const latest = new Map(), executions = new Set(), ids = new Set();
+  for (const item of jobs) {
+    const execution = `${item.name}:${item.run_attempt}`;
+    if (!Number.isSafeInteger(item.id) || item.id < 1 || ids.has(item.id) ||
+        item.run_id !== Number(runId) || item.head_sha !== commit ||
+        !Number.isSafeInteger(item.run_attempt) || item.run_attempt < 1 || item.run_attempt > Number(attempt) ||
+        executions.has(execution)) throw new Error('invalid or duplicate release job execution');
+    ids.add(item.id); executions.add(execution);
+    if (!latest.has(item.name) || latest.get(item.name).run_attempt < item.run_attempt) latest.set(item.name, item);
+  }
+  const names = [...latest.keys()].sort();
   if (JSON.stringify(names) !== JSON.stringify([...PROMOTION_JOBS, 'promote'].sort())) {
     throw new Error('release job inventory must contain every exact native and prerequisite job');
   }
   for (const name of PROMOTION_JOBS) {
-    const item = jobs.find(item => item.name === name);
+    const item = latest.get(name);
     if (item.head_sha !== commit || item.status !== 'completed' || item.conclusion !== 'success') {
       throw new Error(`release prerequisite has not succeeded for this source: ${name}`);
     }
   }
-  const promotion = jobs.find(item => item.name === 'promote');
-  if (promotion.head_sha !== commit || !['in_progress', 'completed'].includes(promotion.status) ||
+  const promotion = latest.get('promote');
+  if (promotion.run_attempt !== Number(attempt) || promotion.head_sha !== commit || !['in_progress', 'completed'].includes(promotion.status) ||
       (promotion.status === 'completed' && promotion.conclusion !== 'success')) {
     throw new Error('promotion job identity mismatch');
   }
@@ -147,14 +160,14 @@ export function promoteRelease(options, env = process.env, api = request) {
   const { prefix, verifyTag, checkAssets } = releaseContext(options, api);
   let release = api(`${prefix}/releases/tags/${options.tag}`);
   const before = checkAssets(release, true);
-  if (release.draft || !release.immutable || typeof release.prerelease !== 'boolean') throw new Error('promotion requires an immutable published candidate');
+  if (release.draft || release.immutable !== true || typeof release.prerelease !== 'boolean') throw new Error('promotion requires an immutable published candidate');
   // An already stable release is a read-only retry, including historical versions.
   if (!release.prerelease) return release;
   verifyTag();
   const id = release.id;
   api(`${prefix}/releases/${id}`, { prerelease: false, make_latest: 'true' }, 'PATCH');
   release = api(`${prefix}/releases/${id}`);
-  if (release.id !== id || release.draft || release.prerelease || !release.immutable) throw new Error('stable promotion readback mismatch');
+  if (release.id !== id || release.draft !== false || release.prerelease !== false || release.immutable !== true) throw new Error('stable promotion readback mismatch');
   sameAssets(before, checkAssets(release, true));
   verifyTag();
   if (api(`${prefix}/releases/latest`).id !== id) throw new Error('latest release readback mismatch');
