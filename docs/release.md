@@ -78,7 +78,16 @@ with Cosign and GitHub CLI. Certificate fields must bind the expected repository
 workflow, source, run and attempt. Authored success messages cannot authorize
 qualification. The returned receipt qualifies signing services; the complete
 release candidate still needs its own signed native staging qualification before
-tagging. Use the pinned verifier setup above.
+tagging. Use Node24 and Cosign3.1.3, then install and select the pinned GitHub
+verifier before invoking the command:
+
+```sh
+bash ops/ci/install-gh.sh
+export PATH="${RUNNER_TEMP:-$PWD/target}/jankurai-ci-tools/bin:$PATH"
+node scripts/pre-tag-qualify.mjs <downloaded-run-directory> <run-id>
+```
+
+Older GitHub CLI versions lack the required source-digest flags and are refused.
 
 Build jobs use read-only tokens and upload unsigned assets. A fresh signing job
 validates the complete unsigned inventory and signs it without building or
