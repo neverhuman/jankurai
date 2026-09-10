@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { qualifyPreTag } from './pre-tag-qualify.mjs';
+import { qualifyPreTag, validateProbeAttestation } from './pre-tag-qualify.mjs';
 
 const SOURCE = '0123456789abcdef0123456789abcdef01234567';
 const CERT = 'https://github.com/neverhuman/jankurai/.github/workflows/release-services.yml@refs/heads/main';
@@ -47,7 +47,7 @@ function fixture(t) {
     assert.equal(args[args.indexOf('--repo') + 1], 'neverhuman/jankurai');
     assert.ok(args.includes('--deny-self-hosted-runners'));
     const result = { signature: { certificate: {
-      subjectAlternativeName: { value: CERT }, issuer: 'https://token.actions.githubusercontent.com',
+      subjectAlternativeName: CERT, issuer: 'https://token.actions.githubusercontent.com',
       buildSignerURI: CERT, buildSignerDigest: SOURCE,
       sourceRepositoryURI: 'https://github.com/neverhuman/jankurai', sourceRepositoryDigest: SOURCE,
       sourceRepositoryRef: 'refs/heads/main', runnerEnvironment: 'github-hosted',
@@ -96,6 +96,7 @@ for (const [name, mutate] of Object.entries({
 });
 
 for (const [field, value] of Object.entries({
+  subjectAlternativeName: CERT.replace('release-services', 'release'),
   issuer: 'https://example.invalid', buildSignerURI: CERT.replace('release-services', 'release'),
   buildSignerDigest: 'a'.repeat(40), sourceRepositoryDigest: 'a'.repeat(40),
   sourceRepositoryURI: 'https://github.com/counterfeit/repository', sourceRepositoryRef: 'refs/tags/v1.8.0',
@@ -134,4 +135,12 @@ test('an expected source and run must come from the caller, not evidence files',
   const f = fixture(t);
   assert.throws(() => qualifyPreTag(f.root), /expected source SHA and run ID/);
   assert.throws(() => qualifyPreTag(f.root, { source: SOURCE, runId: 0 }), /expected source SHA and run ID/);
+});
+
+// Retained output from actual GH2.100 verification, source fb97/run34487611925.
+// This parser regression does not replace live signature verification.
+test('parse the pinned GitHub CLI actual verified certificate representation', () => {
+  const result = JSON.parse(fs.readFileSync(new URL('./fixtures/pretag-gh-2.100.0.json', import.meta.url), 'utf8'));
+  validateProbeAttestation(result, { source: 'fb97e59686fb4c6e1f27b4d567adf8d7606bc881', runId: 34487611925, attempt: 1,
+    artifactSha256: 'ffd51771fd6c328a7a73a829acd0a2cbc18ccd3e3c09fa04c4cf0fc53d61a798' });
 });

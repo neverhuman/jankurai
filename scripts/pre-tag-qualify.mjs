@@ -57,7 +57,7 @@ export function validateProbeAttestation(results, { source, runId, attempt, arti
   const result = results[0]?.verificationResult;
   const cert = result?.signature?.certificate;
   const statement = result?.statement;
-  if (cert?.subjectAlternativeName?.value !== IDENTITY || cert.issuer !== ISSUER ||
+  if (cert?.subjectAlternativeName !== IDENTITY || cert.issuer !== ISSUER ||
       cert.buildSignerURI !== IDENTITY || cert.buildSignerDigest !== source ||
       cert.sourceRepositoryURI !== `https://github.com/${REPO}` || cert.sourceRepositoryDigest !== source ||
       cert.sourceRepositoryRef !== REF || cert.runnerEnvironment !== 'github-hosted' ||
