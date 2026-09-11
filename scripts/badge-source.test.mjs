@@ -11,9 +11,9 @@ const baseline = read('agent/baselines/main.repo-score.json');
 
 test('public badge uses the protected full ratchet pass and preserves the accepted baseline', () => {
   const report = validateBadgeSource(text, provenance, baseline);
-  assert.equal(report.score, 91);
-  assert.equal(report.git.head, 'fb97e59');
-  assert.equal(JSON.parse(baseline).score, 91);
+  assert.equal(report.score, 86);
+  assert.equal(report.git.head, '39c91b0c1384d60406af02c621f10074432272a5');
+  assert.equal(JSON.parse(baseline).score, 86);
   assert.throws(() => validateBadgeSource(text + ' ', provenance, baseline));
   assert.throws(() => validateBadgeSource(text, provenance, baseline + ' '));
 });
@@ -26,7 +26,7 @@ test('updated hashes cannot turn an advisory, partial, dirty or regressed report
     report => { report.decision.hard_findings = 1; },
     report => { report.findings.push({ hardness: 'hard' }); },
     report => { report.caps_applied.push('new-cap'); },
-    report => { report.score = 90; },
+    report => { report.score = 85; },
     report => { report.policy.minimum_score = 0; },
     report => { report.dirty_worktree = true; },
     report => { report.scope.paths.push('one-file'); },

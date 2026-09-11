@@ -1,10 +1,10 @@
 # Jankurai
 
 <!-- jankurai-badge:start -->
-[![Jankurai score: 91/100](agent/jankurai-badge.svg)](agent/jankurai-badge.json)
+[![Jankurai score: 86/100](agent/jankurai-badge.svg)](agent/jankurai-badge.json)
 <!-- jankurai-badge:end -->
 
-Score for protected revision [fb97e59](https://github.com/neverhuman/jankurai/commit/fb97e59686fb4c6e1f27b4d567adf8d7606bc881):
+Score for protected revision [39c91b0c](https://github.com/neverhuman/jankurai/commit/39c91b0c1384d60406af02c621f10074432272a5):
 [ratchet report](agent/badge-source/repo-score.json) · [CI provenance](agent/badge-source/provenance.json).
 
 [**Current release v1.7.0**](https://github.com/neverhuman/jankurai/releases/tag/v1.7.0)
