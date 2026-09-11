@@ -3,6 +3,29 @@ import crypto from 'node:crypto';
 export const sha256 = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 export const phases = ['resolve changed paths', 'load audit mode', 'scan repository',
   'apply score policy', 'apply mode and baseline', 'render artifacts', 'write JSON and Markdown'];
+const phases7 = ['resolve changed paths', 'load audit mode', 'scan repository',
+  'apply mode and baseline', 'render artifacts', 'write JSON and Markdown'];
+
+function labelsFor(total) {
+  if (total === 8) return phases;
+  if (total === 7) return phases7;
+  return null;
+}
+
+function scoreLabel(label) {
+  return /^score \d+ raw \d+ findings \d+$/.test(label);
+}
+
+function timelineOf(events) {
+  const totals = [...new Set(events.map(e => e.total).filter(total => total === 7 || total === 8))];
+  if (totals.length > 1) throw new Error('invalid phase timeline');
+  if (totals[0] === 7 || totals[0] === 8) return { labels: labelsFor(totals[0]), last: totals[0] };
+  const score = events.find(e => scoreLabel(e.label));
+  if (score?.position === 7) return { labels: phases7, last: 7 };
+  if (score?.position === 8) return { labels: phases, last: 8 };
+  if (events.some(e => e.position === 4 && e.label === 'apply mode and baseline')) return { labels: phases7, last: 7 };
+  return { labels: phases, last: 8 };
+}
 
 export function parsePhase(text) {
   const plain = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
@@ -10,12 +33,13 @@ export function parsePhase(text) {
   // "35/100" must not be treated as audit phases.
   const progress = plain.match(/(?:\]|\d+%)\s+(\d+)\/(\d+)\s+(.+)$/);
   if (!progress) return null;
-  const position = Number(progress[1]), label = progress[3].trim();
-  if (Number(progress[2]) !== 8 || !((position > 0 && position < 8 && label === phases[position - 1])
-      || (position === 8 && /^score \d+ raw \d+ findings \d+$/.test(label)))) {
+  const position = Number(progress[1]), total = Number(progress[2]), label = progress[3].trim();
+  const labels = labelsFor(total);
+  if (!labels || !((position > 0 && position < total && label === labels[position - 1])
+      || (position === total && scoreLabel(label)))) {
     throw new Error('unsupported observed audit phase');
   }
-  return { position, label };
+  return { position, label, total };
 }
 
 export function reportSummary(report) {
@@ -41,13 +65,15 @@ export function validateRecording(recording, { allowSynthetic = false } = {}) {
   if (!recording.identity || !/^[a-f0-9]{64}$/.test(recording.identity.executableSha256 || '')
       || !Array.isArray(recording.events) || !recording.events.length) throw new Error('missing recording identity or events');
   if (recording.events[0].atMs !== 0 || recording.events[0].position !== 0 || recording.events.length > 64) throw new Error('invalid initial phase or event bound');
+  const { labels, last: terminal } = timelineOf(recording.events);
   let last = -1, position = 0;
   for (const e of recording.events) {
     if (!Number.isSafeInteger(e.atMs) || e.atMs < last || e.atMs < 0 || e.atMs > 600000
-        || !Number.isSafeInteger(e.position) || e.position < position || e.position > 8
+        || !Number.isSafeInteger(e.position) || e.position < position || e.position > terminal
+        || (e.total != null && e.total !== terminal)
         || typeof e.label !== 'string' || e.label.length > 120) throw new Error('invalid phase timeline');
-    if (e.position > 0 && e.position < 8 && e.label !== phases[e.position - 1]) throw new Error('unsupported phase identity');
-    if (e.position === 8 && !/^score \d+ raw \d+ findings \d+$/.test(e.label)) throw new Error('invalid terminal phase');
+    if (e.position > 0 && e.position < terminal && e.label !== labels[e.position - 1]) throw new Error('unsupported phase identity');
+    if (e.position === terminal && !scoreLabel(e.label)) throw new Error('invalid terminal phase');
     last = e.atMs; position = e.position;
   }
   const r = recording.result;
