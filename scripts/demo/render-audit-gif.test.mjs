@@ -12,16 +12,37 @@ const recording = () => ({ schema: 1, kind: 'synthetic-test', identity: { execut
   result: { atMs: 345, exitCode: 1, signal: null, error: null, report: report(), reportSha256: '0'.repeat(64) } });
 
 test('released and updated forced progress formats are observed without invented phases', () => {
-  assert.deepEqual(parsePhase('\x1b[1;38;5;141m| [==========------------------] 3/8 scan repository\x1b[0m'), { position: 3, label: 'scan repository' });
-  assert.deepEqual(parsePhase('⠇ █████░░░░ 38%  3/8  scan repository'), { position: 3, label: 'scan repository' });
+  assert.deepEqual(parsePhase('\x1b[1;38;5;141m| [==========------------------] 3/8 scan repository\x1b[0m'), { position: 3, label: 'scan repository', total: 8 });
+  assert.deepEqual(parsePhase('⠇ █████░░░░ 38%  3/8  scan repository'), { position: 3, label: 'scan repository', total: 8 });
   assert.deepEqual(parsePhase('⠋ ████████████████████████████████ 100%   8/8  score 36 raw 36 findings 22'),
-    { position: 8, label: 'score 36 raw 36 findings 22' });
+    { position: 8, label: 'score 36 raw 36 findings 22', total: 8 });
   assert.equal(parsePhase('[progress] scoring repository'), null);
   // Bright TUI scorecard uses "36/100"; that must not look like a progress phase.
   assert.equal(parsePhase('│   36/100   raw 36    FAIL      │'), null);
   assert.equal(parsePhase('score=36 raw=36 caps=10 findings=22'), null);
   assert.throws(() => parsePhase('| [==] 3/9 scan repository'), /unsupported/);
   assert.throws(() => parsePhase('| [==] 3/8 invented scan'), /unsupported/);
+});
+
+test('successor seven-phase auditor timeline is observed without invented labels', () => {
+  assert.deepEqual(parsePhase('| [==========------------------] 3/7 scan repository'),
+    { position: 3, label: 'scan repository', total: 7 });
+  assert.deepEqual(parsePhase('⠇ ████████░░ 57%  4/7  apply mode and baseline'),
+    { position: 4, label: 'apply mode and baseline', total: 7 });
+  assert.deepEqual(parsePhase('⠋ ████████████████████████████████ 100%   7/7  score 36 raw 36 findings 22'),
+    { position: 7, label: 'score 36 raw 36 findings 22', total: 7 });
+  assert.throws(() => parsePhase('| [==] 4/7 apply score policy'), /unsupported/);
+  assert.throws(() => parsePhase('| [==] 3/7 invented scan'), /unsupported/);
+  const r = recording();
+  r.events = [
+    { atMs: 0, position: 0, label: 'starting audit process' },
+    { atMs: 100, position: 3, label: 'scan repository', total: 7 },
+    { atMs: 140, position: 4, label: 'apply mode and baseline', total: 7 },
+    { atMs: 200, position: 7, label: 'score 36 raw 36 findings 22', total: 7 },
+  ];
+  assert.equal(validateRecording(r, { allowSynthetic: true }).events.at(-1).position, 7);
+  r.events.push({ atMs: 210, position: 8, label: 'score 36 raw 36 findings 22', total: 7 });
+  assert.throws(() => validateRecording(r, { allowSynthetic: true }), /invalid phase timeline/);
 });
 
 test('failed policy and process outcomes never become PASS', () => {
