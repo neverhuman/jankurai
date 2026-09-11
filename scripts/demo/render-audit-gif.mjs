@@ -40,12 +40,13 @@ export function raster(recording, state, scale) {
   const result = outcome(recording);
   const color = state.finished ? (result.passed ? 3 : 7) : 2;
   const activity = ['|', '/', '-', '\\'][Math.floor(state.atMs / 100) % 4];
+  const totalOf = event => event.total === 7 || event.total === 8 ? event.total : 8;
   text(48, 182, state.finished ? 'AUDIT PROCESS FINISHED' : `[${activity}] ${last.label.toUpperCase()}`, color);
   text(738, 182, (state.atMs / 1000).toFixed(2) + 's elapsed', 5);
-  rect(48, 217, 864, 8, 10); rect(48, 217, Math.round(864 * last.position / 8), 8, color);
+  rect(48, 217, 864, 8, 10); rect(48, 217, Math.round(864 * last.position / totalOf(last)), 8, color);
   const rows = state.events.slice(-6);
   rows.forEach((event, i) => text(48, 243 + i * 27,
-    `${(event.atMs / 1000).toFixed(2).padStart(7)}s  ${String(event.position).padStart(1)}/8  ${event.label}`,
+    `${(event.atMs / 1000).toFixed(2).padStart(7)}s  ${String(event.position).padStart(1)}/${totalOf(event)}  ${event.label}`,
     i === rows.length - 1 ? 5 : 11));
   rect(48, 416, 864, 1, 8);
   if (state.finished) {
